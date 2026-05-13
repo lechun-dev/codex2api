@@ -765,6 +765,8 @@
     "statusErrorDetails": "错误详情",
     "statusErrorEmpty": "未记录具体错误信息",
     "clearFilters": "清除筛选",
+    "showAnalysis": "显示分析",
+    "hideAnalysis": "隐藏分析",
     "modelStatsTitle": "模型统计",
     "modelStatsDesc": "按当前保留日志聚合请求、Token 与金额。",
     "noModelStats": "暂无模型统计",

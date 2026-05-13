@@ -765,6 +765,8 @@
     "statusErrorDetails": "Error Details",
     "statusErrorEmpty": "No detailed error message recorded",
     "clearFilters": "Clear Filters",
+    "showAnalysis": "Show Analysis",
+    "hideAnalysis": "Hide Analysis",
     "modelStatsTitle": "Model Statistics",
     "modelStatsDesc": "Aggregated by retained logs for requests, tokens, and amount.",
     "noModelStats": "No model statistics yet",

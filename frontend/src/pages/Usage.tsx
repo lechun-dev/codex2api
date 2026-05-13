@@ -55,6 +55,22 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
+const USAGE_ANALYSIS_VISIBILITY_KEY = 'usage_analysis_visible'
+
+function getInitialAnalysisVisibility(): boolean {
+  try {
+    return window.localStorage.getItem(USAGE_ANALYSIS_VISIBILITY_KEY) !== 'false'
+  } catch {
+    return true
+  }
+}
+
+function persistAnalysisVisibility(visible: boolean) {
+  try {
+    window.localStorage.setItem(USAGE_ANALYSIS_VISIBILITY_KEY, visible ? 'true' : 'false')
+  } catch {}
+}
+
 function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
   return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
 }
@@ -789,6 +805,7 @@ export default function Usage() {
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
+  const [showAnalysis, setShowAnalysis] = useState(getInitialAnalysisVisibility)
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -887,6 +904,10 @@ export default function Usage() {
     persistUsageVisibleColumns(visibleColumns)
   }, [visibleColumns])
 
+  useEffect(() => {
+    persistAnalysisVisibility(showAnalysis)
+  }, [showAnalysis])
+
   const { stats } = data
   const totalPages = Math.max(1, Math.ceil(logsTotal / pageSize))
   const currentPage = Math.min(page, totalPages)
@@ -936,6 +957,16 @@ export default function Usage() {
           title={t('usage.title')}
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          actions={
+            <Button
+              variant="outline"
+              aria-pressed={showAnalysis}
+              onClick={() => setShowAnalysis((v) => !v)}
+            >
+              <BarChart3 className="size-3.5" />
+              {showAnalysis ? t('usage.hideAnalysis') : t('usage.showAnalysis')}
+            </Button>
+          }
         />
 
         <div className="space-y-6">
@@ -1041,15 +1072,19 @@ export default function Usage() {
           </Card>
         </div>
 
-        <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
-          <ModelStatsPanel stats={modelStats} />
-          <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} />
-        </div>
+        {showAnalysis && (
+          <>
+            <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
+              <ModelStatsPanel stats={modelStats} />
+              <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} />
+            </div>
 
-        <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-          <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} />
-          <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} />
-        </div>
+            <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
+              <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} />
+              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} />
+            </div>
+          </>
+        )}
 
         {/* Logs table */}
         <Card>

@@ -210,26 +210,6 @@ export interface HealthResponse {
   total: number
 }
 
-export interface SelfUpdateStatusResponse {
-  supported: boolean
-  running: boolean
-  method?: string
-  target_container?: string
-  target_image?: string
-  watchtower_image?: string
-  message?: string
-  error?: string
-  reason?: string
-  started_at?: ISODateString
-}
-
-export interface SelfUpdateStartResponse extends MessageResponse {
-  supported: boolean
-  target_container?: string
-  target_image?: string
-  watchtower_image?: string
-}
-
 export interface SiteBranding {
   site_name: string
   site_logo: string
@@ -315,6 +295,7 @@ export interface SystemSettings {
   auto_clean_unauthorized: boolean
   auto_clean_rate_limited: boolean
   admin_secret: string
+  admin_secret_configured?: boolean
   admin_auth_source: 'env' | 'database' | 'disabled' | string
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
@@ -354,6 +335,7 @@ export interface SystemSettings {
   image_s3_bucket: string
   image_s3_access_key: string
   image_s3_secret_key: string
+  image_s3_secret_key_configured?: boolean
   image_s3_prefix: string
   image_s3_force_path_style: boolean
 }

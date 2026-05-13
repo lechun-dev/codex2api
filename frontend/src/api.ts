@@ -31,8 +31,6 @@ import type {
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
-  SelfUpdateStartResponse,
-  SelfUpdateStatusResponse,
   SiteBranding,
   StatsResponse,
   CPAExportEntry,
@@ -225,9 +223,6 @@ export const api = {
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),
-  getSelfUpdateStatus: () => request<SelfUpdateStatusResponse>('/system/update'),
-  startSelfUpdate: (data: { version?: string } = {}) =>
-    request<SelfUpdateStartResponse>('/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getOpsErrorSummary: (params: {
     start: string

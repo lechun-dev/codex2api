@@ -61,13 +61,6 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
-
-	// 容器自更新状态（由一次性 Watchtower 容器执行实际更新）
-	selfUpdateMu        sync.Mutex
-	selfUpdateRunning   bool
-	selfUpdateStartedAt time.Time
-	selfUpdateMessage   string
-	selfUpdateError     string
 }
 
 type chartCacheEntry struct {
@@ -231,8 +224,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
-	api.GET("/system/update", h.GetSelfUpdateStatus)
-	api.POST("/system/update", h.StartSelfUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)

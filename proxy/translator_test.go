@@ -1232,6 +1232,106 @@ func TestPrepareResponsesBody_DefaultsMissingMessageContent(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesFunctionNamesRejectsEmptyInputName(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"function_call","call_id":"call_abc","name":"","arguments":"{}"}
+		]
+	}`)
+
+	err := ValidateResponsesFunctionNames(raw)
+	if err == nil {
+		t.Fatal("expected empty function_call name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "input[1].name") {
+		t.Fatalf("error should identify input item name, got %v", err)
+	}
+}
+
+func TestValidateResponsesFunctionNamesRejectsEmptyToolName(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{"type":"function","name":"  ","parameters":{"type":"object"}}]
+	}`)
+
+	err := ValidateResponsesFunctionNames(raw)
+	if err == nil {
+		t.Fatal("expected empty function tool name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "tools[0].name") {
+		t.Fatalf("error should identify tool name, got %v", err)
+	}
+}
+
+func TestValidateResponsesFunctionNamesRejectsEmptyNestedToolName(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{"type":"function","function":{"name":" ","parameters":{"type":"object"}}}]
+	}`)
+
+	err := ValidateResponsesFunctionNames(raw)
+	if err == nil {
+		t.Fatal("expected empty nested function tool name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "tools[0].function.name") {
+		t.Fatalf("error should identify nested tool name, got %v", err)
+	}
+}
+
+func TestValidateResponsesFunctionNamesAllowsValidFunctionNames(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_abc","name":"lookup","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_abc","output":"ok"}
+		],
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+	}`)
+
+	if err := ValidateResponsesFunctionNames(raw); err != nil {
+		t.Fatalf("valid function names should pass, got %v", err)
+	}
+}
+
+func TestPrepareResponsesBodyNormalizesChatStyleFunctionTool(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"lookup",
+				"description":"Lookup data",
+				"parameters":{"type":"object","properties":{"q":{"type":"string"}}},
+				"strict":true
+			}
+		}]
+	}`)
+
+	if err := ValidateResponsesFunctionNames(raw); err != nil {
+		t.Fatalf("chat-style tool with nested name should pass validation, got %v", err)
+	}
+
+	got, _ := PrepareResponsesBody(raw)
+	tool := gjson.GetBytes(got, "tools.0")
+	if name := tool.Get("name").String(); name != "lookup" {
+		t.Fatalf("nested function name should be promoted, got %q; body=%s", name, got)
+	}
+	if tool.Get("function").Exists() {
+		t.Fatalf("nested function object should be removed after normalization, got %s", got)
+	}
+	if desc := tool.Get("description").String(); desc != "Lookup data" {
+		t.Fatalf("nested function description should be promoted, got %q; body=%s", desc, got)
+	}
+	if strict := tool.Get("strict"); !strict.Bool() {
+		t.Fatalf("nested function strict should be promoted, got %s; body=%s", strict.Raw, got)
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1385,6 +1485,44 @@ func TestConvertMessagesToInput_AssistantWithToolCalls(t *testing.T) {
 	}
 	if fc.Get("arguments").String() != `{"city":"NYC"}` {
 		t.Fatalf("expected arguments to match, got %q", fc.Get("arguments").String())
+	}
+}
+
+func TestTranslateRequestRejectsEmptyToolCallName(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"user","content":"Call a tool"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_123","type":"function","function":{"name":"","arguments":"{}"}}
+			]}
+		]
+	}`)
+
+	_, err := TranslateRequest(raw)
+	if err == nil {
+		t.Fatal("expected empty tool call name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "messages[1].tool_calls[0].function.name") {
+		t.Fatalf("error should identify tool call name, got %v", err)
+	}
+}
+
+func TestTranslateRequestRejectsEmptyFunctionToolName(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[
+			{"type":"function","function":{"name":" ","description":"bad","parameters":{"type":"object"}}}
+		]
+	}`)
+
+	_, err := TranslateRequest(raw)
+	if err == nil {
+		t.Fatal("expected empty function tool name to be rejected")
+	}
+	if !strings.Contains(err.Error(), "tools[0].function.name") {
+		t.Fatalf("error should identify function tool name, got %v", err)
 	}
 }
 
@@ -1775,3 +1913,4 @@ func TestPrepareResponsesBodyHandlesMultipleCompactionItems(t *testing.T) {
 		t.Fatalf("compaction type should not survive in upstream body: %s", codexBody)
 	}
 }
+

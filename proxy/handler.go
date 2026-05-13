@@ -1152,6 +1152,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
+	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -1868,6 +1872,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
+	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)

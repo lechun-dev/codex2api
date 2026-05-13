@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -1013,6 +1014,9 @@ func cachedOrParse(rawJSON []byte) openAIRequest {
 // 采用 Unmarshal→构造 map→Marshal 模式，只做一次 JSON 序列化
 func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	req := cachedOrParse(rawJSON)
+	if err := validateChatCompletionFunctionNames(req); err != nil {
+		return nil, err
+	}
 
 	// 构建输出 map（只包含 Codex 需要的字段）
 	out := map[string]any{
@@ -1063,6 +1067,130 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(out)
+}
+
+func invalidFunctionNameError(path string) error {
+	return fmt.Errorf("Invalid '%s': empty string. Expected a string with minimum length 1, but got an empty string instead.", path)
+}
+
+func validateChatCompletionFunctionNames(req openAIRequest) error {
+	for msgIdx, msg := range req.Messages {
+		for callIdx, toolCall := range msg.ToolCalls {
+			if strings.TrimSpace(toolCall.Function.Name) == "" {
+				return invalidFunctionNameError(fmt.Sprintf("messages[%d].tool_calls[%d].function.name", msgIdx, callIdx))
+			}
+		}
+	}
+	for toolIdx, rawTool := range req.Tools {
+		var parsed openAIToolParsed
+		if err := json.Unmarshal(rawTool, &parsed); err != nil || parsed.Type != "function" || parsed.Function == nil {
+			continue
+		}
+		if strings.TrimSpace(parsed.Function.Name) == "" {
+			return invalidFunctionNameError(fmt.Sprintf("tools[%d].function.name", toolIdx))
+		}
+	}
+	return nil
+}
+
+// ValidateResponsesFunctionNames rejects malformed tool-call names before they
+// reach the upstream Responses API. The upstream reports these as HTTP 400
+// empty_string errors; local validation makes the bad client field obvious.
+func ValidateResponsesFunctionNames(rawBody []byte) error {
+	var body map[string]any
+	if err := json.Unmarshal(rawBody, &body); err != nil {
+		return nil
+	}
+	return validateResponsesFunctionNames(body)
+}
+
+func validateResponsesFunctionNames(body map[string]any) error {
+	inputItems, _ := body["input"].([]any)
+	for itemIdx, rawItem := range inputItems {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(item["type"])) != "function_call" {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(item["name"])) == "" {
+			return invalidFunctionNameError(fmt.Sprintf("input[%d].name", itemIdx))
+		}
+	}
+
+	tools, _ := body["tools"].([]any)
+	for toolIdx, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
+			continue
+		}
+		if responsesFunctionToolName(tool) == "" {
+			path := fmt.Sprintf("tools[%d].name", toolIdx)
+			if _, ok := tool["function"].(map[string]any); ok {
+				path = fmt.Sprintf("tools[%d].function.name", toolIdx)
+			}
+			return invalidFunctionNameError(path)
+		}
+	}
+	return nil
+}
+
+func responsesFunctionToolName(tool map[string]any) string {
+	if name := strings.TrimSpace(firstNonEmptyAnyString(tool["name"])); name != "" {
+		return name
+	}
+	function, _ := tool["function"].(map[string]any)
+	if function == nil {
+		return ""
+	}
+	return strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
+}
+
+func normalizeResponsesFunctionTools(body map[string]any) bool {
+	tools, ok := body["tools"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
+			continue
+		}
+		function, _ := tool["function"].(map[string]any)
+		if function == nil {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(tool["name"])) == "" {
+			if name := strings.TrimSpace(firstNonEmptyAnyString(function["name"])); name != "" {
+				tool["name"] = name
+				modified = true
+			}
+		}
+		if _, ok := tool["description"]; !ok {
+			if desc := strings.TrimSpace(firstNonEmptyAnyString(function["description"])); desc != "" {
+				tool["description"] = desc
+				modified = true
+			}
+		}
+		if _, ok := tool["parameters"]; !ok {
+			if params, ok := function["parameters"]; ok {
+				tool["parameters"] = params
+				modified = true
+			}
+		}
+		if _, ok := tool["strict"]; !ok {
+			if strict, ok := function["strict"]; ok {
+				tool["strict"] = strict
+				modified = true
+			}
+		}
+		delete(tool, "function")
+		modified = true
+	}
+	return modified
 }
 
 // PrepareResponsesBody 将 Responses API 原始请求转换为上游可接受的格式
@@ -1128,6 +1256,7 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		}
 	}
 	normalizeResponsesStructuredOutputFormat(body)
+	normalizeResponsesFunctionTools(body)
 
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
 	if tools, ok := body["tools"].([]any); ok {
@@ -1247,6 +1376,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	}
 
 	normalizeResponsesStructuredOutputFormat(body)
+	normalizeResponsesFunctionTools(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 

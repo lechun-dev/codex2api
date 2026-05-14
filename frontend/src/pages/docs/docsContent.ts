@@ -441,8 +441,8 @@ export function buildAdminSpecs(
       title: copy(locale, "文件批量导入账号", "Bulk import accounts from file"),
       description: copy(
         locale,
-        "通过文件批量导入账号，支持 txt、CLIProxyAPI 导出的 json、以及每行一个 AT 的 at_txt，文件最大 2MB。",
-        "Bulk import accounts from file. Supports txt, CLIProxyAPI-exported json, and at_txt with one access token per line; max file size is 2MB.",
+        "通过文件批量导入账号，支持 txt、CLIProxyAPI 导出的 json、以及每行一个 AT 的 at_txt，文件最大 20MB。",
+        "Bulk import accounts from file. Supports txt, CLIProxyAPI-exported json, and at_txt with one access token per line; max file size is 20MB.",
       ),
       curl: `# TXT — one Refresh Token per line
 curl --request POST \\

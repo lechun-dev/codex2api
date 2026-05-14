@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"reflect"
@@ -75,6 +76,8 @@ const (
 	adminAPIKeyCountNamespace     = "api-key-count"
 	adminUsageStatsCacheTTL       = 5 * time.Second
 	adminChartCacheTTL            = 10 * time.Second
+	importFileSizeLimitBytes      = 20 * 1024 * 1024
+	importFileSizeLimitLabel      = "20MB"
 )
 
 func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
@@ -108,6 +111,13 @@ func (h *Handler) setRuntimeJSON(ctx context.Context, namespace, key string, val
 	if err := h.cache.SetRuntime(ctx, namespace, key, payload, ttl); err != nil {
 		log.Printf("写入运行态缓存失败: namespace=%s err=%v", namespace, err)
 	}
+}
+
+func validateImportFileSize(fh *multipart.FileHeader) error {
+	if fh.Size > importFileSizeLimitBytes {
+		return fmt.Errorf("文件 %s 大小超过 %s", fh.Filename, importFileSizeLimitLabel)
+	}
+	return nil
 }
 
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
@@ -1832,8 +1842,8 @@ func readUploadedImportFiles(c *gin.Context) ([]uploadedImportFile, error) {
 
 	result := make([]uploadedImportFile, 0, len(files))
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			return nil, fmt.Errorf("文件 %s 大小超过 2MB", fh.Filename)
+		if err := validateImportFileSize(fh); err != nil {
+			return nil, err
 		}
 
 		f, err := fh.Open()
@@ -1905,8 +1915,8 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 	var allTokens []importToken
 
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 大小超过 2MB", fh.Filename))
+		if err := validateImportFileSize(fh); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
 			return
 		}
 

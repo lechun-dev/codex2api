@@ -65,6 +65,7 @@ var builtinModelInfos = []ModelInfo{
 	modelInfoForID("gpt-5.3-codex", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.3-codex-spark", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.2", ModelSourceBuiltin),
+	modelInfoForID("codex-auto-review", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-2k", ModelSourceBuiltin),
 	modelInfoForID("gpt-image-2-4k", ModelSourceBuiltin),

@@ -252,6 +252,8 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "gpt-5.3") || strings.Contains(compact, "gpt5-3") || strings.Contains(compact, "gpt5.3"):
 		return "gpt-5.3-codex", true
+	case strings.Contains(compact, "codex-auto-review"):
+		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "codex"):
 		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "gpt-5") || strings.Contains(compact, "gpt5"):

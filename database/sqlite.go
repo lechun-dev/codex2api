@@ -701,18 +701,28 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 	return result, nil
 }
 
-// getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）
-func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
+// getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
+// rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
+func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time) (*UsageStats, error) {
 	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
 	minuteAgo := now.Add(-1 * time.Minute)
 
-	rows, err := db.conn.QueryContext(ctx, `
+	query := `
 			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
 			       cached_tokens, first_token_ms, duration_ms, status_code, account_billed, user_billed
 			FROM usage_logs
 			WHERE created_at >= $1 AND status_code <> 499
-		`, db.timeArg(todayStart))
+		`
+	args := []interface{}{db.timeArg(rangeStart)}
+	if !rangeEnd.IsZero() {
+		query += " AND created_at < $2"
+		args = append(args, db.timeArg(rangeEnd))
+	}
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -136,16 +136,24 @@ func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey stri
 	}
 }
 
-func (h *Handler) getUsageStatsCached(ctx context.Context) (*database.UsageStats, error) {
-	var cached database.UsageStats
-	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
-		return &cached, nil
+func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time) (*database.UsageStats, error) {
+	// 只对"默认今日"区间走 5 秒缓存。
+	// 带显式区间的请求种类多、命中率低,且 ClearUsageLogs 现有的失效逻辑只清 "global" key,
+	// 给区间结果做缓存反而需要扩展失效接口,得不偿失,直接每次重算更简单。
+	useCache := rangeStart.IsZero() && rangeEnd.IsZero()
+	if useCache {
+		var cached database.UsageStats
+		if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
+			return &cached, nil
+		}
 	}
-	stats, err := h.db.GetUsageStats(ctx)
+	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd)
 	if err != nil {
 		return nil, err
 	}
-	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	if useCache {
+		h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	}
 	return stats, nil
 }
 
@@ -371,7 +379,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		}
 	}
 
-	usageStats, _ := h.getUsageStatsCached(ctx)
+	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{})
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
@@ -2721,17 +2729,50 @@ func (h *Handler) GetHealth(c *gin.Context) {
 
 // ==================== Usage ====================
 
-// GetUsageStats 获取使用统计
+// GetUsageStats 获取使用统计。
+// 支持可选 query 参数 start/end (RFC3339);未传时回落"今日"行为。
 func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	stats, err := h.getUsageStatsCached(ctx)
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+// parseUsageStatsRange 解析 /usage/stats 的可选 start/end query。
+// 任一为空则当作零值由调用方决定回退行为(默认"今日");两者都填则要求均合法。
+func parseUsageStatsRange(startStr, endStr string) (time.Time, time.Time, error) {
+	startStr = strings.TrimSpace(startStr)
+	endStr = strings.TrimSpace(endStr)
+	var start, end time.Time
+	if startStr != "" {
+		t, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("start 参数格式错误，需要 RFC3339")
+		}
+		start = t
+	}
+	if endStr != "" {
+		t, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("end 参数格式错误，需要 RFC3339")
+		}
+		end = t
+	}
+	if !start.IsZero() && !end.IsZero() && !end.After(start) {
+		return time.Time{}, time.Time{}, fmt.Errorf("end 必须晚于 start")
+	}
+	return start, end, nil
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）

@@ -1937,16 +1937,27 @@ type TrafficSnapshot struct {
 	TPSPeak float64 `json:"tps_peak"`
 }
 
-// GetUsageStats 获取使用统计（基线 + 当前日志）
-func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+// GetUsageStats 获取使用统计（基线 + 当前日志）。
+// 当 rangeStart 为零值时回落到"今日"(本地 0 点起),与历史行为一致;
+// 当传入显式区间时,today_* 字段语义变为"该区间内的统计",total_* 字段始终是全量累计。
+// rangeEnd 为零值表示"至今"。
+func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time) (*UsageStats, error) {
 	if db.isSQLite() {
-		return db.getUsageStatsSQLite(ctx)
+		return db.getUsageStatsSQLite(ctx, rangeStart, rangeEnd)
 	}
 
 	stats := &UsageStats{}
 	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
 	minuteAgo := now.Add(-1 * time.Minute)
+	endClause := ""
+	args := []interface{}{rangeStart, minuteAgo}
+	if !rangeEnd.IsZero() {
+		endClause = " AND created_at < $3"
+		args = append(args, rangeEnd)
+	}
 
 	todayQuery := `
 	SELECT
@@ -1964,14 +1975,14 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS today_cache_hit_requests,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
-	WHERE created_at >= $1
+	WHERE created_at >= $1` + endClause + `
 	  AND status_code <> 499
 	`
 
 	var todayErrors int64
 	var todayCacheHitRequests int64
 	var todayPrompt, todayCompletion, todayCached int64
-	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
+	err := db.conn.QueryRowContext(ctx, todayQuery, args...).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &todayPrompt, &todayCompletion, &todayCached,
 		&stats.TodayAccountBilled, &stats.TodayUserBilled,
 		&stats.RPM, &stats.TPM,

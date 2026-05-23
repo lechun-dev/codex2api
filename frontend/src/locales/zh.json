@@ -35,6 +35,8 @@
     "info": "实时",
     "switchToDark": "切换为深色模式",
     "switchToLight": "切换为浅色模式",
+    "collapseSidebar": "收起侧栏",
+    "expandSidebar": "展开侧栏",
     "page": "页",
     "prev": "上一页",
     "next": "下一页",

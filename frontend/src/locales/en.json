@@ -35,6 +35,8 @@
     "info": "Live",
     "switchToDark": "Switch to dark mode",
     "switchToLight": "Switch to light mode",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
     "page": "Page",
     "prev": "Previous",
     "next": "Next",

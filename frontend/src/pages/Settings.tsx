@@ -391,6 +391,7 @@ export default function Settings() {
     test_concurrency: 50,
     background_refresh_interval_minutes: 2,
     usage_probe_max_age_minutes: 10,
+    usage_probe_concurrency: 16,
     recovery_probe_interval_minutes: 30,
     lazy_mode: false,
     pg_max_conns: 50,
@@ -647,9 +648,9 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.05fr)]">
+          <div className="grid gap-4 xl:grid-cols-3">
             <SettingsCard title={t('settings.trafficProtection')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-4">
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')}>
                   <Input
                     type="number"
@@ -688,24 +689,8 @@ export default function Settings() {
               </div>
             </SettingsCard>
 
-            <SettingsCard title={t('settings.scheduler')}>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
-                <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
-	                  <Select
-	                    value={settingsForm.test_model}
-	                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
-	                    options={textModelOptions}
-	                  />
-                </SettingField>
-                <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={200}
-                    value={settingsForm.test_concurrency}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
-                  />
-                </SettingField>
+            <SettingsCard title={t('settings.probeScheduling')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
                 <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
                   <Input
                     type="number"
@@ -726,6 +711,16 @@ export default function Settings() {
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
+                <SettingField label={t('settings.usageProbeConcurrency')} description={t('settings.usageProbeConcurrencyDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={128}
+                    value={settingsForm.usage_probe_concurrency}
+                    disabled={lazyModeActive}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
                   <Input
                     type={lazyModeActive ? 'text' : 'number'}
@@ -741,6 +736,27 @@ export default function Settings() {
                     value={settingsForm.lazy_mode ? 'true' : 'false'}
                     onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, lazy_mode: value === 'true' }))}
                     options={booleanOptions}
+                  />
+                </SettingField>
+              </div>
+            </SettingsCard>
+
+            <SettingsCard title={t('settings.schedulingStrategy')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4">
+                <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
+                  <Select
+                    value={settingsForm.test_model}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
+                    options={textModelOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={settingsForm.test_concurrency}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')}>

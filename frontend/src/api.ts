@@ -203,6 +203,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  forceUsageProbe: () =>
+    request<{ triggered: boolean; concurrency: number; reason?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),

@@ -602,6 +602,7 @@ func (db *DB) migrate(ctx context.Context) error {
 			auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
 			background_refresh_interval_minutes INT DEFAULT 2,
 			usage_probe_max_age_minutes INT DEFAULT 10,
+			usage_probe_concurrency INT DEFAULT 16,
 			recovery_probe_interval_minutes INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
@@ -633,6 +634,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_concurrency INT DEFAULT 16;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
@@ -1168,6 +1170,7 @@ type SystemSettings struct {
 	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
 	BackgroundRefreshIntervalMinutes int
 	UsageProbeMaxAgeMinutes          int
+	UsageProbeConcurrency            int
 	RecoveryProbeIntervalMinutes     int
 	SchedulerMode                    string
 	AffinityMode                     string // session 粘性模式: bounded / off / strict
@@ -1210,6 +1213,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(model_mapping, '{}'),
 		       COALESCE(background_refresh_interval_minutes, 2),
 		       COALESCE(usage_probe_max_age_minutes, 10),
+		       COALESCE(usage_probe_concurrency, 16),
 		       COALESCE(recovery_probe_interval_minutes, 30),
 		       COALESCE(scheduler_mode, 'round_robin'),
 		       COALESCE(affinity_mode, 'bounded'),
@@ -1239,7 +1243,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping,
-		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
+		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
 		&s.AffinityMode,
 		&s.ResinURL, &s.ResinPlatformName,
@@ -1266,6 +1270,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
+				usage_probe_concurrency,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
@@ -1275,7 +1280,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				scheduler_mode,
 				affinity_mode
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1301,6 +1306,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				model_mapping           = EXCLUDED.model_mapping,
 				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
+				usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
@@ -1328,6 +1334,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
+		s.UsageProbeConcurrency,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,

@@ -232,6 +232,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
+	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
@@ -3818,6 +3819,7 @@ type settingsResponse struct {
 	TestConcurrency                  int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         bool   `json:"lazy_mode"`
 	ProxyURL                         string `json:"proxy_url"`
@@ -3880,6 +3882,7 @@ type updateSettingsReq struct {
 	TestConcurrency                  *int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes *int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          *int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            *int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     *int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         *bool   `json:"lazy_mode"`
 	ProxyURL                         *string `json:"proxy_url"`
@@ -4022,6 +4025,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4179,6 +4183,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetUsageProbeMaxAge(time.Duration(v) * time.Minute)
 		log.Printf("设置已更新: usage_probe_max_age_minutes = %d", v)
+	}
+
+	if req.UsageProbeConcurrency != nil {
+		v := *req.UsageProbeConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 128 {
+			v = 128
+		}
+		h.store.SetUsageProbeConcurrency(v)
+		log.Printf("设置已更新: usage_probe_concurrency = %d", v)
 	}
 
 	if req.RecoveryProbeIntervalMinutes != nil {
@@ -4514,6 +4530,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4579,6 +4596,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),

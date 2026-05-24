@@ -2314,6 +2314,14 @@ export default function Accounts() {
                 accounts={accounts}
                 compact
                 className="min-w-0"
+                onProbeStarted={() => {
+                  showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
+                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
+                  window.setTimeout(() => {
+                    void reloadSilently()
+                  }, 4000)
+                }}
+                onProbeError={(message) => showToast(message, 'error')}
               />
               <AccountRateLimitRecoveryChart
                 accounts={accounts}

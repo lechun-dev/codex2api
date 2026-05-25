@@ -1,6 +1,6 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import { useTheme } from '../hooks/useTheme'
@@ -105,23 +105,41 @@ export default function Layout({ children }: PropsWithChildren) {
     return location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
   }
 
+  // Apple HIG-style easing for sidebar choreography:
+  //  - container width/padding/gap use 380ms (long, slow ease-out)
+  //  - text opacity/translate use 200ms (snappy)
+  //  - when expanding, text waits 150ms so the container opens up first;
+  //    when collapsing, text fades out immediately
+  const containerEase = 'duration-[380ms] ease-[cubic-bezier(0.32,0.72,0,1)]'
+  const textEase = 'duration-[200ms] ease-[cubic-bezier(0.32,0.72,0,1)]'
+  const textRevealDelay = sidebarCollapsed ? 'delay-0' : 'delay-150'
+
   return (
     <div className="min-h-dvh">
       <div
-        className="grid max-w-full grid-cols-1 max-lg:px-3 lg:grid-cols-[var(--admin-layout-columns)] transition-[grid-template-columns] duration-200"
+        className={`grid max-w-full grid-cols-1 max-lg:px-3 lg:grid-cols-[var(--admin-layout-columns)] transition-[grid-template-columns] ${containerEase}`}
         style={{
           '--admin-layout-columns': sidebarCollapsed ? '64px minmax(0,1fr)' : '264px minmax(0,1fr)',
         } as CSSProperties}
       >
         {/* Sidebar - desktop */}
-        <aside className="sticky top-0 self-start h-dvh border-r border-border bg-[hsl(var(--sidebar-background))] max-lg:hidden">
-          <div className={`flex flex-col h-full ${sidebarCollapsed ? 'px-2' : 'px-4'} pt-5 pb-4 transition-[padding] duration-200`}>
+        <aside className="sticky top-0 self-start h-dvh overflow-hidden border-r border-border bg-[hsl(var(--sidebar-background))] max-lg:hidden">
+          <div className={`flex flex-col h-full ${sidebarCollapsed ? 'px-2' : 'px-4'} pt-5 pb-4 transition-[padding] ${containerEase}`}>
             {/* Brand */}
             <div className={`pb-4 border-b border-border ${sidebarCollapsed ? 'flex justify-center' : ''}`}>
               <div className={`flex items-center gap-3 ${sidebarCollapsed ? 'justify-center' : ''}`}>
                 <img src={logoSrc} alt={siteName} className="size-10 rounded-lg object-cover shadow-sm shrink-0" />
-                {!sidebarCollapsed && (
-                  <div className="flex flex-col gap-1">
+                <div
+                  aria-hidden={sidebarCollapsed}
+                  className={`min-w-0 overflow-hidden transition-[max-width] ${containerEase} ${
+                    sidebarCollapsed ? 'pointer-events-none max-w-0' : 'max-w-[160px]'
+                  }`}
+                >
+                  <div
+                    className={`flex min-w-0 flex-col gap-1 whitespace-nowrap transition-[opacity,transform] ${textEase} ${textRevealDelay} ${
+                      sidebarCollapsed ? '-translate-x-1 opacity-0' : 'translate-x-0 opacity-100'
+                    }`}
+                  >
                     <h1 className="max-w-[160px] truncate text-[20px] leading-tight font-bold text-foreground" title={siteName}>
                       {siteName}
                     </h1>
@@ -130,6 +148,7 @@ export default function Layout({ children }: PropsWithChildren) {
                         type="button"
                         className={`relative inline-flex items-center rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary ring-1 ring-primary/10 transition-colors ${releaseURL ? 'cursor-pointer hover:bg-primary/15' : 'cursor-default'}`}
                         title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
+                        tabIndex={sidebarCollapsed ? -1 : 0}
                         onClick={() => {
                           if (!releaseURL) return
                           setShowVersionPopover((current) => !current)
@@ -165,7 +184,7 @@ export default function Layout({ children }: PropsWithChildren) {
                       )}
                     </div>
                   </div>
-                )}
+                </div>
               </div>
             </div>
 
@@ -175,27 +194,34 @@ export default function Layout({ children }: PropsWithChildren) {
               onClick={toggleSidebarCollapsed}
               title={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
               aria-label={sidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}
-              className={`mt-3 flex items-center min-h-9 rounded-lg text-[12px] font-semibold text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-colors ${
+              className={`mt-3 flex items-center min-h-9 rounded-lg text-[12px] font-semibold text-muted-foreground hover:bg-muted/60 hover:text-foreground transition-[background-color,color,padding] ${containerEase} ${
                 sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-2 px-3 py-2'
               }`}
             >
-              {sidebarCollapsed ? (
-                <ChevronRight className="size-4" />
-              ) : (
-                <>
-                  <ChevronLeft className="size-4" />
-                  <span>{t('common.collapseSidebar')}</span>
-                </>
-              )}
+              <ChevronLeft
+                className={`size-4 transition-transform ${containerEase} ${
+                  sidebarCollapsed ? 'rotate-180' : 'rotate-0'
+                }`}
+              />
+              <span
+                className={`overflow-hidden whitespace-nowrap transition-[max-width,opacity] ${textEase} ${textRevealDelay} ${
+                  sidebarCollapsed ? 'max-w-0 opacity-0' : 'max-w-[160px] opacity-100'
+                }`}
+              >
+                {t('common.collapseSidebar')}
+              </span>
             </button>
 
             {/* Nav */}
             <nav className="flex-1 flex flex-col gap-1 pt-3" aria-label="Main navigation">
-              {!sidebarCollapsed && (
-                <span className="mb-1 px-2 text-[11px] font-bold uppercase text-muted-foreground">
-                  {t('nav.console')}
-                </span>
-              )}
+              <span
+                className={`mb-1 overflow-hidden whitespace-nowrap px-2 text-[11px] font-bold uppercase text-muted-foreground transition-[max-height,opacity,margin] ${textEase} ${textRevealDelay} ${
+                  sidebarCollapsed ? 'mb-0 max-h-0 opacity-0' : 'max-h-5 opacity-100'
+                }`}
+                aria-hidden={sidebarCollapsed}
+              >
+                {t('nav.console')}
+              </span>
               {navDefs.map((item) => {
                 const active = isNavActive(item)
                 const label = t(item.labelKey)
@@ -205,7 +231,7 @@ export default function Layout({ children }: PropsWithChildren) {
                     to={item.to}
                     end={item.end}
                     title={sidebarCollapsed ? label : undefined}
-                    className={`flex items-center min-h-10 border rounded-lg text-[14px] font-semibold transition-colors duration-150 ${
+                    className={`flex items-center min-h-10 border rounded-lg text-[14px] font-semibold transition-[background-color,color,border-color,padding,gap] ${containerEase} ${
                       sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-2.5 px-3 py-2'
                     } ${
                       active
@@ -214,7 +240,13 @@ export default function Layout({ children }: PropsWithChildren) {
                     }`}
                   >
                     {item.icon}
-                    {!sidebarCollapsed && <span>{label}</span>}
+                    <span
+                      className={`overflow-hidden whitespace-nowrap transition-[max-width,opacity] ${textEase} ${textRevealDelay} ${
+                        sidebarCollapsed ? 'max-w-0 opacity-0' : 'max-w-[160px] opacity-100'
+                      }`}
+                    >
+                      {label}
+                    </span>
                   </NavLink>
                 )
               })}
@@ -222,18 +254,21 @@ export default function Layout({ children }: PropsWithChildren) {
 
             {/* Footer */}
             <div
-              className={`mt-auto border-t border-border pt-3 ${
+              className={`mt-auto border-t border-border pt-3 transition-[gap] ${containerEase} ${
                 sidebarCollapsed
                   ? 'flex flex-col items-center gap-1'
                   : 'flex items-center justify-between gap-2'
               }`}
             >
-              {!sidebarCollapsed && (
-                <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/16 bg-[hsl(var(--success-bg))] px-2 py-1 text-[11px] font-bold text-[hsl(var(--success))] shrink-0 whitespace-nowrap">
-                  <span className="size-2 rounded-full bg-emerald-500 shrink-0" />
-                  {t('common.online')}
-                </span>
-              )}
+              <span
+                aria-hidden={sidebarCollapsed}
+                className={`inline-flex items-center gap-1.5 overflow-hidden rounded-md border border-emerald-500/16 bg-[hsl(var(--success-bg))] text-[11px] font-bold text-[hsl(var(--success))] shrink-0 whitespace-nowrap transition-[max-width,opacity,padding] ${textEase} ${textRevealDelay} ${
+                  sidebarCollapsed ? 'pointer-events-none max-w-0 px-0 opacity-0' : 'max-w-[120px] px-2 py-1 opacity-100'
+                }`}
+              >
+                <span className="size-2 rounded-full bg-emerald-500 shrink-0" />
+                {t('common.online')}
+              </span>
               <div className={`flex items-center gap-0.5 ${sidebarCollapsed ? 'flex-col' : ''}`}>
                 <button
                   onClick={toggleLang}

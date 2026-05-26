@@ -1,8 +1,9 @@
 import { type CSSProperties, type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
+import { resetAdminAuthState } from '../api'
+import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useTheme } from '../hooks/useTheme'
 import SecurityBanner from './SecurityBanner'
@@ -33,7 +34,7 @@ export default function Layout({ children }: PropsWithChildren) {
   const location = useLocation()
   const { t, i18n } = useTranslation()
   const { hasUpdate, latestVersion } = useVersionCheck(location.pathname)
-  const { siteName, siteLogo } = useBranding()
+  const { siteName, siteLogo, backgroundImage, backgroundOpacity, backgroundBlur, backgroundGlassOpacity, backgroundGlassBlur } = useBranding()
   const { theme, toggle } = useTheme()
   const [spinning, setSpinning] = useState(false)
   const logoSrc = siteLogo || DEFAULT_SITE_LOGO
@@ -84,6 +85,55 @@ export default function Layout({ children }: PropsWithChildren) {
     }
   }, [showVersionPopover])
 
+  useEffect(() => {
+    const root = document.documentElement
+    const glassVars = [
+      '--admin-glass-card-opacity',
+      '--admin-glass-card-strong-opacity',
+      '--admin-glass-control-opacity',
+      '--admin-glass-sidebar-opacity',
+      '--admin-glass-border-opacity',
+      '--admin-glass-card',
+      '--admin-glass-card-strong',
+      '--admin-glass-control',
+      '--admin-glass-sidebar',
+      '--admin-glass-border',
+      '--admin-glass-panel-blur',
+      '--admin-glass-control-blur',
+      '--admin-glass-shadow-alpha',
+    ]
+    if (backgroundImage) {
+      root.dataset.adminBackground = 'true'
+      const glassOpacity = Math.min(100, Math.max(0, Math.round(backgroundGlassOpacity)))
+      const panelBlur = Math.min(20, Math.max(0, Math.round(backgroundGlassBlur)))
+      const strongOpacity = glassOpacity === 0 ? 0 : Math.min(100, glassOpacity + 8)
+      const controlOpacity = Math.max(0, glassOpacity - 12)
+      const sidebarOpacity = glassOpacity === 0 ? 0 : Math.min(100, glassOpacity + 6)
+      const borderOpacity = glassOpacity === 0 ? 0 : Math.min(100, Math.max(38, glassOpacity + 14))
+      root.style.setProperty('--admin-glass-card-opacity', `${glassOpacity}%`)
+      root.style.setProperty('--admin-glass-card-strong-opacity', `${strongOpacity}%`)
+      root.style.setProperty('--admin-glass-control-opacity', `${controlOpacity}%`)
+      root.style.setProperty('--admin-glass-sidebar-opacity', `${sidebarOpacity}%`)
+      root.style.setProperty('--admin-glass-border-opacity', `${borderOpacity}%`)
+      root.style.setProperty('--admin-glass-card', glassOpacity === 0 ? 'transparent' : `color-mix(in oklab, var(--color-card) ${glassOpacity}%, transparent)`)
+      root.style.setProperty('--admin-glass-card-strong', strongOpacity === 0 ? 'transparent' : `color-mix(in oklab, var(--color-card) ${strongOpacity}%, transparent)`)
+      root.style.setProperty('--admin-glass-control', controlOpacity === 0 ? 'transparent' : `color-mix(in oklab, var(--color-background) ${controlOpacity}%, transparent)`)
+      root.style.setProperty('--admin-glass-sidebar', sidebarOpacity === 0 ? 'transparent' : `color-mix(in oklab, hsl(var(--sidebar-background)) ${sidebarOpacity}%, transparent)`)
+      root.style.setProperty('--admin-glass-border', borderOpacity === 0 ? 'transparent' : `color-mix(in oklab, var(--color-border) ${borderOpacity}%, transparent)`)
+      root.style.setProperty('--admin-glass-panel-blur', `${panelBlur}px`)
+      root.style.setProperty('--admin-glass-control-blur', `${Math.max(0, panelBlur - 2)}px`)
+      root.style.setProperty('--admin-glass-shadow-alpha', `${Math.min(0.24, (glassOpacity / 58) * 0.14).toFixed(3)}`)
+    } else {
+      delete root.dataset.adminBackground
+      glassVars.forEach((name) => root.style.removeProperty(name))
+    }
+
+    return () => {
+      delete root.dataset.adminBackground
+      glassVars.forEach((name) => root.style.removeProperty(name))
+    }
+  }, [backgroundGlassBlur, backgroundGlassOpacity, backgroundImage])
+
   const toggleLang = () => {
     const next = i18n.language === 'zh' ? 'en' : 'zh'
     i18n.changeLanguage(next)
@@ -115,16 +165,51 @@ export default function Layout({ children }: PropsWithChildren) {
   const textEase = 'duration-[200ms] ease-[cubic-bezier(0.32,0.72,0,1)]'
   const textRevealDelay = sidebarCollapsed ? 'delay-0' : 'delay-150'
 
+  const isBackgroundVideo = isBrandingVideo(backgroundImage)
+  const backgroundMediaStyle: CSSProperties | undefined = backgroundImage
+    ? {
+        opacity: backgroundOpacity / 100,
+        filter: backgroundBlur > 0 ? `blur(${backgroundBlur}px)` : undefined,
+        transform: backgroundBlur > 0 ? 'scale(1.04)' : undefined,
+      }
+    : undefined
+  const backgroundLayerStyle: CSSProperties | undefined = backgroundImage && !isBackgroundVideo
+    ? {
+        ...backgroundMediaStyle,
+        backgroundImage: `url(${JSON.stringify(backgroundImage)})`,
+      }
+    : undefined
+
   return (
-    <div className="min-h-dvh">
+    <div className="relative min-h-dvh">
+      {backgroundImage ? (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-0 overflow-hidden">
+          {isBackgroundVideo ? (
+            <video
+              src={backgroundImage}
+              className="absolute inset-0 size-full object-cover transition-[opacity,filter,transform] duration-300"
+              style={backgroundMediaStyle}
+              autoPlay
+              muted
+              loop
+              playsInline
+            />
+          ) : (
+            <div
+              className="absolute inset-0 bg-cover bg-center bg-no-repeat transition-[opacity,filter,transform] duration-300"
+              style={backgroundLayerStyle}
+            />
+          )}
+        </div>
+      ) : null}
       <div
-        className={`grid max-w-full grid-cols-1 max-lg:px-3 lg:grid-cols-[var(--admin-layout-columns)] transition-[grid-template-columns] ${containerEase}`}
+        className={`relative z-10 grid max-w-full grid-cols-1 max-lg:px-3 lg:grid-cols-[var(--admin-layout-columns)] transition-[grid-template-columns] ${containerEase}`}
         style={{
           '--admin-layout-columns': sidebarCollapsed ? '64px minmax(0,1fr)' : '264px minmax(0,1fr)',
         } as CSSProperties}
       >
         {/* Sidebar - desktop */}
-        <aside className="sticky top-0 self-start h-dvh overflow-hidden border-r border-border bg-[hsl(var(--sidebar-background))] max-lg:hidden">
+        <aside data-slot="admin-sidebar" className="sticky top-0 self-start h-dvh overflow-hidden border-r border-border bg-[hsl(var(--sidebar-background))] max-lg:hidden">
           <div className={`flex flex-col h-full ${sidebarCollapsed ? 'px-2' : 'px-4'} pt-5 pb-4 transition-[padding] ${containerEase}`}>
             {/* Brand */}
             <div className={`pb-4 border-b border-border ${sidebarCollapsed ? 'flex justify-center' : ''}`}>
@@ -297,6 +382,14 @@ export default function Layout({ children }: PropsWithChildren) {
                     {theme === 'dark' ? <Sun className="size-[18px]" /> : <Moon className="size-[18px]" />}
                   </span>
                 </button>
+                <button
+                  onClick={resetAdminAuthState}
+                  className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150"
+                  title={t('common.logout')}
+                  aria-label={t('common.logout')}
+                >
+                  <LogOut className="size-[18px]" />
+                </button>
               </div>
             </div>
           </div>
@@ -305,7 +398,7 @@ export default function Layout({ children }: PropsWithChildren) {
         {/* Main content */}
         <main className="min-w-0 p-5 max-lg:p-3 max-lg:pb-[92px]">
           {/* Mobile topbar */}
-          <header className="hidden max-lg:flex min-w-0 w-full max-w-full items-center justify-between gap-2 overflow-hidden mb-4 p-3 border border-border rounded-lg bg-card/95 shadow-sm">
+          <header data-slot="admin-mobile-topbar" className="hidden max-lg:flex min-w-0 w-full max-w-full items-center justify-between gap-2 overflow-hidden mb-4 p-3 border border-border rounded-lg bg-card/95 shadow-sm">
             <div className="flex min-w-0 flex-1 items-center gap-3">
               <img src={logoSrc} alt={siteName} className="w-8 h-8 rounded-[10px] object-cover" />
               <strong className="min-w-0 flex-1 truncate text-lg" title={siteName}>{siteName}</strong>
@@ -328,6 +421,14 @@ export default function Layout({ children }: PropsWithChildren) {
                   {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
                 </span>
               </button>
+              <button
+                onClick={resetAdminAuthState}
+                className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors"
+                title={t('common.logout')}
+                aria-label={t('common.logout')}
+              >
+                <LogOut className="size-4" />
+              </button>
               <span className="inline-flex items-center justify-center min-h-[28px] px-2.5 rounded-full text-[12px] font-bold bg-[hsl(var(--success-bg))] text-[hsl(var(--success))] shrink-0 whitespace-nowrap max-[420px]:hidden">
                 {t('common.online')}
               </span>
@@ -339,7 +440,7 @@ export default function Layout({ children }: PropsWithChildren) {
         </main>
 
         {/* Mobile bottom nav */}
-        <nav className="fixed left-3 right-3 bottom-3 z-40 hidden max-lg:flex gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Mobile navigation">
+        <nav data-slot="admin-mobile-nav" className="fixed left-3 right-3 bottom-3 z-40 hidden max-lg:flex gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Mobile navigation">
           {navDefs.map((item) => {
             const active = isNavActive(item)
             return (

@@ -857,6 +857,77 @@
 }
 
 @layer components {
+  :root[data-admin-background="true"],
+  [data-admin-background="true"] {
+    --admin-glass-card-opacity: 70%;
+    --admin-glass-card-strong-opacity: 78%;
+    --admin-glass-control-opacity: 58%;
+    --admin-glass-sidebar-opacity: 76%;
+    --admin-glass-border-opacity: 72%;
+    --admin-glass-panel-blur: 5px;
+    --admin-glass-control-blur: 3px;
+    --admin-glass-shadow-alpha: 0.14;
+    --admin-glass-card: color-mix(in oklab, var(--color-card) var(--admin-glass-card-opacity), transparent);
+    --admin-glass-card-strong: color-mix(in oklab, var(--color-card) var(--admin-glass-card-strong-opacity), transparent);
+    --admin-glass-control: color-mix(in oklab, var(--color-background) var(--admin-glass-control-opacity), transparent);
+    --admin-glass-sidebar: color-mix(in oklab, hsl(var(--sidebar-background)) var(--admin-glass-sidebar-opacity), transparent);
+    --admin-glass-border: color-mix(in oklab, var(--color-border) var(--admin-glass-border-opacity), transparent);
+    --admin-glass-shadow: 0 18px 46px hsl(222 30% 12% / var(--admin-glass-shadow-alpha));
+    --admin-glass-blur: blur(var(--admin-glass-panel-blur)) saturate(1.06);
+    --admin-glass-control-filter: blur(var(--admin-glass-control-blur)) saturate(1.04);
+  }
+
+  :root.dark[data-admin-background="true"],
+  .dark [data-admin-background="true"] {
+    --admin-glass-card-opacity: 58%;
+    --admin-glass-card-strong-opacity: 68%;
+    --admin-glass-control-opacity: 48%;
+    --admin-glass-sidebar-opacity: 66%;
+    --admin-glass-border-opacity: 62%;
+    --admin-glass-shadow: 0 18px 46px hsl(222 35% 4% / var(--admin-glass-shadow-alpha));
+  }
+
+  [data-admin-background="true"] [data-slot="card"],
+  [data-admin-background="true"] .data-table-shell,
+  [data-admin-background="true"] .toolbar-surface {
+    background-color: var(--admin-glass-card) !important;
+    border-color: var(--admin-glass-border) !important;
+    box-shadow: var(--admin-glass-shadow) !important;
+    -webkit-backdrop-filter: var(--admin-glass-blur);
+    backdrop-filter: var(--admin-glass-blur);
+  }
+
+  [data-admin-background="true"] [data-slot="admin-sidebar"],
+  [data-admin-background="true"] [data-slot="admin-mobile-topbar"],
+  [data-admin-background="true"] [data-slot="admin-mobile-nav"] {
+    background-color: var(--admin-glass-sidebar) !important;
+    border-color: var(--admin-glass-border) !important;
+    box-shadow: var(--admin-glass-shadow) !important;
+    -webkit-backdrop-filter: var(--admin-glass-blur);
+    backdrop-filter: var(--admin-glass-blur);
+  }
+
+  [data-admin-background="true"] [data-slot="status-tile"],
+  [data-admin-background="true"] [data-slot="input"],
+  [data-admin-background="true"] [data-slot="select-trigger"],
+  [data-admin-background="true"] [data-slot="button"][data-variant="outline"],
+  [data-admin-background="true"] [data-select-dropdown="true"] {
+    background-color: var(--admin-glass-control) !important;
+    border-color: var(--admin-glass-border) !important;
+    -webkit-backdrop-filter: var(--admin-glass-control-filter);
+    backdrop-filter: var(--admin-glass-control-filter);
+  }
+
+  [data-admin-background="true"] .data-table-shell [data-slot="table-head"],
+  [data-admin-background="true"] .data-table-shell thead th {
+    background-color: var(--admin-glass-card-strong) !important;
+  }
+
+  [data-admin-background="true"] [data-slot="page-header"] h2,
+  [data-admin-background="true"] [data-slot="page-header"] p {
+    text-shadow: 0 1px 16px color-mix(in oklab, var(--color-background) 72%, transparent);
+  }
+
   .toolbar-surface {
     @apply relative z-30 overflow-visible rounded-lg border border-border bg-card/80 px-3 py-2.5 text-[12px] text-muted-foreground shadow-sm backdrop-blur-sm;
   }

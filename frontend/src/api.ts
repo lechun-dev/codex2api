@@ -32,8 +32,10 @@ import type {
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  RuntimeStatusResponse,
   SiteBranding,
   StatsResponse,
+  SetupHintsResponse,
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
@@ -44,6 +46,7 @@ import type {
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
+  BackgroundUploadResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
 } from './types'
@@ -93,7 +96,8 @@ function extractAdminErrorMessage(body: string, status: number): string {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
-  if (options.body !== undefined && options.body !== null && !headers.has('Content-Type')) {
+  const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
+  if (options.body !== undefined && options.body !== null && !isFormData && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
 
@@ -229,6 +233,7 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
+  getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
   getOpsErrorSummary: (params: {
     start: string
     end: string
@@ -389,9 +394,15 @@ export const api = {
     request<MessageResponse>(`/images/assets/${id}`, { method: 'DELETE' }),
   clearUsageLogs: () =>
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
+  getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  uploadBackground: (file: File) => {
+    const form = new FormData()
+    form.set('file', file)
+    return request<BackgroundUploadResponse>('/settings/background-upload', { method: 'POST', body: form })
+  },
   testImageStorageConnection: (data: {
     endpoint: string
     region: string

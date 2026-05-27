@@ -112,6 +112,7 @@ type Account struct {
 	BaseConcurrencyOverride *int64
 	CreditEnabled           bool // 信用账号标记
 	CreditSkipUsageWindow   bool // 跳过用量窗口惩罚
+	SkipWarmTier            bool // 跳过 warm 层级降级
 	AllowedAPIKeyIDs        []int64
 	allowedAPIKeySet        map[int64]struct{}
 	Tags                    []string
@@ -848,6 +849,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	}
 	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
 		tier = HealthTierRisky
+	}
+	if a.SkipWarmTier && tier == HealthTierWarm {
+		tier = HealthTierHealthy
 	}
 
 	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
@@ -2422,6 +2426,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 		account.CreditEnabled = row.CreditEnabled
 		account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
+		account.SkipWarmTier = row.SkipWarmTier
 		if row.Status == "error" {
 			account.Status = StatusError
 			account.ErrorMsg = row.ErrorMessage
@@ -3520,7 +3525,7 @@ func (s *Store) FindByID(dbID int64) *Account {
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
-func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64) bool {
+func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64, skipWarmTier *bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -3529,6 +3534,9 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	acc.mu.Lock()
 	acc.ScoreBiasOverride = cloneInt64Ptr(scoreBiasOverride)
 	acc.BaseConcurrencyOverride = cloneInt64Ptr(baseConcurrencyOverride)
+	if skipWarmTier != nil {
+		acc.SkipWarmTier = *skipWarmTier
+	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)

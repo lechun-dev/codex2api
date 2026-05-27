@@ -164,6 +164,7 @@ Codex2API 采用三层配置架构：
 | `credit_skip_usage_window` | bool | false | 跳过 7 天/5 小时用量窗口惩罚（适用于信用账号） |
 | `score_bias_override` | int/null | null | 手工覆盖调度权重分，`null` 跟随套餐默认 |
 | `base_concurrency_override` | int/null | null | 手工覆盖基础并发值，`null` 跟随全局默认 |
+| `skip_warm_tier` | bool | false | 跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 
 ### 连接池配置
 

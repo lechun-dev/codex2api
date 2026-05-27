@@ -123,6 +123,101 @@ func TestAccountBaseConcurrencyOverrideControlsDynamicLimit(t *testing.T) {
 	}
 }
 
+func TestAccountSkipWarmTierPromotesWarmScoreToHealthy(t *testing.T) {
+	acc := &Account{
+		AccessToken:   "token",
+		Status:        StatusReady,
+		PlanType:      "pro",
+		SkipWarmTier:  true,
+		LastTimeoutAt: time.Now(),
+	}
+
+	recomputeTestAccount(acc, 6)
+
+	if acc.SchedulerScore >= 85 || acc.SchedulerScore < 60 {
+		t.Fatalf("SchedulerScore = %v, want warm score range", acc.SchedulerScore)
+	}
+	if acc.HealthTier != HealthTierHealthy {
+		t.Fatalf("HealthTier = %s, want %s", acc.HealthTier, HealthTierHealthy)
+	}
+	if acc.DynamicConcurrencyLimit != 6 {
+		t.Fatalf("DynamicConcurrencyLimit = %d, want full healthy limit 6", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestAccountSkipWarmTierPromotesRecentFailureWarmToHealthy(t *testing.T) {
+	acc := &Account{
+		AccessToken:   "token",
+		Status:        StatusReady,
+		PlanType:      "pro",
+		SkipWarmTier:  true,
+		LastFailureAt: time.Now(),
+	}
+
+	recomputeTestAccount(acc, 4)
+
+	if acc.HealthTier != HealthTierHealthy {
+		t.Fatalf("HealthTier = %s, want %s", acc.HealthTier, HealthTierHealthy)
+	}
+	if acc.DynamicConcurrencyLimit != 4 {
+		t.Fatalf("DynamicConcurrencyLimit = %d, want full healthy limit 4", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestAccountSkipWarmTierDoesNotPromoteRiskyOrBanned(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		acc  *Account
+		want AccountHealthTier
+	}{
+		{
+			name: "low score remains risky",
+			acc: &Account{
+				AccessToken:        "token",
+				Status:             StatusReady,
+				PlanType:           "pro",
+				SkipWarmTier:       true,
+				LastUnauthorizedAt: now,
+			},
+			want: HealthTierRisky,
+		},
+		{
+			name: "banned remains banned",
+			acc: &Account{
+				AccessToken:  "token",
+				Status:       StatusReady,
+				PlanType:     "pro",
+				HealthTier:   HealthTierBanned,
+				SkipWarmTier: true,
+			},
+			want: HealthTierBanned,
+		},
+		{
+			name: "premium 5h limit remains risky",
+			acc: &Account{
+				AccessToken:         "token",
+				Status:              StatusReady,
+				PlanType:            "plus",
+				SkipWarmTier:        true,
+				UsagePercent5h:      100,
+				UsagePercent5hValid: true,
+				Reset5hAt:           now.Add(time.Hour),
+			},
+			want: HealthTierRisky,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recomputeTestAccount(tc.acc, 6)
+			if tc.acc.HealthTier != tc.want {
+				t.Fatalf("HealthTier = %s, want %s", tc.acc.HealthTier, tc.want)
+			}
+		})
+	}
+}
+
 func TestNeedsUsageProbeSkipsRateLimited(t *testing.T) {
 	acc := &Account{
 		AccessToken:    "token",

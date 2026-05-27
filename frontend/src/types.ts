@@ -43,6 +43,7 @@ export interface AccountRow {
   score_bias_effective?: number
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
+  skip_warm_tier?: boolean
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
@@ -148,6 +149,7 @@ export interface FetchOpenAIResponsesModelsResponse {
 export interface UpdateAccountSchedulerRequest {
   score_bias_override?: number | null
   base_concurrency_override?: number | null
+  skip_warm_tier?: boolean
   allowed_api_key_ids?: number[] | null
   proxy_url?: string | null
   tags?: string[] | null

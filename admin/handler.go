@@ -439,6 +439,7 @@ type accountResponse struct {
 	ATOnly                   bool                       `json:"at_only"`
 	CreditEnabled            bool                       `json:"credit_enabled"`
 	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
+	SkipWarmTier             bool                       `json:"skip_warm_tier"`
 	AccountType              string                     `json:"account_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
@@ -566,6 +567,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			CreditEnabled:            row.CreditEnabled,
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
+			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
@@ -718,6 +720,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -789,6 +792,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -843,7 +851,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	if req.ProxyURL != nil {
 		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
 	}
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, skipWarmTier, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -852,10 +860,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		if scoreBiasOverride.Set || baseConcurrencyOverride.Set {
+		if scoreBiasOverride.Set || baseConcurrencyOverride.Set || skipWarmTier.Set {
 			current := h.store.FindByID(id)
 			var score *int64
 			var concurrency *int64
+			var skipWarm *bool
 			if current != nil {
 				current.Mu().RLock()
 				if current.ScoreBiasOverride != nil {
@@ -866,6 +875,8 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 					value := *current.BaseConcurrencyOverride
 					concurrency = &value
 				}
+				skipValue := current.SkipWarmTier
+				skipWarm = &skipValue
 				current.Mu().RUnlock()
 			}
 			if scoreBiasOverride.Set {
@@ -874,7 +885,10 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			if baseConcurrencyOverride.Set {
 				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
 			}
-			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency)
+			if skipWarmTier.Set {
+				skipWarm = &skipWarmTier.Value
+			}
+			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency, skipWarm)
 		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
@@ -952,6 +966,21 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
+}
+
+func parseOptionalBoolField(raw json.RawMessage, field string) (database.OptionalBool, error) {
+	if len(raw) == 0 {
+		return database.OptionalBool{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalBool{Set: true, Value: false}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return database.OptionalBool{Set: true, Value: value}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {

@@ -577,6 +577,8 @@
     "schedulerConcurrencyAutoValue": "当前基础并发：{{value}}",
     "schedulerConcurrencyPlaceholder": "输入 1 到 50 的整数",
     "schedulerConcurrencyRange": "请输入 1 到 50 的整数。",
+    "schedulerSkipWarmLabel": "跳过预热层级",
+    "schedulerSkipWarmHint": "开启后该账号只会将预热层级提升为健康，不覆盖风险、封禁或额度限制。",
     "schedulerCustom": "自定义",
     "schedulerCustomValuePreview": "当前输入将保存为：{{value}}",
     "allowedAPIKeysLabel": "允许调用 Token",

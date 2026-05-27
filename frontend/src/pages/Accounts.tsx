@@ -96,7 +96,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
-	"billed",
+  "billed",
   "importTime",
   "updatedAt",
   "actions",
@@ -426,6 +426,7 @@ export default function Accounts() {
     "default",
   );
   const [concurrencyInput, setConcurrencyInput] = useState("");
+  const [skipWarmTier, setSkipWarmTier] = useState(false);
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
@@ -2055,6 +2056,7 @@ export default function Accounts() {
         ? ""
         : String(account.base_concurrency_override),
     );
+    setSkipWarmTier(account.skip_warm_tier ?? false);
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -2079,6 +2081,7 @@ export default function Accounts() {
     setScoreInput("");
     setConcurrencyMode("default");
     setConcurrencyInput("");
+    setSkipWarmTier(false);
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -2125,6 +2128,7 @@ export default function Accounts() {
       concurrencyMode === "custom"
         ? (parsedBaseConcurrency ?? getEffectiveBaseConcurrency(editingAccount))
         : getEffectiveBaseConcurrency(editingAccount);
+    const healthTier = getPreviewHealthTier(editingAccount, skipWarmTier);
 
     return {
       rawScore,
@@ -2133,8 +2137,9 @@ export default function Accounts() {
         rawScore,
         appliedBias,
       ),
-      healthTier: editingAccount.health_tier,
+      healthTier,
       dynamicConcurrency: computePreviewDynamicConcurrency(
+        healthTier,
         editingAccount,
         baseConcurrency,
       ),
@@ -2147,6 +2152,7 @@ export default function Accounts() {
     parsedScoreBias,
     concurrencyMode,
     parsedBaseConcurrency,
+    skipWarmTier,
   ]);
 
   const handleSaveScheduler = async () => {
@@ -2162,6 +2168,7 @@ export default function Accounts() {
         score_bias_override: scoreMode === "custom" ? parsedScoreBias : null,
         base_concurrency_override:
           concurrencyMode === "custom" ? parsedBaseConcurrency : null,
+        skip_warm_tier: skipWarmTier,
         allowed_api_key_ids: allowedAPIKeySelection,
         proxy_url: editProxyUrl.trim() || null,
         tags: editTags,
@@ -4528,34 +4535,64 @@ export default function Accounts() {
                                         editingAccount,
                                       ),
                                   })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.schedulerSkipWarmLabel")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.schedulerSkipWarmHint")}
                             </div>
                           </div>
-                        )}
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-label={t("accounts.schedulerSkipWarmLabel")}
+                            aria-checked={skipWarmTier}
+                            onClick={() =>
+                              setSkipWarmTier((current) => !current)
+                            }
+                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${skipWarmTier ? "bg-primary" : "bg-muted"}`}
+                          >
+                            <span
+                              className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${skipWarmTier ? "translate-x-4" : "translate-x-0"}`}
+                            />
+                          </button>
+                        </div>
                       </div>
-                    </div>
 
-                    <div className="rounded-xl border border-border p-4">
-                      <div className="text-sm font-semibold text-foreground">
-                        {t("accounts.allowedAPIKeysLabel")}
-                      </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {t("accounts.allowedAPIKeysHint")}
-                      </div>
-                      <div className="mt-3">
-                        <APIKeyMultiSelect
-                          options={apiKeys}
-                          value={allowedAPIKeySelection}
-                          disabled={apiKeys.length === 0}
-                          onChange={setAllowedAPIKeySelection}
-                          allLabel={t("accounts.allowedAPIKeysAll")}
-                          selectedLabel={t("accounts.allowedAPIKeysSelected", {
-                            count: allowedAPIKeySelection.length,
-                          })}
-                          placeholder={t("accounts.allowedAPIKeysPlaceholder")}
-                          emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
-                          emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
-                        />
-                      </div>
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.allowedAPIKeysLabel")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.allowedAPIKeysHint")}
+                        </div>
+                          <div className="mt-3">
+                            <APIKeyMultiSelect
+                              options={apiKeys}
+                              value={allowedAPIKeySelection}
+                              disabled={apiKeys.length === 0}
+                              onChange={setAllowedAPIKeySelection}
+                              allLabel={t("accounts.allowedAPIKeysAll")}
+                              selectedLabel={t(
+                                "accounts.allowedAPIKeysSelected",
+                                {
+                                  count: allowedAPIKeySelection.length,
+                                },
+                              )}
+                              placeholder={t("accounts.allowedAPIKeysPlaceholder")}
+                              emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
+                              emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
+                            />
+                          </div>
                     </div>
 
                     <div className="rounded-xl border border-border p-4">
@@ -5831,11 +5868,20 @@ function computePreviewDispatchScore(
   return rawScore;
 }
 
+function getPreviewHealthTier(
+  account: AccountRow,
+  skipWarmTier: boolean,
+): string | undefined {
+  if (skipWarmTier && account.health_tier === "warm") return "healthy";
+  return account.health_tier;
+}
+
 function computePreviewDynamicConcurrency(
+  healthTier: string | undefined,
   account: AccountRow,
   baseConcurrency: number,
 ): number {
-  switch (account.health_tier) {
+  switch (healthTier) {
     case "healthy":
       return baseConcurrency;
     case "warm":

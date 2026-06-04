@@ -1,6 +1,9 @@
 name: Deploy SSH
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       goarch:
@@ -34,9 +37,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      DEPLOY_DIR: ${{ inputs.deploy_dir }}
-      SERVICE_NAME: ${{ inputs.service_name }}
-      HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+      TARGET_GOARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.goarch || 'amd64' }}
+      DEPLOY_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_dir || '/deploy/codex2api' }}
+      SERVICE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.service_name || 'codex2api' }}
+      HEALTHCHECK_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.healthcheck_url || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          CGO_ENABLED=0 GOOS=linux GOARCH="${{ inputs.goarch }}" go build -trimpath -ldflags="-s -w" -o build/codex2api .
+          CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -trimpath -ldflags="-s -w" -o build/codex2api .
           file build/codex2api
 
       - name: Install SSH key

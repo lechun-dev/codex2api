@@ -96,7 +96,7 @@ deployuser ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl
 
 ## 触发部署
 
-进入 GitHub 仓库：
+推送到 `main` 分支会自动部署到服务器。也可以进入 GitHub 仓库手动触发：
 
 ```text
 Actions -> Deploy SSH -> Run workflow
@@ -120,4 +120,3 @@ Actions -> Deploy SSH -> Run workflow
 5. 上传到 `$deploy_dir/releases/<run-number>-<sha>/codex2api`
 6. 切换 `$deploy_dir/current`
 7. 重启 systemd 服务
-

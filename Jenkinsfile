@@ -17,6 +17,10 @@ pipeline {
     string(name: 'HEALTHCHECK_URL', defaultValue: '', description: 'Optional URL checked after restart')
   }
 
+  tools {
+    nodejs 'Node24'
+  }
+
   environment {
     APP_NAME = 'codex2api'
   }

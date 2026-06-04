@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql/driver"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,41 @@ func TestRewriteSQLForMySQLJSONCasts(t *testing.T) {
 	want := `UPDATE accounts SET credentials = ? WHERE id = ?`
 	if got != want {
 		t.Fatalf("rewriteSQLForMySQL() = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteSQLForMySQLRepeatedPlaceholders(t *testing.T) {
+	query, order := rewriteSQLForMySQLWithParamOrder(`SELECT $1, $2, $2 FROM usage_logs WHERE created_at >= $1`)
+	wantQuery := `SELECT ?, ?, ? FROM usage_logs WHERE created_at >= ?`
+	if query != wantQuery {
+		t.Fatalf("query = %q, want %q", query, wantQuery)
+	}
+	wantOrder := []int{1, 2, 2, 1}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("order len = %d, want %d: %v", len(order), len(wantOrder), order)
+	}
+	for i := range wantOrder {
+		if order[i] != wantOrder[i] {
+			t.Fatalf("order = %v, want %v", order, wantOrder)
+		}
+	}
+
+	args, err := rewriteMySQLArgs([]driver.NamedValue{
+		{Ordinal: 1, Value: "start"},
+		{Ordinal: 2, Value: "minute"},
+	}, order)
+	if err != nil {
+		t.Fatalf("rewriteMySQLArgs() error = %v", err)
+	}
+	gotValues := []interface{}{args[0].Value, args[1].Value, args[2].Value, args[3].Value}
+	wantValues := []interface{}{"start", "minute", "minute", "start"}
+	for i := range wantValues {
+		if gotValues[i] != wantValues[i] {
+			t.Fatalf("args values = %v, want %v", gotValues, wantValues)
+		}
+		if args[i].Ordinal != i+1 {
+			t.Fatalf("arg %d ordinal = %d, want %d", i, args[i].Ordinal, i+1)
+		}
 	}
 }
 

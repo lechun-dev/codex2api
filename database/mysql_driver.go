@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -46,26 +48,50 @@ type mysqlRewriteConn struct {
 }
 
 func (c mysqlRewriteConn) Prepare(query string) (driver.Stmt, error) {
-	return c.Conn.Prepare(rewriteSQLForMySQL(query))
+	rewritten, paramOrder := rewriteSQLForMySQLWithParamOrder(query)
+	stmt, err := c.Conn.Prepare(rewritten)
+	if err != nil {
+		return nil, err
+	}
+	return mysqlRewriteStmt{Stmt: stmt, paramOrder: paramOrder}, nil
 }
 
 func (c mysqlRewriteConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	rewritten, paramOrder := rewriteSQLForMySQLWithParamOrder(query)
 	if pc, ok := c.Conn.(driver.ConnPrepareContext); ok {
-		return pc.PrepareContext(ctx, rewriteSQLForMySQL(query))
+		stmt, err := pc.PrepareContext(ctx, rewritten)
+		if err != nil {
+			return nil, err
+		}
+		return mysqlRewriteStmt{Stmt: stmt, paramOrder: paramOrder}, nil
 	}
-	return c.Prepare(query)
+	stmt, err := c.Conn.Prepare(rewritten)
+	if err != nil {
+		return nil, err
+	}
+	return mysqlRewriteStmt{Stmt: stmt, paramOrder: paramOrder}, nil
 }
 
 func (c mysqlRewriteConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if execer, ok := c.Conn.(driver.ExecerContext); ok {
-		return execer.ExecContext(ctx, rewriteSQLForMySQL(query), args)
+		rewritten, paramOrder := rewriteSQLForMySQLWithParamOrder(query)
+		rewrittenArgs, err := rewriteMySQLArgs(args, paramOrder)
+		if err != nil {
+			return nil, err
+		}
+		return execer.ExecContext(ctx, rewritten, rewrittenArgs)
 	}
 	return nil, driver.ErrSkip
 }
 
 func (c mysqlRewriteConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if queryer, ok := c.Conn.(driver.QueryerContext); ok {
-		return queryer.QueryContext(ctx, rewriteSQLForMySQL(query), args)
+		rewritten, paramOrder := rewriteSQLForMySQLWithParamOrder(query)
+		rewrittenArgs, err := rewriteMySQLArgs(args, paramOrder)
+		if err != nil {
+			return nil, err
+		}
+		return queryer.QueryContext(ctx, rewritten, rewrittenArgs)
 	}
 	return nil, driver.ErrSkip
 }
@@ -112,9 +138,72 @@ func (c mysqlRewriteConn) Close() error {
 	return nil
 }
 
+type mysqlRewriteStmt struct {
+	driver.Stmt
+	paramOrder []int
+}
+
+func (s mysqlRewriteStmt) NumInput() int {
+	if len(s.paramOrder) > 0 {
+		max := 0
+		for _, n := range s.paramOrder {
+			if n > max {
+				max = n
+			}
+		}
+		return max
+	}
+	return s.Stmt.NumInput()
+}
+
+func (s mysqlRewriteStmt) Exec(args []driver.Value) (driver.Result, error) {
+	rewrittenArgs, err := rewriteMySQLValues(args, s.paramOrder)
+	if err != nil {
+		return nil, err
+	}
+	return s.Stmt.Exec(rewrittenArgs)
+}
+
+func (s mysqlRewriteStmt) Query(args []driver.Value) (driver.Rows, error) {
+	rewrittenArgs, err := rewriteMySQLValues(args, s.paramOrder)
+	if err != nil {
+		return nil, err
+	}
+	return s.Stmt.Query(rewrittenArgs)
+}
+
+func (s mysqlRewriteStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	rewrittenArgs, err := rewriteMySQLArgs(args, s.paramOrder)
+	if err != nil {
+		return nil, err
+	}
+	if execer, ok := s.Stmt.(driver.StmtExecContext); ok {
+		return execer.ExecContext(ctx, rewrittenArgs)
+	}
+	values := namedValuesToValues(rewrittenArgs)
+	return s.Stmt.Exec(values)
+}
+
+func (s mysqlRewriteStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	rewrittenArgs, err := rewriteMySQLArgs(args, s.paramOrder)
+	if err != nil {
+		return nil, err
+	}
+	if queryer, ok := s.Stmt.(driver.StmtQueryContext); ok {
+		return queryer.QueryContext(ctx, rewrittenArgs)
+	}
+	values := namedValuesToValues(rewrittenArgs)
+	return s.Stmt.Query(values)
+}
+
 func rewriteSQLForMySQL(query string) string {
+	rewritten, _ := rewriteSQLForMySQLWithParamOrder(query)
+	return rewritten
+}
+
+func rewriteSQLForMySQLWithParamOrder(query string) (string, []int) {
 	if query == "" {
-		return query
+		return query, nil
 	}
 	query = rewritePostgresUpsertForMySQL(query)
 	query = mysqlCastAsTextPattern.ReplaceAllString(query, "CAST($1 AS CHAR)")
@@ -123,6 +212,7 @@ func rewriteSQLForMySQL(query string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(query))
+	paramOrder := []int{}
 
 	inSingle := false
 	inDouble := false
@@ -190,10 +280,14 @@ func rewriteSQLForMySQL(query string) string {
 			b.WriteByte(ch)
 			inDouble = true
 		case ch == '$' && next >= '0' && next <= '9':
+			start := i + 1
 			b.WriteByte('?')
 			i++
 			for i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
 				i++
+			}
+			if n, err := strconv.Atoi(query[start : i+1]); err == nil && n > 0 {
+				paramOrder = append(paramOrder, n)
 			}
 		case ch == ':' && next == ':':
 			i += 2
@@ -212,7 +306,46 @@ func rewriteSQLForMySQL(query string) string {
 			b.WriteByte(ch)
 		}
 	}
-	return b.String()
+	return b.String(), paramOrder
+}
+
+func rewriteMySQLArgs(args []driver.NamedValue, paramOrder []int) ([]driver.NamedValue, error) {
+	if len(paramOrder) == 0 {
+		return args, nil
+	}
+	rewritten := make([]driver.NamedValue, 0, len(paramOrder))
+	for i, paramIndex := range paramOrder {
+		if paramIndex < 1 || paramIndex > len(args) {
+			return nil, fmt.Errorf("mysql placeholder $%d has no matching argument", paramIndex)
+		}
+		arg := args[paramIndex-1]
+		arg.Ordinal = i + 1
+		arg.Name = ""
+		rewritten = append(rewritten, arg)
+	}
+	return rewritten, nil
+}
+
+func rewriteMySQLValues(args []driver.Value, paramOrder []int) ([]driver.Value, error) {
+	if len(paramOrder) == 0 {
+		return args, nil
+	}
+	rewritten := make([]driver.Value, 0, len(paramOrder))
+	for _, paramIndex := range paramOrder {
+		if paramIndex < 1 || paramIndex > len(args) {
+			return nil, fmt.Errorf("mysql placeholder $%d has no matching argument", paramIndex)
+		}
+		rewritten = append(rewritten, args[paramIndex-1])
+	}
+	return rewritten, nil
+}
+
+func namedValuesToValues(args []driver.NamedValue) []driver.Value {
+	values := make([]driver.Value, 0, len(args))
+	for _, arg := range args {
+		values = append(values, arg.Value)
+	}
+	return values
 }
 
 func quoteMySQLAPIKeyIdentifier(query string) string {

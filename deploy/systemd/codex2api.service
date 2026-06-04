@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=codex2api
-Group=codex2api
-WorkingDirectory=/opt/codex2api/current
-EnvironmentFile=/opt/codex2api/shared/.env
-ExecStart=/opt/codex2api/current/codex2api
+User=deployuser
+Group=deployuser
+WorkingDirectory=/deploy/current
+EnvironmentFile=/deploy/shared/.env
+ExecStart=/deploy/current/codex2api
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
@@ -19,8 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/opt/codex2api
+ReadWritePaths=/deploy
 
 [Install]
 WantedBy=multi-user.target
-

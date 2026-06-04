@@ -15,7 +15,7 @@ Jenkins Agent 需要安装：
 - Linux + systemd
 - 一个可通过 SSH 登录的部署用户
 - 已安装 `deploy/systemd/codex2api.service`
-- 服务器本地存在 `/opt/codex2api/shared/.env`
+- 服务器本地存在 `/deploy/shared/.env`
 
 数据库密码只放在服务器 `.env` 或 Jenkins Credentials 中，不要提交到仓库。
 
@@ -24,19 +24,19 @@ Jenkins Agent 需要安装：
 以下命令以 root 或具备 sudo 权限的用户执行。
 
 ```bash
-sudo useradd --system --home /opt/codex2api --shell /usr/sbin/nologin codex2api || true
-sudo mkdir -p /opt/codex2api/releases /opt/codex2api/shared
-sudo chown -R codex2api:codex2api /opt/codex2api
-sudo chmod -R 2775 /opt/codex2api
+sudo useradd --system --home /deploy --shell /usr/sbin/nologin deployuser || true
+sudo mkdir -p /deploy/releases /deploy/shared
+sudo chown -R deployuser:deployuser /deploy
+sudo chmod -R 2775 /deploy
 ```
 
-如果 Jenkins 使用 `deploy` 用户 SSH 登录，让它加入 `codex2api` 组；执行后需要重新登录 SSH 会话才生效：
+如果 `deployuser` 已经存在，并且 Jenkins 使用这个用户 SSH 登录，确认它拥有 `/deploy` 目录权限：
 
 ```bash
-sudo usermod -aG codex2api deploy
+sudo chown -R deployuser:deployuser /deploy
 ```
 
-创建 `/opt/codex2api/shared/.env`：
+创建 `/deploy/shared/.env`：
 
 ```env
 PORT=8080
@@ -70,10 +70,10 @@ sudo visudo -f /etc/sudoers.d/codex2api-jenkins
 写入：
 
 ```text
-deploy ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl status codex2api, /bin/systemctl --no-pager --full status codex2api
+deployuser ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl status codex2api, /bin/systemctl --no-pager --full status codex2api
 ```
 
-把 `deploy` 替换成实际 SSH 用户。
+如果实际 SSH 用户不是 `deployuser`，把这一行里的 `deployuser` 替换成实际 SSH 用户。
 
 ## Jenkins 配置
 
@@ -83,7 +83,7 @@ deploy ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl sta
 
 - 类型：SSH Username with private key
 - ID：`codex2api-prod-ssh`
-- Username：服务器 SSH 用户
+- Username：`deployuser`
 
 构建参数：
 
@@ -92,8 +92,8 @@ deploy ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl sta
 | `GOARCH` | 服务器架构，x86_64 选 `amd64`，ARM 选 `arm64` |
 | `SSH_CREDENTIALS_ID` | Jenkins SSH 凭据 ID |
 | `DEPLOY_HOST` | 服务器地址 |
-| `DEPLOY_USER` | SSH 用户 |
-| `DEPLOY_DIR` | 部署目录，默认 `/opt/codex2api` |
+| `DEPLOY_USER` | SSH 用户，默认 `deployuser` |
+| `DEPLOY_DIR` | 部署目录，默认 `/deploy` |
 | `SERVICE_NAME` | systemd 服务名，默认 `codex2api` |
 | `HEALTHCHECK_URL` | 可选，重启后的健康检查 URL |
 
@@ -107,8 +107,8 @@ Jenkins 会执行：
 4. `frontend/npm run typecheck`
 5. `go test ./...`
 6. `GOOS=linux GOARCH=<GOARCH> go build`
-7. 上传二进制到 `/opt/codex2api/releases/<BUILD_NUMBER>/codex2api`
-8. 切换 `/opt/codex2api/current`
+7. 上传二进制到 `/deploy/releases/<BUILD_NUMBER>/codex2api`
+8. 切换 `/deploy/current`
 9. 重启 `codex2api` systemd 服务
 10. 可选执行健康检查
 
@@ -117,12 +117,12 @@ Jenkins 会执行：
 查看历史版本：
 
 ```bash
-ls -la /opt/codex2api/releases
+ls -la /deploy/releases
 ```
 
 回滚到指定构建：
 
 ```bash
-sudo ln -sfn /opt/codex2api/releases/<BUILD_NUMBER> /opt/codex2api/current
+sudo ln -sfn /deploy/releases/<BUILD_NUMBER> /deploy/current
 sudo systemctl restart codex2api
 ```

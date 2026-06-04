@@ -3946,6 +3946,12 @@ export default function Accounts() {
 
             {addMethod === "rt" ? (
               <div className="space-y-4">
+                <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                  <p className="mb-1 font-semibold text-foreground">
+                    {t("accounts.rtHelpTitle")}
+                  </p>
+                  <p>{t("accounts.rtHelpDesc")}</p>
+                </div>
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
                     {t("accounts.refreshTokenLabel")} *
@@ -3981,6 +3987,12 @@ export default function Accounts() {
               </div>
             ) : addMethod === "st" ? (
               <div className="space-y-4">
+                <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                  <p className="mb-1 font-semibold text-foreground">
+                    {t("accounts.sessionTokenHelpTitle")}
+                  </p>
+                  <p>{t("accounts.sessionTokenHelpDesc")}</p>
+                </div>
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
                     {t("accounts.sessionTokenLabel")} *
@@ -4016,6 +4028,12 @@ export default function Accounts() {
               </div>
             ) : addMethod === "at" ? (
               <div className="space-y-4">
+                <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                  <p className="mb-1 font-semibold text-foreground">
+                    {t("accounts.accessTokenHelpTitle")}
+                  </p>
+                  <p>{t("accounts.accessTokenHelpDesc")}</p>
+                </div>
                 <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300">
                   {t("accounts.atWarning")}
                 </div>
@@ -4059,6 +4077,7 @@ export default function Accounts() {
                     {t("accounts.openaiResponsesTitle")}
                   </p>
                   <p>{t("accounts.openaiResponsesDesc")}</p>
+                  <p className="mt-2">{t("accounts.openaiApiKeyHelpDesc")}</p>
                 </div>
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
@@ -4195,6 +4214,7 @@ export default function Accounts() {
                         {t("accounts.oauthStep1Title")}
                       </p>
                       <p>{t("accounts.oauthStep1Desc")}</p>
+                      <p className="mt-2">{t("accounts.oauthHelpDesc")}</p>
                     </div>
                     <div>
                       <label className="block mb-2 text-sm font-semibold text-muted-foreground">

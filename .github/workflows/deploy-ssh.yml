@@ -94,14 +94,16 @@ jobs:
           set -euo pipefail
           test -n "$DEPLOY_USER"
           release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          upload_tmp="/tmp/codex2api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           remote="$DEPLOY_USER@$DEPLOY_HOST"
 
           ssh -i ~/.ssh/deploy_key "$remote" "mkdir -p '$release' '$DEPLOY_DIR/shared'"
-          scp -i ~/.ssh/deploy_key build/codex2api "$remote:$release/codex2api"
+          ssh -i ~/.ssh/deploy_key "$remote" "cat > '$upload_tmp'" < build/codex2api
           ssh -i ~/.ssh/deploy_key "$remote" "
             set -eu
             test -f '$DEPLOY_DIR/shared/.env'
-            chmod +x '$release/codex2api'
+            install -m 755 '$upload_tmp' '$release/codex2api'
+            rm -f '$upload_tmp'
             ln -sfn '$release' '$DEPLOY_DIR/current'
             sudo systemctl restart '$SERVICE_NAME'
             sudo systemctl --no-pager --full status '$SERVICE_NAME' >/dev/null

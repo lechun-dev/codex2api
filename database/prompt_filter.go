@@ -180,6 +180,12 @@ func (db *DB) ClearPromptFilterLogs(ctx context.Context) error {
 		_, err := db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'prompt_filter_logs'`)
 		return err
 	}
+	if db.isMySQL() {
+		if _, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_filter_logs`); err != nil {
+			return err
+		}
+		return db.resetMySQLAutoIncrement(ctx, "prompt_filter_logs")
+	}
 	_, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_filter_logs RESTART IDENTITY`)
 	return err
 }

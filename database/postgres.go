@@ -243,6 +243,8 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if driver == "sqlite" {
 		driverName = "sqlite"
 		dsn = sqliteConnectDSN(dsn)
+	} else if driver == "mysql" {
+		driverName = mysqlDriverName
 	}
 
 	pgSchema := ""
@@ -294,6 +296,10 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		if err := db.configureSQLite(ctx); err != nil {
 			return nil, fmt.Errorf("配置 SQLite 失败: %w", err)
 		}
+	} else if db.isMySQL() {
+		if _, err := conn.ExecContext(ctx, "SET time_zone = '+00:00'"); err != nil {
+			return nil, fmt.Errorf("设置 MySQL 时区失败: %w", err)
+		}
 	} else {
 		// PostgreSQL: 统一会话时区为 UTC，确保 NOW() 和时间字面量一致
 		if _, err := conn.ExecContext(ctx, "SET timezone = 'UTC'"); err != nil {
@@ -326,8 +332,12 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		baselineInsert = `
 			INSERT OR IGNORE INTO usage_stats_baseline (id) VALUES (1)
 		`
+	} else if db.isMySQL() {
+		baselineInsert = `
+			INSERT IGNORE INTO usage_stats_baseline (id) VALUES (1)
+		`
 	}
-	_, err = db.conn.ExecContext(ctx, `
+	baselineDDL := `
 			CREATE TABLE IF NOT EXISTS usage_stats_baseline (
 				id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 				total_requests  BIGINT NOT NULL DEFAULT 0,
@@ -341,7 +351,25 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 				account_billed  DOUBLE PRECISION NOT NULL DEFAULT 0,
 				user_billed     DOUBLE PRECISION NOT NULL DEFAULT 0
 			)
-		`)
+		`
+	if db.isMySQL() {
+		baselineDDL = `
+			CREATE TABLE IF NOT EXISTS usage_stats_baseline (
+				id              INT NOT NULL PRIMARY KEY,
+				total_requests  BIGINT NOT NULL DEFAULT 0,
+				total_tokens    BIGINT NOT NULL DEFAULT 0,
+				prompt_tokens   BIGINT NOT NULL DEFAULT 0,
+				completion_tokens BIGINT NOT NULL DEFAULT 0,
+				cached_tokens   BIGINT NOT NULL DEFAULT 0,
+				cache_hit_requests BIGINT NOT NULL DEFAULT 0,
+				first_token_ms_sum DOUBLE NOT NULL DEFAULT 0,
+				first_token_samples BIGINT NOT NULL DEFAULT 0,
+				account_billed  DOUBLE NOT NULL DEFAULT 0,
+				user_billed     DOUBLE NOT NULL DEFAULT 0
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8
+		`
+	}
+	_, err = db.conn.ExecContext(ctx, baselineDDL)
 	if err != nil {
 		return nil, fmt.Errorf("创建 usage_stats_baseline 表失败: %w", err)
 	}
@@ -378,6 +406,23 @@ func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error 
 				continue
 			}
 			if _, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE usage_stats_baseline ADD COLUMN %s %s", column.name, column.def)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if db.isMySQL() {
+		for _, column := range []struct {
+			name string
+			def  string
+		}{
+			{name: "account_billed", def: "DOUBLE NOT NULL DEFAULT 0"},
+			{name: "user_billed", def: "DOUBLE NOT NULL DEFAULT 0"},
+			{name: "cache_hit_requests", def: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "first_token_ms_sum", def: "DOUBLE NOT NULL DEFAULT 0"},
+			{name: "first_token_samples", def: "BIGINT NOT NULL DEFAULT 0"},
+		} {
+			if err := db.ensureMySQLColumn(ctx, "usage_stats_baseline", column.name, column.def); err != nil {
 				return err
 			}
 		}
@@ -514,6 +559,9 @@ func (db *DB) notifyLogFlush() {
 func (db *DB) migrate(ctx context.Context) error {
 	if db.isSQLite() {
 		return db.migrateSQLite(ctx)
+	}
+	if db.isMySQL() {
+		return db.migrateMySQL(ctx)
 	}
 	query := `
 	CREATE TABLE IF NOT EXISTS accounts (
@@ -1592,7 +1640,7 @@ func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error)
 func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (int, error) {
 	inserted := 0
 	for _, u := range urls {
-		if db.isSQLite() {
+		if db.isSQLite() || db.isMySQL() {
 			res, err := db.conn.ExecContext(ctx, `INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`, u, label)
 			if err != nil {
 				return inserted, err
@@ -2503,6 +2551,9 @@ func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) 
 	if db.isSQLite() {
 		return db.getTrafficSnapshotSQLite(ctx)
 	}
+	if db.isMySQL() {
+		return db.getTrafficSnapshotMySQL(ctx)
+	}
 
 	snapshot := &TrafficSnapshot{}
 	query := `
@@ -2648,6 +2699,9 @@ type AccountUsageDetail struct {
 func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
 	if db.isSQLite() {
 		return db.getChartAggregationSQLite(ctx, start, end, bucketMinutes)
+	}
+	if db.isMySQL() {
+		return db.getChartAggregationMySQL(ctx, start, end, bucketMinutes)
 	}
 
 	if bucketMinutes < 1 {
@@ -3129,6 +3183,12 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 		_, err = db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'usage_logs'`)
 		return err
 	}
+	if db.isMySQL() {
+		if _, err = db.conn.ExecContext(ctx, `TRUNCATE TABLE usage_logs`); err != nil {
+			return err
+		}
+		return db.resetMySQLAutoIncrement(ctx, "usage_logs")
+	}
 	_, err = db.conn.ExecContext(ctx, `TRUNCATE TABLE usage_logs RESTART IDENTITY`)
 	return err
 }
@@ -3271,6 +3331,9 @@ func (db *DB) GetAccountsBilledSince(ctx context.Context, windows map[int64]time
 func (db *DB) getAccountsBilledSinceChunk(ctx context.Context, ids []int64, windows map[int64]time.Time, result map[int64]float64) error {
 	if len(ids) == 0 {
 		return nil
+	}
+	if db.isMySQL() {
+		return db.getAccountsBilledSinceChunkMySQL(ctx, ids, windows, result)
 	}
 
 	values := make([]string, 0, len(ids))
@@ -4362,6 +4425,9 @@ func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source 
 func (db *DB) GetAccountEventTrend(ctx context.Context, start, end time.Time, bucketMinutes int) ([]AccountEventPoint, error) {
 	if db.isSQLite() {
 		return db.getAccountEventTrendSQLite(ctx, start, end, bucketMinutes)
+	}
+	if db.isMySQL() {
+		return db.getAccountEventTrendMySQL(ctx, start, end, bucketMinutes)
 	}
 
 	if bucketMinutes < 1 {

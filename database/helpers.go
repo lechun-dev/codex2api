@@ -77,14 +77,14 @@ func sqliteTimeParam(value time.Time) string {
 }
 
 func (db *DB) timeRangeArgs(start, end time.Time) (interface{}, interface{}) {
-	if db != nil && db.isSQLite() {
+	if db != nil && (db.isSQLite() || db.isMySQL()) {
 		return sqliteTimeParam(start), sqliteTimeParam(end)
 	}
 	return start, end
 }
 
 func (db *DB) timeArg(value time.Time) interface{} {
-	if db != nil && db.isSQLite() {
+	if db != nil && (db.isSQLite() || db.isMySQL()) {
 		return sqliteTimeParam(value)
 	}
 	return value
@@ -314,6 +314,10 @@ func (db *DB) isSQLite() bool {
 	return db != nil && db.driver == "sqlite"
 }
 
+func (db *DB) isMySQL() bool {
+	return db != nil && db.driver == "mysql"
+}
+
 func (db *DB) Driver() string {
 	if db == nil {
 		return "postgres"
@@ -324,6 +328,9 @@ func (db *DB) Driver() string {
 func (db *DB) Label() string {
 	if db.isSQLite() {
 		return "SQLite"
+	}
+	if db.isMySQL() {
+		return "MySQL"
 	}
 	return "PostgreSQL"
 }
@@ -346,7 +353,7 @@ func (db *DB) SetMaxOpenConns(n int) {
 }
 
 func (db *DB) insertRowID(ctx context.Context, postgresQuery string, sqliteQuery string, args ...interface{}) (int64, error) {
-	if db.isSQLite() {
+	if db.isSQLite() || db.isMySQL() {
 		res, err := db.conn.ExecContext(ctx, sqliteQuery, args...)
 		if err != nil {
 			return 0, err

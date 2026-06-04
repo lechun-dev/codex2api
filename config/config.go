@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -32,12 +33,38 @@ type DatabaseConfig struct {
 	DBName   string
 	Schema   string // PostgreSQL schema（search_path）；空值保持数据库默认行为
 	SSLMode  string
+	Charset  string // MySQL 字符集；默认 utf8
 }
 
 // DSN 返回当前驱动的连接字符串。
 func (d *DatabaseConfig) DSN() string {
 	if strings.EqualFold(d.Driver, "sqlite") {
 		return d.Path
+	}
+	if strings.EqualFold(d.Driver, "mysql") {
+		host := d.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := d.Port
+		if port == 0 {
+			port = 3306
+		}
+		charset := strings.TrimSpace(d.Charset)
+		if charset == "" {
+			// MySQL 5.6 的 InnoDB 默认索引长度对 utf8mb4 不友好；
+			// 表结构会以 utf8 建表以兼容 5.6，连接默认也保持一致。
+			charset = "utf8"
+		}
+		q := url.Values{}
+		q.Set("charset", charset)
+		q.Set("parseTime", "true")
+		q.Set("loc", "UTC")
+		q.Set("time_zone", "'+00:00'")
+		q.Set("timeout", "10s")
+		q.Set("readTimeout", "0s")
+		q.Set("writeTimeout", "0s")
+		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", d.User, d.Password, host, port, d.DBName, q.Encode())
 	}
 	sslMode := d.SSLMode
 	if sslMode == "" {
@@ -57,6 +84,9 @@ func (d *DatabaseConfig) DSN() string {
 func (d *DatabaseConfig) Label() string {
 	if strings.EqualFold(d.Driver, "sqlite") {
 		return "SQLite"
+	}
+	if strings.EqualFold(d.Driver, "mysql") {
+		return "MySQL"
 	}
 	return "PostgreSQL"
 }
@@ -158,6 +188,7 @@ func Load(envPath string) (*Config, error) {
 	cfg.Database.User = os.Getenv("DATABASE_USER")
 	cfg.Database.Password = os.Getenv("DATABASE_PASSWORD")
 	cfg.Database.DBName = os.Getenv("DATABASE_NAME")
+	cfg.Database.Charset = strings.TrimSpace(os.Getenv("DATABASE_CHARSET"))
 	if v := strings.TrimSpace(os.Getenv("DATABASE_SCHEMA")); v != "" {
 		if !IsValidSchemaName(v) {
 			return nil, fmt.Errorf("非法的 DATABASE_SCHEMA: %q（仅允许字母、数字、下划线，且不能以数字开头，长度不超过 63）", v)
@@ -187,6 +218,16 @@ func Load(envPath string) (*Config, error) {
 		if cfg.Database.Path == "" {
 			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 SQLite 数据库路径 (DATABASE_PATH)")
 		}
+	case "mysql":
+		if cfg.Database.Host == "" {
+			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 MySQL (DATABASE_HOST)")
+		}
+		if cfg.Database.User == "" {
+			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 MySQL 用户名 (DATABASE_USER)")
+		}
+		if cfg.Database.DBName == "" {
+			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 MySQL 数据库名 (DATABASE_NAME)")
+		}
 	case "postgres":
 		if cfg.Database.Host == "" {
 			return nil, fmt.Errorf("必须通过 .env 或环境变量配置 PostgreSQL (DATABASE_HOST)")
@@ -194,7 +235,9 @@ func Load(envPath string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("不支持的数据库驱动: %s", cfg.Database.Driver)
 	}
-	if cfg.Database.Port == 0 {
+	if cfg.Database.Port == 0 && cfg.Database.Driver == "mysql" {
+		cfg.Database.Port = 3306
+	} else if cfg.Database.Port == 0 {
 		cfg.Database.Port = 5432
 	}
 	if cfg.Database.SSLMode == "" {

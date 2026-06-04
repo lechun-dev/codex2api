@@ -19,6 +19,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 		"DATABASE_PASSWORD",
 		"DATABASE_NAME",
 		"DATABASE_SSLMODE",
+		"DATABASE_CHARSET",
 		"CACHE_DRIVER",
 		"REDIS_ADDR",
 		"REDIS_USERNAME",
@@ -74,6 +75,7 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 		"DATABASE_PASSWORD",
 		"DATABASE_NAME",
 		"DATABASE_SSLMODE",
+		"DATABASE_CHARSET",
 		"CACHE_DRIVER",
 		"REDIS_ADDR",
 		"REDIS_USERNAME",
@@ -103,6 +105,59 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 	}
 	if got := cfg.Cache.Driver; got != "memory" {
 		t.Fatalf("Cache.Driver = %q, want %q", got, "memory")
+	}
+}
+
+func TestLoadAllowsExplicitMySQL(t *testing.T) {
+	keys := []string{
+		"CODEX_PORT",
+		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"PORT",
+		"ADMIN_SECRET",
+		"DATABASE_DRIVER",
+		"DATABASE_PATH",
+		"DATABASE_HOST",
+		"DATABASE_PORT",
+		"DATABASE_USER",
+		"DATABASE_PASSWORD",
+		"DATABASE_NAME",
+		"DATABASE_SSLMODE",
+		"DATABASE_CHARSET",
+		"CACHE_DRIVER",
+		"REDIS_ADDR",
+		"REDIS_USERNAME",
+		"REDIS_PASSWORD",
+		"REDIS_DB",
+		"REDIS_TLS",
+		"REDIS_INSECURE_SKIP_VERIFY",
+	}
+	for _, key := range keys {
+		t.Setenv(key, "")
+	}
+
+	t.Setenv("DATABASE_DRIVER", "mysql")
+	t.Setenv("DATABASE_HOST", "mysql")
+	t.Setenv("DATABASE_USER", "codex2api")
+	t.Setenv("DATABASE_PASSWORD", "secret")
+	t.Setenv("DATABASE_NAME", "codex2api")
+	t.Setenv("CACHE_DRIVER", "memory")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+
+	if got := cfg.Database.Driver; got != "mysql" {
+		t.Fatalf("Database.Driver = %q, want %q", got, "mysql")
+	}
+	if got := cfg.Database.Port; got != 3306 {
+		t.Fatalf("Database.Port = %d, want %d", got, 3306)
+	}
+	dsn := cfg.Database.DSN()
+	for _, want := range []string{"codex2api:secret@tcp(mysql:3306)/codex2api", "charset=utf8", "parseTime=true", "loc=UTC", "time_zone=%27%2B00%3A00%27"} {
+		if !strings.Contains(dsn, want) {
+			t.Fatalf("MySQL DSN %q 不包含 %q", dsn, want)
+		}
 	}
 }
 

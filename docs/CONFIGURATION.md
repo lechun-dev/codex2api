@@ -79,6 +79,20 @@ Codex2API 采用三层配置架构：
 | `DATABASE_SCHEMA` | 否 | - | PostgreSQL schema；适合 Supabase 等多项目共享 database 的场景。配置后启动时自动 `CREATE SCHEMA IF NOT EXISTS` 并将所有连接的 `search_path` 指向该 schema。仅允许字母/数字/下划线，长度 ≤63；留空保持默认（通常是 `public`）。|
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
 
+#### MySQL 模式
+
+支持 MySQL 5.6 及以后版本。为兼容 MySQL 5.6 的 InnoDB 索引长度限制，MySQL 表结构默认使用 `utf8`；`DATABASE_CHARSET` 控制连接字符集，默认同样为 `utf8`。
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `DATABASE_DRIVER` | 是 | mysql | 固定值: mysql |
+| `DATABASE_HOST` | 是 | - | MySQL 主机地址 |
+| `DATABASE_PORT` | 否 | 3306 | MySQL 端口 |
+| `DATABASE_USER` | 是 | - | MySQL 用户名 |
+| `DATABASE_PASSWORD` | 否 | - | MySQL 密码 |
+| `DATABASE_NAME` | 是 | - | MySQL 数据库名；需提前创建 |
+| `DATABASE_CHARSET` | 否 | utf8 | MySQL 连接字符集 |
+
 ### 生图工作台
 
 | 变量 | 必填 | 默认值 | 说明 |

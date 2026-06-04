@@ -5,6 +5,7 @@
 *.so
 *.dylib
 codex2api
+build/
 
 # Go
 /vendor/

@@ -11,8 +11,8 @@ pipeline {
     choice(name: 'GOARCH', choices: ['amd64', 'arm64'], description: 'Linux target architecture')
     string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'codex2api-prod-ssh', description: 'Jenkins SSH credential ID for the deployment server')
     string(name: 'DEPLOY_HOST', defaultValue: 'your-server.example.com', description: 'Deployment server hostname or IP')
-    string(name: 'DEPLOY_USER', defaultValue: 'deployuser', description: 'SSH user on the deployment server')
-    string(name: 'DEPLOY_DIR', defaultValue: '/deploy', description: 'Application directory on the deployment server')
+    string(name: 'DEPLOY_USER', defaultValue: 'appuser', description: 'SSH user on the deployment server')
+    string(name: 'DEPLOY_DIR', defaultValue: '/opt/codex2api', description: 'Application directory on the deployment server')
     string(name: 'SERVICE_NAME', defaultValue: 'codex2api', description: 'systemd service name')
     string(name: 'HEALTHCHECK_URL', defaultValue: '', description: 'Optional URL checked after restart')
   }

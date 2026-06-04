@@ -240,14 +240,15 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | `CODEX_PORT` | HTTP port, default `8080` |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP request body limit in MB, default `48` |
 | `ADMIN_SECRET` | Admin dashboard secret. When set, `/admin` prompts for authentication |
-| `DATABASE_DRIVER` | Database driver: `postgres` or `sqlite` |
+| `DATABASE_DRIVER` | Database driver: `postgres`, `mysql`, or `sqlite` |
 | `DATABASE_PATH` | SQLite database file path, used when `DATABASE_DRIVER=sqlite` |
-| `DATABASE_HOST` | PostgreSQL host |
-| `DATABASE_PORT` | PostgreSQL port, default `5432` |
-| `DATABASE_USER` | PostgreSQL user |
-| `DATABASE_PASSWORD` | PostgreSQL password |
-| `DATABASE_NAME` | PostgreSQL database name |
+| `DATABASE_HOST` | PostgreSQL/MySQL host |
+| `DATABASE_PORT` | PostgreSQL/MySQL port, default `5432` for PostgreSQL and `3306` for MySQL |
+| `DATABASE_USER` | PostgreSQL/MySQL user |
+| `DATABASE_PASSWORD` | PostgreSQL/MySQL password |
+| `DATABASE_NAME` | PostgreSQL/MySQL database name |
 | `DATABASE_SSLMODE` | PostgreSQL SSL mode, default `disable` |
+| `DATABASE_CHARSET` | MySQL charset, default `utf8` for MySQL 5.6 compatibility |
 | `CACHE_DRIVER` | Cache driver: `redis` or `memory` |
 | `REDIS_ADDR` | Redis address, for example `redis:6379`, `redis://default:pass@host:6379/0`, or `rediss://default:pass@host:6379/0` |
 | `REDIS_USERNAME` | Optional Redis ACL username |

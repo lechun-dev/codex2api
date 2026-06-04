@@ -1,0 +1,121 @@
+name: Deploy SSH
+
+on:
+  workflow_dispatch:
+    inputs:
+      goarch:
+        description: Linux target architecture
+        type: choice
+        options:
+          - amd64
+          - arm64
+        default: amd64
+      deploy_dir:
+        description: Application directory on the deployment server
+        type: string
+        default: /deploy/codex2api
+      service_name:
+        description: systemd service name
+        type: string
+        default: codex2api
+      healthcheck_url:
+        description: Optional URL checked after restart
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ssh-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_DIR: ${{ inputs.deploy_dir }}
+      SERVICE_NAME: ${{ inputs.service_name }}
+      HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_APP_VERSION: ${{ github.sha }}
+        run: |
+          npm ci
+          npm run build
+          npm run typecheck
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build Linux binary
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux GOARCH="${{ inputs.goarch }}" go build -trimpath -ldflags="-s -w" -o build/codex2api .
+          file build/codex2api
+
+      - name: Install SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_HOST"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy binary
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_USER"
+          release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          remote="$DEPLOY_USER@$DEPLOY_HOST"
+
+          ssh -i ~/.ssh/deploy_key "$remote" "mkdir -p '$release' '$DEPLOY_DIR/shared'"
+          scp -i ~/.ssh/deploy_key build/codex2api "$remote:$release/codex2api"
+          ssh -i ~/.ssh/deploy_key "$remote" "
+            set -eu
+            test -f '$DEPLOY_DIR/shared/.env'
+            chmod +x '$release/codex2api'
+            ln -sfn '$release' '$DEPLOY_DIR/current'
+            sudo systemctl restart '$SERVICE_NAME'
+            sudo systemctl --no-pager --full status '$SERVICE_NAME' >/dev/null
+          "
+
+      - name: Healthcheck
+        if: ${{ inputs.healthcheck_url != '' }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "$HEALTHCHECK_URL" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "healthcheck failed: $HEALTHCHECK_URL" >&2
+          exit 1

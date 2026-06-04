@@ -64,7 +64,7 @@ func (db *DB) CreateAccountGroup(ctx context.Context, name, description, color s
 	if len(sortOrder) > 0 {
 		order = sortOrder[0]
 	}
-	if db.isSQLite() {
+	if db.isSQLite() || db.isMySQL() {
 		res, err := db.conn.ExecContext(ctx, `INSERT INTO account_groups (name, description, color, sort_order) VALUES (?, ?, ?, ?)`, name, description, color, order)
 		if err != nil {
 			if isUniqueViolation(err) {

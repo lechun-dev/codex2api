@@ -291,14 +291,15 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP 请求体上限，单位 MB，默认 `48` |
 | `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
-| `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
+| `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `mysql` / `sqlite` |
 | `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |
-| `DATABASE_HOST` | PostgreSQL 主机，`DATABASE_DRIVER=postgres` 时生效 |
-| `DATABASE_PORT` | PostgreSQL 端口，默认 `5432` |
-| `DATABASE_USER` | PostgreSQL 用户 |
-| `DATABASE_PASSWORD` | PostgreSQL 密码 |
-| `DATABASE_NAME` | PostgreSQL 数据库名 |
+| `DATABASE_HOST` | PostgreSQL/MySQL 主机 |
+| `DATABASE_PORT` | PostgreSQL/MySQL 端口，PostgreSQL 默认 `5432`，MySQL 默认 `3306` |
+| `DATABASE_USER` | PostgreSQL/MySQL 用户 |
+| `DATABASE_PASSWORD` | PostgreSQL/MySQL 密码 |
+| `DATABASE_NAME` | PostgreSQL/MySQL 数据库名 |
 | `DATABASE_SSLMODE` | PostgreSQL SSL 模式，默认 `disable` |
+| `DATABASE_CHARSET` | MySQL 字符集，默认 `utf8` 以兼容 MySQL 5.6 |
 | `CACHE_DRIVER` | 缓存驱动，支持 `redis` / `memory` |
 | `REDIS_ADDR` | Redis 地址，例如 `redis:6379`、`redis://default:pass@host:6379/0`、`rediss://default:pass@host:6379/0`，`CACHE_DRIVER=redis` 时生效 |
 | `REDIS_USERNAME` | Redis ACL 用户名，可选；URL 中带用户名时可不填 |

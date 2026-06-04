@@ -23,6 +23,7 @@ pipeline {
 
   environment {
     APP_NAME = 'codex2api'
+    PATH = "/usr/local/go/bin:${env.PATH}"
   }
 
   stages {

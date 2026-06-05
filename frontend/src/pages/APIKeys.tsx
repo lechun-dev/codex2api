@@ -1084,7 +1084,13 @@ function buildCodexInstallScript({
   const auth = buildCodexAuthJSON(apiKey);
 
   if (platform === "windows") {
-    return `$ErrorActionPreference = "Stop"
+    return `# How to run:
+# 1. Open Windows PowerShell.
+# 2. Copy this whole script and paste it into PowerShell.
+# 3. Press Enter. If PowerShell asks for confirmation, press Enter again.
+# 4. Restart Codex after the script finishes.
+
+$ErrorActionPreference = "Stop"
 
 $CodexDir = Join-Path $env:USERPROFILE ".codex"
 $ConfigFile = Join-Path $CodexDir "config.toml"
@@ -1112,6 +1118,12 @@ Write-Host "Codex config written to $CodexDir"`;
   }
 
   return `#!/usr/bin/env bash
+# How to run:
+# 1. Open Terminal on macOS or Linux.
+# 2. Copy this whole script and paste it into Terminal.
+# 3. Press Enter. It will create ~/.codex/config.toml and ~/.codex/auth.json.
+# 4. Restart Codex after the script finishes.
+
 set -euo pipefail
 
 CODEX_DIR="$HOME/.codex"

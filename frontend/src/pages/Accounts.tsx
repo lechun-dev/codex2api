@@ -87,6 +87,7 @@ import ChipInput from "../components/ChipInput";
 
 const ACCOUNT_BATCH_CONCURRENCY = 6;
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+const LOCAL_DEFAULT_PROXY_URL = "http://127.0.0.1:7890";
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -480,7 +481,7 @@ export default function Accounts() {
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
     session_token: "",
-    proxy_url: "",
+    proxy_url: LOCAL_DEFAULT_PROXY_URL,
   });
   const [submitting, setSubmitting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -584,14 +585,14 @@ export default function Accounts() {
   >("rt");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
-    proxy_url: "",
+    proxy_url: LOCAL_DEFAULT_PROXY_URL,
   });
   const [openAIForm, setOpenAIForm] =
     useState<AddOpenAIResponsesAccountRequest>({
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
-      proxy_url: "",
+      proxy_url: LOCAL_DEFAULT_PROXY_URL,
     });
   const [openAIModelsLoading, setOpenAIModelsLoading] = useState(false);
   const [oauthStep, setOauthStep] = useState<"generate" | "exchange">(
@@ -601,7 +602,8 @@ export default function Accounts() {
     session_id: string;
     auth_url: string;
   } | null>(null);
-  const [oauthProxyUrl, setOauthProxyUrl] = useState("");
+  const [oauthProxyUrl, setOauthProxyUrl] = useState(LOCAL_DEFAULT_PROXY_URL);
+  const [useLocalDefaultProxy, setUseLocalDefaultProxy] = useState(true);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
   const [oauthName, setOauthName] = useState("");
   const [oauthGenerating, setOauthGenerating] = useState(false);
@@ -1179,6 +1181,88 @@ export default function Accounts() {
     }
   }, [allPageSelected, pagedAccountIds]);
 
+  const setAddDialogLocalDefaultProxy = useCallback((enabled: boolean) => {
+    setUseLocalDefaultProxy(enabled);
+    setAddForm((form) => ({
+      ...form,
+      proxy_url: enabled
+        ? LOCAL_DEFAULT_PROXY_URL
+        : form.proxy_url === LOCAL_DEFAULT_PROXY_URL
+          ? ""
+          : form.proxy_url,
+    }));
+    setAtForm((form) => ({
+      ...form,
+      proxy_url: enabled
+        ? LOCAL_DEFAULT_PROXY_URL
+        : form.proxy_url === LOCAL_DEFAULT_PROXY_URL
+          ? ""
+          : form.proxy_url,
+    }));
+    setOpenAIForm((form) => ({
+      ...form,
+      proxy_url: enabled
+        ? LOCAL_DEFAULT_PROXY_URL
+        : form.proxy_url === LOCAL_DEFAULT_PROXY_URL
+          ? ""
+          : form.proxy_url,
+    }));
+    setOauthProxyUrl((value) =>
+      enabled
+        ? LOCAL_DEFAULT_PROXY_URL
+        : value === LOCAL_DEFAULT_PROXY_URL
+          ? ""
+          : value,
+    );
+  }, []);
+
+  const resetAddDialogState = useCallback(() => {
+    setAddMethod("rt");
+    setUseLocalDefaultProxy(true);
+    setAddForm({
+      refresh_token: "",
+      session_token: "",
+      proxy_url: LOCAL_DEFAULT_PROXY_URL,
+    });
+    setAtForm({ access_token: "", proxy_url: LOCAL_DEFAULT_PROXY_URL });
+    setOauthStep("generate");
+    setOauthSession(null);
+    setOauthCallbackUrl("");
+    setOauthName("");
+    setOauthProxyUrl(LOCAL_DEFAULT_PROXY_URL);
+    setOpenAIForm({
+      base_url: "https://api.openai.com",
+      api_key: "",
+      models: [],
+      proxy_url: LOCAL_DEFAULT_PROXY_URL,
+    });
+    setOpenAIModelDraft("");
+  }, []);
+
+  const handleAddProxyInputChange = useCallback((value: string) => {
+    setUseLocalDefaultProxy(value === LOCAL_DEFAULT_PROXY_URL);
+    return value;
+  }, []);
+
+  const openAddDialog = useCallback(() => {
+    resetAddDialogState();
+    setShowAdd(true);
+  }, [resetAddDialogState]);
+
+  const renderLocalDefaultProxyToggle = () => (
+    <label className="mt-2 flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
+      <input
+        type="checkbox"
+        className="size-4 cursor-pointer accent-primary"
+        checked={useLocalDefaultProxy}
+        onChange={(event) =>
+          setAddDialogLocalDefaultProxy(event.target.checked)
+        }
+      />
+      <span>{t("accounts.useLocalDefaultProxy")}</span>
+    </label>
+  );
+
   const handleAdd = async (credential: "rt" | "st" = "rt") => {
     const payload: AddAccountRequest =
       credential === "st"
@@ -1195,7 +1279,7 @@ export default function Accounts() {
       await api.addAccount(payload);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
+      resetAddDialogState();
       void reload();
     } catch (error) {
       showToast(
@@ -1214,7 +1298,7 @@ export default function Accounts() {
       await api.addATAccount(atForm);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setAtForm({ access_token: "", proxy_url: "" });
+      resetAddDialogState();
       void reload();
     } catch (error) {
       showToast(
@@ -1298,13 +1382,7 @@ export default function Accounts() {
       await api.addOpenAIResponsesAccount({ ...openAIForm, models });
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setOpenAIForm({
-        base_url: "https://api.openai.com",
-        api_key: "",
-        models: [],
-        proxy_url: "",
-      });
-      setOpenAIModelDraft("");
+      resetAddDialogState();
       void reload();
     } catch (error) {
       showToast(
@@ -1424,11 +1502,7 @@ export default function Accounts() {
           : t("accounts.oauthSuccessNoEmail"),
       );
       setShowAdd(false);
-      setAddMethod("rt");
-      setOauthStep("generate");
-      setOauthSession(null);
-      setOauthCallbackUrl("");
-      setOauthName("");
+      resetAddDialogState();
       void reload();
     } catch (error) {
       showToast(
@@ -2739,7 +2813,7 @@ export default function Accounts() {
                     },
                   ]}
                 />
-                <Button onClick={() => setShowAdd(true)}>
+                <Button onClick={openAddDialog}>
                   <Plus className="size-3.5" />
                   {t("accounts.addAccount")}
                 </Button>
@@ -3221,7 +3295,7 @@ export default function Accounts() {
                 emptyTitle={t("accounts.noData")}
                 emptyDescription={t("accounts.noDataDesc")}
                 action={
-                  <Button onClick={() => setShowAdd(true)}>
+                  <Button onClick={openAddDialog}>
                     {t("accounts.addAccount")}
                   </Button>
                 }
@@ -3791,18 +3865,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
-              setAddMethod("rt");
-              setOauthStep("generate");
-              setOauthSession(null);
-              setOauthCallbackUrl("");
-              setOauthName("");
-              setOpenAIForm({
-                base_url: "https://api.openai.com",
-                api_key: "",
-                models: [],
-                proxy_url: "",
-              });
-              setOpenAIModelDraft("");
+              resetAddDialogState();
             }}
             footer={
               <>
@@ -3810,18 +3873,7 @@ export default function Accounts() {
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
-                    setAddMethod("rt");
-                    setOauthStep("generate");
-                    setOauthSession(null);
-                    setOauthCallbackUrl("");
-                    setOauthName("");
-                    setOpenAIForm({
-                      base_url: "https://api.openai.com",
-                      api_key: "",
-                      models: [],
-                      proxy_url: "",
-                    });
-                    setOpenAIModelDraft("");
+                    resetAddDialogState();
                   }}
                 >
                   {t("common.cancel")}
@@ -3979,10 +4031,13 @@ export default function Accounts() {
                     onChange={(event: ChangeEvent<HTMLInputElement>) =>
                       setAddForm((form) => ({
                         ...form,
-                        proxy_url: event.target.value,
+                        proxy_url: handleAddProxyInputChange(
+                          event.target.value,
+                        ),
                       }))
                     }
                   />
+                  {renderLocalDefaultProxyToggle()}
                 </div>
               </div>
             ) : addMethod === "st" ? (
@@ -4020,10 +4075,13 @@ export default function Accounts() {
                     onChange={(event: ChangeEvent<HTMLInputElement>) =>
                       setAddForm((form) => ({
                         ...form,
-                        proxy_url: event.target.value,
+                        proxy_url: handleAddProxyInputChange(
+                          event.target.value,
+                        ),
                       }))
                     }
                   />
+                  {renderLocalDefaultProxyToggle()}
                 </div>
               </div>
             ) : addMethod === "at" ? (
@@ -4064,10 +4122,13 @@ export default function Accounts() {
                     onChange={(event: ChangeEvent<HTMLInputElement>) =>
                       setAtForm((form) => ({
                         ...form,
-                        proxy_url: event.target.value,
+                        proxy_url: handleAddProxyInputChange(
+                          event.target.value,
+                        ),
                       }))
                     }
                   />
+                  {renderLocalDefaultProxyToggle()}
                 </div>
               </div>
             ) : addMethod === "openai" ? (
@@ -4199,10 +4260,13 @@ export default function Accounts() {
                     onChange={(event: ChangeEvent<HTMLInputElement>) =>
                       setOpenAIForm((form) => ({
                         ...form,
-                        proxy_url: event.target.value,
+                        proxy_url: handleAddProxyInputChange(
+                          event.target.value,
+                        ),
                       }))
                     }
                   />
+                  {renderLocalDefaultProxyToggle()}
                 </div>
               </div>
             ) : (
@@ -4236,9 +4300,12 @@ export default function Accounts() {
                         placeholder={t("accounts.oauthProxyUrlPlaceholder")}
                         value={oauthProxyUrl}
                         onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                          setOauthProxyUrl(e.target.value)
+                          setOauthProxyUrl(
+                            handleAddProxyInputChange(e.target.value),
+                          )
                         }
                       />
+                      {renderLocalDefaultProxyToggle()}
                     </div>
                   </>
                 ) : (

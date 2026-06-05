@@ -710,6 +710,7 @@
     "oauthNamePlaceholder": "留空则使用邮箱作为名称",
     "oauthProxyUrl": "代理地址（可选）",
     "oauthProxyUrlPlaceholder": "例如 http://127.0.0.1:7890",
+    "useLocalDefaultProxy": "使用本机默认代理（http://127.0.0.1:7890）",
     "oauthRestart": "重新发起授权",
     "sessionTokenLabel": "Session Token",
     "sessionTokenPlaceholder": "每行一个 Session Token，支持批量粘贴",

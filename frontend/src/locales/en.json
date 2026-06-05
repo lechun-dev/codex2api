@@ -710,6 +710,7 @@
     "oauthNamePlaceholder": "Leave blank to use email as name",
     "oauthProxyUrl": "Proxy URL (optional)",
     "oauthProxyUrlPlaceholder": "e.g. http://127.0.0.1:7890",
+    "useLocalDefaultProxy": "Use local default proxy (http://127.0.0.1:7890)",
     "oauthRestart": "Restart Authorization",
     "sessionTokenLabel": "Session Token",
     "sessionTokenPlaceholder": "One session token per line. Bulk paste is supported.",

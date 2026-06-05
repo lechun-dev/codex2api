@@ -1632,6 +1632,13 @@
     },
     "showKey": "显示密钥",
     "hideKey": "隐藏密钥",
+    "generateScript": "生成脚本",
+    "scriptTitle": "生成 Codex 配置脚本",
+    "scriptForKey": "密钥：{{name}}",
+    "scriptDesc": "复制脚本到目标电脑执行。脚本会创建 .codex 目录；如果 config.toml 或 auth.json 已存在，会先按时间戳备份再写入新文件。",
+    "scriptPlatformUnix": "MAC/Linux",
+    "scriptPlatformWindows": "Windows",
+    "copyScript": "复制脚本",
     "allowedGroups": "允许分组",
     "allowedGroupsHint": "不选择表示该密钥可使用全部账号分组。",
     "limits": {

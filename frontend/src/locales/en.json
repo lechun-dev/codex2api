@@ -1632,6 +1632,13 @@
     },
     "showKey": "Show key",
     "hideKey": "Hide key",
+    "generateScript": "Generate Script",
+    "scriptTitle": "Generate Codex config script",
+    "scriptForKey": "Key: {{name}}",
+    "scriptDesc": "Copy and run this script on the target computer. It creates the .codex directory; if config.toml or auth.json already exists, it backs the file up with a timestamp before writing the new one.",
+    "scriptPlatformUnix": "MAC/Linux",
+    "scriptPlatformWindows": "Windows",
+    "copyScript": "Copy script",
     "allowedGroups": "Allowed Groups",
     "allowedGroupsHint": "Leaving this empty allows the key to use all account groups.",
     "limits": {

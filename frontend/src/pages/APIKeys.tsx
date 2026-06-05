@@ -38,10 +38,12 @@ import {
   Pencil,
   Plus,
   ShieldCheck,
+  Terminal,
   Trash2,
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
+type ScriptPlatform = "unix" | "windows";
 
 interface CreateKeyFormState {
   name: string;
@@ -116,6 +118,9 @@ export default function APIKeys() {
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [saving, setSaving] = useState(false);
+  const [scriptKey, setScriptKey] = useState<APIKeyRow | null>(null);
+  const [scriptPlatform, setScriptPlatform] =
+    useState<ScriptPlatform>("unix");
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
@@ -157,6 +162,20 @@ export default function APIKeys() {
           new Date(a.created_at || 0).getTime(),
       )[0];
   }, [keys]);
+
+  const serviceBaseURL = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    return window.location.origin.replace(/\/$/, "");
+  }, []);
+
+  const generatedScript = useMemo(() => {
+    if (!scriptKey) return "";
+    return buildCodexInstallScript({
+      apiKey: scriptKey.raw_key || scriptKey.key,
+      baseURL: serviceBaseURL,
+      platform: scriptPlatform,
+    });
+  }, [scriptKey, scriptPlatform, serviceBaseURL]);
 
   const expireOptions = useMemo(
     () => [
@@ -303,6 +322,16 @@ export default function APIKeys() {
       allowedGroupIds: keyRow.allowed_group_ids ?? [],
       limits: limitsFromAPIKey(keyRow.limits),
     });
+  };
+
+  const openScriptDialog = (keyRow: APIKeyRow) => {
+    setScriptKey(keyRow);
+    setScriptPlatform("unix");
+  };
+
+  const closeScriptDialog = () => {
+    setScriptKey(null);
+    setScriptPlatform("unix");
   };
 
   const closeEditDialog = () => {
@@ -586,6 +615,14 @@ export default function APIKeys() {
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1.5">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => openScriptDialog(keyRow)}
+                                >
+                                  <Terminal className="size-3.5" />
+                                  {t("apiKeys.generateScript")}
+                                </Button>
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -926,6 +963,83 @@ export default function APIKeys() {
           ) : null}
         </Modal>
 
+        <Modal
+          show={Boolean(scriptKey)}
+          title={t("apiKeys.scriptTitle")}
+          onClose={closeScriptDialog}
+          contentClassName="sm:max-w-[860px]"
+          footer={
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={closeScriptDialog}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleCopy(generatedScript)}
+                disabled={!generatedScript}
+              >
+                <Copy className="size-3.5" />
+                {t("apiKeys.copyScript")}
+              </Button>
+            </>
+          }
+        >
+          {scriptKey ? (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <Terminal className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold text-foreground">
+                    {t("apiKeys.scriptForKey", { name: scriptKey.name })}
+                  </div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                    {t("apiKeys.scriptDesc")}
+                  </p>
+                </div>
+              </div>
+
+              <div className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5">
+                {(
+                  [
+                    ["unix", t("apiKeys.scriptPlatformUnix")],
+                    ["windows", t("apiKeys.scriptPlatformWindows")],
+                  ] as const
+                ).map(([platform, label]) => (
+                  <button
+                    key={platform}
+                    type="button"
+                    onClick={() => setScriptPlatform(platform)}
+                    className={`rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
+                      scriptPlatform === platform
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="rounded-lg border border-border bg-muted/20">
+                <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
+                  {scriptPlatform === "unix"
+                    ? "~/.codex/config.toml, ~/.codex/auth.json"
+                    : "%userprofile%\\.codex\\config.toml, %userprofile%\\.codex\\auth.json"}
+                </div>
+                <pre className="max-h-[460px] overflow-auto p-3 text-xs leading-relaxed text-foreground">
+                  <code>{generatedScript}</code>
+                </pre>
+              </div>
+            </div>
+          ) : null}
+        </Modal>
+
         {confirmDialog}
       </>
     </StateShell>
@@ -933,6 +1047,100 @@ export default function APIKeys() {
 }
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
+
+function buildCodexConfigTOML(baseURL: string): string {
+  const quotedBaseURL = JSON.stringify(baseURL || "https://codexapi.lechun.cc");
+  return `model_provider = "OpenAI"
+model = "gpt-5.4"
+review_model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = ${quotedBaseURL}
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true`;
+}
+
+function buildCodexAuthJSON(apiKey: string): string {
+  return JSON.stringify({ OPENAI_API_KEY: apiKey }, null, 2);
+}
+
+function buildCodexInstallScript({
+  apiKey,
+  baseURL,
+  platform,
+}: {
+  apiKey: string;
+  baseURL: string;
+  platform: ScriptPlatform;
+}): string {
+  const config = buildCodexConfigTOML(baseURL);
+  const auth = buildCodexAuthJSON(apiKey);
+
+  if (platform === "windows") {
+    return `$ErrorActionPreference = "Stop"
+
+$CodexDir = Join-Path $env:USERPROFILE ".codex"
+$ConfigFile = Join-Path $CodexDir "config.toml"
+$AuthFile = Join-Path $CodexDir "auth.json"
+$BackupSuffix = Get-Date -Format "yyyyMMddHHmmss"
+
+New-Item -ItemType Directory -Force -Path $CodexDir | Out-Null
+
+if (Test-Path $ConfigFile) {
+  Copy-Item -Path $ConfigFile -Destination "$($ConfigFile).bak.$BackupSuffix" -Force
+}
+if (Test-Path $AuthFile) {
+  Copy-Item -Path $AuthFile -Destination "$($AuthFile).bak.$BackupSuffix" -Force
+}
+
+@'
+${config}
+'@ | Set-Content -Path $ConfigFile -Encoding UTF8
+
+@'
+${auth}
+'@ | Set-Content -Path $AuthFile -Encoding UTF8
+
+Write-Host "Codex config written to $CodexDir"`;
+  }
+
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_DIR="$HOME/.codex"
+CONFIG_FILE="$CODEX_DIR/config.toml"
+AUTH_FILE="$CODEX_DIR/auth.json"
+BACKUP_SUFFIX="$(date +%Y%m%d%H%M%S)"
+
+mkdir -p "$CODEX_DIR"
+
+if [ -f "$CONFIG_FILE" ]; then
+  cp "$CONFIG_FILE" "$CONFIG_FILE.bak.$BACKUP_SUFFIX"
+fi
+if [ -f "$AUTH_FILE" ]; then
+  cp "$AUTH_FILE" "$AUTH_FILE.bak.$BACKUP_SUFFIX"
+fi
+
+cat > "$CONFIG_FILE" <<'CODEX_CONFIG_EOF'
+${config}
+CODEX_CONFIG_EOF
+
+cat > "$AUTH_FILE" <<'CODEX_AUTH_EOF'
+${auth}
+CODEX_AUTH_EOF
+
+chmod 700 "$CODEX_DIR"
+chmod 600 "$CONFIG_FILE" "$AUTH_FILE"
+
+echo "Codex config written to $CODEX_DIR"`;
+}
 
 function parseQuotaLimit(raw: string, t: Translator): number {
   const quotaLimitText = raw.trim();

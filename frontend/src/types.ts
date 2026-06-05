@@ -373,9 +373,10 @@ export interface RuntimeStatusResponse {
     status: RuntimeHealthStatus
     lazy_mode: boolean
     background_refresh_interval_minutes: number
-    usage_probe_max_age_minutes: number
-    usage_probe_concurrency: number
-    recovery_probe_interval_minutes: number
+	    usage_probe_max_age_minutes: number
+	    usage_probe_concurrency: number
+	    usage_probe_responses_fallback_enabled: boolean
+	    recovery_probe_interval_minutes: number
     usage_probe_running: boolean
     recovery_probe_running: boolean
     auto_cleanup_running: boolean
@@ -520,9 +521,10 @@ export interface SystemSettings {
   test_model: string
   test_concurrency: number
   background_refresh_interval_minutes: number
-  usage_probe_max_age_minutes: number
-  usage_probe_concurrency: number
-  recovery_probe_interval_minutes: number
+	  usage_probe_max_age_minutes: number
+	  usage_probe_concurrency: number
+	  usage_probe_responses_fallback_enabled: boolean
+	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number

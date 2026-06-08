@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.2.9 - 2026-06-09
+
+### Features
+
+- **Account proxy validation (#212).** Added proxy test controls across account add/edit, OAuth generation, and OpenAI Responses account forms, backed by an admin proxy test endpoint that reports reachability, latency, IP, and location.
+- **Usage range and reset-time display.** Dashboard usage cards now label and query the selected time range instead of always showing "today", and account quota reset labels now display precise seconds with full timestamps available in tooltips.
+
+### Fixes
+
+- **WebSocket message-too-big fallback (#214).** Upstream WebSocket `close 1009` / `message too big` failures before the first downstream token now fall back to HTTP for the same request instead of rotating accounts through another WS attempt, with logs classified as `message_too_big`.
+- **CPA/sub2api JSON import (#215).** JSON imports now avoid treating repeated or conflicting ChatGPT account IDs as the same account when credentials differ, fixing failed or collapsed imports from CPA/sub2api export files.
+- **Batch account test state updates.** Batch connection tests now update account status consistently with single-account tests, including `response.failed`, unauthorized, generic upstream errors, and usage-limit results; successful tests still recover stale banned/cooldown state.
+- **Quota auto-pause scheduling (#216).** Accounts that reached configured usage thresholds remain out of scheduling while their quota window is still active, and stale reset timestamps are ignored so reset/cooldown state does not linger incorrectly.
+
 ## v2.2.8 - 2026-06-08
 
 ### Features

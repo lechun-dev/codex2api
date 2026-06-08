@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -375,7 +376,8 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	}
 	defer db.Close()
 
-	columns, err := db.sqliteTableColumns(context.Background(), "usage_logs")
+	ctx := context.Background()
+	columns, err := db.sqliteTableColumns(ctx, "usage_logs")
 	if err != nil {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
@@ -384,6 +386,27 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+
+	rows, err := db.conn.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_logs'`)
+	if err != nil {
+		t.Fatalf("查询 usage_logs 索引返回错误: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("读取 usage_logs 索引返回错误: %v", err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 usage_logs 索引返回错误: %v", err)
+	}
+	if !indexes["idx_usage_logs_account_created_at"] {
+		t.Fatal("usage_logs 缺少索引 idx_usage_logs_account_created_at")
 	}
 }
 
@@ -1708,6 +1731,26 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 			t.Fatal("Compact = false, want true in paged usage logs")
 		}
 	}
+
+	targetAccountID := int64(1)
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:     now.Add(-1 * time.Hour),
+		End:       now.Add(1 * time.Hour),
+		Page:      1,
+		PageSize:  10,
+		AccountID: &targetAccountID,
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged account filter 返回错误: %v", err)
+	}
+	if page.Total != 2 {
+		t.Fatalf("account filter page.Total = %d, want %d", page.Total, 2)
+	}
+	for _, usageLog := range page.Logs {
+		if usageLog.AccountID != targetAccountID {
+			t.Fatalf("AccountID = %d, want %d", usageLog.AccountID, targetAccountID)
+		}
+	}
 }
 
 func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
@@ -1754,6 +1797,137 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
+	}
+}
+
+func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	insertUsage := func(accountID int64, model string, statusCode int, totalTokens, inputTokens, outputTokens, reasoningTokens, cachedTokens, durationMs int, accountBilled, userBilled float64, createdAt time.Time) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				account_id, model, effective_model, status_code, total_tokens,
+				input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+				duration_ms, account_billed, user_billed, created_at
+			)
+			VALUES ($1, $2, '', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`, accountID, model, statusCode, totalTokens, inputTokens, outputTokens, reasoningTokens, cachedTokens, durationMs, accountBilled, userBilled, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	insertUsage(7, "gpt-5.5", 200, 1000, 700, 300, 50, 100, 1000, 1.25, 0.50, todayStart.Add(1*time.Hour))
+	insertUsage(7, "gpt-5.5", 200, 2000, 1500, 500, 100, 0, 2000, 2.50, 1.00, todayStart.AddDate(0, 0, -1).Add(1*time.Hour))
+	insertUsage(7, "gpt-4.1", 500, 3000, 2000, 1000, 150, 250, 3000, 3.75, 1.50, todayStart.AddDate(0, 0, -1).Add(2*time.Hour))
+	insertUsage(7, "old-model", 200, 9000, 9000, 0, 0, 0, 5000, 9.99, 9.99, todayStart.AddDate(0, 0, -40))
+	insertUsage(7, "cancelled", 499, 8000, 8000, 0, 0, 0, 5000, 8.88, 8.88, todayStart.Add(2*time.Hour))
+	insertUsage(8, "other-account", 200, 7000, 7000, 0, 0, 0, 5000, 7.77, 7.77, todayStart.Add(2*time.Hour))
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
+		t.Fatalf("update first usage quality fields: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 1500, compact = 1 WHERE account_id = 7 AND total_tokens = 2000`); err != nil {
+		t.Fatalf("update second usage quality fields: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 2500, stream = 1, compact = 1, is_retry_attempt = 1, attempt_index = 1 WHERE account_id = 7 AND model = 'gpt-4.1'`); err != nil {
+		t.Fatalf("update third usage quality fields: %v", err)
+	}
+
+	got, err := db.GetAccountUsageStats(ctx, 7, 30)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats 返回错误: %v", err)
+	}
+
+	if got.PeriodDays != 30 {
+		t.Fatalf("PeriodDays = %d, want 30", got.PeriodDays)
+	}
+	if got.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", got.TotalRequests)
+	}
+	if got.TotalTokens != 6000 {
+		t.Fatalf("TotalTokens = %d, want 6000", got.TotalTokens)
+	}
+	if got.InputTokens != 4200 || got.OutputTokens != 1800 || got.ReasoningTokens != 300 || got.CachedTokens != 350 {
+		t.Fatalf("token breakdown = input %d output %d reasoning %d cached %d", got.InputTokens, got.OutputTokens, got.ReasoningTokens, got.CachedTokens)
+	}
+	if math.Abs(got.TotalAccountBilled-7.50) > 0.000001 {
+		t.Fatalf("TotalAccountBilled = %.4f, want 7.5000", got.TotalAccountBilled)
+	}
+	if math.Abs(got.TotalUserBilled-3.00) > 0.000001 {
+		t.Fatalf("TotalUserBilled = %.4f, want 3.0000", got.TotalUserBilled)
+	}
+	if got.Today.Requests != 1 || got.Today.Tokens != 1000 {
+		t.Fatalf("Today = %+v, want requests 1 tokens 1000", got.Today)
+	}
+	if got.ActiveDays < 2 {
+		t.Fatalf("ActiveDays = %d, want at least 2", got.ActiveDays)
+	}
+	if got.HighestCostDay == nil || math.Abs(got.HighestCostDay.AccountBilled-6.25) > 0.000001 {
+		t.Fatalf("HighestCostDay = %+v, want account billed 6.25", got.HighestCostDay)
+	}
+	if got.HighestRequestDay == nil || got.HighestRequestDay.Requests != 2 {
+		t.Fatalf("HighestRequestDay = %+v, want requests 2", got.HighestRequestDay)
+	}
+	if len(got.History) != 2 {
+		t.Fatalf("len(History) = %d, want 2", len(got.History))
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("len(Models) = %d, want 2", len(got.Models))
+	}
+	if got.Models[0].Model != "gpt-5.5" || got.Models[0].Requests != 2 {
+		t.Fatalf("Models[0] = %+v, want gpt-5.5 requests 2", got.Models[0])
+	}
+	if got.Models[0].Tokens != 3000 || got.Models[0].InputTokens != 2200 || got.Models[0].OutputTokens != 800 || got.Models[0].ReasoningTokens != 150 || got.Models[0].CachedTokens != 100 {
+		t.Fatalf("Models[0] token breakdown = %+v, want tokens 3000 input 2200 output 800 reasoning 150 cached 100", got.Models[0])
+	}
+	if math.Abs(got.Models[0].AccountBilled-3.75) > 0.000001 || math.Abs(got.Models[0].UserBilled-1.50) > 0.000001 {
+		t.Fatalf("Models[0] billed = account %.4f user %.4f, want 3.7500/1.5000", got.Models[0].AccountBilled, got.Models[0].UserBilled)
+	}
+	if got.ErrorRequests != 1 || math.Abs(got.ErrorRate-33.333333) > 0.001 {
+		t.Fatalf("error quality = requests %d rate %.4f, want 1/33.33", got.ErrorRequests, got.ErrorRate)
+	}
+	if got.RetryRequests != 1 {
+		t.Fatalf("RetryRequests = %d, want 1", got.RetryRequests)
+	}
+	if got.FirstTokenSamples != 3 || math.Abs(got.AvgFirstTokenMs-1500) > 0.001 {
+		t.Fatalf("first token quality = samples %d avg %.2f, want 3/1500", got.FirstTokenSamples, got.AvgFirstTokenMs)
+	}
+	if math.Abs(got.P95DurationMs-3000) > 0.001 {
+		t.Fatalf("P95DurationMs = %.2f, want 3000", got.P95DurationMs)
+	}
+	if got.StreamRequests != 2 || math.Abs(got.StreamRate-66.666667) > 0.001 {
+		t.Fatalf("stream quality = requests %d rate %.4f, want 2/66.67", got.StreamRequests, got.StreamRate)
+	}
+	if got.CompactRequests != 2 || math.Abs(got.CompactRate-66.666667) > 0.001 {
+		t.Fatalf("compact quality = requests %d rate %.4f, want 2/66.67", got.CompactRequests, got.CompactRate)
+	}
+
+	todayOnly, err := db.GetAccountUsageStats(ctx, 7, 1)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats today 返回错误: %v", err)
+	}
+	if todayOnly.TotalRequests != 1 || todayOnly.TotalTokens != 1000 {
+		t.Fatalf("todayOnly = requests %d tokens %d, want 1/1000", todayOnly.TotalRequests, todayOnly.TotalTokens)
+	}
+
+	allTime, err := db.GetAccountUsageStats(ctx, 7, 0)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats all-time 返回错误: %v", err)
+	}
+	if allTime.PeriodDays != 0 {
+		t.Fatalf("allTime.PeriodDays = %d, want 0", allTime.PeriodDays)
+	}
+	if allTime.TotalRequests != 4 || allTime.TotalTokens != 15000 {
+		t.Fatalf("allTime = requests %d tokens %d, want 4/15000", allTime.TotalRequests, allTime.TotalTokens)
 	}
 }
 

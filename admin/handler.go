@@ -46,6 +46,7 @@ type Handler struct {
 	db                     *database.DB
 	rateLimiter            *proxy.RateLimiter
 	refreshAccount         func(context.Context, int64) error
+	probeUsage             func(context.Context, *auth.Account) error
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	cpuSampler             *cpuSampler
 	startedAt              time.Time
@@ -129,6 +130,54 @@ func validateImportFileSize(fh *multipart.FileHeader) error {
 	return nil
 }
 
+func (h *Handler) usageProbeFunc() func(context.Context, *auth.Account) error {
+	if h != nil && h.probeUsage != nil {
+		return h.probeUsage
+	}
+	if h != nil {
+		return h.ProbeUsageSnapshot
+	}
+	return nil
+}
+
+func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64, source string) {
+	if h == nil || h.store == nil {
+		return
+	}
+	account := h.store.FindByID(accountID)
+	if account == nil {
+		return
+	}
+	if account.GetAccessToken() == "" {
+		return
+	}
+	probeFn := h.usageProbeFunc()
+	if probeFn == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	if err := probeFn(probeCtx, account); err != nil {
+		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
+	}
+}
+
+func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
+	go h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
+func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string) {
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := h.refreshAccountByID(refreshCtx, accountID)
+	cancel()
+	if err != nil {
+		log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+		return
+	}
+	log.Printf("导入账号 %d 刷新成功", accountID)
+	h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
 	if h == nil || h.cache == nil {
 		return
@@ -187,6 +236,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
 	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
@@ -1413,6 +1463,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddAccounts(c, req, seeds)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
@@ -1441,17 +1496,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		if !h.store.GetLazyMode() {
-			// 异步刷新 AT
-			go func(accountID int64) {
-				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-					log.Printf("新账号 %d 刷新失败: %v", accountID, err)
-				} else {
-					log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
-				}
-			}(id)
+		if newAcc.GetAccessToken() != "" {
+			h.triggerImportedAccountUsageProbe(id, "manual_add")
+		} else if !h.store.GetLazyMode() {
+			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
+			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
 		}
 	}
 
@@ -1467,6 +1516,64 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		"message": msg,
 		"success": successCount,
 		"failed":  failCount,
+	})
+}
+
+func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []tokenCredentialSeed) {
+	setupSSE(c)
+
+	total := len(seeds)
+	successCount := 0
+	failCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Duplicate: 0, Failed: 0,
+	})
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	for i, seed := range seeds {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("account-%d", i+1)
+		} else if len(seeds) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
+			failCount++
+			sendImportEvent(c, importEvent{
+				Type: "progress", Current: i + 1, Total: total,
+				Success: successCount, Duplicate: 0, Failed: failCount,
+			})
+			continue
+		}
+
+		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual")
+
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		h.store.AddAccount(newAcc)
+
+		if newAcc.GetAccessToken() != "" {
+			h.triggerImportedAccountUsageProbe(id, "manual_add")
+		} else if !h.store.GetLazyMode() {
+			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
+		}
+
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: i + 1, Total: total,
+			Success: successCount, Duplicate: 0, Failed: failCount,
+		})
+	}
+
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Duplicate: 0, Failed: failCount,
 	})
 }
 
@@ -2616,6 +2723,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					credCancel()
 				}
 				h.store.AddAccount(newAcc)
+				if newAcc.GetAccessToken() != "" {
+					h.triggerImportedAccountUsageProbe(id, "import_at")
+				}
 			} else {
 				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
@@ -2682,17 +2792,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				h.store.AddAccount(newAcc)
 
-				if tok.accessToken == "" && !h.store.GetLazyMode() {
-					// 后台异步刷新，不阻塞导入流程
-					go func(accountID int64) {
-						refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
-						if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-							log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-						} else {
-							log.Printf("导入账号 %d 刷新成功", accountID)
-						}
-					}(id)
+				if newAcc.GetAccessToken() != "" {
+					h.triggerImportedAccountUsageProbe(id, "import")
+				} else if !h.store.GetLazyMode() {
+					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
+					go h.refreshImportedAccountAndProbe(id, "import_refresh")
 				}
 			}
 		}(i, t)
@@ -2738,11 +2842,20 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
+	days := 30
+	if raw := strings.TrimSpace(c.Query("days")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 || parsed > 3650 {
+			writeError(c, http.StatusBadRequest, "days 参数无效，需要 0-3650 的整数")
+			return
+		}
+		days = parsed
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	detail, err := h.db.GetAccountUsageStats(ctx, id)
+	detail, err := h.db.GetAccountUsageStats(ctx, id, days)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -3825,16 +3938,26 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				}
 				apiKeyID = &parsed
 			}
+			var accountID *int64
+			if accountIDStr := c.Query("account_id"); accountIDStr != "" {
+				parsed, err := strconv.ParseInt(accountIDStr, 10, 64)
+				if err != nil || parsed <= 0 {
+					writeError(c, http.StatusBadRequest, "account_id 参数无效，需要正整数")
+					return
+				}
+				accountID = &parsed
+			}
 
 			filter := database.UsageLogFilter{
-				Start:    startTime,
-				End:      endTime,
-				Page:     page,
-				PageSize: pageSize,
-				Email:    c.Query("email"),
-				Model:    c.Query("model"),
-				Endpoint: c.Query("endpoint"),
-				APIKeyID: apiKeyID,
+				Start:     startTime,
+				End:       endTime,
+				Page:      page,
+				PageSize:  pageSize,
+				Email:     c.Query("email"),
+				Model:     c.Query("model"),
+				Endpoint:  c.Query("endpoint"),
+				APIKeyID:  apiKeyID,
+				AccountID: accountID,
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"

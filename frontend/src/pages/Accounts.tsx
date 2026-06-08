@@ -581,7 +581,7 @@ export default function Accounts() {
   });
   const [addMethod, setAddMethod] = useState<
     "rt" | "st" | "at" | "openai" | "oauth"
-  >("rt");
+  >("oauth");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -1192,6 +1192,22 @@ export default function Accounts() {
     }
     setSubmitting(true);
     try {
+      const credentialText =
+        credential === "st" ? payload.session_token ?? "" : payload.refresh_token ?? "";
+      const credentialCount = credentialText
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean).length;
+
+      if (credentialCount > 1) {
+        const res = await postAdminSSE("/accounts?stream=true", payload);
+        setShowAdd(false);
+        await readImportSSE(res);
+        showToast(t("accounts.addSuccess"));
+        setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
+        return;
+      }
+
       await api.addAccount(payload);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
@@ -1374,12 +1390,18 @@ export default function Accounts() {
     }
   };
 
+  const startOAuthSession = async () => {
+    const result = await api.generateOAuthURL({ proxy_url: oauthProxyUrl });
+    setOauthSession(result);
+    setOauthCallbackUrl("");
+    setOauthStep("exchange");
+    return result;
+  };
+
   const handleOAuthGenerate = async () => {
     setOauthGenerating(true);
     try {
-      const result = await api.generateOAuthURL({ proxy_url: oauthProxyUrl });
-      setOauthSession(result);
-      setOauthStep("exchange");
+      await startOAuthSession();
     } catch (error) {
       showToast(
         t("accounts.oauthFailed", { error: getErrorMessage(error) }),
@@ -1387,6 +1409,33 @@ export default function Accounts() {
       );
     } finally {
       setOauthGenerating(false);
+    }
+  };
+
+  const handleOAuthRestart = async () => {
+    setOauthGenerating(true);
+    setOauthSession(null);
+    setOauthCallbackUrl("");
+    try {
+      await startOAuthSession();
+    } catch (error) {
+      setOauthStep("generate");
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setOauthGenerating(false);
+    }
+  };
+
+  const handleOAuthCopyLink = async () => {
+    if (!oauthSession?.auth_url) return;
+    try {
+      await copyTextToClipboard(oauthSession.auth_url);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
     }
   };
 
@@ -1424,7 +1473,7 @@ export default function Accounts() {
           : t("accounts.oauthSuccessNoEmail"),
       );
       setShowAdd(false);
-      setAddMethod("rt");
+      setAddMethod("oauth");
       setOauthStep("generate");
       setOauthSession(null);
       setOauthCallbackUrl("");
@@ -1451,7 +1500,10 @@ export default function Accounts() {
       done: false,
     });
     const reader = res.body?.getReader();
-    if (!reader) return;
+    if (!reader) {
+      setImportProgress((p) => ({ ...p, done: true }));
+      return;
+    }
     const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
@@ -1493,6 +1545,15 @@ export default function Accounts() {
     format: "txt" | "json" | "json_at" | "at_txt",
   ) => {
     setImporting(true);
+    setImportProgress({
+      show: true,
+      current: 0,
+      total: 0,
+      success: 0,
+      duplicate: 0,
+      failed: 0,
+      done: false,
+    });
     try {
       const formData = new FormData();
       if (format !== "txt") formData.append("format", format);
@@ -1507,6 +1568,7 @@ export default function Accounts() {
       } else {
         const data = await res.json();
         if (!res.ok) {
+          setImportProgress((p) => ({ ...p, show: false }));
           showToast(
             data.error
               ? t("accounts.importFailedWithReason", { error: data.error })
@@ -1514,11 +1576,29 @@ export default function Accounts() {
             "error",
           );
         } else {
+          setImportProgress({
+            show: true,
+            current: data.total ?? 0,
+            total: data.total ?? 0,
+            success: data.success ?? 0,
+            duplicate: data.duplicate ?? 0,
+            failed: data.failed ?? 0,
+            done: true,
+          });
           showToast(t("accounts.importCompleted"));
           void reload();
         }
       }
     } catch (error) {
+      setImportProgress({
+        show: true,
+        current: 1,
+        total: 1,
+        success: 0,
+        duplicate: 0,
+        failed: 1,
+        done: true,
+      });
       showToast(
         t("accounts.importFailedWithReason", { error: getErrorMessage(error) }),
         "error",
@@ -3791,7 +3871,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
-              setAddMethod("rt");
+              setAddMethod("oauth");
               setOauthStep("generate");
               setOauthSession(null);
               setOauthCallbackUrl("");
@@ -3810,7 +3890,7 @@ export default function Accounts() {
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
-                    setAddMethod("rt");
+                    setAddMethod("oauth");
                     setOauthStep("generate");
                     setOauthSession(null);
                     setOauthCallbackUrl("");
@@ -3883,6 +3963,22 @@ export default function Accounts() {
             {/* Tab switcher */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
+                onClick={() => {
+                  setAddMethod("oauth");
+                  setOauthStep("generate");
+                  setOauthSession(null);
+                  setOauthCallbackUrl("");
+                }}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "oauth"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <KeyRound className="size-3.5" />
+                {t("accounts.addMethodOAuth")}
+              </button>
+              <button
                 onClick={() => setAddMethod("rt")}
                 className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "rt"
@@ -3925,22 +4021,6 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
-              </button>
-              <button
-                onClick={() => {
-                  setAddMethod("oauth");
-                  setOauthStep("generate");
-                  setOauthSession(null);
-                  setOauthCallbackUrl("");
-                }}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "oauth"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <KeyRound className="size-3.5" />
-                {t("accounts.addMethodOAuth")}
               </button>
             </div>
 
@@ -4234,15 +4314,29 @@ export default function Accounts() {
                         <p className="text-xs font-semibold text-muted-foreground mb-2">
                           {t("accounts.oauthOpenLink")}
                         </p>
-                        <a
-                          href={oauthSession.auth_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 text-sm font-semibold text-primary hover:underline break-all"
-                        >
-                          <ExternalLink className="size-3.5 shrink-0" />
-                          {t("accounts.oauthOpenLink")}
-                        </a>
+                        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
+                          <a
+                            href={oauthSession.auth_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={oauthSession.auth_url}
+                            className="inline-flex min-h-10 min-w-0 max-w-full flex-1 items-start gap-1.5 overflow-hidden rounded-lg border bg-background px-3 py-2 text-sm font-semibold text-primary hover:bg-muted/50"
+                          >
+                            <ExternalLink className="mt-0.5 size-3.5 shrink-0" />
+                            <span className="block min-w-0 flex-1 break-all leading-relaxed [overflow-wrap:anywhere]">
+                              {oauthSession.auth_url}
+                            </span>
+                          </a>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void handleOAuthCopyLink()}
+                            className="w-full shrink-0 sm:w-auto"
+                          >
+                            <Copy className="size-4" />
+                            {t("common.copy")}
+                          </Button>
+                        </div>
                       </div>
                     )}
                     <div>
@@ -4261,14 +4355,14 @@ export default function Accounts() {
                       </p>
                     </div>
                     <button
-                      onClick={() => {
-                        setOauthStep("generate");
-                        setOauthSession(null);
-                        setOauthCallbackUrl("");
-                      }}
+                      type="button"
+                      onClick={() => void handleOAuthRestart()}
+                      disabled={oauthGenerating}
                       className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
                     >
-                      {t("accounts.oauthRestart")}
+                      {oauthGenerating
+                        ? t("accounts.oauthGenerating")
+                        : t("accounts.oauthRestart")}
                     </button>
                   </>
                 )}
@@ -5602,12 +5696,12 @@ function formatJSONText(text: string) {
 }
 
 async function copyTextToClipboard(text: string) {
-  if (navigator.clipboard?.writeText) {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
       return;
     } catch {
-      // Fall back for non-secure contexts or browsers that block clipboard writes.
+      // Fall back for browsers that block clipboard writes.
     }
   }
 
@@ -5615,7 +5709,10 @@ async function copyTextToClipboard(text: string) {
   textarea.value = text;
   textarea.setAttribute("readonly", "true");
   textarea.style.position = "fixed";
-  textarea.style.top = "-1000px";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
   textarea.style.opacity = "0";
   textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -597,6 +598,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);
 
@@ -2716,20 +2718,59 @@ type AccountEventPoint struct {
 
 // AccountModelStat 单个模型的使用统计
 type AccountModelStat struct {
-	Model    string `json:"model"`
-	Requests int64  `json:"requests"`
-	Tokens   int64  `json:"tokens"`
+	Model           string  `json:"model"`
+	Requests        int64   `json:"requests"`
+	Tokens          int64   `json:"tokens"`
+	InputTokens     int64   `json:"input_tokens"`
+	OutputTokens    int64   `json:"output_tokens"`
+	ReasoningTokens int64   `json:"reasoning_tokens"`
+	CachedTokens    int64   `json:"cached_tokens"`
+	AccountBilled   float64 `json:"account_billed"`
+	UserBilled      float64 `json:"user_billed"`
+}
+
+type AccountUsageDayStat struct {
+	Date          string  `json:"date"`
+	Label         string  `json:"label"`
+	Requests      int64   `json:"requests"`
+	Tokens        int64   `json:"tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
 }
 
 // AccountUsageDetail 单账号用量详情
 type AccountUsageDetail struct {
-	TotalRequests   int64              `json:"total_requests"`
-	TotalTokens     int64              `json:"total_tokens"`
-	InputTokens     int64              `json:"input_tokens"`
-	OutputTokens    int64              `json:"output_tokens"`
-	ReasoningTokens int64              `json:"reasoning_tokens"`
-	CachedTokens    int64              `json:"cached_tokens"`
-	Models          []AccountModelStat `json:"models"`
+	PeriodDays            int                   `json:"period_days"`
+	ActiveDays            int                   `json:"active_days"`
+	TotalRequests         int64                 `json:"total_requests"`
+	TotalTokens           int64                 `json:"total_tokens"`
+	InputTokens           int64                 `json:"input_tokens"`
+	OutputTokens          int64                 `json:"output_tokens"`
+	ReasoningTokens       int64                 `json:"reasoning_tokens"`
+	CachedTokens          int64                 `json:"cached_tokens"`
+	CacheHitRate          float64               `json:"cache_hit_rate"`
+	TotalAccountBilled    float64               `json:"total_account_billed"`
+	TotalUserBilled       float64               `json:"total_user_billed"`
+	AvgDailyAccountBilled float64               `json:"avg_daily_account_billed"`
+	AvgDailyUserBilled    float64               `json:"avg_daily_user_billed"`
+	AvgDailyRequests      float64               `json:"avg_daily_requests"`
+	AvgDailyTokens        float64               `json:"avg_daily_tokens"`
+	AvgDurationMs         float64               `json:"avg_duration_ms"`
+	AvgFirstTokenMs       float64               `json:"avg_first_token_ms"`
+	P95DurationMs         float64               `json:"p95_duration_ms"`
+	ErrorRequests         int64                 `json:"error_requests"`
+	ErrorRate             float64               `json:"error_rate"`
+	RetryRequests         int64                 `json:"retry_requests"`
+	FirstTokenSamples     int64                 `json:"first_token_samples"`
+	StreamRequests        int64                 `json:"stream_requests"`
+	StreamRate            float64               `json:"stream_rate"`
+	CompactRequests       int64                 `json:"compact_requests"`
+	CompactRate           float64               `json:"compact_rate"`
+	Today                 AccountUsageDayStat   `json:"today"`
+	HighestCostDay        *AccountUsageDayStat  `json:"highest_cost_day,omitempty"`
+	HighestRequestDay     *AccountUsageDayStat  `json:"highest_request_day,omitempty"`
+	History               []AccountUsageDayStat `json:"history"`
+	Models                []AccountModelStat    `json:"models"`
 }
 
 // GetChartAggregation 在数据库层完成图表数据的分桶聚合（无需传输原始行）
@@ -2815,11 +2856,42 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 	return result, mRows.Err()
 }
 
-// GetAccountUsageStats 查询单个账号的用量统计和模型分布
-func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*AccountUsageDetail, error) {
-	result := &AccountUsageDetail{}
+// GetAccountUsageStats 查询单个账号的用量统计和模型分布。days<=0 表示全量。
+func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days int) (*AccountUsageDetail, error) {
+	periodDays := days
+	if periodDays > 3650 {
+		periodDays = 3650
+	}
+	allTime := periodDays <= 0
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	periodEnd := todayStart.AddDate(0, 0, 1)
+	periodStart := todayStart.AddDate(0, 0, -(periodDays - 1))
+	if allTime {
+		periodStart = time.Time{}
+		periodDays = 0
+	}
+	result := &AccountUsageDetail{
+		PeriodDays: periodDays,
+		Today: AccountUsageDayStat{
+			Date:  todayStart.Format("2006-01-02"),
+			Label: todayStart.Format("01/02"),
+		},
+		History: []AccountUsageDayStat{},
+	}
 
 	// 汇总统计
+	dayExpr := "DATE(created_at)"
+	if db.isSQLite() {
+		dayExpr = "date(created_at)"
+	}
+	timeWhere := "created_at >= $2 AND created_at < $3"
+	queryArgs := []interface{}{accountID, db.timeArg(periodStart), db.timeArg(periodEnd)}
+	if allTime {
+		timeWhere = "created_at < $2"
+		queryArgs = []interface{}{accountID, db.timeArg(periodEnd)}
+	}
+
 	summaryQuery := `
 	SELECT
 		COUNT(*),
@@ -2827,27 +2899,171 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*Accou
 		COALESCE(SUM(input_tokens), 0),
 		COALESCE(SUM(output_tokens), 0),
 		COALESCE(SUM(reasoning_tokens), 0),
-		COALESCE(SUM(cached_tokens), 0)
+		COALESCE(SUM(cached_tokens), 0),
+		COALESCE(SUM(account_billed), 0),
+		COALESCE(SUM(user_billed), 0),
+		COALESCE(AVG(NULLIF(duration_ms, 0)), 0),
+		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN compact THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN duration_ms > 0 THEN 1 ELSE 0 END), 0),
+		COUNT(DISTINCT ` + dayExpr + `)
 	FROM usage_logs
-	WHERE account_id = $1 AND status_code <> 499`
+	WHERE account_id = $1
+	  AND ` + timeWhere + `
+	  AND status_code <> 499`
 
-	if err := db.conn.QueryRowContext(ctx, summaryQuery, accountID).Scan(
+	var cacheHitRequests int64
+	var firstTokenMsSum float64
+	var durationSamples int64
+	if err := db.conn.QueryRowContext(ctx, summaryQuery, queryArgs...).Scan(
 		&result.TotalRequests, &result.TotalTokens,
 		&result.InputTokens, &result.OutputTokens,
 		&result.ReasoningTokens, &result.CachedTokens,
+		&result.TotalAccountBilled, &result.TotalUserBilled,
+		&result.AvgDurationMs,
+		&cacheHitRequests,
+		&result.ErrorRequests,
+		&result.RetryRequests,
+		&firstTokenMsSum,
+		&result.FirstTokenSamples,
+		&result.StreamRequests,
+		&result.CompactRequests,
+		&durationSamples,
+		&result.ActiveDays,
 	); err != nil {
+		return nil, err
+	}
+	if result.TotalRequests > 0 {
+		result.CacheHitRate = float64(cacheHitRequests) / float64(result.TotalRequests) * 100
+		result.ErrorRate = float64(result.ErrorRequests) / float64(result.TotalRequests) * 100
+		result.StreamRate = float64(result.StreamRequests) / float64(result.TotalRequests) * 100
+		result.CompactRate = float64(result.CompactRequests) / float64(result.TotalRequests) * 100
+	}
+	if result.FirstTokenSamples > 0 {
+		result.AvgFirstTokenMs = firstTokenMsSum / float64(result.FirstTokenSamples)
+	}
+	if result.ActiveDays > 0 {
+		activeDays := float64(result.ActiveDays)
+		result.AvgDailyAccountBilled = result.TotalAccountBilled / activeDays
+		result.AvgDailyUserBilled = result.TotalUserBilled / activeDays
+		result.AvgDailyRequests = float64(result.TotalRequests) / activeDays
+		result.AvgDailyTokens = float64(result.TotalTokens) / activeDays
+	}
+	if durationSamples > 0 {
+		offset := int64(math.Ceil(float64(durationSamples)*0.95)) - 1
+		if offset < 0 {
+			offset = 0
+		}
+		paramIdx := len(queryArgs) + 1
+		p95Query := fmt.Sprintf(`
+	SELECT duration_ms
+	FROM usage_logs
+	WHERE account_id = $1
+	  AND %s
+	  AND status_code <> 499
+	  AND duration_ms > 0
+	ORDER BY duration_ms ASC
+	LIMIT $%d OFFSET $%d`, timeWhere, paramIdx, paramIdx+1)
+		p95Args := append(append([]interface{}{}, queryArgs...), 1, offset)
+		var p95Duration int64
+		if err := db.conn.QueryRowContext(ctx, p95Query, p95Args...).Scan(&p95Duration); err != nil {
+			return nil, err
+		}
+		result.P95DurationMs = float64(p95Duration)
+	}
+
+	todayQuery := `
+	SELECT
+		COUNT(*),
+		COALESCE(SUM(total_tokens), 0),
+		COALESCE(SUM(account_billed), 0),
+		COALESCE(SUM(user_billed), 0)
+	FROM usage_logs
+	WHERE account_id = $1
+	  AND created_at >= $2 AND created_at < $3
+	  AND status_code <> 499`
+	if err := db.conn.QueryRowContext(ctx, todayQuery, accountID, db.timeArg(todayStart), db.timeArg(periodEnd)).Scan(
+		&result.Today.Requests,
+		&result.Today.Tokens,
+		&result.Today.AccountBilled,
+		&result.Today.UserBilled,
+	); err != nil {
+		return nil, err
+	}
+
+	dateExpr := "TO_CHAR(created_at, 'YYYY-MM-DD')"
+	labelExpr := "TO_CHAR(created_at, 'MM/DD')"
+	if db.isSQLite() {
+		dateExpr = "strftime('%Y-%m-%d', created_at)"
+		labelExpr = "strftime('%m/%d', created_at)"
+	}
+	dayStatsQuery := `
+	SELECT
+		` + dateExpr + ` AS day_date,
+		` + labelExpr + ` AS day_label,
+		COUNT(*) AS requests,
+		COALESCE(SUM(total_tokens), 0) AS tokens,
+		COALESCE(SUM(account_billed), 0) AS account_billed,
+		COALESCE(SUM(user_billed), 0) AS user_billed
+	FROM usage_logs
+	WHERE account_id = $1
+	  AND ` + timeWhere + `
+	  AND status_code <> 499
+	GROUP BY 1, 2
+	ORDER BY 1`
+	dayRows, err := db.conn.QueryContext(ctx, dayStatsQuery, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer dayRows.Close()
+	for dayRows.Next() {
+		var day AccountUsageDayStat
+		if err := dayRows.Scan(&day.Date, &day.Label, &day.Requests, &day.Tokens, &day.AccountBilled, &day.UserBilled); err != nil {
+			return nil, err
+		}
+		result.History = append(result.History, day)
+		if result.HighestCostDay == nil ||
+			day.AccountBilled > result.HighestCostDay.AccountBilled ||
+			(day.AccountBilled == result.HighestCostDay.AccountBilled && day.Requests > result.HighestCostDay.Requests) {
+			copyDay := day
+			result.HighestCostDay = &copyDay
+		}
+		if result.HighestRequestDay == nil ||
+			day.Requests > result.HighestRequestDay.Requests ||
+			(day.Requests == result.HighestRequestDay.Requests && day.AccountBilled > result.HighestRequestDay.AccountBilled) {
+			copyDay := day
+			result.HighestRequestDay = &copyDay
+		}
+	}
+	if err := dayRows.Err(); err != nil {
 		return nil, err
 	}
 
 	// 模型分布
 	modelQuery := `
-	SELECT COALESCE(model, 'unknown'), COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens
+	SELECT
+		COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown'),
+		COUNT(*) AS requests,
+		COALESCE(SUM(total_tokens), 0) AS tokens,
+		COALESCE(SUM(input_tokens), 0) AS input_tokens,
+		COALESCE(SUM(output_tokens), 0) AS output_tokens,
+		COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+		COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+		COALESCE(SUM(account_billed), 0) AS account_billed,
+		COALESCE(SUM(user_billed), 0) AS user_billed
 	FROM usage_logs
-	WHERE account_id = $1 AND status_code <> 499
+	WHERE account_id = $1
+	  AND ` + timeWhere + `
+	  AND status_code <> 499
 	GROUP BY 1
 	ORDER BY 2 DESC`
 
-	rows, err := db.conn.QueryContext(ctx, modelQuery, accountID)
+	rows, err := db.conn.QueryContext(ctx, modelQuery, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -2855,7 +3071,17 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*Accou
 
 	for rows.Next() {
 		var m AccountModelStat
-		if err := rows.Scan(&m.Model, &m.Requests, &m.Tokens); err != nil {
+		if err := rows.Scan(
+			&m.Model,
+			&m.Requests,
+			&m.Tokens,
+			&m.InputTokens,
+			&m.OutputTokens,
+			&m.ReasoningTokens,
+			&m.CachedTokens,
+			&m.AccountBilled,
+			&m.UserBilled,
+		); err != nil {
 			return nil, err
 		}
 		result.Models = append(result.Models, m)
@@ -2974,11 +3200,11 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 	}
 	if f.APIKeyID != nil {
 		p := addArg(*f.APIKeyID)
-		parts = append(parts, fmt.Sprintf(`COALESCE(u.api_key_id, 0) = %s`, p))
+		parts = append(parts, fmt.Sprintf(`u.api_key_id = %s`, p))
 	}
 	if f.AccountID != nil {
 		p := addArg(*f.AccountID)
-		parts = append(parts, fmt.Sprintf(`COALESCE(u.account_id, 0) = %s`, p))
+		parts = append(parts, fmt.Sprintf(`u.account_id = %s`, p))
 	}
 	if f.FastOnly != nil {
 		tierExpr := `LOWER(COALESCE(NULLIF(u.billing_service_tier, ''), u.service_tier, ''))`

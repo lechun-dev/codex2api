@@ -198,9 +198,26 @@ export interface AccountModelStat {
   model: string
   requests: number
   tokens: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface AccountUsageDayStat {
+  date: string
+  label: string
+  requests: number
+  tokens: number
+  account_billed: number
+  user_billed: number
 }
 
 export interface AccountUsageDetail {
+  period_days: number
+  active_days: number
   total_requests: number
   total_tokens: number
   input_tokens: number
@@ -208,6 +225,27 @@ export interface AccountUsageDetail {
   reasoning_tokens: number
   cached_tokens: number
   cache_hit_rate: number
+  total_account_billed: number
+  total_user_billed: number
+  avg_daily_account_billed: number
+  avg_daily_user_billed: number
+  avg_daily_requests: number
+  avg_daily_tokens: number
+  avg_duration_ms: number
+  avg_first_token_ms: number
+  p95_duration_ms: number
+  error_requests: number
+  error_rate: number
+  retry_requests: number
+  first_token_samples: number
+  stream_requests: number
+  stream_rate: number
+  compact_requests: number
+  compact_rate: number
+  today: AccountUsageDayStat
+  highest_cost_day?: AccountUsageDayStat
+  highest_request_day?: AccountUsageDayStat
+  history: AccountUsageDayStat[]
   models: AccountModelStat[]
 }
 

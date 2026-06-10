@@ -4827,6 +4827,8 @@ type settingsResponse struct {
 	ImageS3SecretKey                   string `json:"image_s3_secret_key"`
 	ImageS3Prefix                      string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle              bool   `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
 }
 
 type updateSettingsReq struct {
@@ -4902,6 +4904,8 @@ type updateSettingsReq struct {
 	ImageS3SecretKey                   *string `json:"image_s3_secret_key"`
 	ImageS3Prefix                      *string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle              *bool   `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold               *float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
 }
 
 type brandingResponse struct {
@@ -5470,6 +5474,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3SecretKey:                   imgCfg.SecretKey,
 		ImageS3Prefix:                      imgPrefix,
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 }
 
@@ -5479,6 +5485,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
+	}
+	if req.AutoPause5hThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.AutoPause7dThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_7d_threshold", *req.AutoPause7dThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	currentAdminSecret := ""
@@ -5855,6 +5873,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
+	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
+		t5h := h.store.GetGlobalAutoPause5hThreshold()
+		t7d := h.store.GetGlobalAutoPause7dThreshold()
+		if req.AutoPause5hThreshold != nil {
+			t5h = *req.AutoPause5hThreshold
+		}
+		if req.AutoPause7dThreshold != nil {
+			t7d = *req.AutoPause7dThreshold
+		}
+		h.store.SetGlobalAutoPauseThresholds(t5h, t7d)
+		log.Printf("设置已更新: auto_pause thresholds 5h=%.4f 7d=%.4f", t5h, t7d)
+	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
 	usageLogChanged := false
@@ -6081,6 +6111,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -6177,6 +6209,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3SecretKey:                   imgCfg.SecretKey,
 		ImageS3Prefix:                      strings.TrimSuffix(imgCfg.Prefix, "/"),
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 }
 

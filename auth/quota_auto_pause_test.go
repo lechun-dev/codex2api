@@ -6,13 +6,18 @@ import (
 )
 
 func newQuotaAutoPauseTestAccount() *Account {
-	return &Account{
+	acc := &Account{
 		DBID:        1,
 		AccessToken: "token",
 		PlanType:    "plus",
 		Status:      StatusReady,
 		HealthTier:  HealthTierHealthy,
 	}
+	return acc
+}
+
+func setAutoPauseThresholds(acc *Account) {
+	acc.recomputeEffectiveAutoPause(nil)
 }
 
 func TestQuotaAutoPause5hThresholdFencesAccount(t *testing.T) {
@@ -21,6 +26,7 @@ func TestQuotaAutoPause5hThresholdFencesAccount(t *testing.T) {
 	acc.UsagePercent5h = 95
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = time.Now().Add(time.Hour)
+	setAutoPauseThresholds(acc)
 
 	if acc.IsAvailable() {
 		t.Fatal("IsAvailable() = true, want false after 5h auto-pause threshold is reached")
@@ -40,6 +46,7 @@ func TestQuotaAutoPauseIgnoresBelowThresholdAndDisabledWindow(t *testing.T) {
 	acc.UsagePercent5h = 94.9
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = time.Now().Add(time.Hour)
+	setAutoPauseThresholds(acc)
 
 	if !acc.IsAvailable() {
 		t.Fatal("IsAvailable() = false, want true below threshold")
@@ -47,6 +54,7 @@ func TestQuotaAutoPauseIgnoresBelowThresholdAndDisabledWindow(t *testing.T) {
 
 	acc.UsagePercent5h = 99
 	acc.AutoPause5hDisabled = true
+	setAutoPauseThresholds(acc)
 	if !acc.IsAvailable() {
 		t.Fatal("IsAvailable() = false, want true when 5h auto-pause is disabled")
 	}
@@ -61,6 +69,7 @@ func TestQuotaAutoPauseStopsAfterResetTime(t *testing.T) {
 	acc.UsagePercent5h = 99
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = time.Now().Add(-time.Minute)
+	setAutoPauseThresholds(acc)
 
 	if !acc.IsAvailable() {
 		t.Fatal("IsAvailable() = false, want true after reset time has passed")
@@ -72,6 +81,7 @@ func TestQuotaAutoPause7dThresholdFencesAccount(t *testing.T) {
 	acc.AutoPause7dThreshold = 0.9
 	acc.UsagePercent7d = 91
 	acc.UsagePercent7dValid = true
+	setAutoPauseThresholds(acc)
 
 	if acc.IsAvailable() {
 		t.Fatal("IsAvailable() = true, want false after 7d auto-pause threshold is reached")

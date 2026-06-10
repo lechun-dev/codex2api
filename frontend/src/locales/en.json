@@ -711,6 +711,9 @@
     "autoPauseThresholdPlaceholder": "Blank or 0",
     "autoPauseThresholdHint": "Leave blank or enter 0 to disable this window threshold. Reaching it only skips scheduling.",
     "autoPauseThresholdRange": "Enter a percentage from 0 to 100.",
+    "groupAutoPause5hThreshold": "Group 5h Threshold (%)",
+    "groupAutoPause7dThreshold": "Group 7d Threshold (%)",
+    "groupAutoPauseHint": "Enter 0 to disable group threshold; falls back to global setting.",
     "schedulerCustom": "Custom",
     "schedulerCustomValuePreview": "Current input will be saved as: {{value}}",
     "allowedAPIKeysLabel": "Allowed Tokens",
@@ -1647,7 +1650,13 @@
     "modelProOnly": "Pro",
     "modelImage": "Image",
     "createFailed": "Create failed",
-    "deleteFailed": "Delete failed"
+    "deleteFailed": "Delete failed",
+    "globalAutoPauseTitle": "Global Auto-Pause Thresholds",
+    "globalAutoPauseDesc": "Set default auto-pause thresholds for all accounts. Account-level or group-level settings take priority.",
+    "globalAutoPause5h": "Global 5h Threshold (%)",
+    "globalAutoPause7d": "Global 7d Threshold (%)",
+    "globalAutoPausePlaceholder": "Blank or 0 to disable",
+    "globalAutoPauseHint": "Enter 0 to disable global default. Priority: Account > Group > Global."
   },
   "proxies": {
     "description": "Manage proxy pool with round-robin distribution to accounts",

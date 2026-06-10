@@ -648,7 +648,7 @@ func TestUpdateAPIKeyRefreshesRuntimeStoreAndCache(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0)
+	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
 	}

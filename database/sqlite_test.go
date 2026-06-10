@@ -839,11 +839,11 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0)
+	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup A 返回错误: %v", err)
 	}
-	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 1)
+	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, 1)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup B 返回错误: %v", err)
 	}

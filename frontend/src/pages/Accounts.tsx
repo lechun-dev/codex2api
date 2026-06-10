@@ -130,6 +130,8 @@ type AccountGroupDraft = {
   name: string;
   description: string;
   color: string;
+  auto_pause_5h_threshold: number;
+  auto_pause_7d_threshold: number;
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -631,6 +633,8 @@ export default function Accounts() {
     name: "",
     description: "",
     color: ACCOUNT_GROUP_COLORS[0],
+    auto_pause_5h_threshold: 0,
+    auto_pause_7d_threshold: 0,
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
@@ -2682,6 +2686,8 @@ export default function Accounts() {
       name: "",
       description: "",
       color: ACCOUNT_GROUP_COLORS[0],
+      auto_pause_5h_threshold: 0,
+      auto_pause_7d_threshold: 0,
     });
   };
 
@@ -2691,6 +2697,8 @@ export default function Accounts() {
       name: group.name,
       description: group.description ?? "",
       color: group.color || ACCOUNT_GROUP_COLORS[0],
+      auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
+      auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
     });
   };
 
@@ -2706,6 +2714,8 @@ export default function Accounts() {
         name,
         description: groupDraft.description.trim(),
         color: groupDraft.color.trim() || ACCOUNT_GROUP_COLORS[0],
+        auto_pause_5h_threshold: groupDraft.auto_pause_5h_threshold,
+        auto_pause_7d_threshold: groupDraft.auto_pause_7d_threshold,
       };
       if (groupDraft.id === null) {
         await api.createAccountGroup(payload);
@@ -5642,6 +5652,45 @@ export default function Accounts() {
                       placeholder={t("accounts.groupColorPlaceholder")}
                       maxLength={20}
                     />
+                  </div>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupAutoPause5hThreshold")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.1}
+                      inputMode="decimal"
+                      placeholder={t('settings.globalAutoPausePlaceholder')}
+                      value={groupDraft.auto_pause_5h_threshold > 0 ? (groupDraft.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value
+                        const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                        setGroupDraft(d => ({ ...d, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                      }}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupAutoPause7dThreshold")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.1}
+                      inputMode="decimal"
+                      placeholder={t('settings.globalAutoPausePlaceholder')}
+                      value={groupDraft.auto_pause_7d_threshold > 0 ? (groupDraft.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value
+                        const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                        setGroupDraft(d => ({ ...d, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                      }}
+                    />
+                    <p className="text-[11px] text-muted-foreground">{t("accounts.groupAutoPauseHint")}</p>
                   </div>
                 </div>
               </div>

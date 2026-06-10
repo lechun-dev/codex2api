@@ -711,6 +711,9 @@
     "autoPauseThresholdPlaceholder": "留空或 0",
     "autoPauseThresholdHint": "留空或填 0 表示不启用该窗口阈值；达到阈值后只在调度时跳过账号。",
     "autoPauseThresholdRange": "请输入 0 到 100 之间的百分比。",
+    "groupAutoPause5hThreshold": "分组 5h 阈值(%)",
+    "groupAutoPause7dThreshold": "分组 7d 阈值(%)",
+    "groupAutoPauseHint": "填 0 表示不启用分组阈值，将回退到全局设置。",
     "schedulerCustom": "自定义",
     "schedulerCustomValuePreview": "当前输入将保存为：{{value}}",
     "allowedAPIKeysLabel": "允许调用 Token",
@@ -1647,7 +1650,13 @@
     "modelProOnly": "Pro",
     "modelImage": "图像",
     "createFailed": "创建失败",
-    "deleteFailed": "删除失败"
+    "deleteFailed": "删除失败",
+    "globalAutoPauseTitle": "全局用量自动暂停阈值",
+    "globalAutoPauseDesc": "为所有账号设置默认的自动暂停阈值。账号级别或分组级别的设置优先于全局设置。",
+    "globalAutoPause5h": "全局 5h 阈值(%)",
+    "globalAutoPause7d": "全局 7d 阈值(%)",
+    "globalAutoPausePlaceholder": "留空或 0 表示不启用",
+    "globalAutoPauseHint": "填 0 表示不启用全局默认阈值。优先级: 账号 > 分组 > 全局。"
   },
   "proxies": {
     "description": "管理代理池，支持轮询分配给账号使用",

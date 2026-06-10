@@ -189,6 +189,8 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -202,6 +204,8 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface UpdateAccountGroupRequest {
@@ -209,6 +213,8 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface AccountModelStat {
@@ -644,6 +650,8 @@ export interface SystemSettings {
   image_s3_secret_key_configured?: boolean
   image_s3_prefix: string
   image_s3_force_path_style: boolean
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
 }
 
 export interface SetupHintsResponse {

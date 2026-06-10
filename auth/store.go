@@ -78,6 +78,8 @@ type Account struct {
 	AutoPause7dThreshold  float64 // 0..1, 0 = disabled
 	AutoPause5hDisabled   bool
 	AutoPause7dDisabled   bool
+	effectiveAutoPause5h  float64 // resolved: account > group > global
+	effectiveAutoPause7d  float64
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -950,10 +952,44 @@ func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, thres
 }
 
 func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
-	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.AutoPause5hThreshold, a.AutoPause5hDisabled, now) {
+	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.effectiveAutoPause5h, a.AutoPause5hDisabled, now) {
 		return true
 	}
-	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
+	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.effectiveAutoPause7d, a.AutoPause7dDisabled, now)
+}
+
+func (a *Account) recomputeEffectiveAutoPause(s *Store) {
+	a.effectiveAutoPause5h = resolveEffectiveThreshold(a.AutoPause5hThreshold, a.GroupIDs, s, true)
+	a.effectiveAutoPause7d = resolveEffectiveThreshold(a.AutoPause7dThreshold, a.GroupIDs, s, false)
+}
+
+func resolveEffectiveThreshold(accountThreshold float64, groupIDs []int64, s *Store, is5h bool) float64 {
+	if accountThreshold > 0 {
+		return accountThreshold
+	}
+	if s == nil {
+		return 0
+	}
+	var best float64
+	for _, gid := range groupIDs {
+		t5h, t7d := s.getGroupAutoPauseThresholds(gid)
+		var t float64
+		if is5h {
+			t = t5h
+		} else {
+			t = t7d
+		}
+		if t > 0 && (best == 0 || t < best) {
+			best = t
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	if is5h {
+		return s.GetGlobalAutoPause5hThreshold()
+	}
+	return s.GetGlobalAutoPause7dThreshold()
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -1635,6 +1671,10 @@ type Store struct {
 	promptFilterConfig    atomic.Value // promptfilter.Config
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
+
+	globalAutoPause5hThreshold float64 // protected by mu
+	globalAutoPause7dThreshold float64 // protected by mu
+	groupAutoPauseThresholds   sync.Map // int64 -> [2]float64 {5h, 7d}
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2075,6 +2115,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
+
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2626,6 +2669,13 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 
 	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
+	if groups, err := s.db.ListAccountGroups(ctx); err == nil {
+		for _, g := range groups {
+			if g.AutoPause5hThreshold > 0 || g.AutoPause7dThreshold > 0 {
+				s.groupAutoPauseThresholds.Store(g.ID, [2]float64{g.AutoPause5hThreshold, g.AutoPause7dThreshold})
+			}
+		}
+	}
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
 	} else {
@@ -2761,6 +2811,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+	account.recomputeEffectiveAutoPause(s)
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 	}
@@ -3776,6 +3827,60 @@ func (s *Store) GetPromptFilterConfig() promptfilter.Config {
 	return promptfilter.DefaultConfig()
 }
 
+func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
+	s.mu.Lock()
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(t7d)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetGlobalAutoPause5hThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause5hThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) GetGlobalAutoPause7dThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause7dThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetGroupAutoPauseThresholds(groupID int64, t5h, t7d float64) {
+	s.groupAutoPauseThresholds.Store(groupID, [2]float64{
+		normalizeQuotaAutoPauseThreshold(t5h),
+		normalizeQuotaAutoPauseThreshold(t7d),
+	})
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) DeleteGroupAutoPauseThresholds(groupID int64) {
+	s.groupAutoPauseThresholds.Delete(groupID)
+}
+
+func (s *Store) GetGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	return s.getGroupAutoPauseThresholds(groupID)
+}
+
+func (s *Store) getGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	if v, ok := s.groupAutoPauseThresholds.Load(groupID); ok {
+		t := v.([2]float64)
+		return t[0], t[1]
+	}
+	return 0, 0
+}
+
+func (s *Store) recomputeAllEffectiveAutoPause() {
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveAutoPause(s)
+		acc.mu.Unlock()
+	}
+}
+
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
 	if acc == nil {
@@ -3898,6 +4003,7 @@ func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, thresh
 	if disabled7d != nil {
 		acc.AutoPause7dDisabled = *disabled7d
 	}
+	acc.recomputeEffectiveAutoPause(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
@@ -3922,6 +4028,7 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	}
 	acc.mu.Lock()
 	acc.GroupIDs = cloneInt64Slice(groupIDs)
+	acc.recomputeEffectiveAutoPause(s)
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -3956,6 +4063,7 @@ func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
 	for _, acc := range s.Accounts() {
 		acc.mu.Lock()
 		acc.GroupIDs = cloneInt64Slice(memberships[acc.DBID])
+		acc.recomputeEffectiveAutoPause(s)
 		acc.mu.Unlock()
 		s.fastSchedulerUpdate(acc)
 	}

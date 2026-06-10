@@ -120,6 +120,13 @@ func (h *Handler) Messages(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	// /v1/messages 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发，
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。

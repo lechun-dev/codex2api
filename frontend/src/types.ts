@@ -976,6 +976,7 @@ export interface APIKeyLimits {
   model_deny?: string[]
   rpm?: number
   rpd?: number
+  max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
   token_limit_5h?: number

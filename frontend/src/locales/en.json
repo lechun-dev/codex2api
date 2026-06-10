@@ -1793,6 +1793,8 @@
       "rpmSuffix": "/min",
       "rpd": "Requests per day",
       "rpdSuffix": "/day",
+      "maxConcurrency": "Max concurrency",
+      "concurrencySuffix": "inflight",
       "cost5h": "Cost limit (5h)",
       "cost7d": "Cost limit (7d)",
       "tokens5h": "Token limit (5h)",

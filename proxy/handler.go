@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,12 +30,14 @@ import (
 
 // Handler API 路由处理器
 type Handler struct {
-	store      *auth.Store
-	configKeys map[string]bool // 配置文件中的静态 key
-	db         *database.DB
-	cfg        *config.Config       // 全局配置
-	deviceCfg  *DeviceProfileConfig // 设备指纹配置
-	cache      cache.TokenCache     // Redis/Memory 运行态缓存
+	store        *auth.Store
+	configKeys   map[string]bool // 配置文件中的静态 key
+	db           *database.DB
+	cfg          *config.Config       // 全局配置
+	deviceCfg    *DeviceProfileConfig // 设备指纹配置
+	cache        cache.TokenCache     // Redis/Memory 运行态缓存
+	apiKeyGateMu sync.Mutex
+	apiKeyGate   *apiKeyConcurrencyLimiter
 }
 
 const (
@@ -351,6 +354,7 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 		db:         db,
 		cfg:        cfg,
 		deviceCfg:  deviceCfg,
+		apiKeyGate: newAPIKeyConcurrencyLimiter(),
 	}
 }
 
@@ -1413,6 +1417,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
@@ -2300,6 +2311,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
@@ -2703,6 +2721,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。

@@ -756,6 +756,13 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -870,6 +877,13 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
@@ -974,6 +988,13 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)

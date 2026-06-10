@@ -920,23 +920,25 @@ type APIKeyRow struct {
 // - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
 // - RPM: 每分钟请求数 (滑动 60s 窗口)。
 // - RPD: 每天请求数 (滑动 24h 窗口)。
+// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
 // - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
 // - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
 type APIKeyLimits struct {
-	ModelAllow   []string `json:"model_allow,omitempty"`
-	ModelDeny    []string `json:"model_deny,omitempty"`
-	RPM          int      `json:"rpm,omitempty"`
-	RPD          int      `json:"rpd,omitempty"`
-	CostLimit5h  float64  `json:"cost_limit_5h,omitempty"`
-	CostLimit7d  float64  `json:"cost_limit_7d,omitempty"`
-	TokenLimit5h int64    `json:"token_limit_5h,omitempty"`
-	TokenLimit7d int64    `json:"token_limit_7d,omitempty"`
+	ModelAllow     []string `json:"model_allow,omitempty"`
+	ModelDeny      []string `json:"model_deny,omitempty"`
+	RPM            int      `json:"rpm,omitempty"`
+	RPD            int      `json:"rpd,omitempty"`
+	MaxConcurrency int      `json:"max_concurrency,omitempty"`
+	CostLimit5h    float64  `json:"cost_limit_5h,omitempty"`
+	CostLimit7d    float64  `json:"cost_limit_7d,omitempty"`
+	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
+	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
-		l.RPM == 0 && l.RPD == 0 &&
+		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0
 }

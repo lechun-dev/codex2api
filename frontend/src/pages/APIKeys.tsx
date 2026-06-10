@@ -67,6 +67,7 @@ interface LimitsFormState {
   modelDeny: string[];
   rpm: string;
   rpd: string;
+  maxConcurrency: string;
   costLimit5h: string;
   costLimit7d: string;
   tokenLimit5h: string;
@@ -78,6 +79,7 @@ const emptyLimitsForm: LimitsFormState = {
   modelDeny: [],
   rpm: "",
   rpd: "",
+  maxConcurrency: "",
   costLimit5h: "",
   costLimit7d: "",
   tokenLimit5h: "",
@@ -974,6 +976,10 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
     rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
     rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
+    maxConcurrency:
+      limits.max_concurrency && limits.max_concurrency > 0
+        ? String(limits.max_concurrency)
+        : "",
     costLimit5h:
       limits.cost_limit_5h && limits.cost_limit_5h > 0
         ? String(limits.cost_limit_5h)
@@ -1001,15 +1007,20 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     const n = Number(s.trim());
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
+  const intNum = (s: string) => {
+    const n = Number(s.trim());
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  };
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
-    rpm: num(form.rpm),
-    rpd: num(form.rpd),
+    rpm: intNum(form.rpm),
+    rpd: intNum(form.rpd),
+    max_concurrency: intNum(form.maxConcurrency),
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
-    token_limit_5h: num(form.tokenLimit5h),
-    token_limit_7d: num(form.tokenLimit7d),
+    token_limit_5h: intNum(form.tokenLimit5h),
+    token_limit_7d: intNum(form.tokenLimit7d),
   };
 }
 
@@ -1196,6 +1207,7 @@ function LimitsEditor({
     value.modelDeny.length > 0 ||
     value.rpm !== "" ||
     value.rpd !== "" ||
+    value.maxConcurrency !== "" ||
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.tokenLimit5h !== "" ||
@@ -1269,6 +1281,12 @@ function LimitsEditor({
               value={value.rpd}
               onChange={(rpd) => patch({ rpd })}
               suffix={t("apiKeys.limits.rpdSuffix")}
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.maxConcurrency")}
+              value={value.maxConcurrency}
+              onChange={(maxConcurrency) => patch({ maxConcurrency })}
+              suffix={t("apiKeys.limits.concurrencySuffix")}
             />
             <LimitNumberField
               label={t("apiKeys.limits.cost5h")}

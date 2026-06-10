@@ -211,6 +211,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
 	}
+	releaseAPIKeyConcurrency, concurrencyErr, ok := h.acquireAPIKeyConcurrencyForWebSocket(c)
+	if !ok {
+		_ = writeResponsesWSError(conn, concurrencyErr)
+		return newResponsesWSCloseError(websocket.CloseTryAgainLater, concurrencyErr.Message, concurrencyErr)
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)

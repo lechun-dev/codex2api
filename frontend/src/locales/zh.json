@@ -1793,6 +1793,8 @@
       "rpmSuffix": "/min",
       "rpd": "每天请求",
       "rpdSuffix": "/day",
+      "maxConcurrency": "最大并发数",
+      "concurrencySuffix": "并发",
       "cost5h": "5h 成本上限",
       "cost7d": "7d 成本上限",
       "tokens5h": "5h Token 上限",

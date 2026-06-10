@@ -271,7 +271,17 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		useWebsocket := !forceHTTPAfterWSMessageTooBig
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// 显式生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
+		// 图片数据会卡死（issue #220）。
+		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+			useWebsocket = false
+		}
+		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
+		upstreamBody := codexBody
+		if useWebsocket {
+			upstreamBody = stripResponsesImageGenerationTool(codexBody)
+		}
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {

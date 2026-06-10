@@ -2190,3 +2190,56 @@ func TestSessionAffinityKeySeparatesDifferentAPIKeys(t *testing.T) {
 		t.Fatalf("sessionAffinityKey() with apiKeyID=0 = %q, want session-1", got)
 	}
 }
+
+// TestResponsesWebSocketStripsInjectedImageTool verifies that a plain
+// conversation request — which PrepareResponsesWebSocketBody auto-injects an
+// image_generation tool into — has that tool stripped before going to the
+// WebSocket upstream, so the model can't autonomously generate an image and
+// hang the WS stream (issue #220).
+func TestResponsesWebSocketStripsInjectedImageTool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	bodyCh := make(chan []byte, 1)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+		bodyCh <- append([]byte(nil), requestBody...)
+		sse := `data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","input":"hello"}`)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case gotBody := <-bodyCh:
+		// 整个请求体不应再出现 image_generation（工具与桥接 instructions 均已剥离）。
+		if strings.Contains(string(gotBody), "image_generation") {
+			t.Fatalf("websocket upstream body should not mention image_generation: %s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for upstream request")
+	}
+}

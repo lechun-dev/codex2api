@@ -1450,7 +1450,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
-		if useWebsocket && responsesBodyRequestsImageGeneration(rawBody) {
+		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
+		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 
@@ -1810,7 +1811,13 @@ func (h *Handler) Responses(c *gin.Context) {
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图产生大体积
+		// 数据卡死 WS 流（issue #220）。显式生图请求已在上面强制走 HTTP。
+		upstreamBody := codexBody
+		if useWebsocket {
+			upstreamBody = stripResponsesImageGenerationTool(codexBody)
+		}
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -2741,7 +2748,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
-		if useWebsocket && responsesBodyRequestsImageGeneration(codexBody) {
+		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
+		if useWebsocket && explicitlyRequestsImageGeneration(codexBody) {
 			useWebsocket = false
 		}
 		upstreamEndpoint := "/v1/responses"
@@ -2784,7 +2792,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if isRelayAccount {
 			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, codexBody, proxyURL, downstreamHeaders)
 		} else {
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
+			upstreamBody := codexBody
+			if useWebsocket {
+				upstreamBody = stripResponsesImageGenerationTool(codexBody)
+			}
+			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 

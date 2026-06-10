@@ -98,6 +98,90 @@ func TestResponsesBodyRequestsImageGenerationDetectsExplicitIntent(t *testing.T)
 	}
 }
 
+func TestExplicitlyRequestsImageGeneration(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"explicit_tools_array", []byte(`{"model":"gpt-5.5","tools":[{"type":"image_generation"}]}`), true},
+		{"object_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`), true},
+		{"string_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":"image_generation"}`), true},
+		{"image_model", []byte(`{"model":"gpt-image-2","prompt":"draw a cat"}`), true},
+		{"top_level_option", []byte(`{"model":"gpt-5.5","input":"hi","size":"1024x1024"}`), true},
+		{"plain_request", []byte(`{"model":"gpt-5.5","input":"hello"}`), false},
+		{"function_tool_only", []byte(`{"model":"gpt-5.5","tools":[{"type":"function","name":"lookup"}]}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := explicitlyRequestsImageGeneration(tc.body); got != tc.want {
+				t.Fatalf("explicitlyRequestsImageGeneration(%s) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripResponsesImageGenerationToolRemovesInjectedTool(t *testing.T) {
+	// PrepareResponsesBody 默认给普通请求注入 image_generation 工具 + 桥接 instructions；WS 路径需全部剥离。
+	prepared, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.5","input":"hello"}`))
+	if !responsesBodyHasImageGenerationTool(prepared) {
+		t.Fatalf("setup: prepared body should contain injected image tool: %s", prepared)
+	}
+	stripped := stripResponsesImageGenerationTool(prepared)
+	if responsesBodyHasImageGenerationTool(stripped) {
+		t.Fatalf("stripped body should not contain image tool: %s", stripped)
+	}
+	if strings.Contains(string(stripped), "image_generation") {
+		t.Fatalf("stripped body should not mention image_generation anywhere: %s", stripped)
+	}
+}
+
+func TestStripResponsesImageGenerationToolPreservesUserInstructions(t *testing.T) {
+	prepared, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.5","input":"hello","instructions":"You are a helpful assistant."}`))
+	stripped := stripResponsesImageGenerationTool(prepared)
+	instructions := gjson.GetBytes(stripped, "instructions").String()
+	if !strings.Contains(instructions, "You are a helpful assistant.") {
+		t.Fatalf("user instructions should be preserved: %s", stripped)
+	}
+	if strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		t.Fatalf("bridge instructions should be removed: %s", stripped)
+	}
+}
+
+func TestStripResponsesImageGenerationToolKeepsOtherTools(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","name":"lookup"},{"type":"image_generation","model":"gpt-image-2"}],"tool_choice":{"type":"image_generation"}}`)
+	stripped := stripResponsesImageGenerationTool(body)
+	if responsesBodyHasImageGenerationTool(stripped) {
+		t.Fatalf("image tool/choice should be removed: %s", stripped)
+	}
+	tools := gjson.GetBytes(stripped, "tools").Array()
+	if len(tools) != 1 || tools[0].Get("type").String() != "function" {
+		t.Fatalf("function tool should be preserved: %s", stripped)
+	}
+	if gjson.GetBytes(stripped, "tool_choice").Exists() {
+		t.Fatalf("image tool_choice should be removed: %s", stripped)
+	}
+}
+
+func TestStripResponsesImageGenerationToolNoopWithoutImageTool(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","name":"lookup"}]}`)
+	stripped := stripResponsesImageGenerationTool(body)
+	if gjson.GetBytes(stripped, "tools.0.type").String() != "function" {
+		t.Fatalf("non-image tools should be untouched: %s", stripped)
+	}
+}
+
+func TestTranslateRequestDoesNotFlagPlainChatAsImageGeneration(t *testing.T) {
+	// Chat 入口用 codexBody 判定，TranslateRequest 不应注入图片工具，否则普通对话会被误判强制 HTTP。
+	codexBody, err := TranslateRequest([]byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	if explicitlyRequestsImageGeneration(codexBody) {
+		t.Fatalf("plain chat request should not be flagged as image generation: %s", codexBody)
+	}
+}
+
 func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})

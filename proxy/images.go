@@ -553,6 +553,66 @@ func responsesBodyRequestsImageGeneration(body []byte) bool {
 	return false
 }
 
+// explicitlyRequestsImageGeneration 判断请求是否显式要求图片生成：image-only
+// 模型、tool_choice=image_generation、顶层图片选项字段，或 tools[] 中显式声明的
+// image_generation 工具。WebSocket 上游传输大体积图片数据会卡死，这类请求必须
+// 改走 HTTP（issue #220）。
+func explicitlyRequestsImageGeneration(body []byte) bool {
+	return responsesBodyRequestsImageGeneration(body) || responsesBodyHasImageGenerationTool(body)
+}
+
+// stripResponsesImageGenerationTool 移除请求体中的 image_generation 工具及指向它的
+// tool_choice。仅在 WebSocket 上游模式下、且请求未显式要求生图时使用：此时 body 中
+// 的 image_generation 工具一定是 PrepareResponsesBody 自动注入的，移除后可防止模型
+// 自主调用图片工具产生大体积数据导致 WS 流卡死（issue #220）。显式生图请求已被
+// explicitlyRequestsImageGeneration 判定为强制 HTTP，不会走到这里。
+func stripResponsesImageGenerationTool(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		kept := make([]interface{}, 0, len(tools.Array()))
+		removed := false
+		for _, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
+				removed = true
+				continue
+			}
+			kept = append(kept, tool.Value())
+		}
+		if removed {
+			if len(kept) == 0 {
+				body, _ = sjson.DeleteBytes(body, "tools")
+			} else {
+				body, _ = sjson.SetBytes(body, "tools", kept)
+			}
+		}
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.Exists() {
+		isImageChoice := false
+		if choice.Type == gjson.String {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
+		} else {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
+		}
+		if isImageChoice {
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		}
+	}
+	// 移除与图片工具配套注入的桥接 instructions（引导模型调用 image_generation
+	// 工具）；保留用户自带的 instructions 内容。
+	if instructions := gjson.GetBytes(body, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		cleaned := strings.ReplaceAll(instructions, "\n\n"+codexImageGenerationBridgeText, "")
+		cleaned = strings.ReplaceAll(cleaned, codexImageGenerationBridgeText, "")
+		cleaned = strings.TrimSpace(cleaned)
+		if cleaned == "" {
+			body, _ = sjson.DeleteBytes(body, "instructions")
+		} else {
+			body, _ = sjson.SetBytes(body, "instructions", cleaned)
+		}
+	}
+	return body
+}
+
 func validateImagesModel(model string) error {
 	if !isImageOnlyModel(model) {
 		return fmt.Errorf("images endpoint requires an image model, got %q", strings.TrimSpace(model))

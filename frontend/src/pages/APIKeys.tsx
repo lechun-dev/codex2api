@@ -43,7 +43,6 @@ import {
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
-type ScriptPlatform = "unix" | "windows";
 
 interface CreateKeyFormState {
   name: string;
@@ -119,8 +118,6 @@ export default function APIKeys() {
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [saving, setSaving] = useState(false);
   const [scriptKey, setScriptKey] = useState<APIKeyRow | null>(null);
-  const [scriptPlatform, setScriptPlatform] =
-    useState<ScriptPlatform>("unix");
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
@@ -168,14 +165,13 @@ export default function APIKeys() {
     return window.location.origin.replace(/\/$/, "");
   }, []);
 
-  const generatedScript = useMemo(() => {
+  const generatedPrompt = useMemo(() => {
     if (!scriptKey) return "";
-    return buildCodexInstallScript({
+    return buildCodexSetupPrompt({
       apiKey: scriptKey.raw_key || scriptKey.key,
       baseURL: serviceBaseURL,
-      platform: scriptPlatform,
     });
-  }, [scriptKey, scriptPlatform, serviceBaseURL]);
+  }, [scriptKey, serviceBaseURL]);
 
   const expireOptions = useMemo(
     () => [
@@ -326,12 +322,10 @@ export default function APIKeys() {
 
   const openScriptDialog = (keyRow: APIKeyRow) => {
     setScriptKey(keyRow);
-    setScriptPlatform("unix");
   };
 
   const closeScriptDialog = () => {
     setScriptKey(null);
-    setScriptPlatform("unix");
   };
 
   const closeEditDialog = () => {
@@ -979,11 +973,11 @@ export default function APIKeys() {
               </Button>
               <Button
                 type="button"
-                onClick={() => void handleCopy(generatedScript)}
-                disabled={!generatedScript}
+                onClick={() => void handleCopy(generatedPrompt)}
+                disabled={!generatedPrompt}
               >
                 <Copy className="size-3.5" />
-                {t("apiKeys.copyScript")}
+                {t("apiKeys.copyPrompt")}
               </Button>
             </>
           }
@@ -1004,36 +998,12 @@ export default function APIKeys() {
                 </div>
               </div>
 
-              <div className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5">
-                {(
-                  [
-                    ["unix", t("apiKeys.scriptPlatformUnix")],
-                    ["windows", t("apiKeys.scriptPlatformWindows")],
-                  ] as const
-                ).map(([platform, label]) => (
-                  <button
-                    key={platform}
-                    type="button"
-                    onClick={() => setScriptPlatform(platform)}
-                    className={`rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
-                      scriptPlatform === platform
-                        ? "bg-background text-foreground shadow-sm"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-
               <div className="rounded-lg border border-border bg-muted/20">
                 <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
-                  {scriptPlatform === "unix"
-                    ? "~/.codex/config.toml, ~/.codex/auth.json"
-                    : "%userprofile%\\.codex\\config.toml, %userprofile%\\.codex\\auth.json"}
+                  {t("apiKeys.promptPreview")}
                 </div>
                 <pre className="max-h-[460px] overflow-auto p-3 text-xs leading-relaxed text-foreground">
-                  <code>{generatedScript}</code>
+                  <code>{generatedPrompt}</code>
                 </pre>
               </div>
             </div>
@@ -1048,110 +1018,38 @@ export default function APIKeys() {
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
 
-function buildCodexConfigTOML(baseURL: string): string {
-  const quotedBaseURL = JSON.stringify(baseURL || "https://codexapi.lechun.cc");
-  return `model_provider = "OpenAI"
-model = "gpt-5.4"
-review_model = "gpt-5.4"
-model_reasoning_effort = "xhigh"
-disable_response_storage = true
-network_access = "enabled"
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = ${quotedBaseURL}
-wire_api = "responses"
-requires_openai_auth = true
-
-[features]
-goals = true`;
-}
-
-function buildCodexAuthJSON(apiKey: string): string {
-  return JSON.stringify({ OPENAI_API_KEY: apiKey }, null, 2);
-}
-
-function buildCodexInstallScript({
+function buildCodexSetupPrompt({
   apiKey,
   baseURL,
-  platform,
 }: {
   apiKey: string;
   baseURL: string;
-  platform: ScriptPlatform;
 }): string {
-  const config = buildCodexConfigTOML(baseURL);
-  const auth = buildCodexAuthJSON(apiKey);
+  const renderedAPIKey = JSON.stringify(apiKey);
+  const renderedBaseURL = JSON.stringify(baseURL || "https://codexapi.lechun.cc");
 
-  if (platform === "windows") {
-    return `# How to run:
-# 1. Open Windows PowerShell.
-# 2. Copy this whole script and paste it into PowerShell.
-# 3. Press Enter. If PowerShell asks for confirmation, press Enter again.
-# 4. Restart Codex after the script finishes.
+  return `我需要把 Codex 的登录方式切换为 API Key 登录。
 
-$ErrorActionPreference = "Stop"
+请按以下要求操作：
 
-$CodexDir = Join-Path $env:USERPROFILE ".codex"
-$ConfigFile = Join-Path $CodexDir "config.toml"
-$AuthFile = Join-Path $CodexDir "auth.json"
-$BackupSuffix = Get-Date -Format "yyyyMMddHHmmss"
+1. 使用我提供的 \`OPENAI_API_KEY\` 和 \`base_url\` 配置 Codex 登录。
+2. 修改任何配置文件之前，必须先备份相关文件。
+   - 备份文件名请保留原文件名，并追加时间戳后缀，例如：\`config.toml.20260611224646.bak\`
+   - 时间戳格式建议使用：\`yyyyMMddHHmmss\`
+3. 只修改登录/API 服务地址相关配置，不要改动其他配置项。
+4. 必须保证历史聊天线程、会话记录、归档线程等数据不被删除、不被移动、不被覆盖。
+5. 修改后请进行校验：
+   - 确认 Codex 已识别为 API Key 登录
+   - 确认自定义 \`base_url\` 可被当前 provider 使用
+   - 确认历史线程数据仍然存在且状态正常
+6. 如果需要设置环境变量，请优先设置用户级环境变量，并说明是否需要重启 Codex 或终端才能生效。
 
-New-Item -ItemType Directory -Force -Path $CodexDir | Out-Null
+配置信息如下：
 
-if (Test-Path $ConfigFile) {
-  Copy-Item -Path $ConfigFile -Destination "$($ConfigFile).bak.$BackupSuffix" -Force
-}
-if (Test-Path $AuthFile) {
-  Copy-Item -Path $AuthFile -Destination "$($AuthFile).bak.$BackupSuffix" -Force
-}
+OPENAI_API_KEY = ${renderedAPIKey}
+base_url = ${renderedBaseURL}
 
-@'
-${config}
-'@ | Set-Content -Path $ConfigFile -Encoding UTF8
-
-@'
-${auth}
-'@ | Set-Content -Path $AuthFile -Encoding UTF8
-
-Write-Host "Codex config written to $CodexDir"`;
-  }
-
-  return `#!/usr/bin/env bash
-# How to run:
-# 1. Open Terminal on macOS or Linux.
-# 2. Copy this whole script and paste it into Terminal.
-# 3. Press Enter. It will create ~/.codex/config.toml and ~/.codex/auth.json.
-# 4. Restart Codex after the script finishes.
-
-set -euo pipefail
-
-CODEX_DIR="$HOME/.codex"
-CONFIG_FILE="$CODEX_DIR/config.toml"
-AUTH_FILE="$CODEX_DIR/auth.json"
-BACKUP_SUFFIX="$(date +%Y%m%d%H%M%S)"
-
-mkdir -p "$CODEX_DIR"
-
-if [ -f "$CONFIG_FILE" ]; then
-  cp "$CONFIG_FILE" "$CONFIG_FILE.bak.$BACKUP_SUFFIX"
-fi
-if [ -f "$AUTH_FILE" ]; then
-  cp "$AUTH_FILE" "$AUTH_FILE.bak.$BACKUP_SUFFIX"
-fi
-
-cat > "$CONFIG_FILE" <<'CODEX_CONFIG_EOF'
-${config}
-CODEX_CONFIG_EOF
-
-cat > "$AUTH_FILE" <<'CODEX_AUTH_EOF'
-${auth}
-CODEX_AUTH_EOF
-
-chmod 700 "$CODEX_DIR"
-chmod 600 "$CONFIG_FILE" "$AUTH_FILE"
-
-echo "Codex config written to $CODEX_DIR"`;
+注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除或清理任何 session、state、sqlite、logs、archived_sessions 相关文件。`;
 }
 
 function parseQuotaLimit(raw: string, t: Translator): number {

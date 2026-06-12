@@ -1063,7 +1063,68 @@ function buildCodexSetupPrompt({
 OPENAI_API_KEY = ${renderedAPIKey}
 base_url = ${renderedBaseURL}
 
-注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除、移动、覆盖或清理任何历史线程、会话记录、归档线程、数据库、日志或索引文件。`;
+注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除、移动、覆盖或清理任何历史线程、会话记录、归档线程、数据库、日志或索引文件。
+
+完成配置和校验后，请提示我完整退出并重启 Codex Desktop。重启后如果历史会话列表正常，不需要执行额外修复；如果历史会话列表缺失、数量明显不对或归档状态异常，请让我复制下面这段“重启后备用修复 Prompt”到 Codex 中执行。
+
+重要：下面这段是重启后的备用 Prompt。当前任务不要执行它，只需要在最终回复里原样提供给我。
+
+重启后备用修复 Prompt：
+
+\`\`\`
+我需要在切换 Codex 登录方式或 provider 后，恢复/修复历史会话列表。
+
+请按以下要求操作：
+
+1. 不要删除、移动或清空任何历史数据文件，包括：
+   - ~/.codex/sessions
+   - ~/.codex/archived_sessions
+   - ~/.codex/session_index.jsonl
+   - ~/.codex/state_*.sqlite
+   - ~/.codex/logs_*.sqlite
+
+2. 修改任何文件前，必须先备份原文件。
+   - 备份文件名保留原文件名，并追加时间戳和说明
+   - 示例：session_index.jsonl.20260612002907.before-fix.bak
+   - 时间戳格式使用 yyyyMMddHHmmss
+
+3. 先检查历史会话是否真的存在：
+   - 枚举 ~/.codex/sessions 和 ~/.codex/archived_sessions 下的 rollout-*.jsonl
+   - 校验每个 JSONL 是否可解析
+   - 读取每个文件的 session_meta.id、session_meta.model_provider、cwd、首条用户消息、更新时间
+
+4. 修复 session_index.jsonl：
+   - 根据实际 rollout-*.jsonl 重建索引
+   - 每行必须是合法 JSON
+   - 字段至少包括 id、thread_name、updated_at
+   - 用 UTF-8 写入
+   - 不要把 API key 或长配置文本写进标题，敏感标题要改成安全短标题
+
+5. 检查并修复 ~/.codex/state_*.sqlite 中的 threads 表：
+   - 确认 threads 表里是否存在历史线程
+   - 对比当前 config.toml 的 model_provider
+   - 如果历史线程的 model_provider 是旧值，例如 openai、openai-custom，而当前是 OpenAI，则统一改成当前 provider 名
+   - 同步 title、preview、updated_at、updated_at_ms 等必要字段
+   - 保持 archived 状态，不要把归档会话误改成普通会话，除非我明确要求
+
+6. 重要：同时修复原始 rollout-*.jsonl 的 session_meta.model_provider。
+   - 否则 Codex 可能会从 JSONL 重新 backfill，把 state_*.sqlite 里的 provider 又写回旧值
+   - 修改 JSONL 前必须逐个备份
+   - 只改 session_meta.model_provider，不要改对话内容
+
+7. 修复后做校验：
+   - session_index.jsonl 每行都能 JSON.parse
+   - state_*.sqlite 的 threads 表中 provider 已统一为当前 provider
+   - Codex 线程列表工具或等效方式能看到未归档历史会话
+   - 归档会话仍保持归档状态
+   - 敏感信息没有出现在 title 或 preview 中
+
+8. 如果运行中的 Codex Desktop 仍显示旧列表，说明可能有内存缓存。
+   - 请说明需要完整退出并重启 Codex Desktop
+   - 不要因此重复删除或清空任何缓存目录
+
+请先只读检查并汇报发现，再在确认需要修改时按上述步骤修复。修复过程中要持续说明每一步改了什么、备份在哪里、校验结果是什么。
+\`\`\``;
 }
 
 function parseQuotaLimit(raw: string, t: Translator): number {

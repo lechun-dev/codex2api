@@ -1033,23 +1033,37 @@ function buildCodexSetupPrompt({
 请按以下要求操作：
 
 1. 使用我提供的 \`OPENAI_API_KEY\` 和 \`base_url\` 配置 Codex 登录。
-2. 修改任何配置文件之前，必须先备份相关文件。
-   - 备份文件名请保留原文件名，并追加时间戳后缀，例如：\`config.toml.20260611224646.bak\`
+2. 修改任何配置之前，必须先备份整个 Codex 配置目录。
+   - Windows 配置目录通常是：\`%USERPROFILE%\\.codex\`
+   - macOS / Linux 配置目录通常是：\`~/.codex\`
+   - 备份目录名请保留原目录名，并追加时间戳后缀，例如：\`.codex.backup.20260612002235\`
    - 时间戳格式建议使用：\`yyyyMMddHHmmss\`
 3. 只修改登录/API 服务地址相关配置，不要改动其他配置项。
 4. 必须保证历史聊天线程、会话记录、归档线程等数据不被删除、不被移动、不被覆盖。
-5. 修改后请进行校验：
+5. 不得删除或清理以下目录或文件：
+   - \`sessions\`
+   - \`archived_sessions\`
+   - \`state_*.sqlite\`
+   - \`logs_*.sqlite\`
+   - \`goals_*.sqlite\`
+   - \`memories_*.sqlite\`
+   - \`session_index.jsonl\`
+   - \`.codex-global-state.json\`
+6. 修改后请进行校验：
    - 确认 Codex 已识别为 API Key 登录
    - 确认自定义 \`base_url\` 可被当前 provider 使用
    - 确认历史线程数据仍然存在且状态正常
-6. 如果需要设置环境变量，请优先设置用户级环境变量，并说明是否需要重启 Codex 或终端才能生效。
+7. 如果需要设置环境变量：
+   - Windows 优先设置用户级环境变量
+   - macOS / Linux 优先写入用户 shell 配置文件，或按当前 Codex 启动方式设置持久环境变量
+   - 修改后请说明是否需要重启 Codex、终端或重新登录系统才能生效
 
 配置信息如下：
 
 OPENAI_API_KEY = ${renderedAPIKey}
 base_url = ${renderedBaseURL}
 
-注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除或清理任何 session、state、sqlite、logs、archived_sessions 相关文件。`;
+注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除、移动、覆盖或清理任何历史线程、会话记录、归档线程、数据库、日志或索引文件。`;
 }
 
 function parseQuotaLimit(raw: string, t: Translator): number {

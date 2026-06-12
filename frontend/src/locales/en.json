@@ -1635,7 +1635,7 @@
     "generateScript": "Generate Prompt",
     "scriptTitle": "Generate Codex config prompt",
     "scriptForKey": "Key: {{name}}",
-    "scriptDesc": "Copy this prompt into Codex. It already includes the selected key and current service URL, and instructs Codex to back up config files before changing only login-related settings.",
+    "scriptDesc": "Copy this prompt into Codex. It already includes the selected key and current service URL, and instructs Codex to back up the entire Codex config directory before changing only login-related settings.",
     "promptPreview": "Prompt preview",
     "copyPrompt": "Copy prompt",
     "allowedGroups": "Allowed Groups",

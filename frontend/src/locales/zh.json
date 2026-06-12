@@ -1635,7 +1635,7 @@
     "generateScript": "生成 Prompt",
     "scriptTitle": "生成 Codex 配置 Prompt",
     "scriptForKey": "密钥：{{name}}",
-    "scriptDesc": "复制这段 Prompt 发给 Codex 执行。Prompt 中已填入当前密钥和当前服务地址，并要求先备份配置文件、只修改登录相关配置。",
+    "scriptDesc": "复制这段 Prompt 发给 Codex 执行。Prompt 中已填入当前密钥和当前服务地址，并要求先备份整个 Codex 配置目录、只修改登录相关配置。",
     "promptPreview": "Prompt 预览",
     "copyPrompt": "复制 Prompt",
     "allowedGroups": "允许分组",

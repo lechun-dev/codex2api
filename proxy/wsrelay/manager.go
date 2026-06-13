@@ -169,6 +169,7 @@ type Manager struct {
 	// 清理定时器
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 
 	// 连接回调
 	onConnected    func(accountID int64, session *Session)
@@ -252,8 +253,10 @@ func (m *Manager) evictExpired() {
 
 // Stop 停止管理器
 func (m *Manager) Stop() {
-	close(m.stopCleanup)
-	m.closeAll()
+	m.stopOnce.Do(func() {
+		close(m.stopCleanup)
+		m.closeAll()
+	})
 }
 
 // closeAll 关闭所有连接

@@ -121,6 +121,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
 	poolSessionID := sessionID
+	effectiveProxy := effectiveProxyURL(account, proxyOverride)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
@@ -137,7 +138,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; sendErr != nil && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, proxyOverride)
+		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
 
 		// 短暂退避，避免瞬间重连风暴
 		select {
@@ -154,7 +155,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.ReleaseConnection(wc)
+		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
 		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", sendErr)
 	}
 
@@ -393,6 +394,9 @@ func (r *WsResponse) buildErrorEvent(payload []byte) ([]byte, bool) {
 		errObj = fmt.Sprintf(`{"message":%q,"code":%d}`, errMsg, status)
 	}
 	event := fmt.Sprintf(`{"type":"response.failed","response":{"status":"failed","error":%s}}`, errObj)
+	if status > 0 {
+		event = fmt.Sprintf(`{"type":"response.failed","response":{"status":"failed","status_code":%d,"error":%s}}`, status, errObj)
+	}
 	return []byte(event), true
 }
 

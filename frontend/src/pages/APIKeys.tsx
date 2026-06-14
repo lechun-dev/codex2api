@@ -30,6 +30,7 @@ import {
   Copy,
   CalendarClock,
   CircleDollarSign,
+  Download,
   Eye,
   EyeOff,
   Fingerprint,
@@ -38,11 +39,12 @@ import {
   Pencil,
   Plus,
   ShieldCheck,
-  Terminal,
   Trash2,
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
+const WINDOWS_TOOLKIT_URL = "/downloads/codex-windows-toolkit.zip";
+const MAC_TOOLKIT_URL = "/downloads/codex-mac-toolkit.zip";
 
 interface CreateKeyFormState {
   name: string;
@@ -117,7 +119,6 @@ export default function APIKeys() {
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [saving, setSaving] = useState(false);
-  const [scriptKey, setScriptKey] = useState<APIKeyRow | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
@@ -159,19 +160,6 @@ export default function APIKeys() {
           new Date(a.created_at || 0).getTime(),
       )[0];
   }, [keys]);
-
-  const serviceBaseURL = useMemo(() => {
-    if (typeof window === "undefined") return "";
-    return window.location.origin.replace(/\/$/, "");
-  }, []);
-
-  const generatedPrompt = useMemo(() => {
-    if (!scriptKey) return "";
-    return buildCodexSetupPrompt({
-      apiKey: scriptKey.raw_key || scriptKey.key,
-      baseURL: serviceBaseURL,
-    });
-  }, [scriptKey, serviceBaseURL]);
 
   const expireOptions = useMemo(
     () => [
@@ -320,14 +308,6 @@ export default function APIKeys() {
     });
   };
 
-  const openScriptDialog = (keyRow: APIKeyRow) => {
-    setScriptKey(keyRow);
-  };
-
-  const closeScriptDialog = () => {
-    setScriptKey(null);
-  };
-
   const closeEditDialog = () => {
     if (saving) return;
     setEditingKey(null);
@@ -474,9 +454,23 @@ export default function APIKeys() {
                     {t("apiKeys.tableDesc")}
                   </p>
                 </div>
-                <Badge variant={keys.length > 0 ? "default" : "secondary"}>
-                  {t("apiKeys.keyCount", { count: keys.length })}
-                </Badge>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button asChild variant="outline" size="sm">
+                    <a href={WINDOWS_TOOLKIT_URL} download>
+                      <Download className="size-3.5" />
+                      {t("apiKeys.downloadWindowsScript")}
+                    </a>
+                  </Button>
+                  <Button asChild variant="outline" size="sm">
+                    <a href={MAC_TOOLKIT_URL} download>
+                      <Download className="size-3.5" />
+                      {t("apiKeys.downloadMacScript")}
+                    </a>
+                  </Button>
+                  <Badge variant={keys.length > 0 ? "default" : "secondary"}>
+                    {t("apiKeys.keyCount", { count: keys.length })}
+                  </Badge>
+                </div>
               </div>
 
               <StateShell
@@ -609,14 +603,6 @@ export default function APIKeys() {
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1.5">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => openScriptDialog(keyRow)}
-                                >
-                                  <Terminal className="size-3.5" />
-                                  {t("apiKeys.generateScript")}
-                                </Button>
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -957,59 +943,6 @@ export default function APIKeys() {
           ) : null}
         </Modal>
 
-        <Modal
-          show={Boolean(scriptKey)}
-          title={t("apiKeys.scriptTitle")}
-          onClose={closeScriptDialog}
-          contentClassName="sm:max-w-[860px]"
-          footer={
-            <>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={closeScriptDialog}
-              >
-                {t("common.cancel")}
-              </Button>
-              <Button
-                type="button"
-                onClick={() => void handleCopy(generatedPrompt)}
-                disabled={!generatedPrompt}
-              >
-                <Copy className="size-3.5" />
-                {t("apiKeys.copyPrompt")}
-              </Button>
-            </>
-          }
-        >
-          {scriptKey ? (
-            <div className="space-y-4">
-              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                  <Terminal className="size-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-foreground">
-                    {t("apiKeys.scriptForKey", { name: scriptKey.name })}
-                  </div>
-                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {t("apiKeys.scriptDesc")}
-                  </p>
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-border bg-muted/20">
-                <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
-                  {t("apiKeys.promptPreview")}
-                </div>
-                <pre className="max-h-[460px] overflow-auto p-3 text-xs leading-relaxed text-foreground">
-                  <code>{generatedPrompt}</code>
-                </pre>
-              </div>
-            </div>
-          ) : null}
-        </Modal>
-
         {confirmDialog}
       </>
     </StateShell>
@@ -1017,115 +950,6 @@ export default function APIKeys() {
 }
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
-
-function buildCodexSetupPrompt({
-  apiKey,
-  baseURL,
-}: {
-  apiKey: string;
-  baseURL: string;
-}): string {
-  const renderedAPIKey = JSON.stringify(apiKey);
-  const renderedBaseURL = JSON.stringify(baseURL || "https://codexapi.lechun.cc");
-
-  return `我需要把 Codex 的登录方式切换为 API Key 登录。
-
-请按以下要求操作：
-
-1. 使用我提供的 \`OPENAI_API_KEY\` 和 \`base_url\` 配置 Codex 登录。
-2. 修改任何配置之前，必须先备份整个 Codex 配置目录。
-   - Windows 配置目录通常是：\`%USERPROFILE%\\.codex\`
-   - macOS / Linux 配置目录通常是：\`~/.codex\`
-   - 备份目录名请保留原目录名，并追加时间戳后缀，例如：\`.codex.backup.20260612002235\`
-   - 时间戳格式建议使用：\`yyyyMMddHHmmss\`
-3. 只修改登录/API 服务地址相关配置，不要改动其他配置项。
-4. 必须保证历史聊天线程、会话记录、归档线程等数据不被删除、不被移动、不被覆盖。
-5. 不得删除或清理以下目录或文件：
-   - \`sessions\`
-   - \`archived_sessions\`
-   - \`state_*.sqlite\`
-   - \`logs_*.sqlite\`
-   - \`goals_*.sqlite\`
-   - \`memories_*.sqlite\`
-   - \`session_index.jsonl\`
-   - \`.codex-global-state.json\`
-6. 修改后请进行校验：
-   - 确认 Codex 已识别为 API Key 登录
-   - 确认自定义 \`base_url\` 可被当前 provider 使用
-   - 确认历史线程数据仍然存在且状态正常
-7. 如果需要设置环境变量：
-   - Windows 优先设置用户级环境变量
-   - macOS / Linux 优先写入用户 shell 配置文件，或按当前 Codex 启动方式设置持久环境变量
-   - 修改后请说明是否需要重启 Codex、终端或重新登录系统才能生效
-
-配置信息如下：
-
-OPENAI_API_KEY = ${renderedAPIKey}
-base_url = ${renderedBaseURL}
-
-注意：除登录方式、API Key、base_url 或必要的 provider 配置外，不得修改任何其他 Codex 配置；不得删除、移动、覆盖或清理任何历史线程、会话记录、归档线程、数据库、日志或索引文件。
-
-完成配置和校验后，请提示我完整退出并重启 Codex Desktop。重启后如果历史会话列表正常，不需要执行额外修复；如果历史会话列表缺失、数量明显不对或归档状态异常，请让我复制下面这段“重启后备用修复 Prompt”到 Codex 中执行。
-
-重要：下面这段是重启后的备用 Prompt。当前任务不要执行它，只需要在最终回复里原样提供给我。
-
-重启后备用修复 Prompt：
-
-\`\`\`
-我需要在切换 Codex 登录方式或 provider 后，恢复/修复历史会话列表。
-
-请按以下要求操作：
-
-1. 不要删除、移动或清空任何历史数据文件，包括：
-   - ~/.codex/sessions
-   - ~/.codex/archived_sessions
-   - ~/.codex/session_index.jsonl
-   - ~/.codex/state_*.sqlite
-   - ~/.codex/logs_*.sqlite
-
-2. 修改任何文件前，必须先备份原文件。
-   - 备份文件名保留原文件名，并追加时间戳和说明
-   - 示例：session_index.jsonl.20260612002907.before-fix.bak
-   - 时间戳格式使用 yyyyMMddHHmmss
-
-3. 先检查历史会话是否真的存在：
-   - 枚举 ~/.codex/sessions 和 ~/.codex/archived_sessions 下的 rollout-*.jsonl
-   - 校验每个 JSONL 是否可解析
-   - 读取每个文件的 session_meta.id、session_meta.model_provider、cwd、首条用户消息、更新时间
-
-4. 修复 session_index.jsonl：
-   - 根据实际 rollout-*.jsonl 重建索引
-   - 每行必须是合法 JSON
-   - 字段至少包括 id、thread_name、updated_at
-   - 用 UTF-8 写入
-   - 不要把 API key 或长配置文本写进标题，敏感标题要改成安全短标题
-
-5. 检查并修复 ~/.codex/state_*.sqlite 中的 threads 表：
-   - 确认 threads 表里是否存在历史线程
-   - 对比当前 config.toml 的 model_provider
-   - 如果历史线程的 model_provider 是旧值，例如 openai、openai-custom，而当前是 OpenAI，则统一改成当前 provider 名
-   - 同步 title、preview、updated_at、updated_at_ms 等必要字段
-   - 保持 archived 状态，不要把归档会话误改成普通会话，除非我明确要求
-
-6. 重要：同时修复原始 rollout-*.jsonl 的 session_meta.model_provider。
-   - 否则 Codex 可能会从 JSONL 重新 backfill，把 state_*.sqlite 里的 provider 又写回旧值
-   - 修改 JSONL 前必须逐个备份
-   - 只改 session_meta.model_provider，不要改对话内容
-
-7. 修复后做校验：
-   - session_index.jsonl 每行都能 JSON.parse
-   - state_*.sqlite 的 threads 表中 provider 已统一为当前 provider
-   - Codex 线程列表工具或等效方式能看到未归档历史会话
-   - 归档会话仍保持归档状态
-   - 敏感信息没有出现在 title 或 preview 中
-
-8. 如果运行中的 Codex Desktop 仍显示旧列表，说明可能有内存缓存。
-   - 请说明需要完整退出并重启 Codex Desktop
-   - 不要因此重复删除或清空任何缓存目录
-
-请先只读检查并汇报发现，再在确认需要修改时按上述步骤修复。修复过程中要持续说明每一步改了什么、备份在哪里、校验结果是什么。
-\`\`\``;
-}
 
 function parseQuotaLimit(raw: string, t: Translator): number {
   const quotaLimitText = raw.trim();

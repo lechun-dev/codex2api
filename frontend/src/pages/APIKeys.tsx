@@ -39,6 +39,7 @@ import {
   Pencil,
   Plus,
   ShieldCheck,
+  Terminal,
   Trash2,
 } from "lucide-react";
 
@@ -119,6 +120,7 @@ export default function APIKeys() {
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [saving, setSaving] = useState(false);
+  const [promptKey, setPromptKey] = useState<APIKeyRow | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
@@ -306,6 +308,14 @@ export default function APIKeys() {
       allowedGroupIds: keyRow.allowed_group_ids ?? [],
       limits: limitsFromAPIKey(keyRow.limits),
     });
+  };
+
+  const openPromptDialog = (keyRow: APIKeyRow) => {
+    setPromptKey(keyRow);
+  };
+
+  const closePromptDialog = () => {
+    setPromptKey(null);
   };
 
   const closeEditDialog = () => {
@@ -603,6 +613,14 @@ export default function APIKeys() {
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1.5">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => openPromptDialog(keyRow)}
+                                >
+                                  <Terminal className="size-3.5" />
+                                  {t("apiKeys.generatePrompt")}
+                                </Button>
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -940,6 +958,63 @@ export default function APIKeys() {
                 modelOptions={modelOptions}
               />
             </form>
+          ) : null}
+        </Modal>
+
+        <Modal
+          show={Boolean(promptKey)}
+          title={t("apiKeys.promptTitle")}
+          onClose={closePromptDialog}
+          contentClassName="sm:max-w-[720px]"
+          footer={
+            <Button type="button" variant="outline" onClick={closePromptDialog}>
+              {t("common.close")}
+            </Button>
+          }
+        >
+          {promptKey ? (
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3">
+                <div className="mb-2 text-sm font-semibold text-foreground">
+                  {t("apiKeys.promptKeyLabel")}
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="min-w-0 flex-1 overflow-x-auto rounded-md bg-background px-3 py-2 font-mono text-sm text-foreground">
+                    {promptKey.raw_key || promptKey.key}
+                  </code>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleCopy(promptKey.raw_key || promptKey.key)}
+                  >
+                    <Copy className="size-3.5" />
+                    {t("common.copy")}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="space-y-3 text-sm leading-relaxed text-muted-foreground">
+                <p>{t("apiKeys.promptIntro")}</p>
+                <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-destructive">
+                  {t("apiKeys.promptRisk")}
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Button asChild variant="outline" className="justify-start">
+                    <a href={WINDOWS_TOOLKIT_URL} download>
+                      <Download className="size-3.5" />
+                      {t("apiKeys.promptWindowsToolkit")}
+                    </a>
+                  </Button>
+                  <Button asChild variant="outline" className="justify-start">
+                    <a href={MAC_TOOLKIT_URL} download>
+                      <Download className="size-3.5" />
+                      {t("apiKeys.promptMacToolkit")}
+                    </a>
+                  </Button>
+                </div>
+                <p>{t("apiKeys.promptTrafficNote")}</p>
+              </div>
+            </div>
           ) : null}
         </Modal>
 

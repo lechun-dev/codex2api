@@ -577,6 +577,14 @@ export default function APIKeys() {
                                 >
                                   <Copy className="size-3.5" />
                                 </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => openPromptDialog(keyRow)}
+                                >
+                                  <Terminal className="size-3.5" />
+                                  {t("apiKeys.generatePrompt")}
+                                </Button>
                               </div>
                             </TableCell>
                             <TableCell className="min-w-[180px]">
@@ -613,14 +621,6 @@ export default function APIKeys() {
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1.5">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => openPromptDialog(keyRow)}
-                                >
-                                  <Terminal className="size-3.5" />
-                                  {t("apiKeys.generatePrompt")}
-                                </Button>
                                 <Button
                                   variant="outline"
                                   size="sm"

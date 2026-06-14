@@ -321,6 +321,19 @@ func main() {
 		r.GET("/admin/*filepath", serveAdmin)
 		r.HEAD("/admin", serveAdmin)
 		r.HEAD("/admin/*filepath", serveAdmin)
+
+		serveDownload := func(c *gin.Context) {
+			fileName := strings.TrimPrefix(c.Param("filepath"), "/")
+			switch fileName {
+			case "codex-windows-toolkit.zip", "codex-mac-toolkit.zip":
+				c.Header("Cache-Control", "public, max-age=86400")
+				c.FileFromFS("/downloads/"+fileName, httpFS)
+			default:
+				c.Status(http.StatusNotFound)
+			}
+		}
+		r.GET("/downloads/*filepath", serveDownload)
+		r.HEAD("/downloads/*filepath", serveDownload)
 	}
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）

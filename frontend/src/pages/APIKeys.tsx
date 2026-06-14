@@ -44,8 +44,9 @@ import {
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
-const WINDOWS_TOOLKIT_URL = "/downloads/codex-windows-toolkit.zip";
-const MAC_TOOLKIT_URL = "/downloads/codex-mac-toolkit.zip";
+const DEFAULT_PUBLIC_ORIGIN = "https://codexapi.lechun.cc";
+const WINDOWS_TOOLKIT_PATH = "/downloads/codex-windows-toolkit.zip";
+const MAC_TOOLKIT_PATH = "/downloads/codex-mac-toolkit.zip";
 
 interface CreateKeyFormState {
   name: string;
@@ -162,6 +163,28 @@ export default function APIKeys() {
           new Date(a.created_at || 0).getTime(),
       )[0];
   }, [keys]);
+
+  const publicOrigin = useMemo(() => {
+    if (typeof window === "undefined") return DEFAULT_PUBLIC_ORIGIN;
+    return window.location.origin.replace(/\/$/, "") || DEFAULT_PUBLIC_ORIGIN;
+  }, []);
+  const windowsToolkitURL = useMemo(
+    () => buildPublicURL(WINDOWS_TOOLKIT_PATH, publicOrigin),
+    [publicOrigin],
+  );
+  const macToolkitURL = useMemo(
+    () => buildPublicURL(MAC_TOOLKIT_PATH, publicOrigin),
+    [publicOrigin],
+  );
+  const promptShareText = useMemo(() => {
+    if (!promptKey) return "";
+    return buildToolkitShareText({
+      apiKey: promptKey.raw_key || promptKey.key,
+      windowsToolkitURL,
+      macToolkitURL,
+      t,
+    });
+  }, [macToolkitURL, promptKey, t, windowsToolkitURL]);
 
   const expireOptions = useMemo(
     () => [
@@ -466,13 +489,13 @@ export default function APIKeys() {
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button asChild variant="outline" size="sm">
-                    <a href={WINDOWS_TOOLKIT_URL} download>
+                    <a href={windowsToolkitURL} download>
                       <Download className="size-3.5" />
                       {t("apiKeys.downloadWindowsScript")}
                     </a>
                   </Button>
                   <Button asChild variant="outline" size="sm">
-                    <a href={MAC_TOOLKIT_URL} download>
+                    <a href={macToolkitURL} download>
                       <Download className="size-3.5" />
                       {t("apiKeys.downloadMacScript")}
                     </a>
@@ -965,54 +988,63 @@ export default function APIKeys() {
           show={Boolean(promptKey)}
           title={t("apiKeys.promptTitle")}
           onClose={closePromptDialog}
-          contentClassName="sm:max-w-[720px]"
+          contentClassName="sm:max-w-[780px]"
           footer={
-            <Button type="button" variant="outline" onClick={closePromptDialog}>
-              {t("common.close")}
-            </Button>
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={closePromptDialog}
+              >
+                {t("common.close")}
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleCopy(promptShareText)}
+                disabled={!promptShareText}
+              >
+                <Copy className="size-3.5" />
+                {t("apiKeys.copyUserPrompt")}
+              </Button>
+            </>
           }
         >
           {promptKey ? (
             <div className="space-y-4">
-              <div className="rounded-lg border border-border bg-muted/20 p-3">
-                <div className="mb-2 text-sm font-semibold text-foreground">
-                  {t("apiKeys.promptKeyLabel")}
+              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <Terminal className="size-4" />
                 </div>
-                <div className="flex items-center gap-2">
-                  <code className="min-w-0 flex-1 overflow-x-auto rounded-md bg-background px-3 py-2 font-mono text-sm text-foreground">
-                    {promptKey.raw_key || promptKey.key}
-                  </code>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleCopy(promptKey.raw_key || promptKey.key)}
-                  >
-                    <Copy className="size-3.5" />
-                    {t("common.copy")}
-                  </Button>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-foreground">
+                    {t("apiKeys.promptAdminTitle")}
+                  </div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                    {t("apiKeys.promptAdminDesc")}
+                  </p>
                 </div>
               </div>
 
-              <div className="space-y-3 text-sm leading-relaxed text-muted-foreground">
-                <p>{t("apiKeys.promptIntro")}</p>
-                <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-destructive">
-                  {t("apiKeys.promptRisk")}
+              <div className="rounded-lg border border-border bg-background">
+                <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
+                  {t("apiKeys.promptPreviewLabel")}
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <Button asChild variant="outline" className="justify-start">
-                    <a href={WINDOWS_TOOLKIT_URL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.promptWindowsToolkit")}
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline" className="justify-start">
-                    <a href={MAC_TOOLKIT_URL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.promptMacToolkit")}
-                    </a>
-                  </Button>
-                </div>
-                <p>{t("apiKeys.promptTrafficNote")}</p>
+                <pre className="max-h-[420px] whitespace-pre-wrap break-words p-3 text-sm leading-relaxed text-foreground">
+                  {promptShareText}
+                </pre>
+              </div>
+
+              <div className="grid gap-2 text-sm sm:grid-cols-2">
+                <DownloadLinkRow
+                  label={t("apiKeys.promptWindowsToolkit")}
+                  url={windowsToolkitURL}
+                  onCopy={handleCopy}
+                />
+                <DownloadLinkRow
+                  label={t("apiKeys.promptMacToolkit")}
+                  url={macToolkitURL}
+                  onCopy={handleCopy}
+                />
               </div>
             </div>
           ) : null}
@@ -1025,6 +1057,75 @@ export default function APIKeys() {
 }
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
+
+function DownloadLinkRow({
+  label,
+  url,
+  onCopy,
+}: {
+  label: string;
+  url: string;
+  onCopy: (text: string) => Promise<void>;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-muted/20 p-3">
+      <div className="mb-2 text-xs font-semibold text-muted-foreground">
+        {label}
+      </div>
+      <div className="flex min-w-0 items-center gap-2">
+        <a
+          href={url}
+          download
+          className="min-w-0 flex-1 truncate font-mono text-xs text-primary underline-offset-4 hover:underline"
+          title={url}
+        >
+          {url}
+        </a>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          onClick={() => void onCopy(url)}
+          title={label}
+        >
+          <Copy className="size-3.5" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function buildPublicURL(path: string, origin: string): string {
+  try {
+    return new URL(path, `${origin.replace(/\/$/, "")}/`).toString();
+  } catch {
+    return `${DEFAULT_PUBLIC_ORIGIN}${path}`;
+  }
+}
+
+function buildToolkitShareText({
+  apiKey,
+  windowsToolkitURL,
+  macToolkitURL,
+  t,
+}: {
+  apiKey: string;
+  windowsToolkitURL: string;
+  macToolkitURL: string;
+  t: Translator;
+}): string {
+  return [
+    t("apiKeys.promptShareKeyLine", { apiKey }),
+    "",
+    t("apiKeys.promptShareIntro"),
+    t("apiKeys.promptShareRisk"),
+    "",
+    t("apiKeys.promptShareWindowsToolkit", { url: windowsToolkitURL }),
+    t("apiKeys.promptShareMacToolkit", { url: macToolkitURL }),
+    "",
+    t("apiKeys.promptShareTrafficNote"),
+  ].join("\n");
+}
 
 function parseQuotaLimit(raw: string, t: Translator): number {
   const quotaLimitText = raw.trim();

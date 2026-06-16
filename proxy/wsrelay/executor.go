@@ -71,6 +71,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	apiKey string,
 	deviceCfg *proxy.DeviceProfileConfig,
 	ginHeaders http.Header,
+	poolRouteKey string,
 ) (*WsResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -120,13 +121,27 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
+	//
+	// 连接池 baseKey 必须按 API Key 稳定，绝不能等于每请求唯一的上游身份键，否则
+	// 默认隔离模式下 headerSessionID 每请求都变 → 槽位池失效 → 逐请求握手触发 503。
+	// poolRouteKey（来自上游确定性键）非空时优先用它作 baseKey：连接复用按 API Key
+	// 稳定命中同一组 8 槽。
+	//
+	// 隔离说明：默认隔离模式下，每请求的上游身份隔离由写入每个 response.create 帧体的
+	// 每请求唯一 prompt_cache_key 保证（见 proxy/executor.go 注入处）。握手头里的
+	// Session_id/Conversation_id 只在建连时发送一次、对一条复用连接的生命周期保持不变
+	// （复用连接上不是逐请求轮换），因此不能依赖它做逐请求隔离。
 	poolSessionID := sessionID
 	effectiveProxy := effectiveProxyURL(account, proxyOverride)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	if proxy.IsStatelessWebsocketSessionID(sessionID) && headerSessionID != sessionID {
-		wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, headerSessionID, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+		baseKey := headerSessionID
+		if strings.TrimSpace(poolRouteKey) != "" {
+			baseKey = poolRouteKey
+		}
+		wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
 	} else {
 		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 	}
@@ -502,9 +517,9 @@ func ShutdownExecutor() {
 
 // ExecuteRequestWebsocket 通过 WebSocket 发送请求
 // 返回一个模拟的 http.Response 用于兼容现有代码
-func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *proxy.DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *proxy.DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 	exec := GetExecutor()
-	wsResp, err := exec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
+	wsResp, err := exec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	if err != nil {
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -210,10 +211,46 @@ func (h *Handler) findAccountByID(id int64) *auth.Account {
 	return nil
 }
 
-// upstreamResetErrorMessage 从上游响应里提取简短错误信息用于回传。
+// upstreamResetErrorMessage 从上游响应里提取错误信息用于回传。
+// 已知的上游错误 code 会被翻译成中文提示，并附带上游返回的原文，
+// 形如「<中文说明>（上游：<原文>）」，既易读又保留可排查的原始信息。
 func upstreamResetErrorMessage(statusCode int, body []byte) string {
-	if msg := truncate(string(body), 200); msg != "" {
-		return msg
+	raw := truncate(strings.TrimSpace(string(body)), 300)
+
+	if zh := resetErrorCodeToChinese(body); zh != "" {
+		if raw != "" {
+			return zh + "（上游：" + raw + "）"
+		}
+		return zh
+	}
+
+	if raw != "" {
+		return raw
 	}
 	return "上游返回状态 " + strconv.Itoa(statusCode)
+}
+
+// resetErrorCodeToChinese 解析上游错误 body 里的 code/reason，映射为中文说明；
+// 无法识别时返回空串（调用方回退到原文）。
+// 典型响应：{"detail":{"code":"rate_limit_not_resettable","reason":"credits_only"}}
+func resetErrorCodeToChinese(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	// code 可能出现在 detail.code 或顶层 code / error.code。
+	code := firstNonEmptyGJSONString(body, "detail.code", "code", "error.code")
+	reason := firstNonEmptyGJSONString(body, "detail.reason", "reason", "error.reason")
+
+	switch code {
+	case "rate_limit_not_resettable":
+		if reason == "credits_only" {
+			return "该账号为额度（credits）计费计划，当前限流不支持主动重置"
+		}
+		return "当前限流状态不支持主动重置"
+	case "no_reset_credits_available", "insufficient_reset_credits":
+		return "该账号没有可用的主动重置次数"
+	case "rate_limit_already_reset":
+		return "该账号的限流已被重置，暂无需再次重置"
+	}
+	return ""
 }

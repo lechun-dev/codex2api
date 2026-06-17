@@ -649,17 +649,20 @@ export default function APIKeys() {
                                 t={t}
                               />
                             </TableCell>
-                            <TableCell className="min-w-[150px] text-sm text-muted-foreground">
-                              <div className="space-y-1">
+                            <TableCell className="min-w-[170px] text-sm text-muted-foreground">
+                              <div className="space-y-1.5">
                                 <div className="font-medium text-foreground">
-                                  {formatQuotaLimit(keyRow, t)}
+                                  {formatQuotaUsage(keyRow, t)}
+                                </div>
+                                <div className="text-xs">
+                                  {formatQuotaMeta(keyRow, t)}
                                 </div>
                                 {keyRow.quota_limit > 0 ? (
                                   <div className="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
                                     <div
                                       className="h-full rounded-full bg-primary"
                                       style={{
-                                        width: `${Math.min(100, Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100))}%`,
+                                        width: `${getQuotaUsagePercent(keyRow)}%`,
                                       }}
                                     />
                                   </div>
@@ -820,6 +823,9 @@ export default function APIKeys() {
                     updateCreateForm({ quotaLimit: event.target.value })
                   }
                 />
+                <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                  {t("apiKeys.quotaLimitHelp")}
+                </p>
               </FormField>
               <FormField
                 label={t("apiKeys.expireModeLabel")}
@@ -947,6 +953,9 @@ export default function APIKeys() {
                       updateEditForm({ quotaLimit: event.target.value })
                     }
                   />
+                  <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                    {t("apiKeys.quotaLimitHelp")}
+                  </p>
                 </FormField>
               </div>
 
@@ -1338,14 +1347,32 @@ function getAPIKeyStatus(
   return "active";
 }
 
-function formatQuotaLimit(keyRow: APIKeyRow, t: Translator) {
+function formatQuotaUsage(keyRow: APIKeyRow, t: Translator) {
+  const used = formatUSD(keyRow.quota_used);
   if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
-    return t("apiKeys.unlimited");
+    return t("apiKeys.quotaUsageUnlimited", { used });
   }
   return t("apiKeys.quotaUsedOfLimit", {
-    used: formatUSD(keyRow.quota_used),
+    used,
     limit: formatUSD(keyRow.quota_limit),
   });
+}
+
+function formatQuotaMeta(keyRow: APIKeyRow, t: Translator) {
+  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
+    return t("apiKeys.quotaUnlimitedMeta");
+  }
+  return t("apiKeys.quotaUsedPercent", {
+    percent: getQuotaUsagePercent(keyRow).toFixed(1),
+  });
+}
+
+function getQuotaUsagePercent(keyRow: APIKeyRow) {
+  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) return 0;
+  return Math.min(
+    100,
+    Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100),
+  );
 }
 
 function formatExpiration(keyRow: APIKeyRow, t: Translator) {

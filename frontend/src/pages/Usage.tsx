@@ -1282,6 +1282,8 @@ export default function Usage() {
     : t(`dashboard.timeRange${timeRange.toUpperCase()}`)
   const rangeRequestsLabel = t('usage.rangeRequests', { range: rangeLabel })
   const rangeCostLabel = t('usage.rangeCost', { range: rangeLabel })
+  const analysisRangeLabel = t('usage.analysisRange', { range: rangeLabel })
+  const analysisTotalRequests = todayRequests
 
   return (
     <StateShell
@@ -1415,16 +1417,20 @@ export default function Usage() {
 
         {showAnalysis && (
           <>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2">
+              <div className="text-sm font-medium text-foreground">{t('usage.analysisTitle')}</div>
+              <Badge variant="secondary">{analysisRangeLabel}</Badge>
+            </div>
             <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
               <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
-              <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <FeatureStatsPanel stats={featureStats} totalRequests={analysisTotalRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
 
             <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-              <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <EndpointStatsPanel stats={endpointStats} totalRequests={analysisTotalRequests} showFullUsageNumbers={showFullUsageNumbers} />
               <APIKeyStatsPanel
                 stats={apiKeyStats}
-                totalRequests={totalRequests}
+                totalRequests={analysisTotalRequests}
                 showFullUsageNumbers={showFullUsageNumbers}
                 onMore={() => setShowAPIKeyUsageModal(true)}
               />

@@ -2396,38 +2396,54 @@ func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time)
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 	}
-	stats.ModelStats, err = db.getUsageModelStats(ctx, 10)
+	stats.ModelStats, err = db.getUsageModelStats(ctx, rangeStart, rangeEnd, 10)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.populateUsageBreakdownStats(ctx, stats); err != nil {
+	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd); err != nil {
 		return nil, err
 	}
 
 	return stats, nil
 }
 
-func (db *DB) getUsageModelStats(ctx context.Context, limit int) ([]UsageModelStat, error) {
+func (db *DB) usageStatsRangeClause(rangeStart, rangeEnd time.Time, firstParam int) (string, []interface{}) {
+	if rangeStart.IsZero() {
+		now := time.Now()
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
+	clause := fmt.Sprintf(" AND created_at >= $%d", firstParam)
+	args := []interface{}{db.timeArg(rangeStart)}
+	if !rangeEnd.IsZero() {
+		clause += fmt.Sprintf(" AND created_at < $%d", firstParam+1)
+		args = append(args, db.timeArg(rangeEnd))
+	}
+	return clause, args
+}
+
+func (db *DB) getUsageModelStats(ctx context.Context, rangeStart, rangeEnd time.Time, limit int) ([]UsageModelStat, error) {
 	if limit <= 0 {
 		limit = 10
 	}
+	rangeClause, rangeArgs := db.usageStatsRangeClause(rangeStart, rangeEnd, 2)
+	args := append([]interface{}{limit}, rangeArgs...)
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown') AS model_name,
-			COUNT(*) AS requests,
+			SELECT
+				COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown') AS model_name,
+				COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(input_tokens), 0) AS input_tokens,
 			COALESCE(SUM(output_tokens), 0) AS output_tokens,
 			COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
 			COALESCE(SUM(account_billed), 0) AS account_billed,
 			COALESCE(SUM(user_billed), 0) AS user_billed,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-		FROM usage_logs
-		WHERE status_code <> 499
-		GROUP BY 1
-		ORDER BY user_billed DESC, requests DESC, model_name ASC
-		LIMIT $1
-	`, limit)
+				COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
+			FROM usage_logs
+			WHERE status_code <> 499`+rangeClause+`
+			GROUP BY 1
+			ORDER BY user_billed DESC, requests DESC, model_name ASC
+			LIMIT $1
+		`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2460,23 +2476,24 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int) ([]UsageModelSt
 	return stats, nil
 }
 
-func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats) error {
+func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time) error {
 	if stats == nil {
 		return nil
 	}
+	rangeClause, rangeArgs := db.usageStatsRangeClause(rangeStart, rangeEnd, 1)
 	if err := db.conn.QueryRowContext(ctx, `
-		SELECT
-			COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
+			SELECT
+				COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
 			COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0) AS sync_requests,
 				COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(billing_service_tier, ''), service_tier, '')) IN ('fast', 'priority') THEN 1 ELSE 0 END), 0) AS fast_requests,
 			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_requests,
 			COALESCE(SUM(CASE WHEN reasoning_tokens > 0 OR NULLIF(reasoning_effort, '') IS NOT NULL THEN 1 ELSE 0 END), 0) AS reasoning_requests,
 			COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(inbound_endpoint, ''), endpoint, '')) LIKE '%/images/%' OR LOWER(COALESCE(model, '')) LIKE 'gpt-image-%' OR image_count > 0 THEN 1 ELSE 0 END), 0) AS image_requests,
-			COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0) AS retry_requests,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
-		FROM usage_logs
-		WHERE status_code <> 499
-	`).Scan(
+				COALESCE(SUM(CASE WHEN is_retry_attempt OR attempt_index > 0 THEN 1 ELSE 0 END), 0) AS retry_requests,
+				COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
+			FROM usage_logs
+			WHERE status_code <> 499`+rangeClause+`
+		`, rangeArgs...).Scan(
 		&stats.FeatureStats.StreamRequests,
 		&stats.FeatureStats.SyncRequests,
 		&stats.FeatureStats.FastRequests,
@@ -2489,11 +2506,11 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 		return err
 	}
 
-	endpoints, err := db.getUsageEndpointStats(ctx, 8)
+	endpoints, err := db.getUsageEndpointStats(ctx, rangeStart, rangeEnd, 8)
 	if err != nil {
 		return err
 	}
-	apiKeys, err := db.getUsageAPIKeyStats(ctx, 8)
+	apiKeys, err := db.getUsageAPIKeyStats(ctx, rangeStart, rangeEnd, 8)
 	if err != nil {
 		return err
 	}
@@ -2502,23 +2519,25 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 	return nil
 }
 
-func (db *DB) getUsageEndpointStats(ctx context.Context, limit int) ([]UsageEndpointStat, error) {
+func (db *DB) getUsageEndpointStats(ctx context.Context, rangeStart, rangeEnd time.Time, limit int) ([]UsageEndpointStat, error) {
 	if limit <= 0 {
 		limit = 8
 	}
+	rangeClause, rangeArgs := db.usageStatsRangeClause(rangeStart, rangeEnd, 2)
+	args := append([]interface{}{limit}, rangeArgs...)
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
-			COUNT(*) AS requests,
+			SELECT
+				COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
+				COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs
-		WHERE status_code <> 499
-		GROUP BY 1
-		ORDER BY requests DESC, endpoint_name ASC
-		LIMIT $1
-	`, limit)
+				COALESCE(SUM(user_billed), 0) AS user_billed
+			FROM usage_logs
+			WHERE status_code <> 499`+rangeClause+`
+			GROUP BY 1
+			ORDER BY requests DESC, endpoint_name ASC
+			LIMIT $1
+		`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2541,24 +2560,26 @@ func (db *DB) getUsageEndpointStats(ctx context.Context, limit int) ([]UsageEndp
 	return items, nil
 }
 
-func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int) ([]UsageAPIKeyStat, error) {
+func (db *DB) getUsageAPIKeyStats(ctx context.Context, rangeStart, rangeEnd time.Time, limit int) ([]UsageAPIKeyStat, error) {
 	if limit <= 0 {
 		limit = 8
 	}
+	rangeClause, rangeArgs := db.usageStatsRangeClause(rangeStart, rangeEnd, 2)
+	args := append([]interface{}{limit}, rangeArgs...)
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(api_key_id, 0) AS api_key_id,
-			COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
+			SELECT
+				COALESCE(api_key_id, 0) AS api_key_id,
+				COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
 			COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs
-		WHERE status_code <> 499
-		GROUP BY 1, 2
-		ORDER BY requests DESC, api_key_label ASC
-		LIMIT $1
-	`, limit)
+				COALESCE(SUM(user_billed), 0) AS user_billed
+			FROM usage_logs
+			WHERE status_code <> 499`+rangeClause+`
+			GROUP BY 1, 2
+			ORDER BY requests DESC, api_key_label ASC
+			LIMIT $1
+		`, args...)
 	if err != nil {
 		return nil, err
 	}

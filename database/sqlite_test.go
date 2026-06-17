@@ -1241,6 +1241,84 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 }
 
+func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	recentAt := now.Add(-30 * time.Minute)
+	oldAt := now.Add(-48 * time.Hour)
+	logs := []*UsageLogInput{
+		{
+			AccountID:          1,
+			Endpoint:           "/v1/responses",
+			InboundEndpoint:    "/v1/responses",
+			Model:              "gpt-5.4",
+			EffectiveModel:     "gpt-5.4",
+			StatusCode:         200,
+			Stream:             true,
+			APIKeyID:           7,
+			APIKeyName:         "Recent Key",
+			TotalTokens:        1000,
+			InputTokens:        700,
+			OutputTokens:       300,
+			BillingServiceTier: "default",
+		},
+		{
+			AccountID:       2,
+			Endpoint:        "/v1/chat/completions",
+			InboundEndpoint: "/v1/chat/completions",
+			Model:           "gpt-old",
+			EffectiveModel:  "gpt-old",
+			StatusCode:      500,
+			Stream:          false,
+			APIKeyID:        8,
+			APIKeyName:      "Old Key",
+			TotalTokens:     9000,
+			InputTokens:     6000,
+			OutputTokens:    3000,
+		},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1 WHERE api_key_id = $2`, db.timeArg(recentAt), int64(7)); err != nil {
+		t.Fatalf("update recent usage created_at: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1 WHERE api_key_id = $2`, db.timeArg(oldAt), int64(8)); err != nil {
+		t.Fatalf("update old usage created_at: %v", err)
+	}
+
+	stats, err := db.GetUsageStats(ctx, now.Add(-2*time.Hour), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+	if stats.TodayRequests != 1 {
+		t.Fatalf("TodayRequests = %d, want 1", stats.TodayRequests)
+	}
+	if len(stats.ModelStats) != 1 || stats.ModelStats[0].Model != "gpt-5.4" {
+		t.Fatalf("ModelStats = %+v, want only gpt-5.4", stats.ModelStats)
+	}
+	if len(stats.EndpointStats) != 1 || stats.EndpointStats[0].Endpoint != "/v1/responses" {
+		t.Fatalf("EndpointStats = %+v, want only /v1/responses", stats.EndpointStats)
+	}
+	if len(stats.APIKeyStats) != 1 || stats.APIKeyStats[0].APIKeyID != 7 {
+		t.Fatalf("APIKeyStats = %+v, want only API key 7", stats.APIKeyStats)
+	}
+	if stats.FeatureStats.StreamRequests != 1 || stats.FeatureStats.SyncRequests != 0 || stats.FeatureStats.ErrorRequests != 0 {
+		t.Fatalf("FeatureStats = %+v, want only recent stream success request", stats.FeatureStats)
+	}
+}
+
 func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

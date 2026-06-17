@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
 import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
+import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
@@ -11,7 +12,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
+import type { APIKeyRow, APIKeyTokenStat, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -26,7 +27,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, MoreHorizontal } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -628,10 +629,12 @@ function APIKeyStatsPanel({
   stats,
   totalRequests,
   showFullUsageNumbers,
+  onMore,
 }: {
   stats: UsageAPIKeyStat[]
   totalRequests: number
   showFullUsageNumbers: boolean
+  onMore?: () => void
 }) {
   const { t } = useTranslation()
   return (
@@ -650,6 +653,12 @@ function APIKeyStatsPanel({
       limit={3}
       totalRequests={totalRequests}
       showFullUsageNumbers={showFullUsageNumbers}
+      action={stats.length > 0 && onMore ? (
+        <Button variant="ghost" size="sm" onClick={onMore} className="h-8 px-2 text-xs">
+          <MoreHorizontal className="size-3.5" />
+          {t('usage.more')}
+        </Button>
+      ) : null}
     />
   )
 }
@@ -659,6 +668,7 @@ function DistributionPanel({
   description,
   emptyText,
   icon,
+  action,
   items,
   limit = 6,
   totalRequests,
@@ -668,6 +678,7 @@ function DistributionPanel({
   description: string
   emptyText: string
   icon: ReactNode
+  action?: ReactNode
   items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
@@ -684,8 +695,11 @@ function DistributionPanel({
             <h3 className="text-base font-semibold text-foreground">{title}</h3>
             <p className="mt-1 text-xs text-muted-foreground">{description}</p>
           </div>
-          <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-muted text-foreground">
-            {icon}
+          <div className="flex shrink-0 items-center gap-2">
+            {action}
+            <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-muted text-foreground">
+              {icon}
+            </div>
           </div>
         </div>
 
@@ -726,6 +740,134 @@ function DistributionPanel({
         )}
       </CardContent>
     </Card>
+  )
+}
+
+function APIKeyUsageModal({
+  show,
+  onClose,
+  stats,
+  fallbackStats,
+  loading,
+  showFullUsageNumbers,
+}: {
+  show: boolean
+  onClose: () => void
+  stats: APIKeyTokenStat[]
+  fallbackStats: UsageAPIKeyStat[]
+  loading?: boolean
+  showFullUsageNumbers: boolean
+}) {
+  const { t } = useTranslation()
+  const rows: APIKeyTokenStat[] = (stats.length > 0
+    ? stats
+    : fallbackStats.map((item) => ({
+        api_key_id: item.api_key_id,
+        api_key_name: item.label,
+        api_key_masked: '',
+        label: item.label,
+        requests: item.requests,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        total_tokens: item.tokens,
+        error_count: item.error_count,
+        user_billed: item.user_billed,
+      }))
+  ).sort((a, b) => (
+    safeNumber(b.total_tokens) - safeNumber(a.total_tokens) ||
+    safeNumber(b.requests) - safeNumber(a.requests) ||
+    (a.label || '').localeCompare(b.label || '')
+  ))
+  const totalRequests = rows.reduce((sum, item) => sum + safeNumber(item.requests), 0)
+
+  return (
+    <Modal
+      show={show}
+      title={t('usage.apiKeyUsageModalTitle')}
+      onClose={onClose}
+      contentClassName="sm:max-w-[980px]"
+      bodyClassName="space-y-4"
+    >
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        {t('usage.apiKeyUsageModalDesc')}
+      </p>
+      {loading ? (
+        <div className="flex min-h-48 items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 text-sm text-muted-foreground">
+          {t('common.loading')}
+        </div>
+      ) : (
+        <div className="data-table-shell max-h-[62vh] overflow-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-14 text-center">{t('usage.rank')}</TableHead>
+                <TableHead>{t('usage.tableApiKey')}</TableHead>
+                <TableHead className="text-right">{t('usage.modelStatsRequests')}</TableHead>
+                <TableHead className="text-right">{t('usage.inputTokens')}</TableHead>
+                <TableHead className="text-right">{t('usage.outputTokens')}</TableHead>
+                <TableHead className="text-right">{t('usage.tableCached')}</TableHead>
+                <TableHead className="text-right">{t('usage.modelStatsTokens')}</TableHead>
+                <TableHead className="text-right">{t('usage.modelStatsErrors')}</TableHead>
+                <TableHead className="text-right">{t('usage.tableCost')}</TableHead>
+                <TableHead className="text-right">{t('usage.share')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">
+                    {t('usage.noApiKeyStats')}
+                  </TableCell>
+                </TableRow>
+              ) : rows.map((item, index) => (
+                <TableRow key={`${item.api_key_id}-${item.label}-${index}`}>
+                  <TableCell className="text-center font-geist-mono text-xs text-muted-foreground">
+                    #{index + 1}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <span className="max-w-[220px] truncate font-medium text-foreground" title={item.label}>
+                        {formatCompactEmail(item.label) || item.label || t('usage.unknownApiKey')}
+                      </span>
+                      {item.api_key_masked ? (
+                        <Badge variant="secondary" className="w-fit font-geist-mono text-[10px]">
+                          {item.api_key_masked}
+                        </Badge>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums">
+                    {formatTokens(item.requests, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-blue-600 dark:text-blue-400">
+                    {formatTokens(item.input_tokens, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-emerald-600 dark:text-emerald-400">
+                    {formatTokens(item.output_tokens, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-cyan-600 dark:text-cyan-400">
+                    {formatTokens(item.cached_tokens, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs font-semibold tabular-nums">
+                    {formatTokens(item.total_tokens, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className={`text-right font-geist-mono text-xs tabular-nums ${item.error_count > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                    {formatTokens(item.error_count, showFullUsageNumbers)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-emerald-700 dark:text-emerald-400">
+                    {formatCostCardValue(item.user_billed)}
+                  </TableCell>
+                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-muted-foreground">
+                    {formatPercent(item.requests, totalRequests)}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </Modal>
   )
 }
 
@@ -957,6 +1099,9 @@ export default function Usage() {
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
   const [showAnalysis, setShowAnalysis] = useState(getInitialAnalysisVisibility)
+  const [showAPIKeyUsageModal, setShowAPIKeyUsageModal] = useState(false)
+  const [apiKeyTokenStats, setAPIKeyTokenStats] = useState<APIKeyTokenStat[]>([])
+  const [apiKeyTokenStatsLoading, setAPIKeyTokenStatsLoading] = useState(false)
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -997,9 +1142,23 @@ export default function Usage() {
     }
   }, [])
 
+  const loadAPIKeyTokenStats = useCallback(async () => {
+    setAPIKeyTokenStatsLoading(true)
+    try {
+      const { start, end } = resolveRangeISO(timeRange, customRange)
+      const response = await api.getAPIKeyTokenStats({ start, end })
+      setAPIKeyTokenStats(response.items ?? [])
+    } catch {
+      setAPIKeyTokenStats([])
+      showToast(t('usage.apiKeyUsageLoadFailed'), 'error')
+    } finally {
+      setAPIKeyTokenStatsLoading(false)
+    }
+  }, [customRange, showToast, t, timeRange])
+
   // 服务端分页加载日志
-  const loadLogs = useCallback(async () => {
-    setLogsLoading(true)
+  const loadLogs = useCallback(async (silent = false) => {
+    if (!silent) setLogsLoading(true)
     try {
       const { start, end } = resolveRangeISO(timeRange, customRange)
       const res = await api.getUsageLogsPaged({
@@ -1016,7 +1175,7 @@ export default function Usage() {
     } catch {
       // 静默容错
     } finally {
-      setLogsLoading(false)
+      if (!silent) setLogsLoading(false)
     }
   }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
@@ -1028,6 +1187,12 @@ export default function Usage() {
   useEffect(() => {
     void loadAPIKeys()
   }, [loadAPIKeys])
+
+  useEffect(() => {
+    if (showAPIKeyUsageModal) {
+      void loadAPIKeyTokenStats()
+    }
+  }, [loadAPIKeyTokenStats, showAPIKeyUsageModal])
 
   useEffect(() => {
     let active = true
@@ -1052,9 +1217,10 @@ export default function Usage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void reloadSilently()
+      void loadLogs(true)
     }, 30000)
     return () => window.clearInterval(timer)
-  }, [reloadSilently])
+  }, [reloadSilently, loadLogs])
 
   useEffect(() => {
     persistUsageVisibleColumns(visibleColumns)
@@ -1094,6 +1260,17 @@ export default function Usage() {
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const usageLogMode = settings?.usage_log_mode ?? 'full'
+  const hasStatsButNoLogs = !hasActiveFilters && logsTotal === 0 && totalRequests > 0
+  const emptyLogsDescription = hasActiveFilters
+    ? t('usage.emptyFilteredDesc')
+    : usageLogMode === 'off'
+      ? t('usage.emptyLogsOffDesc')
+      : usageLogMode === 'errors'
+        ? t('usage.emptyLogsErrorsDesc')
+        : hasStatsButNoLogs
+          ? t('usage.emptyStatsWithoutLogsDesc')
+          : t('usage.emptyDesc')
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -1245,7 +1422,12 @@ export default function Usage() {
 
             <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
               <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
-              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <APIKeyStatsPanel
+                stats={apiKeyStats}
+                totalRequests={totalRequests}
+                showFullUsageNumbers={showFullUsageNumbers}
+                onMore={() => setShowAPIKeyUsageModal(true)}
+              />
             </div>
           </>
         )}
@@ -1453,7 +1635,7 @@ export default function Usage() {
               variant="section"
               isEmpty={logs.length === 0}
               emptyTitle={t('usage.emptyTitle')}
-              emptyDescription={hasActiveFilters ? t('usage.emptyFilteredDesc') : t('usage.emptyDesc')}
+              emptyDescription={emptyLogsDescription}
             >
               <div className="data-table-shell">
                 <TooltipProvider>
@@ -1639,6 +1821,14 @@ export default function Usage() {
         </Card>
         </div>
 
+        <APIKeyUsageModal
+          show={showAPIKeyUsageModal}
+          onClose={() => setShowAPIKeyUsageModal(false)}
+          stats={apiKeyTokenStats}
+          fallbackStats={apiKeyStats}
+          loading={apiKeyTokenStatsLoading}
+          showFullUsageNumbers={showFullUsageNumbers}
+        />
         {confirmDialog}
       </>
     </StateShell>

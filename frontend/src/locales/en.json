@@ -1071,6 +1071,9 @@
     "emptyTitle": "No request logs yet",
     "emptyDesc": "Once requests pass through the proxy, recent logs and status codes will appear here.",
     "emptyFilteredDesc": "No request logs match the current filters. Clear filters and try again.",
+    "emptyLogsOffDesc": "usage_logs detail writes are currently disabled. Aggregate statistics above can still show accumulated data; switch Usage Log Mode to full in Settings to capture per-request logs.",
+    "emptyLogsErrorsDesc": "Usage Log Mode currently records failed requests only. If recent requests succeeded, this table can be empty. Switch Usage Log Mode to full for complete request details.",
+    "emptyStatsWithoutLogsDesc": "The statistics above may include retained aggregates or snapshots saved before logs were cleared; there are no per-request logs available for the current range.",
     "tableStatus": "Status",
     "tableModel": "Model",
     "tableAccount": "Account",
@@ -1118,6 +1121,9 @@
     "clearFilters": "Clear Filters",
     "showAnalysis": "Show Analysis",
     "hideAnalysis": "Hide Analysis",
+    "more": "More",
+    "rank": "Rank",
+    "share": "Share",
     "modelStatsTitle": "Model Statistics",
     "modelStatsDesc": "Aggregated by retained logs for requests, tokens, and amount.",
     "noModelStats": "No model statistics yet",
@@ -1143,7 +1149,10 @@
     "noEndpointStats": "No endpoint statistics yet",
     "apiKeyStatsTitle": "API Key Ranking",
     "apiKeyStatsDesc": "Call volume grouped by API key.",
-    "noApiKeyStats": "No API key statistics yet"
+    "noApiKeyStats": "No API key statistics yet",
+    "apiKeyUsageModalTitle": "All API Key Usage",
+    "apiKeyUsageModalDesc": "All API keys for the current time range, sorted by total tokens from high to low by default.",
+    "apiKeyUsageLoadFailed": "Failed to load API key usage"
   },
   "promptFilter": {
     "title": "Prompt Filter",

@@ -1071,6 +1071,9 @@
     "emptyTitle": "暂无请求记录",
     "emptyDesc": "请求进入代理后，会在这里展示最近日志和状态码。",
     "emptyFilteredDesc": "当前筛选条件下暂无请求记录，可清除筛选后重试。",
+    "emptyLogsOffDesc": "当前系统设置已关闭 usage_logs 明细写入，上方统计仍可展示累计/聚合数据；如需查看逐条请求，请在系统设置中把请求日志模式改为 full。",
+    "emptyLogsErrorsDesc": "当前系统设置只记录错误请求；如果最近请求都成功，明细列表会为空。需要完整明细时，请在系统设置中把请求日志模式改为 full。",
+    "emptyStatsWithoutLogsDesc": "上方统计可能来自已保留的聚合数据或清空日志前的累计快照；当前时间范围内没有可展示的逐条请求明细。",
     "tableStatus": "状态",
     "tableModel": "模型",
     "tableAccount": "来源账号",
@@ -1118,6 +1121,9 @@
     "clearFilters": "清除筛选",
     "showAnalysis": "显示分析",
     "hideAnalysis": "隐藏分析",
+    "more": "更多",
+    "rank": "排名",
+    "share": "占比",
     "modelStatsTitle": "模型统计",
     "modelStatsDesc": "按当前保留日志聚合请求、Token 与金额。",
     "noModelStats": "暂无模型统计",
@@ -1143,7 +1149,10 @@
     "noEndpointStats": "暂无端点统计",
     "apiKeyStatsTitle": "密钥排行",
     "apiKeyStatsDesc": "按 API 密钥统计调用量。",
-    "noApiKeyStats": "暂无密钥统计"
+    "noApiKeyStats": "暂无密钥统计",
+    "apiKeyUsageModalTitle": "全部密钥用量",
+    "apiKeyUsageModalDesc": "按当前时间范围统计所有 API 密钥用量，默认按总 Token 从高到低排序。",
+    "apiKeyUsageLoadFailed": "密钥用量加载失败"
   },
   "promptFilter": {
     "title": "Prompt 检查",

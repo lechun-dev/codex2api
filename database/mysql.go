@@ -453,7 +453,7 @@ func (db *DB) getChartAggregationMySQL(ctx context.Context, start, end time.Time
 
 	timelineQuery := `
 	SELECT
-		DATE_FORMAT(FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(created_at) / (? * 60)) * (? * 60)), '%Y-%m-%dT%H:%i:%s') AS bucket,
+		CONCAT(DATE_FORMAT(FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(created_at) / (? * 60)) * (? * 60)), '%Y-%m-%dT%H:%i:%s'), 'Z') AS bucket,
 		COUNT(*)                              AS requests,
 		COALESCE(AVG(duration_ms), 0)         AS avg_latency,
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,

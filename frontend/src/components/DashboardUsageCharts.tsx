@@ -86,7 +86,7 @@ export default function DashboardUsageCharts({
     const totalRequests = serverData.timeline.reduce((sum, p) => sum + p.requests, 0)
 
     const timelineData: TimelinePoint[] = serverData.timeline.map((point) => {
-      const d = new Date(point.bucket)
+      const d = parseChartBucket(point.bucket)
       return {
         label: useFullDate ? formatDateLabel(d, bucketMinutes) : formatMinuteLabel(d),
         fullLabel: formatFullLabel(d, bucketMinutes),
@@ -335,6 +335,11 @@ function ChartCard({ title, description, children }: { title: string; descriptio
       </CardContent>
     </Card>
   )
+}
+
+function parseChartBucket(bucket: string): Date {
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/.test(bucket) ? bucket : `${bucket}Z`
+  return new Date(normalized)
 }
 
 function formatMinuteLabel(date: Date): string {

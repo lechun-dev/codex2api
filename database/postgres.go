@@ -2769,10 +2769,10 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 	timelineQuery := `
 	SELECT
 		TO_CHAR(
-			date_trunc('minute', created_at)
-			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			date_trunc('minute', created_at AT TIME ZONE 'UTC')
+			- (EXTRACT(MINUTE FROM created_at AT TIME ZONE 'UTC')::int % $3) * INTERVAL '1 minute',
 			'YYYY-MM-DD"T"HH24:MI:SS'
-		) AS bucket,
+		) || 'Z' AS bucket,
 		COUNT(*)                              AS requests,
 		COALESCE(AVG(duration_ms), 0)         AS avg_latency,
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,

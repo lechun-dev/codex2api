@@ -641,7 +641,7 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			continue
 		}
 
-		bucket := createdAt.Truncate(time.Duration(bucketMinutes) * time.Minute).Format("2006-01-02T15:04:05")
+		bucket := createdAt.UTC().Truncate(time.Duration(bucketMinutes) * time.Minute).Format(time.RFC3339)
 		agg, ok := timelineMap[bucket]
 		if !ok {
 			agg = &bucketAgg{}

@@ -4499,6 +4499,19 @@ type updateSettingsReq struct {
 	ImageS3ForcePathStyle              *bool   `json:"image_s3_force_path_style"`
 }
 
+func sameImageStorageConfig(a, b imagestore.Config) bool {
+	a = a.Normalize()
+	b = b.Normalize()
+	return a.Backend == b.Backend &&
+		a.Endpoint == b.Endpoint &&
+		a.Region == b.Region &&
+		a.Bucket == b.Bucket &&
+		a.AccessKey == b.AccessKey &&
+		a.SecretKey == b.SecretKey &&
+		a.Prefix == b.Prefix &&
+		a.ForcePathStyle == b.ForcePathStyle
+}
+
 type brandingResponse struct {
 	SiteName               string `json:"site_name"`
 	SiteLogo               string `json:"site_logo"`
@@ -5559,40 +5572,42 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	// 图片存储后端配置
 	imgCfg := imagestore.CurrentConfig()
-	imgChanged := false
+	imgBefore := imgCfg
+	imgConfigProvided := false
 	if req.ImageStorageBackend != nil {
 		imgCfg.Backend = *req.ImageStorageBackend
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3Endpoint != nil {
 		imgCfg.Endpoint = *req.ImageS3Endpoint
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3Region != nil {
 		imgCfg.Region = *req.ImageS3Region
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3Bucket != nil {
 		imgCfg.Bucket = *req.ImageS3Bucket
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3AccessKey != nil {
 		imgCfg.AccessKey = *req.ImageS3AccessKey
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3SecretKey != nil {
 		imgCfg.SecretKey = *req.ImageS3SecretKey
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3Prefix != nil {
 		imgCfg.Prefix = *req.ImageS3Prefix
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	if req.ImageS3ForcePathStyle != nil {
 		imgCfg.ForcePathStyle = *req.ImageS3ForcePathStyle
-		imgChanged = true
+		imgConfigProvided = true
 	}
 	imgCfg.LocalDir = imageAssetDir()
+	imgChanged := imgConfigProvided && !sameImageStorageConfig(imgBefore, imgCfg)
 	if imgChanged {
 		if err := imagestore.Configure(imgCfg); err != nil {
 			writeError(c, http.StatusBadRequest, "图片存储配置无效: "+err.Error())

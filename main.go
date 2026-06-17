@@ -100,6 +100,7 @@ func main() {
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -141,6 +142,7 @@ func main() {
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -311,7 +313,7 @@ func main() {
 		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
 		indexHTML, _ := fs.ReadFile(subFS, "index.html")
 
-		serveAdmin := func(c *gin.Context) {
+		serveFrontend := func(c *gin.Context) {
 			fp := c.Param("filepath")
 			// 尝试打开请求的文件（排除目录和根路径）
 			if fp != "/" && len(fp) > 1 {
@@ -328,12 +330,32 @@ func main() {
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
+		serveKeyUsageFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicAPIKeyUsagePageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取 API Key 自助用量页开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
 
 		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
-		r.GET("/admin", serveAdmin)
-		r.GET("/admin/*filepath", serveAdmin)
-		r.HEAD("/admin", serveAdmin)
-		r.HEAD("/admin/*filepath", serveAdmin)
+		r.GET("/admin", serveFrontend)
+		r.GET("/admin/*filepath", serveFrontend)
+		r.HEAD("/admin", serveFrontend)
+		r.HEAD("/admin/*filepath", serveFrontend)
+		r.GET("/key-usage", serveKeyUsageFrontend)
+		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
+		r.HEAD("/key-usage", serveKeyUsageFrontend)
+		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
 	}
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）
@@ -363,6 +385,7 @@ func main() {
 	log.Printf("  Listen: %s", addr)
 	log.Printf("  HTTP:   http://%s:%d", displayHost, cfg.Port)
 	log.Printf("  管理台: http://%s:%d/admin/", displayHost, cfg.Port)
+	log.Printf("  Key用量: http://%s:%d/key-usage", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")

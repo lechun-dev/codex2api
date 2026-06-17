@@ -75,6 +75,13 @@ function accountSearchText(account: AccountRow): string {
     .toLowerCase()
 }
 
+function isCodexInviteCandidate(account: AccountRow): boolean {
+  if (account.openai_responses_api || account.at_only) return false
+  if (account.enabled === false || account.locked) return false
+  const status = (account.status || '').toLowerCase()
+  return status !== 'unauthorized' && status !== 'error'
+}
+
 function resolveAccountInput(accounts: AccountRow[], input: string): AccountRow | null {
   const normalized = input.trim().toLowerCase()
   if (!normalized) return null
@@ -97,9 +104,9 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
   const { t } = useTranslation()
   const { showToast } = useToast()
 
-  // 仅可用 Codex OAuth 账号发送邀请（中转 / AT-only 账号没有可用于 referral 的凭证）。
+  // 仅保留可用于 referral 的 Codex OAuth 账号；中转 / AT-only / 失效账号不能发送邀请。
   const codexAccounts = useMemo(
-    () => accounts.filter((a) => !a.openai_responses_api && !a.at_only),
+    () => accounts.filter(isCodexInviteCandidate),
     [accounts],
   )
   const firstAccount = codexAccounts[0] ?? null
@@ -132,7 +139,7 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
   }, [accountTyping, accountQuery, codexAccounts])
   const overLimit = parsed.valid.length > MAX_EMAILS
   const canSend =
-    !sending && accountQuery.trim() !== '' && parsed.valid.length > 0 && !overLimit
+    !sending && accountQuery.trim() !== '' && parsed.valid.length > 0 && parsed.invalid.length === 0 && !overLimit
 
   useEffect(() => {
     if (accountId == null) return

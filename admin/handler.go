@@ -273,6 +273,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.GET("/api/branding", h.GetBranding)
+	keyUsage := r.Group("/api/key-usage")
+	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
+	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -4633,10 +4636,50 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		return
 	}
 
+	// 检查是否有任何 key 配置了窗口 cost limit
+	var need5h, need7d, need30d bool
+	for _, k := range keys {
+		if k.Limits.CostLimit5h > 0 {
+			need5h = true
+		}
+		if k.Limits.CostLimit7d > 0 {
+			need7d = true
+		}
+		if k.Limits.CostLimit30d > 0 {
+			need30d = true
+		}
+	}
+
+	// 按需批量查询窗口用量
+	var cost5h, cost7d, cost30d map[int64]float64
+	if need5h {
+		cost5h, _ = h.db.GetAllAPIKeysWindowCost(ctx, 5*time.Hour)
+	}
+	if need7d {
+		cost7d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 7*24*time.Hour)
+	}
+	if need30d {
+		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
+	}
+
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
-		maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		mk := NewMaskedAPIKeyRow(k)
+		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 {
+			detail := &APIKeyWindowUsageDetail{}
+			if cost5h != nil {
+				detail.Cost5h = cost5h[k.ID]
+			}
+			if cost7d != nil {
+				detail.Cost7d = cost7d[k.ID]
+			}
+			if cost30d != nil {
+				detail.Cost30d = cost30d[k.ID]
+			}
+			mk.WindowUsage = detail
+		}
+		maskedKeys = append(maskedKeys, mk)
 	}
 
 	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
@@ -4790,6 +4833,7 @@ type updateAPIKeyReq struct {
 	Name            *string                `json:"name"`
 	QuotaLimit      json.RawMessage        `json:"quota_limit"`
 	Quota           json.RawMessage        `json:"quota"`
+	ResetQuota      *bool                  `json:"reset_quota"`
 	ExpiresAt       json.RawMessage        `json:"expires_at"`
 	ExpiresInDays   *int                   `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
@@ -4877,6 +4921,7 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	update := database.APIKeyUpdate{
 		QuotaLimit:         quotaLimit,
 		QuotaLimitSet:      quotaLimitSet,
+		ResetQuota:         req.ResetQuota != nil && *req.ResetQuota,
 		ExpiresAt:          expiresAt,
 		ExpiresAtSet:       expiresAtSet,
 		AllowedGroupIDs:    allowedGroupValues,
@@ -4932,8 +4977,10 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
 		CostLimit5h:    maxFloat(in.CostLimit5h, 0),
 		CostLimit7d:    maxFloat(in.CostLimit7d, 0),
+		CostLimit30d:   maxFloat(in.CostLimit30d, 0),
 		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
+		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
 	}
 	return out
 }
@@ -5142,6 +5189,7 @@ type settingsResponse struct {
 	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
 	ImageS3Region                      string  `json:"image_s3_region"`
@@ -5227,6 +5275,7 @@ type updateSettingsReq struct {
 	FirstTokenTimeoutSeconds           *int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -5713,6 +5762,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -5720,6 +5770,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -5805,6 +5856,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -5858,6 +5910,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
@@ -5865,6 +5918,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -6227,6 +6281,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
+	if req.PublicKeyUsagePageEnabled != nil {
+		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
+		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
+	}
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
 		t5h := h.store.GetGlobalAutoPause5hThreshold()
 		t7d := h.store.GetGlobalAutoPause7dThreshold()
@@ -6511,6 +6569,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),

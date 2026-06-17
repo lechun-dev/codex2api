@@ -355,6 +355,9 @@ export default function AuthGate({ children }: PropsWithChildren) {
         setStatus('need_login')
       } else if (res.status === 503) {
         setStatus('need_bootstrap')
+      } else if (!res.ok) {
+        setAdminKey('')
+        setStatus('need_login')
       } else {
         if (key && shouldShowSetupReview()) {
           await loadSetupReview()
@@ -363,7 +366,8 @@ export default function AuthGate({ children }: PropsWithChildren) {
         }
       }
     } catch {
-      setStatus('authenticated')
+      setAdminKey('')
+      setStatus('need_login')
     }
   }, [loadSetupReview])
 
@@ -491,6 +495,10 @@ export default function AuthGate({ children }: PropsWithChildren) {
         headers: { 'X-Admin-Key': inputKey.trim() },
       })
       if (res.status === 401) {
+        setError(copy.loginError)
+      } else if (res.status === 503) {
+        setStatus('need_bootstrap')
+      } else if (!res.ok) {
         setError(copy.loginError)
       } else {
         setAdminKey(inputKey.trim())

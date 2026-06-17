@@ -33,6 +33,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  FileDown,
   Fingerprint,
   KeyRound,
   LockKeyhole,
@@ -312,6 +313,27 @@ export default function APIKeys() {
     }
   };
 
+  const handleExportKeys = () => {
+    if (keys.length === 0) {
+      showToast(t("apiKeys.exportEmpty"), "error");
+      return;
+    }
+    const csv = buildAPIKeysCSV(keys, groups, t);
+    const blob = new Blob([`\uFEFF${csv}`], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const date = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `api-keys-${date}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    showToast(t("apiKeys.exportSuccess"));
+  };
+
   const toggleVisible = (id: number) => {
     setVisibleKeys((prev) => {
       const next = new Set(prev);
@@ -488,6 +510,16 @@ export default function APIKeys() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleExportKeys}
+                    disabled={keys.length === 0}
+                  >
+                    <FileDown className="size-3.5" />
+                    {t("apiKeys.exportKeys")}
+                  </Button>
                   <Button asChild variant="outline" size="sm">
                     <a href={windowsToolkitURL} download>
                       <Download className="size-3.5" />
@@ -1125,6 +1157,80 @@ function buildToolkitShareText({
     "",
     t("apiKeys.promptShareTrafficNote"),
   ].join("\n");
+}
+
+function buildAPIKeysCSV(
+  keys: APIKeyRow[],
+  groups: AccountGroup[],
+  t: Translator,
+): string {
+  const headers = [
+    t("common.name"),
+    t("apiKeys.keyColumn"),
+    t("apiKeys.exportStatus"),
+    t("apiKeys.exportQuotaLimitUSD"),
+    t("apiKeys.exportQuotaUsedUSD"),
+    t("apiKeys.expiresColumn"),
+    t("common.createdAt"),
+    t("apiKeys.allowedGroups"),
+    t("apiKeys.exportModelAllow"),
+    t("apiKeys.exportModelDeny"),
+    t("apiKeys.exportRPM"),
+    t("apiKeys.exportRPD"),
+    t("apiKeys.exportCostLimit5h"),
+    t("apiKeys.exportCostLimit7d"),
+    t("apiKeys.exportTokenLimit5h"),
+    t("apiKeys.exportTokenLimit7d"),
+  ];
+  const rows = keys.map((keyRow) => {
+    const limits = keyRow.limits ?? {};
+    return [
+      keyRow.name,
+      keyRow.raw_key || keyRow.key,
+      t(`apiKeys.status.${getAPIKeyStatus(keyRow)}`),
+      keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : t("apiKeys.unlimited"),
+      String(keyRow.quota_used ?? 0),
+      keyRow.expires_at ? formatBeijingTime(keyRow.expires_at) : t("apiKeys.neverExpires"),
+      formatBeijingTime(keyRow.created_at),
+      formatExportGroups(keyRow.allowed_group_ids ?? [], groups, t),
+      (limits.model_allow ?? []).join("; "),
+      (limits.model_deny ?? []).join("; "),
+      formatOptionalNumber(limits.rpm),
+      formatOptionalNumber(limits.rpd),
+      formatOptionalNumber(limits.cost_limit_5h),
+      formatOptionalNumber(limits.cost_limit_7d),
+      formatOptionalNumber(limits.token_limit_5h),
+      formatOptionalNumber(limits.token_limit_7d),
+    ];
+  });
+  return [headers, ...rows]
+    .map((row) => row.map((value) => csvEscape(String(value ?? ""))).join(","))
+    .join("\n");
+}
+
+function formatExportGroups(
+  ids: number[],
+  groups: AccountGroup[],
+  t: Translator,
+): string {
+  if (ids.length === 0) return t("apiKeys.allowedGroupsAll");
+  const groupMap = new Map(groups.map((group) => [group.id, group.name]));
+  return ids
+    .map((id) => groupMap.get(id) || `#${id}`)
+    .join("; ");
+}
+
+function formatOptionalNumber(value: number | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? String(value)
+    : "";
+}
+
+function csvEscape(value: string): string {
+  if (/[",\n\r]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
 }
 
 function parseQuotaLimit(raw: string, t: Translator): number {

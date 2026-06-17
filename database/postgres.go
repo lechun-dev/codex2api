@@ -3107,6 +3107,18 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	}
 
 	where, args := db.buildUsageLogWhere(f)
+	result := &UsageLogPage{Logs: []*UsageLog{}}
+	countQuery := `SELECT COUNT(*)
+		   FROM usage_logs u
+		   LEFT JOIN accounts a ON u.account_id = a.id
+		   WHERE ` + where
+	if err := db.conn.QueryRowContext(ctx, countQuery, args...).Scan(&result.Total); err != nil {
+		return nil, err
+	}
+	if result.Total == 0 {
+		return result, nil
+	}
+
 	offset := (f.Page - 1) * f.PageSize
 	paramIdx := len(args) + 1
 	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
@@ -3121,12 +3133,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	            COALESCE(u.image_count, 0), COALESCE(u.image_width, 0), COALESCE(u.image_height, 0), COALESCE(u.image_bytes, 0),
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
-			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
-	            COUNT(*) OVER() AS total_count
-	           FROM usage_logs u
-	           LEFT JOIN accounts a ON u.account_id = a.id
-	           WHERE ` + where
+				            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+				            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		           FROM usage_logs u
+		           LEFT JOIN accounts a ON u.account_id = a.id
+		           WHERE ` + where
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -3134,7 +3145,6 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	}
 	defer rows.Close()
 
-	result := &UsageLogPage{}
 	for rows.Next() {
 		l := &UsageLog{}
 		var credentialRaw interface{}
@@ -3142,7 +3152,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3152,9 +3162,6 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		}
 		l.populateBillingBreakdown()
 		result.Logs = append(result.Logs, l)
-	}
-	if result.Logs == nil {
-		result.Logs = []*UsageLog{}
 	}
 	return result, rows.Err()
 }

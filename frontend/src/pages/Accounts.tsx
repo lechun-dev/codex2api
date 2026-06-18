@@ -1216,8 +1216,6 @@ export default function Accounts() {
             isRateLimitedAccount(account)
           )
             return false;
-          if (account.status !== "active" && account.status !== "ready")
-            return false;
           break;
         case "rate_limited":
           if (

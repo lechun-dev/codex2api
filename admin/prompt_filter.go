@@ -222,8 +222,8 @@ func (h *Handler) TestPromptFilterRulePattern(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	req.Pattern = strings.TrimSpace(req.Pattern)
-	if req.Pattern == "" {
+	trimmedPattern := strings.TrimSpace(req.Pattern)
+	if trimmedPattern == "" {
 		writeError(c, http.StatusBadRequest, "pattern 不能为空")
 		return
 	}

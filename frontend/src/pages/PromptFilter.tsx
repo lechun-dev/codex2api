@@ -1,5 +1,5 @@
 import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { AlertTriangle, CheckCircle2, ChevronDown, HelpCircle, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, ShieldAlert, Trash2, Wand2, X } from 'lucide-react'
@@ -124,6 +124,14 @@ const defaultRulePatternTestState: RulePatternTestState = {
   testing: false,
   result: null,
   message: '',
+}
+
+function parseRuleWeight(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const weight = Number(trimmed)
+  if (!Number.isSafeInteger(weight) || weight <= 0 || weight > 1000) return null
+  return weight
 }
 
 function customRuleDraftFromRule(rule: PromptFilterRule): CustomRuleDraft {
@@ -856,9 +864,9 @@ function RulesView({
 
   const saveCustomRuleDialog = async () => {
     const name = customDialogDraft.name.trim()
-    const pattern = customDialogDraft.pattern.trim()
-    const weight = parseInt(customDialogDraft.weight, 10)
-    if (!name || !pattern || !weight || weight <= 0) return
+    const pattern = customDialogDraft.pattern
+    const weight = parseRuleWeight(customDialogDraft.weight)
+    if (!name || !pattern.trim() || weight === null) return
 
     if (customDialogMode === 'create') {
       await saveCustomPatterns([
@@ -1051,7 +1059,7 @@ function RulesView({
       </Card>
 
       <Dialog open={customDialogMode !== null} onOpenChange={(open) => { if (!open) closeCustomRuleDialog() }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{customDialogMode === 'create' ? t('promptFilter.addCustomRule') : t('promptFilter.editCustomRule')}</DialogTitle>
             <DialogDescription>{customDialogMode === 'create' ? t('promptFilter.addCustomRuleDesc') : t('promptFilter.editCustomRuleDesc')}</DialogDescription>
@@ -1078,7 +1086,7 @@ function RulesView({
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={closeCustomRuleDialog} disabled={savingRule !== ''}>{t('common.cancel')}</Button>
-            <Button onClick={() => void saveCustomRuleDialog()} disabled={savingRule !== '' || !customDialogDraft.name.trim() || !customDialogDraft.pattern.trim()}>
+            <Button onClick={() => void saveCustomRuleDialog()} disabled={savingRule !== '' || !customDialogDraft.name.trim() || !customDialogDraft.pattern.trim() || parseRuleWeight(customDialogDraft.weight) === null}>
               <Save className="size-4" />
               {savingRule !== '' ? t('common.saving') : t('common.save')}
             </Button>
@@ -1116,15 +1124,16 @@ function RulesView({
 function RulePatternTester({ pattern, className }: { pattern: string; className?: string }) {
   const { t } = useTranslation()
   const [state, setState] = useState<RulePatternTestState>(defaultRulePatternTestState)
+  const requestIdRef = useRef(0)
 
   useEffect(() => {
+    requestIdRef.current += 1
     setState((current) => ({ ...current, result: null, message: '' }))
   }, [pattern])
 
   const runPatternTest = async () => {
-    const trimmedPattern = pattern.trim()
     const text = state.text
-    if (!trimmedPattern) {
+    if (!pattern.trim()) {
       setState((current) => ({ ...current, result: 'invalid', message: t('promptFilter.rulePatternRequired') }))
       return
     }
@@ -1132,9 +1141,12 @@ function RulePatternTester({ pattern, className }: { pattern: string; className?
       setState((current) => ({ ...current, result: 'invalid', message: t('promptFilter.ruleTestTextRequired') }))
       return
     }
+    const requestId = requestIdRef.current + 1
+    requestIdRef.current = requestId
     setState((current) => ({ ...current, testing: true, result: null, message: '' }))
     try {
-      const result = await api.testPromptFilterRulePattern({ pattern: trimmedPattern, text })
+      const result = await api.testPromptFilterRulePattern({ pattern, text })
+      if (requestIdRef.current !== requestId) return
       if (result.error) {
         setState((current) => ({ ...current, testing: false, result: 'invalid', message: result.error || t('promptFilter.rulePatternInvalid') }))
       } else if (result.matched) {
@@ -1143,6 +1155,7 @@ function RulePatternTester({ pattern, className }: { pattern: string; className?
         setState((current) => ({ ...current, testing: false, result: 'not_matched', message: t('promptFilter.ruleTestNotMatched') }))
       }
     } catch (err) {
+      if (requestIdRef.current !== requestId) return
       setState((current) => ({ ...current, testing: false, result: 'invalid', message: getErrorMessage(err) }))
     }
   }
@@ -1169,7 +1182,10 @@ function RulePatternTester({ pattern, className }: { pattern: string; className?
         rows={3}
         value={state.text}
         placeholder={t('promptFilter.ruleTestTextPlaceholder')}
-        onChange={(event) => setState((current) => ({ ...current, text: event.target.value, result: null, message: '' }))}
+        onChange={(event) => {
+          requestIdRef.current += 1
+          setState((current) => ({ ...current, text: event.target.value, result: null, message: '' }))
+        }}
       />
       {state.result && state.message ? (
         <div className={cn('mt-3 rounded-md border px-3 py-2 text-sm font-medium', resultClass)}>{state.message}</div>

@@ -3,6 +3,7 @@ package promptfilter
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func testConfig(mode string) Config {
@@ -139,6 +140,44 @@ func TestExtractTextResponses(t *testing.T) {
 	}
 	if !strings.Contains(got, "SQL injection prevention") {
 		t.Fatalf("ExtractText = %q, want prompt text", got)
+	}
+}
+
+func TestExtractTextSkipsMultimodalNonTextFields(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Explain DDoS detection"},{"type":"image_url","image_url":{"url":"https://private.example/secret.png"}},{"type":"input_image","source":{"type":"base64","data":"BASE64SECRET"}}]}]}`)
+	got := ExtractText(body, "/v1/messages", DefaultMaxTextLength)
+	if !strings.Contains(got, "Explain DDoS detection") {
+		t.Fatalf("ExtractText = %q, want text content", got)
+	}
+	for _, leaked := range []string{"private.example", "secret.png", "BASE64SECRET"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("ExtractText leaked non-text field %q in %q", leaked, got)
+		}
+	}
+}
+
+func TestLimitScanTextPreservesUTF8(t *testing.T) {
+	text := strings.Repeat("界", 40000) + strings.Repeat("🙂", 1000) + "tail关键字"
+	got := limitScanText(text, 80*1024)
+	if !utf8.ValidString(got) {
+		t.Fatalf("limitScanText returned invalid UTF-8")
+	}
+	if !strings.Contains(got, "tail关键字") {
+		t.Fatalf("limitScanText lost tail content")
+	}
+}
+
+func TestSensitiveWordMatchDoesNotExposeWordInName(t *testing.T) {
+	cfg := testConfig(ModeBlock)
+	cfg.SensitiveWords = "customer-secret-keyword"
+	v := InspectText("please check customer-secret-keyword", cfg)
+	if len(v.Matched) == 0 {
+		t.Fatalf("matched = 0; verdict=%+v", v)
+	}
+	for _, match := range v.Matched {
+		if strings.Contains(match.Name, "customer-secret-keyword") {
+			t.Fatalf("match name leaked sensitive word: %+v", match)
+		}
 	}
 }
 

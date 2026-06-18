@@ -26,6 +26,8 @@ const (
 	DefaultMaxTextLength   = 80 * 1024
 	defaultHeadScanLength  = 64 * 1024
 	defaultTailScanLength  = 16 * 1024
+	HitStartMarker         = "⟦PF_HIT⟧"
+	HitEndMarker           = "⟦/PF_HIT⟧"
 )
 
 type Config struct {
@@ -292,6 +294,19 @@ func (e *Engine) InspectText(text string) Verdict {
 		return verdict
 	}
 
+	matchContexts := make([]string, 0, 3)
+	recordContext := func(context string) {
+		context = strings.TrimSpace(context)
+		if context == "" || len(matchContexts) >= 3 {
+			return
+		}
+		for _, existing := range matchContexts {
+			if existing == context {
+				return
+			}
+		}
+		matchContexts = append(matchContexts, context)
+	}
 	matchesByName := map[string]Match{}
 	rawScore := 0
 	strictScore := 0
@@ -300,18 +315,22 @@ func (e *Engine) InspectText(text string) Verdict {
 			continue
 		}
 		if strings.Contains(scanText, word) {
-			match := Match{Name: "sensitive_word:" + word, Weight: 100, Category: "sensitive_word", Strict: true}
-			matchesByName[match.Name] = match
+			match := Match{Name: "sensitive_word", Weight: 100, Category: "sensitive_word", Strict: true}
+			_, context := matchContextFromLiteral(scanText, word)
+			recordContext(context)
+			matchesByName[match.Name+":"+word] = match
 		}
 	}
 	for _, pattern := range e.patterns {
-		if pattern.re.MatchString(scanText) {
+		if loc := pattern.re.FindStringIndex(scanText); loc != nil {
 			match := Match{
 				Name:     pattern.cfg.Name,
 				Weight:   pattern.cfg.Weight,
 				Category: pattern.cfg.Category,
 				Strict:   pattern.cfg.Strict,
 			}
+			_, context := regexMatchContext(scanText, loc)
+			recordContext(context)
 			matchesByName[match.Name] = match
 		}
 	}
@@ -359,6 +378,9 @@ func (e *Engine) InspectText(text string) Verdict {
 	if len(matches) > 0 {
 		verdict.Reason = reasonForVerdict(action, score, cfg.Threshold, matches)
 	}
+	if len(matchContexts) > 0 {
+		verdict.TextPreview = strings.Join(matchContexts, "\n---\n")
+	}
 	return verdict
 }
 
@@ -405,6 +427,101 @@ func Preview(text string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "..."
 }
 
+func RedactedPreview(text string, maxRunes int) string {
+	return Preview(RedactSensitive(text), maxRunes)
+}
+
+func RedactSensitive(text string) string {
+	if text == "" {
+		return ""
+	}
+	redacted := text
+	for _, pattern := range sensitiveRedactionPatterns {
+		redacted = pattern.re.ReplaceAllString(redacted, pattern.replacement)
+	}
+	return redacted
+}
+
+func matchContextFromLiteral(text string, literal string) (string, string) {
+	start := strings.Index(text, literal)
+	if start < 0 {
+		return "", ""
+	}
+	return matchContext(text, start, start+len(literal))
+}
+
+func regexMatchContext(text string, loc []int) (string, string) {
+	if len(loc) != 2 {
+		return "", ""
+	}
+	return matchContext(text, loc[0], loc[1])
+}
+
+func matchContext(text string, start int, end int) (string, string) {
+	if start < 0 || end < start || start > len(text) {
+		return "", ""
+	}
+	if end > len(text) {
+		end = len(text)
+	}
+	sample := RedactedPreview(text[start:end], 120)
+	contextStart := byteOffsetBefore(text, start, 80)
+	contextEnd := byteOffsetAfter(text, end, 80)
+	rawContext := strings.TrimSpace(text[contextStart:contextEnd])
+	redactedContext := RedactSensitive(rawContext)
+	if redactedContext != rawContext {
+		if contextStart > 0 {
+			redactedContext = "..." + redactedContext
+		}
+		return sample, redactedContext
+	}
+
+	before := strings.TrimSpace(text[contextStart:start])
+	hit := text[start:end]
+	after := strings.TrimSpace(text[end:contextEnd])
+	parts := make([]string, 0, 3)
+	if before != "" {
+		parts = append(parts, before)
+	}
+	parts = append(parts, HitStartMarker+hit+HitEndMarker)
+	if after != "" {
+		parts = append(parts, after)
+	}
+	context := strings.Join(parts, " ")
+	if contextStart > 0 {
+		context = "..." + context
+	}
+	return sample, context
+}
+
+func byteOffsetBefore(text string, start int, maxRunes int) int {
+	if start <= 0 || maxRunes <= 0 {
+		return start
+	}
+	offsets := make([]int, 0, maxRunes+1)
+	for idx := range text[:start] {
+		offsets = append(offsets, idx)
+	}
+	if len(offsets) <= maxRunes {
+		return 0
+	}
+	return offsets[len(offsets)-maxRunes]
+}
+
+func byteOffsetAfter(text string, end int, maxRunes int) int {
+	if end >= len(text) || maxRunes <= 0 {
+		return end
+	}
+	count := 0
+	for idx := range text[end:] {
+		if count >= maxRunes {
+			return end + idx
+		}
+		count++
+	}
+	return len(text)
+}
+
 func MatchesJSON(matches []Match) string {
 	if len(matches) == 0 {
 		return "[]"
@@ -426,15 +543,23 @@ func collectGJSONText(result gjson.Result, parts *[]string) {
 			collectGJSONText(item, parts)
 		}
 	case result.IsObject():
-		if t := strings.TrimSpace(result.Get("text").String()); t != "" {
-			*parts = append(*parts, t)
+		if textValue := result.Get("text"); textValue.Type == gjson.String {
+			if t := strings.TrimSpace(textValue.String()); t != "" {
+				*parts = append(*parts, t)
+			}
 		}
-		if t := strings.TrimSpace(result.Get("content").String()); t != "" {
-			*parts = append(*parts, t)
+		if contentValue := result.Get("content"); contentValue.Exists() {
+			if contentValue.Type == gjson.String {
+				if t := strings.TrimSpace(contentValue.String()); t != "" {
+					*parts = append(*parts, t)
+				}
+			} else {
+				collectGJSONText(contentValue, parts)
+			}
 		}
 		result.ForEach(func(key, value gjson.Result) bool {
-			switch key.String() {
-			case "image_url", "file_id", "result":
+			switch strings.ToLower(key.String()) {
+			case "text", "content", "image_url", "url", "file_id", "result", "data", "b64_json", "source", "file", "type", "role":
 				return true
 			}
 			collectGJSONText(value, parts)
@@ -526,7 +651,34 @@ func limitScanText(text string, maxLen int) string {
 	if tail > len(text)-head {
 		tail = len(text) - head
 	}
-	return text[:head] + "\n" + text[len(text)-tail:]
+	return safeUTF8Prefix(text, head) + "\n" + safeUTF8Suffix(text, tail)
+}
+
+func safeUTF8Prefix(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if maxBytes >= len(text) {
+		return text
+	}
+	for maxBytes > 0 && !utf8.ValidString(text[:maxBytes]) {
+		maxBytes--
+	}
+	return text[:maxBytes]
+}
+
+func safeUTF8Suffix(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if maxBytes >= len(text) {
+		return text
+	}
+	start := len(text) - maxBytes
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	return text[start:]
 }
 
 func defensiveContextDiscount(text string) int {

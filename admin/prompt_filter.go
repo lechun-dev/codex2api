@@ -65,7 +65,7 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
-	textPreview := verdict.TextPreview
+	textPreview := promptfilter.RedactedPreview(verdict.TextPreview, 500)
 	if redactPreview {
 		textPreview = "[redacted]"
 	}

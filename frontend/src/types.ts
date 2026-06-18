@@ -735,8 +735,8 @@ export interface SetupHintsResponse {
 export interface PromptFilterMatch {
   name: string
   weight: number
-  category: string
-  strict: boolean
+  category?: string
+  strict?: boolean
 }
 
 export interface PromptFilterVerdict {
@@ -748,8 +748,8 @@ export interface PromptFilterVerdict {
   threshold: number
   strict_hit: boolean
   matched: PromptFilterMatch[]
-  text_preview: string
-  reason: string
+  text_preview?: string
+  reason?: string
   extracted_chars: number
   reviewed?: boolean
   review_flagged?: boolean

@@ -71,6 +71,18 @@ var defaultPatternConfigs = []PatternConfig{
 	{Name: "social_media_hijack", Pattern: `(?i)\b(account\s+takeover|social\s+media\s+hijacking|credential\s+stuffing)\b|账号接管|撞库攻击`, Weight: 40, Category: "credential_attack"},
 }
 
+var sensitiveRedactionPatterns = []struct {
+	re          *regexp.Regexp
+	replacement string
+}{
+	{regexp.MustCompile(`(?i)\b(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(["']?\b(?:password|passwd|pwd|token|api[_-]?key|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?id)\b["']?\s*[:=]\s*["']?)[^"',\s}]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)\b(cookie\s*[:=]\s*)[^\n]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`\bsk-[A-Za-z0-9][A-Za-z0-9_-]{7,}\b`), `[REDACTED_API_KEY]`},
+	{regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`), `[REDACTED_JWT]`},
+	{regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), `[REDACTED_EMAIL]`},
+}
+
 var defensiveContextPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(defensive|defense|prevent|prevention|mitigation|detect|detection|hardening|patch|remediation|incident\s+response)\b`),
 	regexp.MustCompile(`(?i)\b(do\s+not\s+provide|without\s+code|no\s+commands|high\s+level|non[-\s]?operational|refusal|unsafe)\b`),

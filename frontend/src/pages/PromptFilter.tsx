@@ -37,6 +37,8 @@ import {
 import { cn } from '@/lib/utils'
 
 const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules'] as const
+const HIT_START_MARKER = '⟦PF_HIT⟧'
+const HIT_END_MARKER = '⟦/PF_HIT⟧'
 type PromptFilterView = typeof PROMPT_FILTER_VIEWS[number]
 
 type PromptFilterForm = Pick<
@@ -1067,15 +1069,15 @@ function PromptFilterLogsTable({ logs, compact = false }: { logs: PromptFilterLo
   const { t } = useTranslation()
   return (
     <div className="rounded-lg border border-border">
-      <Table>
+      <Table className="table-fixed">
         <TableHeader>
           <TableRow>
-            <TableHead>{t('promptFilter.colTime')}</TableHead>
-            <TableHead>{t('promptFilter.colAction')}</TableHead>
-            <TableHead>{t('promptFilter.colEndpoint')}</TableHead>
-            <TableHead>{t('promptFilter.colScore')}</TableHead>
-            <TableHead>{t('promptFilter.colMatch')}</TableHead>
-            <TableHead>{t('promptFilter.colApiKey')}</TableHead>
+            <TableHead className={compact ? 'w-[92px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
+            <TableHead className={compact ? 'w-[82px]' : 'w-[96px]'}>{t('promptFilter.colAction')}</TableHead>
+            <TableHead className={compact ? 'w-[150px]' : 'w-[180px]'}>{t('promptFilter.colEndpoint')}</TableHead>
+            <TableHead className={compact ? 'w-[72px]' : 'w-[88px]'}>{t('promptFilter.colScore')}</TableHead>
+            <TableHead className={compact ? 'w-[150px]' : 'w-[220px]'}>{t('promptFilter.colMatch')}</TableHead>
+            <TableHead className={compact ? 'w-[118px]' : 'w-[160px]'}>{t('promptFilter.colApiKey')}</TableHead>
             <TableHead>{t('promptFilter.colPreview')}</TableHead>
           </TableRow>
         </TableHeader>
@@ -1172,10 +1174,104 @@ function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
         </div>
       ) : null}
       {verdict.text_preview ? (
-        <pre className="mt-3 max-h-28 overflow-auto rounded-md bg-background p-2 text-xs leading-5 text-muted-foreground">{verdict.text_preview}</pre>
+        <pre className="mt-3 max-h-28 overflow-auto rounded-md bg-background p-2 text-xs leading-5 text-muted-foreground"><HighlightedPromptPreview text={verdict.text_preview} /></pre>
       ) : null}
     </div>
   )
+}
+
+function HighlightedPromptPreview({ text, className }: { text: string; className?: string }) {
+  const parts = parseHitMarkedText(text)
+  return <HighlightedParts parts={parts} className={className} />
+}
+
+function HighlightedPromptText({ text, terms, className }: { text: string; terms: string[]; className?: string }) {
+  return <HighlightedParts parts={splitTextByHitTerms(text, terms)} className={className} />
+}
+
+function HighlightedParts({ parts, className }: { parts: Array<{ text: string; hit: boolean }>; className?: string }) {
+  return (
+    <span className={className}>
+      {parts.map((part, index) => part.hit ? (
+        <mark key={index} className="rounded bg-amber-200 px-1 py-0.5 font-medium text-amber-950 dark:bg-amber-400/25 dark:text-amber-100">
+          {part.text}
+        </mark>
+      ) : <span key={index}>{part.text}</span>)}
+    </span>
+  )
+}
+
+function parseHitMarkedText(text: string): Array<{ text: string; hit: boolean }> {
+  const parts: Array<{ text: string; hit: boolean }> = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const start = text.indexOf(HIT_START_MARKER, cursor)
+    if (start < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    const end = text.indexOf(HIT_END_MARKER, start + HIT_START_MARKER.length)
+    if (end < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    if (start > cursor) {
+      parts.push({ text: text.slice(cursor, start), hit: false })
+    }
+    parts.push({ text: text.slice(start + HIT_START_MARKER.length, end), hit: true })
+    cursor = end + HIT_END_MARKER.length
+  }
+  return parts.length ? parts : [{ text, hit: false }]
+}
+
+function extractHitTerms(text: string): string[] {
+  const terms: string[] = []
+  for (const part of parseHitMarkedText(text)) {
+    const term = stripHitMarkers(part.text).trim()
+    if (part.hit && term && !terms.some((existing) => existing.toLowerCase() === term.toLowerCase())) {
+      terms.push(term)
+    }
+  }
+  return terms
+}
+
+function splitTextByHitTerms(text: string, terms: string[]): Array<{ text: string; hit: boolean }> {
+  const normalizedTerms = terms
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0)
+    .sort((a, b) => b.length - a.length)
+  if (text === '' || normalizedTerms.length === 0) {
+    return [{ text, hit: false }]
+  }
+
+  const lowerText = text.toLowerCase()
+  const parts: Array<{ text: string; hit: boolean }> = []
+  let cursor = 0
+  while (cursor < text.length) {
+    let bestIndex = -1
+    let bestTerm = ''
+    for (const term of normalizedTerms) {
+      const index = lowerText.indexOf(term.toLowerCase(), cursor)
+      if (index >= 0 && (bestIndex < 0 || index < bestIndex || (index === bestIndex && term.length > bestTerm.length))) {
+        bestIndex = index
+        bestTerm = term
+      }
+    }
+    if (bestIndex < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    if (bestIndex > cursor) {
+      parts.push({ text: text.slice(cursor, bestIndex), hit: false })
+    }
+    parts.push({ text: text.slice(bestIndex, bestIndex + bestTerm.length), hit: true })
+    cursor = bestIndex + bestTerm.length
+  }
+  return parts.length ? parts : [{ text, hit: false }]
+}
+
+function stripHitMarkers(text: string): string {
+  return text.split(HIT_START_MARKER).join('').split(HIT_END_MARKER).join('')
 }
 
 function MiniStat({ label, value }: { label: string; value: string }) {
@@ -1193,10 +1289,11 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const [expanded, setExpanded] = useState(false)
   const fullText = (log.full_text || '').trim()
   const hasFull = fullText.length > 0
+  const hitTerms = extractHitTerms(log.text_preview || '')
   return (
     <>
     <TableRow>
-      <TableCell className="min-w-[150px]">
+      <TableCell className={compact ? 'w-[92px] min-w-0' : 'w-[150px] min-w-0'}>
         <div className="font-medium text-foreground">{formatRelativeTime(log.created_at, { variant: 'compact' })}</div>
         {!compact ? <div className="text-xs text-muted-foreground">{formatBeijingTime(log.created_at)}</div> : null}
       </TableCell>
@@ -1208,14 +1305,14 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         </div>
       </TableCell>
       <TableCell>
-        <div className="font-mono text-xs text-foreground">{log.endpoint || '-'}</div>
-        <div className="font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
+        <div className="truncate font-mono text-xs text-foreground">{log.endpoint || '-'}</div>
+        <div className="truncate font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
       </TableCell>
       <TableCell>
         <span className="font-semibold">{log.score}</span>
         <span className="text-muted-foreground"> / {log.threshold}</span>
       </TableCell>
-      <TableCell className="max-w-[220px]">
+      <TableCell className={compact ? 'w-[150px] min-w-0' : 'w-[220px] min-w-0'}>
         {matches.length ? (
           <div className="flex flex-wrap gap-1">
             {matches.slice(0, 3).map((match, index) => <Badge key={`${match.name}-${index}`} variant="outline">{match.name}</Badge>)}
@@ -1224,11 +1321,11 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         ) : <span className="text-muted-foreground">-</span>}
       </TableCell>
       <TableCell>
-        <div className="max-w-[160px] truncate">{log.api_key_name || log.api_key_masked || '-'}</div>
+        <div className={compact ? 'max-w-[110px] truncate' : 'max-w-[160px] truncate'}>{log.api_key_name || log.api_key_masked || '-'}</div>
         {!compact && log.client_ip ? <div className="text-xs text-muted-foreground">{log.client_ip}</div> : null}
       </TableCell>
-      <TableCell className="max-w-[360px]">
-        <div className="truncate text-muted-foreground" title={log.text_preview || log.error_code || log.review_error || ''}>{log.text_preview || log.error_code || log.review_error || '-'}</div>
+      <TableCell className="min-w-0">
+        <div className="truncate text-muted-foreground" title={stripHitMarkers(log.text_preview || log.error_code || log.review_error || '')}>{log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : (log.error_code || log.review_error || '-')}</div>
         {hasFull ? (
           <button
             type="button"
@@ -1255,7 +1352,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
               {t('common.copy')}
             </button>
           </div>
-          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 text-xs leading-relaxed text-foreground">{fullText}</pre>
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptText text={fullText} terms={hitTerms} /></pre>
         </TableCell>
       </TableRow>
     ) : null}

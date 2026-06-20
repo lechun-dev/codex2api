@@ -19,6 +19,12 @@ type SessionAffinityBinding struct {
 	ProxyURL  string `json:"proxy_url,omitempty"`
 }
 
+// APIKeyClientLimitResult describes whether a downstream client ID was accepted.
+type APIKeyClientLimitResult struct {
+	Allowed bool
+	Count   int64
+}
+
 // TokenCache 统一的 token 缓存、刷新锁与短期运行态缓存接口。
 type TokenCache interface {
 	Driver() string
@@ -42,4 +48,5 @@ type TokenCache interface {
 	SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error
 	GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error)
 	DeleteRuntime(ctx context.Context, namespace string, key string) error
+	TrackAPIKeyClient(ctx context.Context, apiKeyID int64, clientID string, maxClients int, ttl time.Duration) (APIKeyClientLimitResult, error)
 }

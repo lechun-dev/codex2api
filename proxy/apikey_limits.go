@@ -3,14 +3,15 @@
 // 入口:enforceAPIKeyLimits()。在请求鉴权后、转发上游前调用。失败返回 (httpStatus, message),
 // handler 直接以该响应短路;成功则返回 (0, "")。
 //
-// 6 类限制:
+// 7 类限制:
 //   - ModelAllow / ModelDeny: O(1) string set,本机内存即可,无副作用。
+//   - MaxClients: 按 X-Client-Id 统计窗口内客户端数量。Redis 原子集合,无缓存时可用性优先放行。
 //   - RPM:  滑动 60s 内请求数。Redis INCR + EXPIRE 60s 计数器(没 Redis 时回退 DB 聚合 + 短缓存)。
 //   - RPD:  滑动 24h 内请求数。同上,EXPIRE 86400。
-//   - CostLimit5h / CostLimit7d:    滑动 5h / 7d 内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
-//   - TokenLimit5h / TokenLimit7d:  同 cost,聚合 total_tokens。
+//   - CostLimit5h / CostLimit7d / CostLimit30d: 滑动窗口内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
+//   - TokenLimit5h / TokenLimit7d / TokenLimit30d: 同 cost,聚合 total_tokens。
 //
-// Redis 失效或不存在时一律退到 DB 聚合 + 1 分钟缓存,保证可用性优先。
+// 请求窗口聚合在 Redis 失效或不存在时退到 DB 聚合 + 1 分钟缓存;客户端数量限制在缓存不可用时放行。
 package proxy
 
 import (
@@ -34,6 +35,7 @@ const (
 	apiKey5hWindow             = 5 * time.Hour
 	apiKey7dWindow             = 7 * 24 * time.Hour
 	apiKey30dWindow            = 30 * 24 * time.Hour
+	apiKeyClientDefaultWindow  = 30 * 24 * time.Hour
 )
 
 // apiKeyRowFromContext 从 gin context 中取出鉴权时已存的 APIKeyRow。
@@ -89,7 +91,12 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
-	// 2. RPM
+	// 2. 客户端数量限制。默认不启用;observe 只记录不阻断,enforce 才拒绝。
+	if status, msg := h.enforceAPIKeyClientLimit(ctx, c, row.ID, limits); status != 0 {
+		return status, msg
+	}
+
+	// 3. RPM
 	if limits.RPM > 0 {
 		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
 		if err == nil && count >= int64(limits.RPM) {
@@ -98,7 +105,7 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 3. RPD
+	// 4. RPD
 	if limits.RPD > 0 {
 		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpd", apiKeyRPDWindow)
 		if err == nil && count >= int64(limits.RPD) {
@@ -107,7 +114,7 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 4. cost / token 5h & 7d
+	// 5. cost / token 5h & 7d
 	if limits.CostLimit5h > 0 || limits.TokenLimit5h > 0 {
 		usage, err := h.apiKeyWindowUsage(ctx, row.ID, "5h", apiKey5hWindow)
 		if err == nil && usage != nil {
@@ -164,6 +171,9 @@ func SendAPIKeyLimitError(c *gin.Context, status int, msg string) {
 	if status == http.StatusForbidden {
 		errType = api.ErrorTypePermission
 		errCode = api.ErrCodeInvalidRequest
+	} else if status == http.StatusBadRequest {
+		errType = api.ErrorTypeInvalidRequest
+		errCode = api.ErrCodeInvalidParameter
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
 }
@@ -198,6 +208,61 @@ func checkAPIKeyModel(model string, limits database.APIKeyLimits) string {
 		}
 	}
 	return ""
+}
+
+func (h *Handler) enforceAPIKeyClientLimit(ctx context.Context, c *gin.Context, apiKeyID int64, limits database.APIKeyLimits) (int, string) {
+	mode := strings.ToLower(strings.TrimSpace(limits.ClientLimitMode))
+	if limits.MaxClients <= 0 || (mode != database.APIKeyClientLimitModeObserve && mode != database.APIKeyClientLimitModeEnforce) {
+		return 0, ""
+	}
+	clientID := strings.TrimSpace(c.GetHeader("X-Client-Id"))
+	if clientID == "" {
+		if mode == database.APIKeyClientLimitModeEnforce {
+			return http.StatusBadRequest, "X-Client-Id header is required for this API key"
+		}
+		return 0, ""
+	}
+	if !validAPIKeyClientID(clientID) {
+		if mode == database.APIKeyClientLimitModeEnforce {
+			return http.StatusBadRequest, "X-Client-Id must be 8-128 characters and contain only letters, numbers, '.', '_', '-' or ':'"
+		}
+		return 0, ""
+	}
+	if h == nil || h.cache == nil {
+		return 0, ""
+	}
+	window := apiKeyClientDefaultWindow
+	if limits.ClientWindowMinutes > 0 {
+		window = time.Duration(limits.ClientWindowMinutes) * time.Minute
+	}
+	result, err := h.cache.TrackAPIKeyClient(ctx, apiKeyID, clientID, limits.MaxClients, window)
+	if err != nil || mode == database.APIKeyClientLimitModeObserve {
+		return 0, ""
+	}
+	if !result.Allowed {
+		return http.StatusTooManyRequests,
+			fmt.Sprintf("API key client limit exceeded: max %d clients in %d minutes",
+				limits.MaxClients, int(window/time.Minute))
+	}
+	return 0, ""
+}
+
+func validAPIKeyClientID(clientID string) bool {
+	if len(clientID) < 8 || len(clientID) > 128 {
+		return false
+	}
+	for _, r := range clientID {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		switch r {
+		case '.', '_', '-', ':':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // apiKeyWindowRequests 返回某 API Key 在指定窗口内的请求数。

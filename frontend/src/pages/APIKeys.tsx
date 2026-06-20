@@ -47,6 +47,7 @@ import {
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
+type ClientLimitMode = "off" | "observe" | "enforce";
 const DEFAULT_PUBLIC_ORIGIN = "https://codexapi.lechun.cc";
 const WINDOWS_TOOLKIT_PATH = "/downloads/codex-windows-toolkit.zip";
 const MAC_TOOLKIT_PATH = "/downloads/codex-mac-toolkit.zip";
@@ -77,6 +78,9 @@ interface LimitsFormState {
   rpm: string;
   rpd: string;
   maxConcurrency: string;
+  maxClients: string;
+  clientWindowMinutes: string;
+  clientLimitMode: ClientLimitMode;
   costLimit5h: string;
   costLimit7d: string;
   costLimit30d: string;
@@ -103,6 +107,9 @@ const emptyLimitsForm: LimitsFormState = {
   rpm: "",
   rpd: "",
   maxConcurrency: "",
+  maxClients: "",
+  clientWindowMinutes: "",
+  clientLimitMode: "off",
   costLimit5h: "",
   costLimit7d: "",
   costLimit30d: "",
@@ -1386,6 +1393,9 @@ function buildAPIKeysCSV(
     t("apiKeys.exportModelDeny"),
     t("apiKeys.exportRPM"),
     t("apiKeys.exportRPD"),
+    t("apiKeys.exportClientLimitMode"),
+    t("apiKeys.exportMaxClients"),
+    t("apiKeys.exportClientWindowMinutes"),
     t("apiKeys.exportCostLimit5h"),
     t("apiKeys.exportCostLimit7d"),
     t("apiKeys.exportTokenLimit5h"),
@@ -1406,6 +1416,9 @@ function buildAPIKeysCSV(
       (limits.model_deny ?? []).join("; "),
       formatOptionalNumber(limits.rpm),
       formatOptionalNumber(limits.rpd),
+      limits.client_limit_mode ? t(`apiKeys.limits.clientModes.${limits.client_limit_mode}`) : "",
+      formatOptionalNumber(limits.max_clients),
+      formatOptionalNumber(limits.client_window_minutes),
       formatOptionalNumber(limits.cost_limit_5h),
       formatOptionalNumber(limits.cost_limit_7d),
       formatOptionalNumber(limits.token_limit_5h),
@@ -1489,6 +1502,18 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.max_concurrency && limits.max_concurrency > 0
         ? String(limits.max_concurrency)
         : "",
+    maxClients:
+      limits.max_clients && limits.max_clients > 0
+        ? String(limits.max_clients)
+        : "",
+    clientWindowMinutes:
+      limits.client_window_minutes && limits.client_window_minutes > 0
+        ? String(limits.client_window_minutes)
+        : "",
+    clientLimitMode:
+      limits.client_limit_mode === "observe" || limits.client_limit_mode === "enforce"
+        ? limits.client_limit_mode
+        : "off",
     costLimit5h:
       limits.cost_limit_5h && limits.cost_limit_5h > 0
         ? String(limits.cost_limit_5h)
@@ -1549,12 +1574,16 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     const n = Number(s.trim());
     return Number.isInteger(n) && n > 0 ? n : 0;
   };
+  const clientLimitEnabled = form.clientLimitMode !== "off";
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
     max_concurrency: intNum(form.maxConcurrency),
+    max_clients: clientLimitEnabled ? intNum(form.maxClients) : 0,
+    client_window_minutes: clientLimitEnabled ? intNum(form.clientWindowMinutes) : 0,
+    client_limit_mode: clientLimitEnabled ? form.clientLimitMode : "off",
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
     cost_limit_30d: num(form.costLimit30d),
@@ -1812,6 +1841,9 @@ function LimitsEditor({
     value.rpm !== "" ||
     value.rpd !== "" ||
     value.maxConcurrency !== "" ||
+    value.clientLimitMode !== "off" ||
+    value.maxClients !== "" ||
+    value.clientWindowMinutes !== "" ||
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.costLimit30d !== "" ||
@@ -1825,6 +1857,14 @@ function LimitsEditor({
         label: t(`apiKeys.limits.tokenUnits.${unit}`),
         triggerLabel: t(`apiKeys.limits.tokenUnitShort.${unit}`),
         value: unit,
+      })),
+    [t],
+  );
+  const clientLimitModeOptions = useMemo(
+    () =>
+      (["off", "observe", "enforce"] as ClientLimitMode[]).map((mode) => ({
+        label: t(`apiKeys.limits.clientModes.${mode}`),
+        value: mode,
       })),
     [t],
   );
@@ -1884,6 +1924,29 @@ function LimitsEditor({
               onChange={(maxConcurrency) => patch({ maxConcurrency })}
               suffix={t("apiKeys.limits.concurrencySuffix")}
             />
+            <div className="space-y-1">
+              <label className="text-[11px] font-medium text-muted-foreground">
+                {t("apiKeys.limits.clientLimitMode")}
+              </label>
+              <Select
+                value={value.clientLimitMode}
+                onValueChange={(clientLimitMode) => patch({ clientLimitMode: clientLimitMode as ClientLimitMode })}
+                options={clientLimitModeOptions}
+                compact
+              />
+            </div>
+            <LimitNumberField
+              label={t("apiKeys.limits.maxClients")}
+              value={value.maxClients}
+              onChange={(maxClients) => patch({ maxClients })}
+              suffix={t("apiKeys.limits.clientsSuffix")}
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.clientWindowMinutes")}
+              value={value.clientWindowMinutes}
+              onChange={(clientWindowMinutes) => patch({ clientWindowMinutes })}
+              suffix={t("apiKeys.limits.minutesSuffix")}
+            />
             <LimitNumberField
               label={t("apiKeys.limits.cost5h")}
               value={value.costLimit5h}
@@ -1906,6 +1969,9 @@ function LimitsEditor({
               step="0.01"
             />
           </div>
+          <p className="text-[10px] text-muted-foreground">
+            {t("apiKeys.limits.clientLimitHint")}
+          </p>
         </div>
     );
 

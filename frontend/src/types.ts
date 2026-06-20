@@ -1046,6 +1046,9 @@ export interface APIKeyLimits {
   rpm?: number
   rpd?: number
   max_concurrency?: number
+  max_clients?: number
+  client_window_minutes?: number
+  client_limit_mode?: 'off' | 'observe' | 'enforce'
   cost_limit_5h?: number
   cost_limit_7d?: number
   cost_limit_30d?: number

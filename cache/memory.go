@@ -29,6 +29,11 @@ type memoryRuntimeEntry struct {
 	expiresAt time.Time
 }
 
+type memoryAPIKeyClientEntry struct {
+	clients   map[string]struct{}
+	expiresAt time.Time
+}
+
 // MemoryTokenCache 为单机轻量部署提供进程内 token 缓存和刷新锁。
 // 重启后缓存丢失属于预期行为。
 type MemoryTokenCache struct {
@@ -38,6 +43,7 @@ type MemoryTokenCache struct {
 	sessions  map[string]memorySessionAffinityEntry
 	responses map[string]memoryResponseContextEntry
 	runtime   map[string]memoryRuntimeEntry
+	clients   map[int64]memoryAPIKeyClientEntry
 	poolSize  int
 }
 
@@ -52,6 +58,7 @@ func NewMemory(poolSize int) TokenCache {
 		sessions:  make(map[string]memorySessionAffinityEntry),
 		responses: make(map[string]memoryResponseContextEntry),
 		runtime:   make(map[string]memoryRuntimeEntry),
+		clients:   make(map[int64]memoryAPIKeyClientEntry),
 		poolSize:  poolSize,
 	}
 	// 启动后台定时清理过期 token 和过期锁，防止已删除账号的条目永驻内存
@@ -89,6 +96,11 @@ func (tc *MemoryTokenCache) cleanupLoop() {
 		for key, entry := range tc.runtime {
 			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
 				delete(tc.runtime, key)
+			}
+		}
+		for key, entry := range tc.clients {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.clients, key)
 			}
 		}
 		tc.mu.Unlock()
@@ -397,4 +409,36 @@ func (tc *MemoryTokenCache) DeleteRuntime(ctx context.Context, namespace string,
 	delete(tc.runtime, mapKey)
 	tc.mu.Unlock()
 	return nil
+}
+
+func (tc *MemoryTokenCache) TrackAPIKeyClient(ctx context.Context, apiKeyID int64, clientID string, maxClients int, ttl time.Duration) (APIKeyClientLimitResult, error) {
+	clientID = strings.TrimSpace(clientID)
+	if apiKeyID <= 0 || clientID == "" || maxClients <= 0 {
+		return APIKeyClientLimitResult{Allowed: true}, nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	entry, ok := tc.clients[apiKeyID]
+	if !ok || (!entry.expiresAt.IsZero() && now.After(entry.expiresAt)) {
+		entry = memoryAPIKeyClientEntry{
+			clients: make(map[string]struct{}),
+		}
+	}
+	entry.expiresAt = now.Add(ttl)
+	if _, exists := entry.clients[clientID]; exists {
+		tc.clients[apiKeyID] = entry
+		return APIKeyClientLimitResult{Allowed: true, Count: int64(len(entry.clients))}, nil
+	}
+	if len(entry.clients) >= maxClients {
+		tc.clients[apiKeyID] = entry
+		return APIKeyClientLimitResult{Allowed: false, Count: int64(len(entry.clients))}, nil
+	}
+	entry.clients[clientID] = struct{}{}
+	tc.clients[apiKeyID] = entry
+	return APIKeyClientLimitResult{Allowed: true, Count: int64(len(entry.clients))}, nil
 }

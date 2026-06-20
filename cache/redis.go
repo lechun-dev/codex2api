@@ -333,6 +333,10 @@ func runtimeValueKey(namespace, raw string) string {
 	return runtimeHashKey("codex:runtime:"+runtimeNamespace(namespace)+":", raw)
 }
 
+func apiKeyClientsKey(apiKeyID int64) string {
+	return fmt.Sprintf("codex:api-key-clients:%d", apiKeyID)
+}
+
 func (tc *redisTokenCache) SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error {
 	key = strings.TrimSpace(key)
 	if key == "" || binding.AccountID == 0 {
@@ -460,4 +464,64 @@ func (tc *redisTokenCache) DeleteRuntime(ctx context.Context, namespace string, 
 		return nil
 	}
 	return tc.client.Del(ctx, runtimeValueKey(namespace, key)).Err()
+}
+
+func (tc *redisTokenCache) TrackAPIKeyClient(ctx context.Context, apiKeyID int64, clientID string, maxClients int, ttl time.Duration) (APIKeyClientLimitResult, error) {
+	clientID = strings.TrimSpace(clientID)
+	if apiKeyID <= 0 || clientID == "" || maxClients <= 0 {
+		return APIKeyClientLimitResult{Allowed: true}, nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	ttlSeconds := int64(ttl.Seconds())
+	if ttlSeconds <= 0 {
+		ttlSeconds = 1
+	}
+	const script = `
+local max_clients = tonumber(ARGV[1])
+local ttl_seconds = tonumber(ARGV[2])
+local client_id = ARGV[3]
+if max_clients <= 0 or client_id == "" then
+  return {1, 0}
+end
+if redis.call("SISMEMBER", KEYS[1], client_id) == 1 then
+  redis.call("EXPIRE", KEYS[1], ttl_seconds)
+  return {1, redis.call("SCARD", KEYS[1])}
+end
+local count = tonumber(redis.call("SCARD", KEYS[1]))
+if count >= max_clients then
+  redis.call("EXPIRE", KEYS[1], ttl_seconds)
+  return {0, count}
+end
+redis.call("SADD", KEYS[1], client_id)
+redis.call("EXPIRE", KEYS[1], ttl_seconds)
+return {1, count + 1}
+`
+	result, err := tc.client.Eval(ctx, script, []string{apiKeyClientsKey(apiKeyID)}, maxClients, ttlSeconds, clientID).Result()
+	if err != nil {
+		return APIKeyClientLimitResult{}, err
+	}
+	values, ok := result.([]interface{})
+	if !ok || len(values) < 2 {
+		return APIKeyClientLimitResult{Allowed: true}, nil
+	}
+	allowed := redisInt64(values[0]) == 1
+	count := redisInt64(values[1])
+	return APIKeyClientLimitResult{Allowed: allowed, Count: count}, nil
+}
+
+func redisInt64(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case string:
+		var out int64
+		_, _ = fmt.Sscan(n, &out)
+		return out
+	default:
+		return 0
+	}
 }

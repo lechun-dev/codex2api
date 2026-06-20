@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -91,11 +93,21 @@ type Engine struct {
 	cfg            Config
 	patterns       []compiledPattern
 	sensitiveWords []string
+	literalIndex   *literalIndex
 }
 
 type compiledPattern struct {
-	cfg PatternConfig
-	re  *regexp.Regexp
+	cfg      PatternConfig
+	re       *regexp.Regexp
+	requires []string
+}
+
+type literalIndex struct {
+	literals []literalNeedle
+}
+
+type literalNeedle struct {
+	text string
 }
 
 func DefaultConfig() Config {
@@ -205,6 +217,51 @@ func NormalizeConfig(cfg Config) Config {
 	return cfg
 }
 
+var engineCache sync.Map // map[string]*Engine
+
+func engineForConfig(cfg Config) (*Engine, error) {
+	key := engineCacheKey(cfg)
+	if cached, ok := engineCache.Load(key); ok {
+		return cached.(*Engine), nil
+	}
+	engine, err := NewEngine(cfg)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := engineCache.LoadOrStore(key, engine)
+	return actual.(*Engine), nil
+}
+
+func engineCacheKey(cfg Config) string {
+	cfg = NormalizeConfig(cfg)
+	key := struct {
+		Enabled          bool            `json:"enabled"`
+		Mode             string          `json:"mode"`
+		Threshold        int             `json:"threshold"`
+		StrictThreshold  int             `json:"strict_threshold"`
+		LogMatches       bool            `json:"log_matches"`
+		MaxTextLength    int             `json:"max_text_length"`
+		SensitiveWords   string          `json:"sensitive_words"`
+		CustomPatterns   []PatternConfig `json:"custom_patterns"`
+		DisabledPatterns []string        `json:"disabled_patterns"`
+	}{
+		Enabled:          cfg.Enabled,
+		Mode:             cfg.Mode,
+		Threshold:        cfg.Threshold,
+		StrictThreshold:  cfg.StrictThreshold,
+		LogMatches:       cfg.LogMatches,
+		MaxTextLength:    cfg.MaxTextLength,
+		SensitiveWords:   cfg.SensitiveWords,
+		CustomPatterns:   cfg.CustomPatterns,
+		DisabledPatterns: cfg.DisabledPatterns,
+	}
+	data, err := json.Marshal(key)
+	if err != nil {
+		return fmt.Sprintf("%t|%s|%d|%d|%t|%d|%s|%s|%s", cfg.Enabled, cfg.Mode, cfg.Threshold, cfg.StrictThreshold, cfg.LogMatches, cfg.MaxTextLength, cfg.SensitiveWords, MarshalCustomPatterns(cfg.CustomPatterns), MarshalDisabledPatterns(cfg.DisabledPatterns))
+	}
+	return string(data)
+}
+
 func NewEngine(cfg Config) (*Engine, error) {
 	cfg = NormalizeConfig(cfg)
 	disabled := disabledPatternSet(cfg.DisabledPatterns)
@@ -229,19 +286,167 @@ func NewEngine(cfg Config) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("compile pattern %q: %w", pattern.Name, err)
 		}
-		patterns = append(patterns, compiledPattern{cfg: pattern, re: re})
+		patterns = append(patterns, compiledPattern{
+			cfg:      pattern,
+			re:       re,
+			requires: patternRequires(pattern.Pattern),
+		})
 	}
+	sensitiveWords := parseSensitiveWords(cfg.SensitiveWords)
 
 	return &Engine{
 		cfg:            cfg,
 		patterns:       patterns,
-		sensitiveWords: parseSensitiveWords(cfg.SensitiveWords),
+		sensitiveWords: sensitiveWords,
+		literalIndex:   buildLiteralIndex(patterns, sensitiveWords),
 	}, nil
 }
 
 func BuiltinPatternConfigs() []PatternConfig {
 	out := make([]PatternConfig, len(defaultPatternConfigs))
 	copy(out, defaultPatternConfigs)
+	return out
+}
+
+func patternShouldRun(text string, pattern compiledPattern, literalHits map[string]bool) bool {
+	for _, required := range pattern.requires {
+		if !literalMatched(text, literalHits, required) {
+			return false
+		}
+	}
+	return true
+}
+
+func literalMatched(text string, literalHits map[string]bool, literal string) bool {
+	if literal == "" {
+		return true
+	}
+	if literalHits != nil {
+		return literalHits[literal]
+	}
+	return strings.Contains(text, literal)
+}
+
+func (idx *literalIndex) match(text string) map[string]bool {
+	if idx == nil || len(idx.literals) == 0 || text == "" {
+		return nil
+	}
+	hits := make(map[string]bool, len(idx.literals))
+	for _, literal := range idx.literals {
+		if strings.Contains(text, literal.text) {
+			hits[literal.text] = true
+		}
+	}
+	return hits
+}
+
+func buildLiteralIndex(patterns []compiledPattern, sensitiveWords []string) *literalIndex {
+	index := &literalIndex{}
+	seen := map[string]int{}
+	add := func(text string) int {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return -1
+		}
+		if existing, ok := seen[text]; ok {
+			return existing
+		}
+		id := len(index.literals)
+		seen[text] = id
+		index.literals = append(index.literals, literalNeedle{text: text})
+		return id
+	}
+	for _, pattern := range patterns {
+		for _, literal := range pattern.requires {
+			add(literal)
+		}
+	}
+	for _, word := range sensitiveWords {
+		add(word)
+	}
+	return index
+}
+
+func patternRequires(pattern string) []string {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	return regexpRequiredLiterals(parsed.Simplify())
+}
+
+func regexpRequiredLiterals(re *syntax.Regexp) []string {
+	literals := requiredLiteralSet(re)
+	return sortedLiteralSet(literals, 4)
+}
+
+func requiredLiteralSet(re *syntax.Regexp) map[string]struct{} {
+	if re == nil {
+		return nil
+	}
+	switch re.Op {
+	case syntax.OpLiteral:
+		return literalSetFromRunes(re.Rune, 4)
+	case syntax.OpCapture, syntax.OpPlus:
+		return requiredLiteralSet(re.Sub[0])
+	case syntax.OpConcat:
+		out := map[string]struct{}{}
+		for _, sub := range re.Sub {
+			for literal := range requiredLiteralSet(sub) {
+				out[literal] = struct{}{}
+			}
+		}
+		return out
+	case syntax.OpAlternate:
+		var common map[string]struct{}
+		for _, sub := range re.Sub {
+			literals := requiredLiteralSet(sub)
+			if common == nil {
+				common = literals
+				continue
+			}
+			for literal := range common {
+				if _, ok := literals[literal]; !ok {
+					delete(common, literal)
+				}
+			}
+		}
+		return common
+	}
+	return nil
+}
+
+func literalSetFromRunes(runes []rune, minRunes int) map[string]struct{} {
+	literal := normalizeForScan(string(runes))
+	if utf8.RuneCountInString(literal) < minRunes {
+		return nil
+	}
+	return map[string]struct{}{literal: {}}
+}
+
+func sortedLiteralSet(literals map[string]struct{}, minRunes int) []string {
+	if len(literals) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(literals))
+	seen := map[string]struct{}{}
+	for literal := range literals {
+		literal = strings.TrimSpace(literal)
+		if utf8.RuneCountInString(literal) < minRunes {
+			continue
+		}
+		if _, ok := seen[literal]; ok {
+			continue
+		}
+		seen[literal] = struct{}{}
+		out = append(out, literal)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i]) == len(out[j]) {
+			return out[i] < out[j]
+		}
+		return len(out[i]) > len(out[j])
+	})
 	return out
 }
 
@@ -265,7 +470,7 @@ func InspectText(text string, cfg Config) Verdict {
 		return verdict
 	}
 
-	engine, err := NewEngine(cfg)
+	engine, err := engineForConfig(cfg)
 	if err != nil {
 		verdict.Reason = err.Error()
 		return verdict
@@ -310,11 +515,12 @@ func (e *Engine) InspectText(text string) Verdict {
 	matchesByName := map[string]Match{}
 	rawScore := 0
 	strictScore := 0
+	literalHits := e.literalIndex.match(scanText)
 	for _, word := range e.sensitiveWords {
 		if word == "" {
 			continue
 		}
-		if strings.Contains(scanText, word) {
+		if literalMatched(scanText, literalHits, word) {
 			match := Match{Name: "sensitive_word", Weight: 100, Category: "sensitive_word", Strict: true}
 			_, context := matchContextFromLiteral(scanText, word)
 			recordContext(context)
@@ -322,6 +528,9 @@ func (e *Engine) InspectText(text string) Verdict {
 		}
 	}
 	for _, pattern := range e.patterns {
+		if !patternShouldRun(scanText, pattern, literalHits) {
+			continue
+		}
 		if loc := pattern.re.FindStringIndex(scanText); loc != nil {
 			match := Match{
 				Name:     pattern.cfg.Name,
@@ -351,8 +560,10 @@ func (e *Engine) InspectText(text string) Verdict {
 	})
 
 	score := rawScore
+	contextDiscount := 0
 	if rawScore > 0 {
-		score -= defensiveContextDiscount(scanText)
+		contextDiscount = defensiveContextDiscount(scanText)
+		score -= contextDiscount
 		if score < 0 {
 			score = 0
 		}
@@ -685,11 +896,11 @@ func defensiveContextDiscount(text string) int {
 	discount := 0
 	for _, pattern := range defensiveContextPatterns {
 		if pattern.MatchString(text) {
-			discount += 15
+			discount += 30
 		}
 	}
-	if discount > 45 {
-		return 45
+	if discount > 90 {
+		return 90
 	}
 	return discount
 }

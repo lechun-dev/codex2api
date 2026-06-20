@@ -3,7 +3,7 @@ package promptfilter
 import "regexp"
 
 var defaultPatternConfigs = []PatternConfig{
-	{Name: "credential_theft", Pattern: `(?i)\b(steal|dump|extract|exfiltrate)\s+(credentials?|passwords?|tokens?|cookies?)\b`, Weight: 100, Category: "malicious", Strict: true},
+	{Name: "credential_theft", Pattern: `(?i)(?:^|[.!?。！？]\s*)(steal|dump|extract|exfiltrate|harvest|grab)\b.{0,50}\b(?:credentials?|passwords?|tokens?|cookies?)\b|\b(write|generate|create|give|build|craft|make|show|provide|implement|code|script|tool|steps?|instructions?|how\s+to|how\s+(?:can|do)\s+i|help\s+me|i\s+want\s+to|please|can\s+you)\b.{0,100}\b(steal|dump|extract|exfiltrate|harvest|grab)\b.{0,50}\b(?:credentials?|passwords?|tokens?|cookies?)\b|(?:写|生成|给我|构造|制作|提供|实现).{0,50}(窃取|导出|转储|提取).{0,30}(凭证|密码|令牌|token|cookie)`, Weight: 100, Category: "malicious", Strict: true},
 	{Name: "malware_family", Pattern: `(?i)\b(keylogger|ransomware|trojan|backdoor|botnet|infostealer)\b`, Weight: 80, Category: "malware", Strict: true},
 	{Name: "evasion", Pattern: `(?i)\b(bypass|disable|evade)\s+(av|edr|defender|antivirus|endpoint\s+detection)\b|免杀|绕过\s*(杀软|edr)`, Weight: 80, Category: "evasion", Strict: true},
 	{Name: "persistence", Pattern: `(?i)\b(persistence|persist(?:ent)?\s+access|startup\s+persistence|registry\s+run\s+key)\b`, Weight: 35, Category: "post_exploitation"},

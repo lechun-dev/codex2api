@@ -96,12 +96,16 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenMode:                   proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			AutoPause5hGuardBandPercent:      5,
+			AutoPause5hGuardConcurrency:      1,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -134,12 +138,16 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenMode:                   proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			AutoPause5hGuardBandPercent:      5,
+			AutoPause5hGuardConcurrency:      1,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -188,7 +196,7 @@ func main() {
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
-	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_timeout=%ds billing_tier_policy=%s",
+	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_mode=%s first_token_timeout=%ds billing_tier_policy=%s",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
 		db.GetUsageLogMode(),
@@ -196,6 +204,7 @@ func main() {
 		db.GetUsageLogFlushIntervalSeconds(),
 		runtimeSettings.StreamFlushPolicy,
 		runtimeSettings.StreamFlushIntervalMS,
+		runtimeSettings.FirstTokenMode,
 		runtimeSettings.FirstTokenTimeoutSec,
 		runtimeSettings.BillingTierPolicy,
 	)
@@ -252,6 +261,11 @@ func main() {
 	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// 默认信任本机回环与常见私有网段，兼顾同机 / Docker WAF 反代获取真实 IP 与公网直连防伪造；
+	// 如需收紧或扩展可信代理范围，可通过 CODEX_TRUSTED_PROXIES 显式配置 CIDR/IP。
+	if err := configureTrustedProxies(r, cfg.TrustedProxies); err != nil {
+		log.Fatalf("配置可信代理失败: %v", err)
+	}
 	r.Use(api.RecoveryMiddleware())
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
@@ -287,6 +301,7 @@ func main() {
 	log.Printf("单账号并发上限: %d", settings.MaxConcurrency)
 
 	handler.RegisterRoutes(r)
+	adminHandler.RegisterExternalImageRoutes(r, handler)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -298,7 +313,7 @@ func main() {
 		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
 		indexHTML, _ := fs.ReadFile(subFS, "index.html")
 
-		serveAdmin := func(c *gin.Context) {
+		serveFrontend := func(c *gin.Context) {
 			fp := c.Param("filepath")
 			// 尝试打开请求的文件（排除目录和根路径）
 			if fp != "/" && len(fp) > 1 {
@@ -315,12 +330,32 @@ func main() {
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
+		serveKeyUsageFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicAPIKeyUsagePageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取 API Key 自助用量页开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
 
 		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
-		r.GET("/admin", serveAdmin)
-		r.GET("/admin/*filepath", serveAdmin)
-		r.HEAD("/admin", serveAdmin)
-		r.HEAD("/admin/*filepath", serveAdmin)
+		r.GET("/admin", serveFrontend)
+		r.GET("/admin/*filepath", serveFrontend)
+		r.HEAD("/admin", serveFrontend)
+		r.HEAD("/admin/*filepath", serveFrontend)
+		r.GET("/key-usage", serveKeyUsageFrontend)
+		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
+		r.HEAD("/key-usage", serveKeyUsageFrontend)
+		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
 
 		serveDownload := func(c *gin.Context) {
 			fileName := strings.TrimPrefix(c.Param("filepath"), "/")
@@ -363,10 +398,12 @@ func main() {
 	log.Printf("  Listen: %s", addr)
 	log.Printf("  HTTP:   http://%s:%d", displayHost, cfg.Port)
 	log.Printf("  管理台: http://%s:%d/admin/", displayHost, cfg.Port)
+	log.Printf("  Key用量: http://%s:%d/key-usage", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
-	log.Printf("  API:    POST /v1/images/edits")
+	log.Printf("  API:    POST /v1/images/jobs")
+	log.Printf("  API:    GET  /v1/images/jobs/:id")
 	log.Printf("  API:    POST /v1/messages")
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
@@ -401,6 +438,14 @@ func main() {
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
+}
+
+// configureTrustedProxies 配置 Gin 的可信代理列表。
+func configureTrustedProxies(r *gin.Engine, proxies []string) error {
+	if r == nil {
+		return nil
+	}
+	return r.SetTrustedProxies(proxies)
 }
 
 // loggerMiddleware 简单日志中间件（增强版，支持敏感信息脱敏）

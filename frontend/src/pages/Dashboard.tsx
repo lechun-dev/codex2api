@@ -8,7 +8,9 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
-import type { StatsResponse, UsageStats, ChartAggregation, UsageLog } from '../types'
+import TimeRangeSelector from '../components/TimeRangeSelector'
+import SystemHealthBar from '../components/SystemHealthBar'
+import type { StatsResponse, SystemSettings, UsageStats, ChartAggregation, UsageLog } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
@@ -57,23 +59,37 @@ export default function Dashboard() {
   const [recentErrors, setRecentErrors] = useState<UsageLog[]>([])
   const [recentErrorsLoading, setRecentErrorsLoading] = useState(true)
   const chartAbort = useRef<AbortController | null>(null)
+  const timeRangeRef = useRef<TimeRangeKey>(timeRange)
+  const usageStatsRangeInitialized = useRef(false)
 
   // 仅加载轻量级统计数据（秒级响应）
   const loadDashboardStats = useCallback(async () => {
-    const [stats, usageStats] = await Promise.all([
+    const { start, end } = getTimeRangeISO(timeRangeRef.current)
+    const [stats, usageStats, settings] = await Promise.all([
       api.getStats(),
-      api.getUsageStats(),
+      api.getUsageStats({ start, end }),
+      api.getSettings().catch((): SystemSettings | null => null),
     ])
-    return { stats, usageStats }
+    return { stats, usageStats, settings }
   }, [])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: StatsResponse | null
     usageStats: UsageStats | null
+    settings: SystemSettings | null
   }>({
-    initialData: { stats: null, usageStats: null },
+    initialData: { stats: null, usageStats: null, settings: null },
     load: loadDashboardStats,
   })
+
+  useEffect(() => {
+    timeRangeRef.current = timeRange
+    if (!usageStatsRangeInitialized.current) {
+      usageStatsRangeInitialized.current = true
+      return
+    }
+    void reloadSilently()
+  }, [timeRange, reloadSilently])
 
   // 加载服务端聚合的图表数据（12~48 个聚合点，非原始行）
   const loadChartData = useCallback(async () => {
@@ -136,7 +152,8 @@ export default function Dashboard() {
     return () => window.clearInterval(timer)
   }, [reloadSilently, timeRange, loadChartData, loadRecentErrors])
 
-  const { stats, usageStats } = data
+  const { stats, usageStats, settings } = data
+  const showFullUsageNumbers = settings?.show_full_usage_numbers ?? false
   const total = stats?.total ?? 0
   const available = stats?.available ?? 0
   const rateLimited = stats?.rate_limited ?? 0
@@ -166,6 +183,12 @@ export default function Dashboard() {
           title={t('dashboard.title')}
           description={t('dashboard.description')}
           onRefresh={() => { void reload(); void loadChartData(); void loadRecentErrors() }}
+          actions={
+            <TimeRangeSelector
+              timeRange={timeRange}
+              onTimeRangeChange={setTimeRange}
+            />
+          }
         />
 
         {/* Account status */}
@@ -187,10 +210,19 @@ export default function Dashboard() {
           <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
         </div>
 
+        {/* System health */}
+        <div className="mb-6">
+          <SystemHealthBar chartData={chartData} timeRange={timeRange} loading={chartLoading} />
+        </div>
+
         {/* Usage stats */}
         {usageStats && (
           <div className="space-y-6">
-            <UsageStatsSummary stats={usageStats} />
+            <UsageStatsSummary
+              stats={usageStats}
+              rangeLabel={t(`dashboard.timeRange${timeRange.toUpperCase()}`)}
+              showFullUsageNumbers={showFullUsageNumbers}
+            />
             <DashboardErrorDetails logs={recentErrors} loading={recentErrorsLoading} />
             <Suspense fallback={<ChartsSkeleton />}>
               <DashboardUsageCharts
@@ -198,7 +230,6 @@ export default function Dashboard() {
                 refreshedAt={chartRefreshedAt}
                 refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
                 timeRange={timeRange}
-                onTimeRangeChange={setTimeRange}
                 loading={chartLoading}
               />
             </Suspense>

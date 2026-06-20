@@ -136,7 +136,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		t.Fatalf("unexpected API key row: %#v", row)
 	}
 
-	groupID, err := db.CreateAccountGroup(ctx, groupName, "integration", "#123456")
+	groupID, err := db.CreateAccountGroup(ctx, groupName, "integration", "#123456", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup failed: %v", err)
 	}

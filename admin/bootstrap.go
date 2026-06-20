@@ -360,11 +360,15 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		UsageLogFlushIntervalSeconds:     5,
 		StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 		StreamFlushIntervalMS:            20,
+		FirstTokenMode:                   proxy.FirstTokenModeStrict,
 		FirstTokenTimeoutSeconds:         0,
 		BillingTierPolicy:                proxy.BillingTierPolicyActual,
 		AffinityMode:                     "bounded",
+		PublicKeyUsagePageEnabled:        true,
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          2,
+		AutoPause5hGuardBandPercent:      5,
+		AutoPause5hGuardConcurrency:      1,
 	}
 }

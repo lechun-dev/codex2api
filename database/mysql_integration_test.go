@@ -27,13 +27,93 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	proxyURL := "http://127.0.0.1:18080/" + suffix
 	modelID := "mysql-smoke-model-" + suffix
 	templateName := "mysql-smoke-template-" + suffix
+	previousSettings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings before smoke failed: %v", err)
+	}
 	t.Cleanup(func() {
+		if previousSettings != nil {
+			_ = db.UpdateSystemSettings(ctx, previousSettings)
+		} else {
+			_, _ = db.conn.ExecContext(ctx, "DELETE FROM system_settings WHERE id = 1")
+		}
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id IN (SELECT id FROM account_groups WHERE name = ?)", groupName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM image_prompt_templates WHERE name = ?", templateName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM model_registry WHERE id = ?", modelID)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM proxies WHERE url = ?", proxyURL)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_groups WHERE name = ?", groupName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM api_keys WHERE `key` = ?", smokeKey)
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM accounts WHERE name IN (?, ?)", "mysql smoke account "+suffix, "mysql smoke responses "+suffix)
 	})
+
+	settings := &SystemSettings{
+		SiteName:                           "mysql smoke " + suffix,
+		SiteLogo:                           "https://example.test/logo.png",
+		BackgroundConfig:                   `{"image":"https://example.test/bg.png","opacity":20}`,
+		MaxConcurrency:                     3,
+		GlobalRPM:                          11,
+		TestModel:                          "gpt-5.4",
+		TestConcurrency:                    7,
+		ProxyURL:                           proxyURL,
+		PgMaxConns:                         12,
+		RedisPoolSize:                      13,
+		AdminSecret:                        "mysql-smoke-secret",
+		BackgroundRefreshIntervalMinutes:   4,
+		UsageProbeMaxAgeMinutes:            5,
+		UsageProbeConcurrency:              6,
+		UsageProbeResponsesFallbackEnabled: false,
+		RecoveryProbeIntervalMinutes:       8,
+		ModelMapping:                       "{}",
+		CodexModelMapping:                  "{}",
+		ReasoningEffortModels:              "[]",
+		ClientCompatMode:                   "responses",
+		CodexMinCLIVersion:                 "0.119.0",
+		UsageLogMode:                       "minimal",
+		UsageLogBatchSize:                  33,
+		UsageLogFlushIntervalSeconds:       9,
+		StreamFlushPolicy:                  "buffered",
+		StreamFlushIntervalMS:              44,
+		FirstTokenTimeoutSeconds:           55,
+		BillingTierPolicy:                  "requested",
+		ImageStorageConfig:                 `{"backend":"local"}`,
+		ShowFullUsageNumbers:               true,
+		SchedulerMode:                      "weighted",
+		AffinityMode:                       "strict",
+		CodexForceWebsocket:                true,
+		CodexWSKeepaliveEnabled:            true,
+		CodexWSKeepaliveIntervalSec:        66,
+		CodexWSHideUpstreamErrors:          false,
+		CodexWSSilentRetryEnabled:          false,
+		CodexWSSilentMaxRetries:            4,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings failed: %v", err)
+	}
+	savedSettings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings failed: %v", err)
+	}
+	if savedSettings == nil {
+		t.Fatal("GetSystemSettings returned nil")
+	}
+	if savedSettings.FirstTokenTimeoutSeconds != 55 ||
+		savedSettings.StreamFlushPolicy != "buffered" ||
+		savedSettings.StreamFlushIntervalMS != 44 ||
+		savedSettings.ClientCompatMode != "responses" ||
+		savedSettings.CodexMinCLIVersion != "0.119.0" ||
+		savedSettings.UsageLogMode != "minimal" ||
+		savedSettings.UsageLogBatchSize != 33 ||
+		savedSettings.UsageLogFlushIntervalSeconds != 9 ||
+		savedSettings.SchedulerMode != "weighted" ||
+		savedSettings.AffinityMode != "strict" ||
+		savedSettings.CodexForceWebsocket != true ||
+		savedSettings.CodexWSKeepaliveEnabled != true ||
+		savedSettings.CodexWSKeepaliveIntervalSec != 66 ||
+		savedSettings.CodexWSHideUpstreamErrors != false ||
+		savedSettings.CodexWSSilentRetryEnabled != false ||
+		savedSettings.CodexWSSilentMaxRetries != 4 {
+		t.Fatalf("system settings were not persisted correctly: %#v", savedSettings)
+	}
 
 	keyID, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
 		Name:            "mysql smoke key",
@@ -62,6 +142,67 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	}
 	if groupID <= 0 {
 		t.Fatalf("groupID = %d, want positive", groupID)
+	}
+
+	accountID, err := db.InsertAccountWithCredentials(ctx, "mysql smoke account "+suffix, map[string]interface{}{
+		"refresh_token": "rt-smoke-" + suffix,
+	}, proxyURL)
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials failed: %v", err)
+	}
+	if err := db.UpdateAccountSchedulerMetadata(ctx, accountID,
+		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 17, Valid: true}},
+		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 19, Valid: true}},
+		OptionalBool{Set: true, Value: true},
+		OptionalInt64Slice{Set: true, Values: []int64{keyID}},
+		OptionalStringSlice{Set: true, Values: []string{"smoke", "mysql"}},
+		OptionalInt64Slice{Set: true, Values: []int64{groupID}},
+		OptionalString{Set: true, Value: proxyURL + "/updated"},
+		map[string]interface{}{"auto_pause_5h_disabled": true},
+	); err != nil {
+		t.Fatalf("UpdateAccountSchedulerMetadata failed: %v", err)
+	}
+	account, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID failed: %v", err)
+	}
+	if !account.ScoreBiasOverride.Valid || account.ScoreBiasOverride.Int64 != 17 ||
+		!account.BaseConcurrencyOverride.Valid || account.BaseConcurrencyOverride.Int64 != 19 ||
+		!account.SkipWarmTier ||
+		account.ProxyURL != proxyURL+"/updated" ||
+		!account.GetCredentialBool("auto_pause_5h_disabled") ||
+		len(account.GetCredentialInt64Slice("allowed_api_key_ids")) != 1 ||
+		account.GetCredentialInt64Slice("allowed_api_key_ids")[0] != keyID {
+		t.Fatalf("account metadata was not persisted correctly: %#v", account)
+	}
+
+	responsesID, err := db.InsertOpenAIResponsesAccount(ctx, "mysql smoke responses "+suffix, map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"base_url":      "https://api.example.test",
+		"api_key":       "sk-smoke-old",
+		"models":        []string{"gpt-5.4"},
+	}, proxyURL)
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount failed: %v", err)
+	}
+	if err := db.UpdateOpenAIResponsesAccount(ctx, responsesID, "mysql smoke responses "+suffix, map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"base_url":      "https://api2.example.test",
+		"api_key":       "sk-smoke-new",
+		"models":        []string{"gpt-5.4", "gpt-5.5"},
+		"plan_type":     "api",
+	}, proxyURL+"/responses"); err != nil {
+		t.Fatalf("UpdateOpenAIResponsesAccount failed: %v", err)
+	}
+	responsesAccount, err := db.GetAccountByID(ctx, responsesID)
+	if err != nil {
+		t.Fatalf("GetAccountByID responses failed: %v", err)
+	}
+	if responsesAccount.ProxyURL != proxyURL+"/responses" ||
+		responsesAccount.GetCredential("base_url") != "https://api2.example.test" ||
+		responsesAccount.GetCredential("api_key") != "sk-smoke-new" ||
+		len(responsesAccount.GetCredentialStringSlice("models")) != 2 {
+		t.Fatalf("responses account was not persisted correctly: %#v", responsesAccount)
 	}
 
 	if inserted, err := db.InsertProxies(ctx, []string{proxyURL, proxyURL}, "smoke"); err != nil {

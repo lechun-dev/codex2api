@@ -53,6 +53,12 @@ const errorTableHeadClass = 'text-[12px] font-semibold'
 const errorTableTextClass = 'text-[14px]'
 const errorTableMonoClass = 'font-geist-mono text-[13px] tabular-nums'
 
+type SummaryHelp = {
+  title: string
+  description: string
+  items: string[]
+}
+
 export default function OperationsErrors() {
   const { t } = useTranslation()
   const { toast, showToast } = useToast()
@@ -70,6 +76,7 @@ export default function OperationsErrors() {
   const [exportExcludeAuthRateLimit, setExportExcludeAuthRateLimit] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [selectedLog, setSelectedLog] = useState<UsageLog | null>(null)
+  const [selectedSummaryHelp, setSelectedSummaryHelp] = useState<SummaryHelp | null>(null)
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
   const handleSearchChange = useCallback((value: string) => {
@@ -156,6 +163,56 @@ export default function OperationsErrors() {
       value: String(apiKey.id),
     })),
   ], [data.apiKeys, t])
+  const summaryHelp = useMemo<Record<string, SummaryHelp>>(() => ({
+    total: {
+      title: t('opsErrors.helpTotalTitle'),
+      description: t('opsErrors.helpTotalDesc'),
+      items: [
+        t('opsErrors.helpTotalItem1'),
+        t('opsErrors.helpTotalItem2'),
+      ],
+    },
+    status5xx: {
+      title: t('opsErrors.help5xxTitle'),
+      description: t('opsErrors.help5xxDesc'),
+      items: [
+        t('opsErrors.help5xxItem1'),
+        t('opsErrors.help5xxItem2'),
+      ],
+    },
+    status401: {
+      title: t('opsErrors.help401Title'),
+      description: t('opsErrors.help401Desc'),
+      items: [
+        t('opsErrors.help401Item1'),
+        t('opsErrors.help401Item2'),
+      ],
+    },
+    status429: {
+      title: t('opsErrors.help429Title'),
+      description: t('opsErrors.help429Desc'),
+      items: [
+        t('opsErrors.help429Item1'),
+        t('opsErrors.help429Item2'),
+      ],
+    },
+    timeouts: {
+      title: t('opsErrors.helpTimeoutTitle'),
+      description: t('opsErrors.helpTimeoutDesc'),
+      items: [
+        t('opsErrors.helpTimeoutItem1'),
+        t('opsErrors.helpTimeoutItem2'),
+      ],
+    },
+    retries: {
+      title: t('opsErrors.helpRetryTitle'),
+      description: t('opsErrors.helpRetryDesc'),
+      items: [
+        t('opsErrors.helpRetryItem1'),
+        t('opsErrors.helpRetryItem2'),
+      ],
+    },
+  }), [t])
 
   useEffect(() => {
     if (page > totalPages) {
@@ -249,36 +306,48 @@ export default function OperationsErrors() {
             value={formatNumber(data.summary?.total_errors ?? 0)}
             icon={<AlertCircle className="size-4" />}
             tone="danger"
+            help={summaryHelp.total}
+            onHelp={setSelectedSummaryHelp}
           />
           <SummaryPill
             label="5xx"
             value={formatNumber(data.summary?.status_5xx ?? 0)}
             icon={<ServerCrash className="size-4" />}
             tone="danger"
+            help={summaryHelp.status5xx}
+            onHelp={setSelectedSummaryHelp}
           />
           <SummaryPill
             label="401"
             value={formatNumber(data.summary?.unauthorized ?? 0)}
             icon={<ShieldAlert className="size-4" />}
             tone="danger"
+            help={summaryHelp.status401}
+            onHelp={setSelectedSummaryHelp}
           />
           <SummaryPill
             label="429"
             value={formatNumber(data.summary?.rate_limited ?? 0)}
             icon={<TimerReset className="size-4" />}
             tone="warning"
+            help={summaryHelp.status429}
+            onHelp={setSelectedSummaryHelp}
           />
           <SummaryPill
             label={t('opsErrors.timeouts')}
             value={formatNumber(data.summary?.timeouts ?? 0)}
             icon={<Clock3 className="size-4" />}
             tone="warning"
+            help={summaryHelp.timeouts}
+            onHelp={setSelectedSummaryHelp}
           />
           <SummaryPill
             label={t('opsErrors.retryAttempts')}
             value={formatNumber(data.summary?.retry_attempts ?? 0)}
             icon={<RotateCcw className="size-4" />}
             tone="info"
+            help={summaryHelp.retries}
+            onHelp={setSelectedSummaryHelp}
           />
         </div>
 
@@ -567,6 +636,27 @@ export default function OperationsErrors() {
             </DialogContent>
           ) : null}
         </Dialog>
+        <Dialog open={Boolean(selectedSummaryHelp)} onOpenChange={(open) => { if (!open) setSelectedSummaryHelp(null) }}>
+          {selectedSummaryHelp ? (
+            <DialogContent className="sm:max-w-lg">
+              <DialogHeader>
+                <DialogTitle>{selectedSummaryHelp.title}</DialogTitle>
+                <DialogDescription>{selectedSummaryHelp.description}</DialogDescription>
+              </DialogHeader>
+              <div className="rounded-lg border border-border bg-muted/25 p-4">
+                <div className="mb-2 text-[12px] font-semibold uppercase text-muted-foreground">{t('opsErrors.helpHowToRead')}</div>
+                <ul className="space-y-2 text-sm leading-relaxed text-foreground">
+                  {selectedSummaryHelp.items.map((item) => (
+                    <li key={item} className="flex gap-2">
+                      <span className="mt-2 size-1.5 shrink-0 rounded-full bg-primary" />
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </DialogContent>
+          ) : null}
+        </Dialog>
       </>
     </StateShell>
   )
@@ -577,11 +667,15 @@ function SummaryPill({
   value,
   icon,
   tone,
+  help,
+  onHelp,
 }: {
   label: string
   value: string
   icon: ReactNode
   tone: 'danger' | 'warning' | 'info'
+  help: SummaryHelp
+  onHelp: (help: SummaryHelp) => void
 }) {
   const toneStyle = {
     danger: 'bg-red-500/10 text-red-600 dark:bg-red-500/20 dark:text-red-300',
@@ -593,9 +687,15 @@ function SummaryPill({
     <div className="rounded-lg border border-border bg-card/85 px-3 py-3 shadow-sm">
       <div className="flex items-center justify-between gap-3">
         <div className="text-[12px] font-bold uppercase text-muted-foreground">{label}</div>
-        <div className={`flex size-8 items-center justify-center rounded-lg ${toneStyle}`}>
+        <button
+          type="button"
+          onClick={() => onHelp(help)}
+          className={`flex size-8 items-center justify-center rounded-lg transition-all hover:scale-105 hover:ring-2 hover:ring-ring/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${toneStyle}`}
+          aria-label={`${label} ${help.title}`}
+          title={help.title}
+        >
           {icon}
-        </div>
+        </button>
       </div>
       <div className="mt-3 text-[24px] font-bold leading-none text-foreground">{value}</div>
     </div>

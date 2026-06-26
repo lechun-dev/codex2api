@@ -2034,7 +2034,7 @@
       "clientWindowMinutes": "客户端窗口",
       "clientsSuffix": "台",
       "minutesSuffix": "分钟",
-      "clientLimitHint": "客户端 ID 来自请求头 X-Client-Id。观察模式只记录不拦截；强制模式会要求客户端携带该头，并在窗口内超过数量时拒绝新客户端。窗口留空默认 43200 分钟（30 天）。",
+      "clientLimitHint": "客户端 ID 优先取请求头 X-Client-Id；未提供时，服务端会基于 API Key、下游指纹头和网络信息派生 fallback ID。观察模式只记录不拦截；强制模式会在窗口内超过数量时拒绝新客户端。窗口留空默认 43200 分钟（30 天）。",
       "clientModes": {
         "off": "关闭",
         "observe": "观察",

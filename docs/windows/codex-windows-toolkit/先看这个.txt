@@ -1,0 +1,29 @@
+# Codex Windows 使用说明
+
+这个工具包给 Windows 用户使用。普通用户只需要双击根目录下的 `run-*.cmd` 文件，不需要手动改 `.codex` 里的文件。
+
+开始之前，请先关闭 Codex Desktop 程序窗口。不是退出登录，也不是退出账号。
+
+
+
+## 我该点哪个
+
+## 第一步切换lechun接口
+
+1. 关闭 Codex Desktop。
+2. 双击 `run-codex-lechun-provider.cmd`。
+3. 输入你的 Lechun API Key。
+4. 窗口会先显示 dry-run 计划，这一步不会改文件。
+5. 确认无误后，输入 `CONFIGURE`。
+6. 等窗口提示完成。
+7. 关闭窗口。
+
+第一次切换会先创建完整 Codex Home 快照，再改 provider 和历史记录 provider，这个完整快照包含配置、登录态、本地历史、数据库和日志，不能发给别人。
+
+## 第二步 修复历史记录不
+
+1. 双击 `run-codex-history-repair.cmd`。
+2. 窗口会先显示 dry-run 计划，这一步不会改文件。
+3. 输入 `REPAIR` 确认。
+4. 等窗口提示完成。
+

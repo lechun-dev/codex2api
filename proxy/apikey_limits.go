@@ -5,7 +5,9 @@
 //
 // 7 类限制:
 //   - ModelAllow / ModelDeny: O(1) string set,本机内存即可,无副作用。
-//   - MaxClients: 按 X-Client-Id 统计窗口内客户端数量。Redis 原子集合,无缓存时可用性优先放行。
+//   - MaxClients: 按 X-Client-Id 统计窗口内客户端数量；未显式传入时后端会基于
+//     API Key + 下游指纹头派生 fallback client id。Redis 原子集合,
+//     无缓存时可用性优先放行。
 //   - RPM:  滑动 60s 内请求数。Redis INCR + EXPIRE 60s 计数器(没 Redis 时回退 DB 聚合 + 短缓存)。
 //   - RPD:  滑动 24h 内请求数。同上,EXPIRE 86400。
 //   - CostLimit5h / CostLimit7d / CostLimit30d: 滑动窗口内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
@@ -215,16 +217,16 @@ func (h *Handler) enforceAPIKeyClientLimit(ctx context.Context, c *gin.Context, 
 	if limits.MaxClients <= 0 || (mode != database.APIKeyClientLimitModeObserve && mode != database.APIKeyClientLimitModeEnforce) {
 		return 0, ""
 	}
-	clientID := strings.TrimSpace(c.GetHeader("X-Client-Id"))
-	if clientID == "" {
+	clientID, explicit := resolveAPIKeyClientID(c, apiKeyRowFromContext(c))
+	if explicit && !validAPIKeyClientID(clientID) {
 		if mode == database.APIKeyClientLimitModeEnforce {
-			return http.StatusBadRequest, "X-Client-Id header is required for this API key"
+			return http.StatusBadRequest, "X-Client-Id must be 8-128 characters and contain only letters, numbers, '.', '_', '-' or ':'"
 		}
 		return 0, ""
 	}
-	if !validAPIKeyClientID(clientID) {
+	if clientID == "" {
 		if mode == database.APIKeyClientLimitModeEnforce {
-			return http.StatusBadRequest, "X-Client-Id must be 8-128 characters and contain only letters, numbers, '.', '_', '-' or ':'"
+			return http.StatusBadRequest, "Unable to derive a stable client identity for this API key"
 		}
 		return 0, ""
 	}

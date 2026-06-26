@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -123,6 +124,7 @@ type Config struct {
 	AdminSecret            string
 	AllowAnonymousV1       bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
 	MaxRequestBodySize     int
+	UsageLogMasterKey      []byte
 	Database               DatabaseConfig
 	Cache                  CacheConfig
 	UseWebsocket           bool     // 是否启用 WebSocket 传输
@@ -162,6 +164,13 @@ func Load(envPath string) (*Config, error) {
 		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
 			cfg.MaxRequestBodySize = mb * 1024 * 1024
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_USAGE_LOG_MASTER_KEY")); v != "" {
+		key, err := parseUsageLogMasterKeyEnv(v)
+		if err != nil {
+			return nil, err
+		}
+		cfg.UsageLogMasterKey = key
 	}
 	cfg.TrustedProxies = parseTrustedProxiesEnv(os.Getenv("CODEX_TRUSTED_PROXIES"))
 
@@ -257,6 +266,29 @@ func Load(envPath string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseUsageLogMasterKeyEnv(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+	}
+	var lastErr error
+	for _, enc := range decoders {
+		key, err := enc.DecodeString(raw)
+		if err == nil {
+			if len(key) != 32 {
+				return nil, fmt.Errorf("CODEX_USAGE_LOG_MASTER_KEY 解码后必须正好 32 字节，当前 %d 字节", len(key))
+			}
+			return key, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("CODEX_USAGE_LOG_MASTER_KEY 必须是 base64 编码的 32 字节密钥: %w", lastErr)
 }
 
 func normalizeDriver(value string, fallback string) string {

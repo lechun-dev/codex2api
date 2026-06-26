@@ -46,6 +46,9 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if err := db.SetUsageLogRequestTextMasterKey(cfg.UsageLogMasterKey); err != nil {
+		log.Fatalf("usage log request_text 加密配置失败: %v", err)
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)

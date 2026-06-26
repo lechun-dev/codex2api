@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -392,6 +393,35 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	}
 	if !cfg.Cache.Redis.InsecureSkipVerify {
 		t.Fatal("Redis.InsecureSkipVerify = false, want true")
+	}
+}
+
+func TestLoadParsesUsageLogMasterKey(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_USAGE_LOG_MASTER_KEY", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")))
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := string(cfg.UsageLogMasterKey); got != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("UsageLogMasterKey = %q", got)
+	}
+}
+
+func TestLoadRejectsInvalidUsageLogMasterKeyLength(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_USAGE_LOG_MASTER_KEY", base64.StdEncoding.EncodeToString([]byte("too-short")))
+
+	_, err := Load("__not_exists__.env")
+	if err == nil || !strings.Contains(err.Error(), "32 字节") {
+		t.Fatalf("Load() err = %v, want 32-byte validation error", err)
 	}
 }
 

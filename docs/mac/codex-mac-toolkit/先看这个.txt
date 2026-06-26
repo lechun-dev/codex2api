@@ -1,0 +1,31 @@
+# Codex Mac 工具包使用说明
+
+这个工具包给 Mac 用户使用。正常情况只需要双击运行，不需要手动改 `~/.codex` 里的文件。
+
+开始之前，请先完整退出 Codex Desktop。不是退出登录，也不是退出账号，而是关闭 Codex 应用本身。脚本会尽量检测 Codex 是否还在运行；如果还在运行，修复步骤会拒绝写入，避免和 Codex 后台写数据库冲突。
+
+## 我该点哪个
+
+## 第一步切换乐纯接口
+
+1. 完整退出 Codex Desktop。
+2. 双击 `codex-lechun-provider-mac.command`。如果提示
+『无法打开“codex-lechun-provider-mac.command”，因为它来自身份不明的开发者。』，需要打开终端，cd到这个目录，执行：
+	chmod +x ./codex-lechun-provider-mac.command
+	xattr -d com.apple.quarantine ./codex-lechun-provider-mac.command
+3. 输入你的 Lechun API Key，输入时不会显示在屏幕上。
+4. 脚本会先做两次 dry-run：配置检查和历史修复检查，这一步不改文件。
+5. 确认输出没有明显异常后，输入 `CONFIGURE`。
+6. 等窗口提示完成。
+7. 关闭窗口。
+
+
+## 第二步 恢复历史会话
+
+1. 双击 `codex-history-repair-mac.command`。
+2. 脚本会先 dry-run，显示会修哪些 SQLite、多少 rollout、是否需要重建索引。
+3. 确认输出后，输入 `REPAIR`。
+4. 等窗口提示完成。
+5. 重新打开 Codex Desktop。
+
+这个脚本只修复历史记录显示问题，不会删除你的历史记录。

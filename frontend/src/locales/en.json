@@ -2034,7 +2034,7 @@
       "clientWindowMinutes": "Client window",
       "clientsSuffix": "clients",
       "minutesSuffix": "min",
-      "clientLimitHint": "Client ID comes from the X-Client-Id request header. Observe records without blocking; enforce requires the header and rejects new clients after the window reaches the limit. Empty window defaults to 43200 minutes (30 days).",
+      "clientLimitHint": "Client ID prefers the X-Client-Id request header; when absent, the server derives a fallback ID from the API key, downstream fingerprint headers, and network hints. Observe records without blocking; enforce rejects new clients after the window reaches the limit. Empty window defaults to 43200 minutes (30 days).",
       "clientModes": {
         "off": "Off",
         "observe": "Observe",

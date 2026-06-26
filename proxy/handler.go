@@ -560,6 +560,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
+	populateRequestContentUsageMeta(c, input)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
 }

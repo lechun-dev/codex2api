@@ -1,0 +1,10 @@
+Bundled Node.js runtime for Codex Windows toolkit.
+
+Version: v24.16.0
+LTS: Krypton
+Platform: Windows x64
+Source: https://nodejs.org/dist/v24.16.0/node-v24.16.0-win-x64.zip
+SHA256: edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56
+
+This runtime is used only to run the toolkit's local .mjs scripts.
+Users do not need to install Node.js separately when this folder is present.

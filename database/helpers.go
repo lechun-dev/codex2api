@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func normalizeDriver(driver string) string {
@@ -273,6 +274,26 @@ func stringSliceFromValue(value interface{}) []string {
 		return []string{}
 	}
 	return result
+}
+
+func sanitizeMySQLTextValue(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	raw = strings.ToValidUTF8(raw, "")
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if r > utf8.MaxRune {
+			continue
+		}
+		if r > '\uFFFF' {
+			b.WriteRune('\uFFFD')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func credentialString(raw interface{}, key string) string {

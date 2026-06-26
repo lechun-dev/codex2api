@@ -52,6 +52,19 @@ const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
 const errorTableHeadClass = 'text-[12px] font-semibold'
 const errorTableTextClass = 'text-[14px]'
 const errorTableMonoClass = 'font-geist-mono text-[13px] tabular-nums'
+const opsErrorKindOptions = [
+  'server',
+  'client',
+  'transport',
+  'timeout',
+  'rate_limited',
+  'unauthorized',
+  'payment_required',
+  'usage_limit',
+  'deactivated_workspace',
+  'cyber_policy',
+  'message_too_big',
+] as const
 
 type SummaryHelp = {
   title: string
@@ -410,11 +423,7 @@ export default function OperationsErrors() {
                 placeholder={t('opsErrors.allErrorKinds')}
                 options={[
                   { label: t('opsErrors.allErrorKinds'), value: '' },
-                  { label: 'upstream_error', value: 'upstream_error' },
-                  { label: 'upstream_timeout', value: 'upstream_timeout' },
-                  { label: 'server_error', value: 'server_error' },
-                  { label: 'rate_limit', value: 'rate_limit' },
-                  { label: 'transport_error', value: 'transport_error' },
+                  ...opsErrorKindOptions.map((value) => ({ label: value, value })),
                 ]}
               />
               <Select
@@ -796,11 +805,11 @@ function buildOpsErrorExportFilename(timeRange: TimeRangeKey, dedupe: boolean, e
 
 function classifyStatus(statusCode: number): string {
   if (statusCode === 401) return 'unauthorized'
-  if (statusCode === 403) return 'forbidden'
-  if (statusCode === 429) return 'rate_limit'
-  if (statusCode === 499) return 'client_closed'
-  if (statusCode >= 500) return 'server_error'
-  if (statusCode >= 400) return 'client_error'
+  if (statusCode === 403) return 'payment_required'
+  if (statusCode === 429) return 'rate_limited'
+  if (statusCode === 499) return 'client_canceled'
+  if (statusCode >= 500) return 'server'
+  if (statusCode >= 400) return 'client'
   return 'error'
 }
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -9,6 +10,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -68,6 +72,9 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -115,6 +122,9 @@ func TestLoadAllowsExplicitMySQL(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -168,6 +178,9 @@ func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -208,6 +221,9 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -241,6 +257,38 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 
 	if got := cfg.MaxRequestBodySize; got != 64*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 64*1024*1024)
+	}
+}
+
+func TestLoadReadsDownloadsDirFromEnv(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_DOWNLOADS_DIR", "/deploy/codex2api/downloads")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.DownloadsDir; got != "/deploy/codex2api/downloads" {
+		t.Fatalf("DownloadsDir = %q, want %q", got, "/deploy/codex2api/downloads")
+	}
+}
+
+func TestLoadReadsUsageLogCaptureContentFromEnv(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if !cfg.UsageLogCaptureContent {
+		t.Fatal("UsageLogCaptureContent = false, want true")
 	}
 }
 
@@ -340,6 +388,9 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_USAGE_LOG_MASTER_KEY",
+		"CODEX_DOWNLOADS_DIR",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -392,6 +443,35 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	}
 	if !cfg.Cache.Redis.InsecureSkipVerify {
 		t.Fatal("Redis.InsecureSkipVerify = false, want true")
+	}
+}
+
+func TestLoadParsesUsageLogMasterKey(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_USAGE_LOG_MASTER_KEY", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")))
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := string(cfg.UsageLogMasterKey); got != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("UsageLogMasterKey = %q", got)
+	}
+}
+
+func TestLoadRejectsInvalidUsageLogMasterKeyLength(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_USAGE_LOG_MASTER_KEY", base64.StdEncoding.EncodeToString([]byte("too-short")))
+
+	_, err := Load("__not_exists__.env")
+	if err == nil || !strings.Contains(err.Error(), "32 字节") {
+		t.Fatalf("Load() err = %v, want 32-byte validation error", err)
 	}
 }
 

@@ -485,6 +485,14 @@ BIND_HOST=${BIND_HOST}
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
 
+# usage_logs 请求内容采集（默认关闭）
+CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT=false
+# 可选：usage_logs.request_text 写库前加密主密钥（base64 编码的 32 字节）
+# CODEX_USAGE_LOG_MASTER_KEY=
+
+# 工具包目录（大文件下载优先走物理目录，便于后续直接替换 zip）
+CODEX_DOWNLOADS_DIR=/deploy/codex2api/downloads
+
 # 数据库 — SQLite
 DATABASE_DRIVER=sqlite
 DATABASE_PATH=${SQLITE_PATH}
@@ -510,6 +518,14 @@ BIND_HOST=${BIND_HOST}
 
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
+
+# usage_logs 请求内容采集（默认关闭）
+CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT=false
+# 可选：usage_logs.request_text 写库前加密主密钥（base64 编码的 32 字节）
+# CODEX_USAGE_LOG_MASTER_KEY=
+
+# 工具包目录（大文件下载优先走物理目录，便于后续直接替换 zip）
+CODEX_DOWNLOADS_DIR=/deploy/codex2api/downloads
 
 # 数据库 — PostgreSQL
 DATABASE_DRIVER=postgres

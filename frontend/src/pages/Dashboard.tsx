@@ -254,11 +254,12 @@ function statusBadgeClass(statusCode: number) {
 }
 
 function classifyStatus(statusCode: number) {
-  if (statusCode === 401 || statusCode === 403) return 'auth_error'
-  if (statusCode === 429) return 'rate_limit'
+  if (statusCode === 401) return 'unauthorized'
+  if (statusCode === 403) return 'payment_required'
+  if (statusCode === 429) return 'rate_limited'
   if (statusCode === 499) return 'client_canceled'
-  if (statusCode >= 500) return 'server_error'
-  if (statusCode >= 400) return 'request_error'
+  if (statusCode >= 500) return 'server'
+  if (statusCode >= 400) return 'client'
   return 'error'
 }
 

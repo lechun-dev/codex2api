@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -123,6 +124,9 @@ type Config struct {
 	AdminSecret            string
 	AllowAnonymousV1       bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
 	MaxRequestBodySize     int
+	UsageLogCaptureContent bool   // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
+	UsageLogMasterKey      []byte // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
+	DownloadsDir           string // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
 	Database               DatabaseConfig
 	Cache                  CacheConfig
 	UseWebsocket           bool     // 是否启用 WebSocket 传输
@@ -163,6 +167,15 @@ func Load(envPath string) (*Config, error) {
 			cfg.MaxRequestBodySize = mb * 1024 * 1024
 		}
 	}
+	cfg.UsageLogCaptureContent = parseBoolEnv(os.Getenv("CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT"))
+	if v := strings.TrimSpace(os.Getenv("CODEX_USAGE_LOG_MASTER_KEY")); v != "" {
+		key, err := parseUsageLogMasterKeyEnv(v)
+		if err != nil {
+			return nil, err
+		}
+		cfg.UsageLogMasterKey = key
+	}
+	cfg.DownloadsDir = strings.TrimSpace(os.Getenv("CODEX_DOWNLOADS_DIR"))
 	cfg.TrustedProxies = parseTrustedProxiesEnv(os.Getenv("CODEX_TRUSTED_PROXIES"))
 
 	// Codex 上游传输配置。CODEX_UPSTREAM_TRANSPORT 优先；USE_WEBSOCKET 保留为旧开关。
@@ -257,6 +270,29 @@ func Load(envPath string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseUsageLogMasterKeyEnv(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+	}
+	var lastErr error
+	for _, enc := range decoders {
+		key, err := enc.DecodeString(raw)
+		if err == nil {
+			if len(key) != 32 {
+				return nil, fmt.Errorf("CODEX_USAGE_LOG_MASTER_KEY 解码后必须正好 32 字节，当前 %d 字节", len(key))
+			}
+			return key, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("CODEX_USAGE_LOG_MASTER_KEY 必须是 base64 编码的 32 字节密钥: %w", lastErr)
 }
 
 func normalizeDriver(value string, fallback string) string {

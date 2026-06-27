@@ -39,6 +39,9 @@ func main() {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
+	if cfg.DownloadsDir != "" {
+		log.Printf("工具包目录覆盖已启用: %s", cfg.DownloadsDir)
+	}
 
 	// 2. 初始化数据库
 	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
@@ -46,6 +49,9 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if err := db.SetUsageLogRequestTextMasterKey(cfg.UsageLogMasterKey); err != nil {
+		log.Fatalf("usage log request_text 加密配置失败: %v", err)
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
@@ -208,6 +214,12 @@ func main() {
 		runtimeSettings.FirstTokenTimeoutSec,
 		runtimeSettings.BillingTierPolicy,
 	)
+	if cfg.UsageLogCaptureContent {
+		log.Printf("usage_logs 请求内容采集已启用")
+	}
+	if len(cfg.UsageLogMasterKey) > 0 {
+		log.Printf("usage_logs request_text 加密已启用")
+	}
 
 	// 4b'. 应用图片存储后端配置
 	imgLocalDir := strings.TrimSpace(os.Getenv("IMAGE_ASSET_DIR"))
@@ -306,10 +318,12 @@ func main() {
 
 	// 管理后台前端静态文件
 	subFS, err := fs.Sub(frontendFS, "frontend/dist")
+	var embeddedHTTPFS http.FileSystem
 	if err != nil {
 		log.Printf("前端静态文件加载失败（开发模式可忽略）: %v", err)
 	} else {
 		httpFS := http.FS(subFS)
+		embeddedHTTPFS = httpFS
 		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
 		indexHTML, _ := fs.ReadFile(subFS, "index.html")
 
@@ -356,20 +370,36 @@ func main() {
 		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
 		r.HEAD("/key-usage", serveKeyUsageFrontend)
 		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
-
-		serveDownload := func(c *gin.Context) {
-			fileName := strings.TrimPrefix(c.Param("filepath"), "/")
-			switch fileName {
-			case "codex-windows-toolkit.zip", "codex-mac-toolkit.zip":
-				c.Header("Cache-Control", "public, max-age=86400")
-				c.FileFromFS("/downloads/"+fileName, httpFS)
-			default:
-				c.Status(http.StatusNotFound)
-			}
-		}
-		r.GET("/downloads/*filepath", serveDownload)
-		r.HEAD("/downloads/*filepath", serveDownload)
 	}
+
+	var externalDownloadsFS http.FileSystem
+	if cfg.DownloadsDir != "" {
+		externalDownloadsFS = http.Dir(cfg.DownloadsDir)
+	}
+	serveDownload := func(c *gin.Context) {
+		fileName := strings.TrimPrefix(c.Param("filepath"), "/")
+		switch fileName {
+		case "codex-windows-toolkit.zip", "codex-mac-toolkit.zip", "Codex Toolkit-0.1.0-x64-setup.exe.zip", "Codex Toolkit-0.1.0-arm64.dmg.zip":
+			c.Header("Cache-Control", "public, max-age=86400")
+			if externalDownloadsFS != nil {
+				file, err := externalDownloadsFS.Open(fileName)
+				if err == nil {
+					_ = file.Close()
+					c.FileFromFS("/"+fileName, externalDownloadsFS)
+					return
+				}
+			}
+			if embeddedHTTPFS != nil && (fileName == "codex-windows-toolkit.zip" || fileName == "codex-mac-toolkit.zip") {
+				c.FileFromFS("/downloads/"+fileName, embeddedHTTPFS)
+				return
+			}
+			c.Status(http.StatusNotFound)
+		default:
+			c.Status(http.StatusNotFound)
+		}
+	}
+	r.GET("/downloads/*filepath", serveDownload)
+	r.HEAD("/downloads/*filepath", serveDownload)
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）
 	r.GET("/", func(c *gin.Context) {

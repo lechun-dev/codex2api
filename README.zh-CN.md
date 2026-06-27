@@ -307,6 +307,9 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `REDIS_DB` | Redis DB 库号 |
 | `REDIS_TLS` | 是否为 `host:port` 形式的 Redis 启用 TLS；使用 `rediss://` 时会自动启用 |
 | `REDIS_INSECURE_SKIP_VERIFY` | 跳过 Redis TLS 证书校验，默认 `false`，仅用于自签证书或排障 |
+| `CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT` | 是否把 `session_id` / `conversation_id` / `previous_response_id` / `request_text` 写入 `usage_logs`；默认 `false` |
+| `CODEX_USAGE_LOG_MASTER_KEY` | 可选；`usage_logs.request_text` 写库前加密用的 base64 编码 32 字节密钥 |
+| `CODEX_DOWNLOADS_DIR` | 工具包物理目录；配置后 `/downloads/*.zip` 优先从该目录读取，推荐 `/deploy/codex2api/downloads` |
 | `TZ` | 时区，例如 `Asia/Shanghai` |
 
 > Aiven、Upstash 等云 Redis 通常要求 TLS。推荐直接将 `REDIS_ADDR` 配置为平台提供的 `rediss://...` URL；如果只填写 `host:port`，请同时设置 `REDIS_TLS=true`。

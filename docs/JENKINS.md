@@ -54,6 +54,10 @@ DATABASE_PASSWORD=your-password
 DATABASE_CHARSET=utf8
 
 CACHE_DRIVER=memory
+CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT=false
+# CODEX_USAGE_LOG_MASTER_KEY=
+
+CODEX_DOWNLOADS_DIR=/deploy/codex2api/downloads
 ```
 
 安装 systemd 服务：

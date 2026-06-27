@@ -166,13 +166,14 @@ type DB struct {
 	logStop chan struct{}
 	logWg   sync.WaitGroup
 
-	usageLogMode          atomic.Value // string: full|errors|off
-	usageLogBatchSize     int64
-	usageLogFlushInterval int64 // ns
-	logFlushNotify        chan struct{}
-	accountInsertMu       sync.Mutex
-	sqliteWriteSem        chan struct{}
-	sqliteSingleConn      bool
+	usageLogMode                 atomic.Value // string: full|errors|off
+	usageLogBatchSize            int64
+	usageLogFlushInterval        int64        // ns
+	usageLogRequestTextMasterKey atomic.Value // []byte
+	logFlushNotify               chan struct{}
+	accountInsertMu              sync.Mutex
+	sqliteWriteSem               chan struct{}
+	sqliteSingleConn             bool
 }
 
 const (
@@ -228,6 +229,10 @@ func NormalizeUsageLogFlushIntervalSeconds(n int) int {
 type usageLogEntry struct {
 	AccountID            int64
 	ClientIP             string
+	SessionID            string
+	ConversationID       string
+	PreviousResponseID   string
+	RequestText          string
 	Endpoint             string
 	Model                string
 	EffectiveModel       string
@@ -267,6 +272,12 @@ type usageLogEntry struct {
 	UpstreamErrorKind    string
 	ErrorMessage         string
 }
+
+const (
+	usageLogInsertColumnCount = 44
+	maxPostgresBindParams     = 65535
+	maxUsageLogRowsPerBatch   = maxPostgresBindParams / usageLogInsertColumnCount
+)
 
 // New 创建数据库连接并自动建表。
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
@@ -667,6 +678,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE TABLE IF NOT EXISTS usage_logs (
 		id             SERIAL PRIMARY KEY,
 		account_id     INT DEFAULT 0,
+		client_ip      VARCHAR(64) DEFAULT '',
+		session_id     VARCHAR(255) DEFAULT '',
+		conversation_id VARCHAR(255) DEFAULT '',
+		previous_response_id VARCHAR(255) DEFAULT '',
+		request_text   TEXT DEFAULT '',
 		endpoint       VARCHAR(100) DEFAULT '',
 		model          VARCHAR(100) DEFAULT '',
 		prompt_tokens  INT DEFAULT 0,
@@ -703,6 +719,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_name VARCHAR(255) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_masked VARCHAR(64) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS client_ip VARCHAR(64) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS session_id VARCHAR(255) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(255) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS previous_response_id VARCHAR(255) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS request_text TEXT DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_count INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_width INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_height INT DEFAULT 0;
@@ -1984,6 +2004,10 @@ type UsageLog struct {
 	ID                   int64     `json:"id"`
 	AccountID            int64     `json:"account_id"`
 	ClientIP             string    `json:"client_ip"`
+	SessionID            string    `json:"session_id"`
+	ConversationID       string    `json:"conversation_id"`
+	PreviousResponseID   string    `json:"previous_response_id"`
+	RequestText          string    `json:"request_text"`
 	Endpoint             string    `json:"endpoint"`
 	Model                string    `json:"model"`
 	EffectiveModel       string    `json:"effective_model"`
@@ -2037,83 +2061,94 @@ type UsageLog struct {
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
-func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
-	if db == nil || log == nil || !db.shouldStoreUsageLog(log) {
+func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
+	if db == nil || input == nil || !db.shouldStoreUsageLog(input) {
 		return nil
 	}
 
 	// 计算计费金额（基于 input/output tokens 和模型）
 	// 使用 EffectiveModel 作为计费模型（如果有映射则使用映射后的模型）
-	billingModel := log.EffectiveModel
+	billingModel := input.EffectiveModel
 	if billingModel == "" {
-		billingModel = log.Model
+		billingModel = input.Model
 	}
 
-	billingServiceTier := log.BillingServiceTier
+	billingServiceTier := input.BillingServiceTier
 	if billingServiceTier == "" {
-		billingServiceTier = log.ActualServiceTier
+		billingServiceTier = input.ActualServiceTier
 	}
 	if billingServiceTier == "" {
-		billingServiceTier = log.ServiceTier
+		billingServiceTier = input.ServiceTier
 	}
 
-	serviceTier := log.ServiceTier
+	serviceTier := input.ServiceTier
 	if serviceTier == "" {
-		serviceTier = log.ActualServiceTier
+		serviceTier = input.ActualServiceTier
 	}
 	if serviceTier == "" {
-		serviceTier = log.RequestedServiceTier
+		serviceTier = input.RequestedServiceTier
 	}
 
 	// 计算账号计费金额（基于实际计费 service tier）
-	accountBilled := calculateCost(log.InputTokens, log.OutputTokens, log.CachedTokens, billingModel, billingServiceTier)
+	accountBilled := calculateCost(input.InputTokens, input.OutputTokens, input.CachedTokens, billingModel, billingServiceTier)
 
 	// 用户计费金额与账号计费金额相同（简化版，未来可支持倍率）
 	userBilled := accountBilled
 
-	db.logMu.Lock()
-	db.logBuf = append(db.logBuf, usageLogEntry{
-		AccountID:            log.AccountID,
-		ClientIP:             log.ClientIP,
-		Endpoint:             log.Endpoint,
-		Model:                log.Model,
-		EffectiveModel:       log.EffectiveModel,
-		PromptTokens:         log.PromptTokens,
-		CompletionTokens:     log.CompletionTokens,
-		TotalTokens:          log.TotalTokens,
-		StatusCode:           log.StatusCode,
-		DurationMs:           log.DurationMs,
-		InputTokens:          log.InputTokens,
-		OutputTokens:         log.OutputTokens,
-		ReasoningTokens:      log.ReasoningTokens,
-		FirstTokenMs:         log.FirstTokenMs,
-		ReasoningEffort:      log.ReasoningEffort,
-		InboundEndpoint:      log.InboundEndpoint,
-		UpstreamEndpoint:     log.UpstreamEndpoint,
-		Stream:               log.Stream,
-		Compact:              log.Compact,
-		ViaWebsocket:         log.ViaWebsocket,
-		CachedTokens:         log.CachedTokens,
+	entry := usageLogEntry{
+		AccountID:            input.AccountID,
+		ClientIP:             input.ClientIP,
+		SessionID:            input.SessionID,
+		ConversationID:       input.ConversationID,
+		PreviousResponseID:   input.PreviousResponseID,
+		RequestText:          input.RequestText,
+		Endpoint:             input.Endpoint,
+		Model:                input.Model,
+		EffectiveModel:       input.EffectiveModel,
+		PromptTokens:         input.PromptTokens,
+		CompletionTokens:     input.CompletionTokens,
+		TotalTokens:          input.TotalTokens,
+		StatusCode:           input.StatusCode,
+		DurationMs:           input.DurationMs,
+		InputTokens:          input.InputTokens,
+		OutputTokens:         input.OutputTokens,
+		ReasoningTokens:      input.ReasoningTokens,
+		FirstTokenMs:         input.FirstTokenMs,
+		ReasoningEffort:      input.ReasoningEffort,
+		InboundEndpoint:      input.InboundEndpoint,
+		UpstreamEndpoint:     input.UpstreamEndpoint,
+		Stream:               input.Stream,
+		Compact:              input.Compact,
+		ViaWebsocket:         input.ViaWebsocket,
+		CachedTokens:         input.CachedTokens,
 		ServiceTier:          serviceTier,
-		RequestedServiceTier: log.RequestedServiceTier,
-		ActualServiceTier:    log.ActualServiceTier,
+		RequestedServiceTier: input.RequestedServiceTier,
+		ActualServiceTier:    input.ActualServiceTier,
 		BillingServiceTier:   billingServiceTier,
-		APIKeyID:             log.APIKeyID,
-		APIKeyName:           log.APIKeyName,
-		APIKeyMasked:         log.APIKeyMasked,
-		ImageCount:           log.ImageCount,
-		ImageWidth:           log.ImageWidth,
-		ImageHeight:          log.ImageHeight,
-		ImageBytes:           log.ImageBytes,
-		ImageFormat:          log.ImageFormat,
-		ImageSize:            log.ImageSize,
+		APIKeyID:             input.APIKeyID,
+		APIKeyName:           input.APIKeyName,
+		APIKeyMasked:         input.APIKeyMasked,
+		ImageCount:           input.ImageCount,
+		ImageWidth:           input.ImageWidth,
+		ImageHeight:          input.ImageHeight,
+		ImageBytes:           input.ImageBytes,
+		ImageFormat:          input.ImageFormat,
+		ImageSize:            input.ImageSize,
 		AccountBilled:        accountBilled,
 		UserBilled:           userBilled,
-		IsRetryAttempt:       log.IsRetryAttempt,
-		AttemptIndex:         log.AttemptIndex,
-		UpstreamErrorKind:    log.UpstreamErrorKind,
-		ErrorMessage:         log.ErrorMessage,
-	})
+		IsRetryAttempt:       input.IsRetryAttempt,
+		AttemptIndex:         input.AttemptIndex,
+		UpstreamErrorKind:    input.UpstreamErrorKind,
+		ErrorMessage:         input.ErrorMessage,
+	}
+	if err := db.protectUsageLogEntryForStorage(&entry); err != nil {
+		log.Printf("usage log request_text encryption failed, clearing request_text: %v", err)
+		entry.RequestText = ""
+	}
+	db.sanitizeUsageLogEntryForStorage(&entry)
+
+	db.logMu.Lock()
+	db.logBuf = append(db.logBuf, entry)
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
 
@@ -2124,10 +2159,41 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	return nil
 }
 
+func (db *DB) sanitizeUsageLogEntryForStorage(entry *usageLogEntry) {
+	if db == nil || entry == nil || !db.isMySQL() {
+		return
+	}
+	entry.ClientIP = sanitizeMySQLTextValue(entry.ClientIP)
+	entry.SessionID = sanitizeMySQLTextValue(entry.SessionID)
+	entry.ConversationID = sanitizeMySQLTextValue(entry.ConversationID)
+	entry.PreviousResponseID = sanitizeMySQLTextValue(entry.PreviousResponseID)
+	entry.RequestText = sanitizeMySQLTextValue(entry.RequestText)
+	entry.Endpoint = sanitizeMySQLTextValue(entry.Endpoint)
+	entry.Model = sanitizeMySQLTextValue(entry.Model)
+	entry.EffectiveModel = sanitizeMySQLTextValue(entry.EffectiveModel)
+	entry.ReasoningEffort = sanitizeMySQLTextValue(entry.ReasoningEffort)
+	entry.InboundEndpoint = sanitizeMySQLTextValue(entry.InboundEndpoint)
+	entry.UpstreamEndpoint = sanitizeMySQLTextValue(entry.UpstreamEndpoint)
+	entry.ServiceTier = sanitizeMySQLTextValue(entry.ServiceTier)
+	entry.RequestedServiceTier = sanitizeMySQLTextValue(entry.RequestedServiceTier)
+	entry.ActualServiceTier = sanitizeMySQLTextValue(entry.ActualServiceTier)
+	entry.BillingServiceTier = sanitizeMySQLTextValue(entry.BillingServiceTier)
+	entry.APIKeyName = sanitizeMySQLTextValue(entry.APIKeyName)
+	entry.APIKeyMasked = sanitizeMySQLTextValue(entry.APIKeyMasked)
+	entry.ImageFormat = sanitizeMySQLTextValue(entry.ImageFormat)
+	entry.ImageSize = sanitizeMySQLTextValue(entry.ImageSize)
+	entry.UpstreamErrorKind = sanitizeMySQLTextValue(entry.UpstreamErrorKind)
+	entry.ErrorMessage = sanitizeMySQLTextValue(entry.ErrorMessage)
+}
+
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
 	AccountID            int64
 	ClientIP             string
+	SessionID            string
+	ConversationID       string
+	PreviousResponseID   string
+	RequestText          string
 	Endpoint             string
 	Model                string
 	EffectiveModel       string
@@ -2301,19 +2367,19 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+		`INSERT INTO usage_logs (account_id, client_ip, session_id, conversation_id, previous_response_id, request_text, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 			  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
 			  requested_service_tier, actual_service_tier, billing_service_tier,
 			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)`)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)`)
 	if err != nil {
 		return fmt.Errorf("准备语句: %w", err)
 	}
 	defer stmt.Close()
 
 	for _, e := range batch {
-		if _, err := stmt.ExecContext(ctx, e.AccountID, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+		if _, err := stmt.ExecContext(ctx, e.AccountID, e.ClientIP, e.SessionID, e.ConversationID, e.PreviousResponseID, e.RequestText, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
@@ -2332,7 +2398,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 40 个参数）。
+// 分批处理以避免 PostgreSQL 参数上限（65535）被 usage log 的多列 INSERT 撑爆。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -2344,11 +2410,9 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
-	const maxRowsPerBatch = 1600
-
 	// 分批处理
-	for start := 0; start < len(batch); start += maxRowsPerBatch {
-		end := start + maxRowsPerBatch
+	for start := 0; start < len(batch); start += maxUsageLogRowsPerBatch {
+		end := start + maxUsageLogRowsPerBatch
 		if end > len(batch) {
 			end = len(batch)
 		}
@@ -2375,24 +2439,25 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*40)
+	valueArgs := make([]interface{}, 0, len(batch)*usageLogInsertColumnCount)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
 			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
 			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19,
 			argIdx+20, argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25, argIdx+26, argIdx+27, argIdx+28, argIdx+29,
-			argIdx+30, argIdx+31, argIdx+32, argIdx+33, argIdx+34, argIdx+35, argIdx+36, argIdx+37, argIdx+38, argIdx+39))
-		valueArgs = append(valueArgs, e.AccountID, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			argIdx+30, argIdx+31, argIdx+32, argIdx+33, argIdx+34, argIdx+35, argIdx+36, argIdx+37, argIdx+38, argIdx+39,
+			argIdx+40, argIdx+41, argIdx+42, argIdx+43))
+		valueArgs = append(valueArgs, e.AccountID, e.ClientIP, e.SessionID, e.ConversationID, e.PreviousResponseID, e.RequestText, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket)
-		argIdx += 40
+		argIdx += usageLogInsertColumnCount
 	}
 
-	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, client_ip, session_id, conversation_id, previous_response_id, request_text, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
@@ -3254,7 +3319,10 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 
 	dateExpr := "TO_CHAR(created_at, 'YYYY-MM-DD')"
 	labelExpr := "TO_CHAR(created_at, 'MM/DD')"
-	if db.isSQLite() {
+	if db.isMySQL() {
+		dateExpr = "DATE_FORMAT(created_at, '%Y-%m-%d')"
+		labelExpr = "DATE_FORMAT(created_at, '%m/%d')"
+	} else if db.isSQLite() {
 		dateExpr = "strftime('%Y-%m-%d', created_at)"
 		labelExpr = "strftime('%m/%d', created_at)"
 	}

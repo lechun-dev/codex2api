@@ -590,6 +590,7 @@ export default function Accounts() {
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [importProxyUrl, setImportProxyUrl] = useState("");
   const [showSub2APIImport, setShowSub2APIImport] = useState(false);
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
@@ -631,6 +632,8 @@ export default function Accounts() {
     access_token: "",
     proxy_url: "",
   });
+  // 允许重复添加：勾选后本次添加/导入跳过去重，强制新建（添加弹窗与导入弹窗共用）。
+  const [allowDuplicate, setAllowDuplicate] = useState(false);
   const [openAIForm, setOpenAIForm] =
     useState<AddOpenAIResponsesAccountRequest>({
       base_url: "https://api.openai.com",
@@ -1375,8 +1378,8 @@ export default function Accounts() {
   const handleAdd = async (credential: "rt" | "st" = "rt") => {
     const payload: AddAccountRequest =
       credential === "st"
-        ? { ...addForm, refresh_token: "" }
-        : { ...addForm, session_token: "" };
+        ? { ...addForm, refresh_token: "", allow_duplicate: allowDuplicate }
+        : { ...addForm, session_token: "", allow_duplicate: allowDuplicate };
     if (
       !payload.refresh_token?.trim() &&
       !payload.session_token?.trim()
@@ -1420,7 +1423,7 @@ export default function Accounts() {
     if (!atForm.access_token.trim()) return;
     setSubmitting(true);
     try {
-      await api.addATAccount(atForm);
+      await api.addATAccount({ ...atForm, allow_duplicate: allowDuplicate });
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
       setAtForm({ access_token: "", proxy_url: "" });
@@ -1828,6 +1831,9 @@ export default function Accounts() {
     try {
       const formData = new FormData();
       if (format !== "txt") formData.append("format", format);
+      const trimmedImportProxy = importProxyUrl.trim();
+      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+      if (allowDuplicate) formData.append("allow_duplicate", "true");
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -4337,6 +4343,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
+              setAllowDuplicate(false);
               setAddMethod("oauth");
               setOauthStep("generate");
               setOauthSession(null);
@@ -4352,10 +4359,24 @@ export default function Accounts() {
             }}
             footer={
               <>
+                {(addMethod === "rt" ||
+                  addMethod === "st" ||
+                  addMethod === "at") && (
+                  <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      className="size-3.5"
+                      checked={allowDuplicate}
+                      onChange={(e) => setAllowDuplicate(e.target.checked)}
+                    />
+                    {t("accounts.allowDuplicate")}
+                  </label>
+                )}
                 <Button
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
+                    setAllowDuplicate(false);
                     setAddMethod("oauth");
                     setOauthStep("generate");
                     setOauthSession(null);
@@ -4813,6 +4834,26 @@ export default function Accounts() {
             contentClassName="sm:max-w-[640px]"
             onClose={() => setShowImportPicker(false)}
           >
+            <div className="mb-4 space-y-1.5">
+              {renderProxyInput({
+                value: importProxyUrl,
+                testKey: "import-batch",
+                label: t("accounts.importProxyLabel"),
+                onChange: setImportProxyUrl,
+              })}
+              <p className="text-[11px] text-muted-foreground">
+                {t("accounts.importProxyHint")}
+              </p>
+              <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5"
+                  checked={allowDuplicate}
+                  onChange={(e) => setAllowDuplicate(e.target.checked)}
+                />
+                {t("accounts.allowDuplicate")}
+              </label>
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <button
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"

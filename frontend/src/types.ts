@@ -172,12 +172,14 @@ export interface AddAccountRequest {
   refresh_token?: string
   session_token?: string
   proxy_url: string
+  allow_duplicate?: boolean
 }
 
 export interface AddATAccountRequest {
   name?: string
   access_token: string
   proxy_url: string
+  allow_duplicate?: boolean
 }
 
 export interface AddOpenAIResponsesAccountRequest {

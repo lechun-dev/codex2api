@@ -53,6 +53,7 @@ const WINDOWS_TOOLKIT_PATH = "/downloads/codex-windows-toolkit.zip";
 const MAC_TOOLKIT_PATH = "/downloads/codex-mac-toolkit.zip";
 const WINDOWS_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64-setup.exe.zip";
 const MAC_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-arm64.dmg.zip";
+const MAC_INTEL_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64.dmg.zip";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
 
 interface CreateKeyFormState {
@@ -229,6 +230,10 @@ export default function APIKeys() {
     () => buildPublicURL(MAC_INSTALLER_PATH, publicOrigin),
     [publicOrigin],
   );
+  const macIntelInstallerURL = useMemo(
+    () => buildPublicURL(MAC_INTEL_INSTALLER_PATH, publicOrigin),
+    [publicOrigin],
+  );
   const promptShareText = useMemo(() => {
     if (!promptKey) return "";
     return buildToolkitShareText({
@@ -237,9 +242,10 @@ export default function APIKeys() {
       macToolkitURL,
       windowsInstallerURL,
       macInstallerURL,
+      macIntelInstallerURL,
       t,
     });
-  }, [macInstallerURL, macToolkitURL, promptKey, t, windowsInstallerURL, windowsToolkitURL]);
+  }, [macInstallerURL, macIntelInstallerURL, macToolkitURL, promptKey, t, windowsInstallerURL, windowsToolkitURL]);
 
   const expireOptions = useMemo(
     () => [
@@ -646,7 +652,13 @@ export default function APIKeys() {
                   <Button asChild variant="outline" size="sm">
                     <a href={macInstallerURL} download>
                       <Download className="size-3.5" />
-                      {t("apiKeys.downloadMacInstaller")}
+                      {t("apiKeys.downloadMacAppleInstaller")}
+                    </a>
+                  </Button>
+                  <Button asChild variant="outline" size="sm">
+                    <a href={macIntelInstallerURL} download>
+                      <Download className="size-3.5" />
+                      {t("apiKeys.downloadMacIntelInstaller")}
                     </a>
                   </Button>
                   <Badge variant={keys.length > 0 ? "default" : "secondary"}>
@@ -1313,8 +1325,13 @@ export default function APIKeys() {
                   onCopy={handleCopy}
                 />
                 <DownloadLinkRow
-                  label={t("apiKeys.promptMacInstaller")}
+                  label={t("apiKeys.promptMacAppleInstaller")}
                   url={macInstallerURL}
+                  onCopy={handleCopy}
+                />
+                <DownloadLinkRow
+                  label={t("apiKeys.promptMacIntelInstaller")}
+                  url={macIntelInstallerURL}
                   onCopy={handleCopy}
                 />
                 <DownloadLinkRow
@@ -1391,6 +1408,7 @@ function buildToolkitShareText({
   macToolkitURL,
   windowsInstallerURL,
   macInstallerURL,
+  macIntelInstallerURL,
   t,
 }: {
   apiKey: string;
@@ -1398,6 +1416,7 @@ function buildToolkitShareText({
   macToolkitURL: string;
   windowsInstallerURL: string;
   macInstallerURL: string;
+  macIntelInstallerURL: string;
   t: Translator;
 }): string {
   return [
@@ -1408,7 +1427,8 @@ function buildToolkitShareText({
     t("apiKeys.promptShareRisk"),
     "",
     t("apiKeys.promptShareWindowsInstaller", { url: windowsInstallerURL }),
-    t("apiKeys.promptShareMacInstaller", { url: macInstallerURL }),
+    t("apiKeys.promptShareMacAppleInstaller", { url: macInstallerURL }),
+    t("apiKeys.promptShareMacIntelInstaller", { url: macIntelInstallerURL }),
     t("apiKeys.promptShareWindowsToolkit", { url: windowsToolkitURL }),
     t("apiKeys.promptShareMacToolkit", { url: macToolkitURL }),
     "",

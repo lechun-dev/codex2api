@@ -1962,6 +1962,8 @@ type Store struct {
 	apiKeyGroupsMu                     sync.RWMutex
 	apiKeyAllowedGroups                map[int64][]int64
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
+	apiKeyAllowedPlans                 map[int64][]string
+	apiKeyAllowedPlanSets              map[int64]map[string]struct{}
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
 	usageProbeBatch                    atomic.Bool
@@ -4609,12 +4611,46 @@ func (s *Store) SetAPIKeyAllowedGroups(apiKeyID int64, groupIDs []int64) {
 	if s.apiKeyAllowedGroupSets == nil {
 		s.apiKeyAllowedGroupSets = make(map[int64]map[int64]struct{})
 	}
+	if int64SliceEqual(s.apiKeyAllowedGroups[apiKeyID], normalized) {
+		s.apiKeyGroupsMu.Unlock()
+		return
+	}
 	if len(normalized) == 0 {
 		delete(s.apiKeyAllowedGroups, apiKeyID)
 		delete(s.apiKeyAllowedGroupSets, apiKeyID)
 	} else {
 		s.apiKeyAllowedGroups[apiKeyID] = cloneInt64Slice(normalized)
 		s.apiKeyAllowedGroupSets[apiKeyID] = int64Set(normalized)
+	}
+	s.apiKeyGroupsMu.Unlock()
+	s.rebuildFastScheduler()
+}
+
+// SetAPIKeyAllowedPlans 设置某 API Key 的账号套餐白名单。plans 归一(小写、去空白、去重)
+// 后落入内存集合;为空表示不限套餐。仅当集合真正变化时才重建调度器,以免鉴权热路径
+// 每次请求都触发重建。
+func (s *Store) SetAPIKeyAllowedPlans(apiKeyID int64, plans []string) {
+	if apiKeyID <= 0 {
+		return
+	}
+	normalized := normalizeAllowedPlans(plans)
+	s.apiKeyGroupsMu.Lock()
+	if s.apiKeyAllowedPlans == nil {
+		s.apiKeyAllowedPlans = make(map[int64][]string)
+	}
+	if s.apiKeyAllowedPlanSets == nil {
+		s.apiKeyAllowedPlanSets = make(map[int64]map[string]struct{})
+	}
+	if stringSliceEqual(s.apiKeyAllowedPlans[apiKeyID], normalized) {
+		s.apiKeyGroupsMu.Unlock()
+		return
+	}
+	if len(normalized) == 0 {
+		delete(s.apiKeyAllowedPlans, apiKeyID)
+		delete(s.apiKeyAllowedPlanSets, apiKeyID)
+	} else {
+		s.apiKeyAllowedPlans[apiKeyID] = append([]string(nil), normalized...)
+		s.apiKeyAllowedPlanSets[apiKeyID] = stringSet(normalized)
 	}
 	s.apiKeyGroupsMu.Unlock()
 	s.rebuildFastScheduler()
@@ -4640,11 +4676,18 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	s.apiKeyGroupsMu.Lock()
 	s.apiKeyAllowedGroups = make(map[int64][]int64, len(keys))
 	s.apiKeyAllowedGroupSets = make(map[int64]map[int64]struct{}, len(keys))
+	s.apiKeyAllowedPlans = make(map[int64][]string, len(keys))
+	s.apiKeyAllowedPlanSets = make(map[int64]map[string]struct{}, len(keys))
 	for _, key := range keys {
 		normalized := normalizeAllowedGroupIDs(key.AllowedGroupIDs)
 		if len(normalized) > 0 {
 			s.apiKeyAllowedGroups[key.ID] = cloneInt64Slice(normalized)
 			s.apiKeyAllowedGroupSets[key.ID] = int64Set(normalized)
+		}
+		plans := normalizeAllowedPlans(key.Limits.PlanAllow)
+		if len(plans) > 0 {
+			s.apiKeyAllowedPlans[key.ID] = append([]string(nil), plans...)
+			s.apiKeyAllowedPlanSets[key.ID] = stringSet(plans)
 		}
 	}
 	s.apiKeyGroupsMu.Unlock()
@@ -4652,20 +4695,31 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	return nil
 }
 
+// APIKeyAllowsAccount 判断某 API Key 是否允许调度到该账号。分组白名单与套餐白名单
+// 各自非空时都必须命中(AND 语义);任一为空表示该维度不限。
 func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	if s == nil || apiKeyID <= 0 || acc == nil {
 		return true
 	}
 	s.apiKeyGroupsMu.RLock()
-	allowedSet := s.apiKeyAllowedGroupSets[apiKeyID]
+	allowedGroups := s.apiKeyAllowedGroupSets[apiKeyID]
+	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
-	if len(allowedSet) == 0 {
+	if len(allowedGroups) == 0 && len(allowedPlans) == 0 {
 		return true
 	}
 	acc.mu.RLock()
 	defer acc.mu.RUnlock()
+	if len(allowedPlans) > 0 {
+		if _, ok := allowedPlans[lowerTrimPlan(acc.PlanType)]; !ok {
+			return false
+		}
+	}
+	if len(allowedGroups) == 0 {
+		return true
+	}
 	for _, id := range acc.GroupIDs {
-		if _, ok := allowedSet[id]; ok {
+		if _, ok := allowedGroups[id]; ok {
 			return true
 		}
 	}
@@ -4694,6 +4748,64 @@ func int64Set(values []int64) map[int64]struct{} {
 	for _, value := range values {
 		out[value] = struct{}{}
 	}
+	return out
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[value] = struct{}{}
+	}
+	return out
+}
+
+func int64SliceEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// lowerTrimPlan 归一单个套餐名用于匹配:小写去空白。刻意不折叠 prolite→pro,
+// 使 API Key 的套餐过滤与账号列表(Accounts 页)按原始 plan_type 精确匹配的语义一致。
+func lowerTrimPlan(plan string) string {
+	return strings.ToLower(strings.TrimSpace(plan))
+}
+
+// normalizeAllowedPlans 归一账号套餐白名单:小写去空白、去重并排序,保证
+// SetAPIKeyAllowedPlans 的变化检测稳定。匹配时账号侧同样走 lowerTrimPlan。
+func normalizeAllowedPlans(plans []string) []string {
+	out := make([]string, 0, len(plans))
+	seen := make(map[string]struct{}, len(plans))
+	for _, plan := range plans {
+		normalized := lowerTrimPlan(plan)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
 	return out
 }
 

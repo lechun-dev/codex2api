@@ -1007,15 +1007,18 @@ type APIKeyRow struct {
 // APIKeyLimits 是 API Key 级别的细粒度限流/配额配置。
 // 0 或空字段表示该项不限。落库为 JSON,允许平滑扩展字段。
 //
-// - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
-// - RPM: 每分钟请求数 (滑动 60s 窗口)。
-// - RPD: 每天请求数 (滑动 24h 窗口)。
-// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
-// - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
-// - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
+//   - RPM: 每分钟请求数 (滑动 60s 窗口)。
+//   - RPD: 每天请求数 (滑动 24h 窗口)。
+//   - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
+//   - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
+//   - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - PlanAllow: 账号套餐白名单(plus/pro/team/...)。非空时该 Key 仅调度命中其一的账号,
+//     语义与 AllowedGroupIDs 类似,均在账号选择阶段过滤。空表示不限套餐。
 type APIKeyLimits struct {
 	ModelAllow     []string `json:"model_allow,omitempty"`
 	ModelDeny      []string `json:"model_deny,omitempty"`
+	PlanAllow      []string `json:"plan_allow,omitempty"`
 	RPM            int      `json:"rpm,omitempty"`
 	RPD            int      `json:"rpd,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
@@ -1029,7 +1032,7 @@ type APIKeyLimits struct {
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
-	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
+	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0

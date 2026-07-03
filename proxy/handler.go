@@ -477,6 +477,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 		return
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
+	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）

@@ -953,6 +953,7 @@ export interface ChartAggregation {
 export interface APIKeyLimits {
   model_allow?: string[]
   model_deny?: string[]
+  plan_allow?: string[]
   rpm?: number
   rpd?: number
   max_concurrency?: number

@@ -5267,6 +5267,9 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 			h.store.SetAPIKeyAllowedGroups(id, values)
 		}
 	}
+	if h.store != nil {
+		h.store.SetAPIKeyAllowedPlans(id, limits.PlanAllow)
+	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, key)
 
 	// 记录安全审计日志
@@ -5401,6 +5404,9 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	if allowedGroupIDs.Set && h.store != nil {
 		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
 	}
+	if update.LimitsSet && h.store != nil {
+		h.store.SetAPIKeyAllowedPlans(id, update.Limits.PlanAllow)
+	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
 	writeMessage(c, http.StatusOK, "API Key 已更新")
 }
@@ -5431,6 +5437,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 	out := database.APIKeyLimits{
 		ModelAllow:     clean(in.ModelAllow),
 		ModelDeny:      clean(in.ModelDeny),
+		PlanAllow:      cleanPlanAllow(in.PlanAllow),
 		RPM:            maxInt(in.RPM, 0),
 		RPD:            maxInt(in.RPD, 0),
 		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
@@ -5440,6 +5447,38 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
+	}
+	return out
+}
+
+// knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
+// Key 永远选不到账号。
+var knownAPIKeyPlanFilters = map[string]struct{}{
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+}
+
+// cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
+func cleanPlanAllow(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		plan := strings.ToLower(strings.TrimSpace(item))
+		if plan == "" {
+			continue
+		}
+		if _, ok := knownAPIKeyPlanFilters[plan]; !ok {
+			continue
+		}
+		if _, ok := seen[plan]; ok {
+			continue
+		}
+		seen[plan] = struct{}{}
+		out = append(out, plan)
 	}
 	return out
 }
@@ -5564,6 +5603,7 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.SetAPIKeyAllowedGroups(id, nil)
+		h.store.SetAPIKeyAllowedPlans(id, nil)
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")

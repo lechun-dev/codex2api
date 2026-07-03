@@ -911,6 +911,15 @@ func responseFailedStatusCode(payload []byte) int {
 		return http.StatusPaymentRequired
 	case strings.Contains(codeOrType, "forbidden"):
 		return http.StatusForbidden
+	// 确定性客户端错误：输入超上下文窗口/字段超长/模型不存在等，换号重试
+	// 也必然失败。归为 400，避免落入 default 500 触发透明重试并惩罚账号
+	// 健康度 (issue #310)。
+	case strings.Contains(codeOrType, "context_length") ||
+		strings.Contains(codeOrType, "context_window") ||
+		strings.Contains(codeOrType, "above_max_length") ||
+		strings.Contains(codeOrType, "model_not_found") ||
+		strings.Contains(codeOrType, "unsupported"):
+		return http.StatusBadRequest
 	case strings.Contains(codeOrType, "invalid") || strings.Contains(codeOrType, "bad_request"):
 		return http.StatusBadRequest
 	default:
@@ -1545,8 +1554,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
+		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 
@@ -2321,6 +2331,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	// newapi 等聚合网关会给 compact 请求追加 -openai-compact 后缀（如 gpt-5.4-openai-compact）。
+	// 在映射与校验之前剥除后缀，让 newapi 渠道保持该命名，而内部按基础模型 gpt-5.4 处理并转发上游。
+	rawBody, _, _ = stripCompactModelSuffixFromBody(rawBody)
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
@@ -2941,8 +2954,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(codexBody) {
+		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
+		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 			useWebsocket = false
 		}
 		upstreamEndpoint := "/v1/responses"
@@ -3147,7 +3161,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					ttftRecorded = true
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
@@ -3229,7 +3243,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullContent.WriteString(delta)
 				case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 					fullReasoning.WriteString(parsed.Get("delta").String())
-				case "response.function_call_arguments.delta":
+				case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
 				case "response.completed":
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
@@ -3812,8 +3826,8 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 		// Free 只有 7d 窗口，429 = 额度耗尽，冷却 7 天
 		return 7 * 24 * time.Hour
 
-	case "team", "teamplus", "pro", "plus", "enterprise":
-		// Team/Pro/Plus 有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
+	case "team", "teamplus", "pro", "plus", "enterprise", "k12", "edu", "education":
+		// Team/Pro/Plus 及教育版(k12/edu)有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
 		return detectTeamCooldownWindow(resp)
 
 	default:

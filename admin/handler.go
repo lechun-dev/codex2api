@@ -69,10 +69,6 @@ type Handler struct {
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
 
-	resetRadarHookMu     sync.Mutex
-	resetRadarHookState  resetRadarHookState
-	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
-
 	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
@@ -189,7 +185,79 @@ func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string)
 		return
 	}
 	log.Printf("导入账号 %d 刷新成功", accountID)
+	// 裸 RT 导入时身份要等首次刷新后才可知：此刻回查身份重复，
+	// 若与已有账号同一身份则合并凭证并移除本账号（保留旧账号的用量统计）。
+	if h.mergeRefreshedDuplicateIntoExisting(accountID, source) {
+		return
+	}
 	h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
+// mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
+// 同一 OAuth 身份。若重复，把新凭证（refresh_token 优先级最高，可自动续期）
+// 合并进已有账号——codex_* 用量快照键不在更新集里，旧账号的用量统计与按
+// 账号 ID 关联的请求历史全部保留——然后软删新插入的账号。返回 true 表示已合并。
+func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string) bool {
+	if h == nil || h.db == nil || h.store == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	newRow, err := h.db.GetAccountByID(ctx, newID)
+	if err != nil || newRow == nil {
+		return false
+	}
+	// 勾选"允许重复添加"导入的副本是用户故意保留的，不合并。
+	if strings.EqualFold(strings.TrimSpace(newRow.GetCredential("allow_duplicate")), "true") {
+		return false
+	}
+	email := strings.TrimSpace(newRow.GetCredential("email"))
+	identity := strings.TrimSpace(newRow.GetCredential("account_id"))
+	if identity == "" {
+		identity = strings.TrimSpace(newRow.GetCredential("chatgpt_account_id"))
+	}
+	if identity == "" {
+		identity = strings.TrimSpace(newRow.GetCredential("user_id"))
+	}
+	if email == "" || identity == "" {
+		return false
+	}
+	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, identity, newID)
+	if err != nil || oldID <= 0 {
+		return false
+	}
+
+	updates := make(map[string]interface{})
+	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "user_id", "plan_type", "subscription_expires_at"} {
+		if v := strings.TrimSpace(newRow.GetCredential(key)); v != "" {
+			updates[key] = v
+		}
+	}
+	if len(updates) == 0 {
+		return false
+	}
+	proxyURL := strings.TrimSpace(newRow.ProxyURL)
+	if proxyURL == "" {
+		if oldRow, err := h.db.GetAccountByID(ctx, oldID); err == nil && oldRow != nil {
+			proxyURL = strings.TrimSpace(oldRow.ProxyURL)
+		}
+	}
+	if err := h.db.UpdateOAuthAccountCredentials(ctx, oldID, updates, proxyURL); err != nil {
+		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
+		return false
+	}
+	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
+		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
+	}
+	if err := h.db.SoftDeleteAccount(ctx, newID); err != nil {
+		log.Printf("软删重复导入账号 %d 失败: %v", newID, err)
+	}
+	h.store.RemoveAccount(newID)
+	h.db.InsertAccountEventAsync(newID, "deleted", fmt.Sprintf("merged_into_%d", oldID))
+	h.db.InsertAccountEventAsync(oldID, "updated", "rt_upgrade_merge")
+	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
+	return true
 }
 
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
@@ -252,7 +320,6 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
-	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
@@ -347,7 +414,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
-	api.GET("/reset-radar", h.GetResetRadar)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
@@ -598,6 +664,10 @@ type accountResponse struct {
 	AutoPause7dThreshold     *float64                   `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled      bool                       `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled      bool                       `json:"auto_pause_7d_disabled"`
+	DispatchCountLimit       *int64                     `json:"dispatch_count_limit"`
+	DispatchCountUsed        int64                      `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt     string                     `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited     bool                       `json:"dispatch_count_limited,omitempty"`
 	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
@@ -752,6 +822,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+		resp.DispatchCountLimit = accountDispatchCountLimit(row)
 		if acc, ok := accountMap[row.ID]; ok {
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
@@ -793,6 +864,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if credits, ok := acc.GetRateLimitResetCredits(); ok {
 				resp.RateLimitResetCredits = &credits
+			}
+			if snapshot := acc.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
+				limit := snapshot.Limit
+				resp.DispatchCountLimit = &limit
+				resp.DispatchCountUsed = snapshot.Used
+				resp.DispatchCountLimited = snapshot.Limited
+				if !snapshot.ResetAt.IsZero() {
+					resp.DispatchCountResetAt = snapshot.ResetAt.Format(time.RFC3339)
+				}
 			}
 			if t := acc.GetReset5hAt(); !t.IsZero() {
 				resp.Reset5hAt = t.Format(time.RFC3339)
@@ -912,6 +992,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dThreshold    json.RawMessage `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled     json.RawMessage `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
+	DispatchCountLimit      json.RawMessage `json:"dispatch_count_limit"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 }
 
@@ -926,6 +1007,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dThreshold    optionalFloat64
 	AutoPause5hDisabled     database.OptionalBool
 	AutoPause7dDisabled     database.OptionalBool
+	DispatchCountLimit      database.OptionalNullInt64
 	ProxyURL                database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
@@ -971,6 +1053,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	dispatchCountLimit, err := parseOptionalIntegerField(req.DispatchCountLimit, "dispatch_count_limit", 0, 1000000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 
 	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
 	if err != nil {
@@ -989,6 +1075,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
 	}
+	if dispatchCountLimit.Set {
+		if dispatchCountLimit.Value.Valid {
+			credentialUpdates["dispatch_count_limit"] = dispatchCountLimit.Value.Int64
+		} else {
+			credentialUpdates["dispatch_count_limit"] = int64(0)
+		}
+	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
 	}
@@ -1004,6 +1097,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dThreshold:    autoPause7dThreshold,
 		AutoPause5hDisabled:     autoPause5hDisabled,
 		AutoPause7dDisabled:     autoPause7dDisabled,
+		DispatchCountLimit:      dispatchCountLimit,
 		ProxyURL:                proxyURL,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
@@ -1020,6 +1114,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dThreshold.Set ||
 		u.AutoPause5hDisabled.Set ||
 		u.AutoPause7dDisabled.Set ||
+		u.DispatchCountLimit.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1164,6 +1259,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.AutoPause7dDisabled),
 		)
 	}
+	if update.DispatchCountLimit.Set {
+		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
+	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
 	}
@@ -1192,6 +1290,17 @@ func accountQuotaAutoPauseThreshold(row *database.AccountRow, key string) *float
 	}
 	if value > 1 {
 		value = 1
+	}
+	return &value
+}
+
+func accountDispatchCountLimit(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("dispatch_count_limit")
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1000000 {
+		value = 1000000
 	}
 	return &value
 }
@@ -1403,8 +1512,9 @@ func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
 	if override.Valid {
 		return override.Int64
 	}
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "pro", "plus", "team":
+	// 与 auth.defaultScoreBiasForPlan 保持一致；k12 是教育版 team (issue #282)
+	switch auth.NormalizePlanType(planType) {
+	case "pro", "plus", "team", "k12":
 		return 50
 	default:
 		return 0
@@ -1519,10 +1629,11 @@ func (h *Handler) getAccountUsageWindows(ctx context.Context) (map[int64]*databa
 }
 
 type addAccountReq struct {
-	Name         string `json:"name"`
-	RefreshToken string `json:"refresh_token"`
-	SessionToken string `json:"session_token"`
-	ProxyURL     string `json:"proxy_url"`
+	Name           string `json:"name"`
+	RefreshToken   string `json:"refresh_token"`
+	SessionToken   string `json:"session_token"`
+	ProxyURL       string `json:"proxy_url"`
+	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
 func splitAccountCredentialLines(raw string, sanitize bool) []string {
@@ -1538,6 +1649,54 @@ func splitAccountCredentialLines(raw string, sanitize bool) []string {
 		}
 	}
 	return tokens
+}
+
+// accountCredentialDedup 跟踪 RT/ST 原文去重（用于 RT/ST 单账号/批量添加路径）。
+// 身份型（OAuth）去重在文件导入与 AT 路径单独处理，这里只覆盖加入时无法解出身份的 RT/ST。
+type accountCredentialDedup struct {
+	existingRT map[string]bool
+	existingST map[string]bool
+	seenRT     map[string]bool
+	seenST     map[string]bool
+}
+
+func (h *Handler) newAccountCredentialDedup(ctx context.Context) *accountCredentialDedup {
+	d := &accountCredentialDedup{
+		seenRT: make(map[string]bool),
+		seenST: make(map[string]bool),
+	}
+	var err error
+	if d.existingRT, err = h.db.GetAllRefreshTokens(ctx); err != nil {
+		log.Printf("查询已有 RT 失败: %v", err)
+		d.existingRT = make(map[string]bool)
+	}
+	if d.existingST, err = h.db.GetAllSessionTokens(ctx); err != nil {
+		log.Printf("查询已有 ST 失败: %v", err)
+		d.existingST = make(map[string]bool)
+	}
+	return d
+}
+
+// checkAndMark 返回 true 表示该 seed 与已有库或本批次重复（应跳过）；非重复时记录其凭证。
+func (d *accountCredentialDedup) checkAndMark(seed tokenCredentialSeed) bool {
+	rt := strings.TrimSpace(seed.refreshToken)
+	st := strings.TrimSpace(seed.sessionToken)
+	if rt != "" {
+		if d.existingRT[rt] || d.seenRT[rt] {
+			return true
+		}
+	} else if st != "" {
+		if d.existingST[st] || d.seenST[st] {
+			return true
+		}
+	}
+	if rt != "" {
+		d.seenRT[rt] = true
+	}
+	if st != "" {
+		d.seenST[st] = true
+	}
+	return false
 }
 
 // AddAccount 添加新账号（支持批量：refresh_token/session_token 按行分割）
@@ -1590,7 +1749,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	var seeds []tokenCredentialSeed
 	for i := 0; i < total; i++ {
-		seed := tokenCredentialSeed{}
+		seed := tokenCredentialSeed{allowDuplicate: req.AllowDuplicate}
 		if len(refreshTokens) > 0 {
 			seed.refreshToken = refreshTokens[i]
 		}
@@ -1623,6 +1782,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	successCount := 0
 	failCount := 0
+	duplicateCount := 0
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -1630,6 +1795,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			name = fmt.Sprintf("account-%d", i+1)
 		} else if len(seeds) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		if dedup != nil && dedup.checkAndMark(seed) {
+			duplicateCount++
+			log.Printf("添加账号 %d 已存在（RT/ST 重复），跳过", i+1)
+			continue
 		}
 
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
@@ -1655,17 +1826,21 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	}
 
 	// 记录安全审计日志
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
 	})
 }
 
@@ -1675,6 +1850,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 	total := len(seeds)
 	successCount := 0
 	failCount := 0
+	duplicateCount := 0
 	sendImportEvent(c, importEvent{
 		Type: "progress", Current: 0, Total: total,
 		Success: 0, Duplicate: 0, Failed: 0,
@@ -1682,6 +1858,11 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -1691,13 +1872,22 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
+		if dedup != nil && dedup.checkAndMark(seed) {
+			duplicateCount++
+			sendImportEvent(c, importEvent{
+				Type: "progress", Current: i + 1, Total: total,
+				Success: successCount, Duplicate: duplicateCount, Failed: failCount,
+			})
+			continue
+		}
+
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
 			sendImportEvent(c, importEvent{
 				Type: "progress", Current: i + 1, Total: total,
-				Success: successCount, Duplicate: 0, Failed: failCount,
+				Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 			})
 			continue
 		}
@@ -1716,22 +1906,23 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 		sendImportEvent(c, importEvent{
 			Type: "progress", Current: i + 1, Total: total,
-			Success: successCount, Duplicate: 0, Failed: failCount,
+			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
 
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
-		Success: successCount, Duplicate: 0, Failed: failCount,
+		Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 	})
 }
 
 // addATAccountReq AT 模式添加账号请求
 type addATAccountReq struct {
-	Name        string `json:"name"`
-	AccessToken string `json:"access_token"`
-	ProxyURL    string `json:"proxy_url"`
+	Name           string `json:"name"`
+	AccessToken    string `json:"access_token"`
+	ProxyURL       string `json:"proxy_url"`
+	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
@@ -1785,11 +1976,32 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddATAccounts(c, req, tokens)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
 	successCount := 0
 	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+
+	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 工作区/用户 ID，如 codex_at）
+	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
+	//（email + account_id/user_id）去重/更新——AT 会轮换，仅按原文去重会重复导入同一账号。
+	// 勾选"允许重复添加"时跳过全部去重，强制新建。
+	existingATs := make(map[string]bool)
+	seenAT := make(map[string]bool)
+	if !req.AllowDuplicate {
+		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
+			log.Printf("查询已有 AT 失败: %v", err)
+		} else {
+			existingATs = got
+		}
+	}
 
 	for i, at := range tokens {
 		name := req.Name
@@ -1800,18 +2012,31 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-			accessToken: at,
+			accessToken:    at,
+			allowDuplicate: req.AllowDuplicate,
 		})
-		if seed.email != "" && seed.accountID != "" {
-			id, _, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
 				continue
 			}
 			successCount++
+			if updated {
+				updatedCount++
+			}
 			log.Printf("AT 账号 %d 已加入或更新号池 (id=%d)", i+1, id)
 			continue
+		}
+
+		if !req.AllowDuplicate {
+			if existingATs[at] || seenAT[at] {
+				duplicateCount++
+				log.Printf("AT 账号 %d 已存在（access_token 重复），跳过", i+1)
+				continue
+			}
+			seenAT[at] = true
 		}
 
 		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
@@ -1838,17 +2063,121 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
 
-	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
+	if updatedCount > 0 {
+		msg += fmt.Sprintf("（其中 %d 个为已有账号更新）", updatedCount)
+	}
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"updated":   updatedCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
+	})
+}
+
+// streamAddATAccounts 以 SSE 流式推送 AT 批量添加进度（与 streamAddAccounts 对齐）。
+func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, tokens []string) {
+	setupSSE(c)
+
+	total := len(tokens)
+	successCount := 0
+	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Duplicate: 0, Failed: 0,
+	})
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	existingATs := make(map[string]bool)
+	seenAT := make(map[string]bool)
+	if !req.AllowDuplicate {
+		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
+			log.Printf("查询已有 AT 失败: %v", err)
+		} else {
+			existingATs = got
+		}
+	}
+
+	progress := func(current int) {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: current, Total: total,
+			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
+		})
+	}
+
+	for i, at := range tokens {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("at-account-%d", i+1)
+		} else if total > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate})
+		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+				failCount++
+			} else {
+				successCount++
+				if updated {
+					updatedCount++
+					duplicateCount++ // 前端进度条以 duplicate 展示"已有账号更新"
+				}
+				log.Printf("AT 账号 %d 已加入或更新号池 (id=%d)", i+1, id)
+			}
+			progress(i + 1)
+			continue
+		}
+
+		if !req.AllowDuplicate {
+			if existingATs[at] || seenAT[at] {
+				duplicateCount++
+				progress(i + 1)
+				continue
+			}
+			seenAT[at] = true
+		}
+
+		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		if err != nil {
+			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+			failCount++
+			progress(i + 1)
+			continue
+		}
+
+		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual_at")
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		h.store.AddAccount(newAcc)
+		if creds := tokenCredentialMap(seed); len(creds) > 0 {
+			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
+				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
+			}
+		}
+		progress(i + 1)
+	}
+
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 	})
 }
 
@@ -2492,6 +2821,11 @@ func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) strin
 	if accountID == "" && strings.TrimSpace(t.accountID) == "" {
 		accountID = strings.TrimSpace(t.chatgptAccountID)
 	}
+	// 个人账号可能只有 user_id（无工作区 account_id），用它兜底做身份键，
+	// 否则文件导入会退化为凭证原文比对，AT 轮换后重复导入。
+	if accountID == "" {
+		accountID = strings.TrimSpace(seed.userID)
+	}
 	if email == "" || accountID == "" {
 		return ""
 	}
@@ -2502,16 +2836,27 @@ func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) strin
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
 	proxyURL := c.PostForm("proxy_url")
+	allowDuplicate := parseBoolForm(c.PostForm("allow_duplicate"))
 
 	switch format {
 	case "json":
-		h.importAccountsJSON(c, proxyURL)
+		h.importAccountsJSON(c, proxyURL, allowDuplicate)
 	case "json_at":
-		h.importAccountsJSONPreferAT(c, proxyURL)
+		h.importAccountsJSONPreferAT(c, proxyURL, allowDuplicate)
 	case "at_txt":
-		h.importAccountsATTXT(c, proxyURL)
+		h.importAccountsATTXT(c, proxyURL, allowDuplicate)
 	default:
-		h.importAccountsTXT(c, proxyURL)
+		h.importAccountsTXT(c, proxyURL, allowDuplicate)
+	}
+}
+
+// parseBoolForm 解析表单中的布尔开关（1/true/yes/on 视为真）。
+func parseBoolForm(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2571,7 +2916,7 @@ func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string
 }
 
 // importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -2586,11 +2931,11 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
 }
 
 // importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
-func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -2636,12 +2981,12 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
 }
 
 // importAccountsJSONPreferAT 通过 JSON 文件导入，但只信任 access_token，
 // 用于一些导出工具中 refresh_token / session_token 是占位/重复值的场景。
-func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -2694,7 +3039,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
 }
 
 // importEvent SSE 导入进度事件
@@ -2733,7 +3078,7 @@ func sendSSEJSON(c *gin.Context, event any) {
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
-func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool) {
 	// 文件内去重：
 	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
@@ -2830,81 +3175,91 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	}
 	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复，%d 条 OAuth 身份冲突跳过）", len(tokens), len(unique), fileDuplicateCount, ambiguousOAuthIdentityCount)
 
-	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
-	if err != nil {
-		log.Printf("查询已有 RT 失败: %v", err)
-		existingRTs = make(map[string]bool)
-	}
-
-	// 存在 AT-only token 时额外查询已有 AT
-	hasAT := len(seenAT) > 0
-	var existingATs map[string]bool
-	if hasAT {
-		existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
-		if err != nil {
-			log.Printf("查询已有 AT 失败: %v", err)
-			existingATs = make(map[string]bool)
-		}
-	}
-	hasST := len(seenST) > 0
-	var existingSTs map[string]bool
-	if hasST {
-		existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
-		if err != nil {
-			log.Printf("查询已有 ST 失败: %v", err)
-			existingSTs = make(map[string]bool)
-		}
-	}
-
 	var newTokens []importToken
 	duplicateCount := ambiguousOAuthIdentityCount
-	for _, t := range unique {
-		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
-		if oauthIdentity != "" {
-			seed := importTokenSeed(t, conflictingChatGPTIDs)
-			if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
-				log.Printf("查询已有 OAuth 身份失败: %v", err)
-			} else if duplicateID > 0 {
-				row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
-				if err != nil {
-					log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
-				} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
-					duplicateCount++
-					continue
-				}
-			}
-			newTokens = append(newTokens, t)
-			continue
+
+	if allowDuplicate {
+		// 允许重复添加：跳过数据库去重，所有解析出的 token 均作为新账号导入。
+		newTokens = tokens
+		duplicateCount = 0
+	} else {
+		existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有 RT 失败: %v", err)
+			existingRTs = make(map[string]bool)
 		}
-		switch {
-		case t.refreshToken != "":
-			if existingRTs[t.refreshToken] {
-				duplicateCount++
-			} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
-				duplicateCount++
-			} else if t.accessToken != "" && existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
+
+		// 存在 AT-only token 时额外查询已有 AT
+		hasAT := len(seenAT) > 0
+		var existingATs map[string]bool
+		if hasAT {
+			existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
+			if err != nil {
+				log.Printf("查询已有 AT 失败: %v", err)
+				existingATs = make(map[string]bool)
 			}
-		case t.sessionToken != "":
-			if existingSTs[t.sessionToken] {
-				duplicateCount++
-			} else if t.accessToken != "" && existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
+		}
+		hasST := len(seenST) > 0
+		var existingSTs map[string]bool
+		if hasST {
+			existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
+			if err != nil {
+				log.Printf("查询已有 ST 失败: %v", err)
+				existingSTs = make(map[string]bool)
 			}
-		case t.accessToken != "":
-			if existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
+		}
+
+		for _, t := range unique {
+			oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+			if oauthIdentity != "" {
+				seed := importTokenSeed(t, conflictingChatGPTIDs)
+				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", err)
+				} else if duplicateID > 0 {
+					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+					if err != nil {
+						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+						duplicateCount++
+						continue
+					}
+				}
 				newTokens = append(newTokens, t)
+				continue
+			}
+			switch {
+			case t.refreshToken != "":
+				if existingRTs[t.refreshToken] {
+					duplicateCount++
+				} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
+					duplicateCount++
+				} else if t.accessToken != "" && existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
+			case t.sessionToken != "":
+				if existingSTs[t.sessionToken] {
+					duplicateCount++
+				} else if t.accessToken != "" && existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
+			case t.accessToken != "":
+				if existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
 			}
 		}
 	}
 
 	total := len(unique) + ambiguousOAuthIdentityCount
+	if allowDuplicate {
+		total = len(tokens)
+	}
 
 	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
@@ -2959,11 +3314,12 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			name := tok.name
 
 			seed := importTokenSeed(tok, conflictingChatGPTIDs)
+			seed.allowDuplicate = allowDuplicate
 			importSource := "import"
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
 			}
-			if seed.email != "" && seed.accountID != "" {
+			if !allowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
 				if name == "" {
 					if importSource == "import_at" {
 						name = fmt.Sprintf("at-import-%d", idx+1)
@@ -3090,7 +3446,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
-func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -3105,7 +3461,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -3692,7 +4048,24 @@ func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
 	if refreshFn == nil {
 		refreshFn = h.refreshSingleAccount
 	}
-	return refreshFn(refreshCtx, id)
+	if err := refreshFn(refreshCtx, id); err != nil {
+		return err
+	}
+
+	// 刷新成功后顺带做一次零成本 wham 用量探针，从服务端权威数据同步订阅到期时间与用量。
+	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
+	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
+	// （issue #300）
+	if probe := h.usageProbeFunc(); probe != nil && h.store != nil {
+		if acc := h.store.FindByID(id); acc != nil {
+			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+			if err := probe(probeCtx, acc); err != nil {
+				log.Printf("[账号 %d] 刷新后用量/订阅到期探针失败（忽略）: %v", id, err)
+			}
+			probeCancel()
+		}
+	}
+	return nil
 }
 
 func (h *Handler) streamBatchRefreshAccounts(c *gin.Context, ids []int64) {
@@ -5218,12 +5591,14 @@ type settingsResponse struct {
 	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
 	PromptFilterReviewEnabled          bool    `json:"prompt_filter_review_enabled"`
 	PromptFilterReviewAPIKeyConfigured bool    `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewAPIKeyCount      int     `json:"prompt_filter_review_api_key_count"`
 	PromptFilterReviewBaseURL          string  `json:"prompt_filter_review_base_url"`
 	PromptFilterReviewModel            string  `json:"prompt_filter_review_model"`
 	PromptFilterReviewTimeoutSeconds   int     `json:"prompt_filter_review_timeout_seconds"`
 	PromptFilterReviewFailClosed       bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig               string  `json:"codex_user_agent_config"`
 	UsageLogMode                       string  `json:"usage_log_mode"`
 	UsageLogBatchSize                  int     `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int     `json:"usage_log_flush_interval_seconds"`
@@ -5310,6 +5685,7 @@ type updateSettingsReq struct {
 	PromptFilterReviewFailClosed       *bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   *string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 *string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig               *string  `json:"codex_user_agent_config"`
 	UsageLogMode                       *string  `json:"usage_log_mode"`
 	UsageLogBatchSize                  *int     `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       *int     `json:"usage_log_flush_interval_seconds"`
@@ -5898,12 +6274,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
 		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
 		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
 		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                  h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:       h.db.GetUsageLogFlushIntervalSeconds(),
@@ -6314,6 +6692,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexMinCLIVersion = strings.TrimSpace(*req.CodexMinCLIVersion)
 		log.Printf("设置已更新: codex_min_cli_version = %s", runtimeCfg.CodexMinCLIVersion)
 	}
+	if req.CodexUserAgentConfig != nil {
+		normalized, err := proxy.NormalizeCodexUserAgentConfigJSON(*req.CodexUserAgentConfig)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		runtimeCfg.CodexUserAgentConfig = normalized
+		log.Printf("设置已更新: codex_user_agent_config")
+	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
 		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
@@ -6619,6 +7006,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       usageLogMode,
 		UsageLogBatchSize:                  usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
@@ -6717,12 +7105,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
 		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
 		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
 		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       usageLogMode,
 		UsageLogBatchSize:                  usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
@@ -7079,7 +7469,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 	}
 
 	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
-	h.importAccountsCommon(c, tokens, "")
+	h.importAccountsCommon(c, tokens, "", false)
 }
 
 // ==================== Models ====================

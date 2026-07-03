@@ -2015,6 +2015,7 @@
     "promptShareMacInstaller": "Mac installer: {{url}}",
     "promptShareMacAppleInstaller": "Mac installer (Apple silicon M1/M2/M3/M4): {{url}}",
     "promptShareMacIntelInstaller": "Mac installer (Intel): {{url}}",
+    "promptShareMacQuarantine": "If macOS reports the app as damaged, run this in Terminal: xattr -dr com.apple.quarantine \"/Applications/Codex Toolkit.app\"",
     "promptShareTrafficNote": "After switching, your original account information remains on the machine, but requests will no longer use the original account's traffic.",
     "downloadWindowsScript": "Windows script download",
     "downloadMacScript": "MAC script download",

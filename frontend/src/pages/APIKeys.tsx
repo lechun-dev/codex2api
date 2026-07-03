@@ -1429,6 +1429,7 @@ function buildToolkitShareText({
     t("apiKeys.promptShareWindowsInstaller", { url: windowsInstallerURL }),
     t("apiKeys.promptShareMacAppleInstaller", { url: macInstallerURL }),
     t("apiKeys.promptShareMacIntelInstaller", { url: macIntelInstallerURL }),
+    t("apiKeys.promptShareMacQuarantine"),
     t("apiKeys.promptShareWindowsToolkit", { url: windowsToolkitURL }),
     t("apiKeys.promptShareMacToolkit", { url: macToolkitURL }),
     "",

@@ -2015,6 +2015,7 @@
     "promptShareMacInstaller": "Mac 安装包：{{url}}",
     "promptShareMacAppleInstaller": "Mac 安装包（Apple 芯片 M1/M2/M3/M4）：{{url}}",
     "promptShareMacIntelInstaller": "Mac 安装包（Intel 芯片）：{{url}}",
+    "promptShareMacQuarantine": "如果 macOS 提示应用已损坏或无法打开，可以在终端执行：xattr -dr com.apple.quarantine \"/Applications/Codex Toolkit.app\"",
     "promptShareTrafficNote": "切换后您的原账号信息还在，但是不会再走原账号的流量。",
     "downloadWindowsScript": "Windows脚本下载",
     "downloadMacScript": "MAC脚本下载",

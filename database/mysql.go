@@ -503,7 +503,11 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			updated_at = CURRENT_TIMESTAMP
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') = 'deleted'
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	return db.runDataMigrationsWithTimeout()
 }
 
 func (db *DB) ensureMySQLColumn(ctx context.Context, table, name, columnDef string) error {

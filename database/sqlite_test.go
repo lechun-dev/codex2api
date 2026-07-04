@@ -351,6 +351,14 @@ func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
 		t.Fatal("allow_duplicate 副本被迁移误删，应保留")
 	}
 
+	var eventCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = $1 AND account_id = $2`, dataMigrationOAuthIdentityDedupeV2, pollutedID).Scan(&eventCount); err != nil {
+		t.Fatalf("查询 v2 account_events 返回错误: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("v2 dedupe event count = %d, want 1", eventCount)
+	}
+
 	// 强制副本也不作为身份判重锚点：按身份查找应命中主账号而非副本
 	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != nil {
 		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
@@ -501,7 +509,7 @@ func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	}
 
 	var eventCount int
-	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = 'oauth_identity_dedupe_v1' AND account_id IN ($1, $2, $3)`, oldID, midID, bridgeOldID).Scan(&eventCount); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = $1 AND account_id IN ($2, $3, $4)`, dataMigrationOAuthIdentityDedupeV1, oldID, midID, bridgeOldID).Scan(&eventCount); err != nil {
 		t.Fatalf("查询 account_events 返回错误: %v", err)
 	}
 	if eventCount != 3 {

@@ -32,10 +32,14 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.ensureDataMigrationsTable(ctx); err != nil {
 		return err
 	}
-	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, db.dedupeOAuthIdentityAccounts); err != nil {
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, func(ctx context.Context, tx *sql.Tx) error {
+		return db.dedupeOAuthIdentityAccounts(ctx, tx, dataMigrationOAuthIdentityDedupeV1)
+	}); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts)
+	return db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, func(ctx context.Context, tx *sql.Tx) error {
+		return db.dedupeOAuthIdentityAccounts(ctx, tx, dataMigrationOAuthIdentityDedupeV2)
+	})
 }
 
 func (db *DB) runDataMigrationsWithTimeout() error {
@@ -45,12 +49,7 @@ func (db *DB) runDataMigrationsWithTimeout() error {
 }
 
 func (db *DB) ensureDataMigrationsTable(ctx context.Context) error {
-	_, err := db.conn.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS data_migrations (
-			version TEXT PRIMARY KEY,
-			applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
+	_, err := db.conn.ExecContext(ctx, db.dataMigrationsTableDDL())
 	if err != nil {
 		return fmt.Errorf("创建 data_migrations 表失败: %w", err)
 	}
@@ -65,11 +64,7 @@ func (db *DB) runDataMigrationOnce(ctx context.Context, version string, migrate 
 		}
 		defer tx.Rollback()
 
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO data_migrations (version, applied_at)
-			VALUES ($1, CURRENT_TIMESTAMP)
-			ON CONFLICT(version) DO NOTHING
-		`, version)
+		res, err := tx.ExecContext(ctx, db.dataMigrationInsertSQL(), version)
 		if err != nil {
 			return fmt.Errorf("记录 data migration %s 失败: %w", version, err)
 		}
@@ -88,7 +83,39 @@ func (db *DB) runDataMigrationOnce(ctx context.Context, version string, migrate 
 	})
 }
 
-func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx) error {
+// 2026-07-03 lq: data_migrations 需要按驱动生成 DDL/DML；MySQL 5.6 不支持 TIMESTAMPTZ 和 ON CONFLICT。
+func (db *DB) dataMigrationsTableDDL() string {
+	if db != nil && db.isMySQL() {
+		return `
+			CREATE TABLE IF NOT EXISTS data_migrations (
+				version VARCHAR(191) NOT NULL PRIMARY KEY,
+				applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8
+		`
+	}
+	return `
+		CREATE TABLE IF NOT EXISTS data_migrations (
+			version TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+		)
+	`
+}
+
+func (db *DB) dataMigrationInsertSQL() string {
+	if db != nil && db.isMySQL() {
+		return `
+			INSERT IGNORE INTO data_migrations (version, applied_at)
+			VALUES (?, CURRENT_TIMESTAMP)
+		`
+	}
+	return `
+		INSERT INTO data_migrations (version, applied_at)
+		VALUES ($1, CURRENT_TIMESTAMP)
+		ON CONFLICT(version) DO NOTHING
+	`
+}
+
+func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx, migrationVersion string) error {
 	accounts, err := db.listOAuthIdentityDedupeAccounts(ctx, tx)
 	if err != nil {
 		return err
@@ -160,10 +187,10 @@ func (db *DB) dedupeOAuthIdentityAccounts(ctx context.Context, tx *sql.Tx) error
 	if err := softDeleteAccountsTx(ctx, tx, loserIDs); err != nil {
 		return err
 	}
-	if err := insertAccountEventsTx(ctx, tx, loserIDs, "deleted", "oauth_identity_dedupe_v1"); err != nil {
+	if err := insertAccountEventsTx(ctx, tx, loserIDs, "deleted", migrationVersion); err != nil {
 		return err
 	}
-	log.Printf("[data_migration] %s: 发现 %d 组重复 OAuth 身份，已软删除 %d 个重复账号", dataMigrationOAuthIdentityDedupeV1, duplicateGroups, len(loserIDs))
+	log.Printf("[data_migration] %s: 发现 %d 组重复 OAuth 身份，已软删除 %d 个重复账号", migrationVersion, duplicateGroups, len(loserIDs))
 	return nil
 }
 

@@ -872,6 +872,9 @@ export default function Settings() {
     auto_pause_7d_threshold: 0,
     auto_pause_5h_guard_band_percent: 5,
     auto_pause_5h_guard_concurrency: 1,
+    smart_pacing_enabled: false,
+    smart_pacing_min_concurrency: 1,
+    smart_pacing_windows: '5h,7d',
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1578,6 +1581,51 @@ export default function Settings() {
                   }}
                   onBlur={() => {
                     void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: settingsForm.auto_pause_5h_guard_concurrency })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.smartPacingEnabled')} description={t('settings.smartPacingEnabledHint')}>
+                <Select
+                  value={settingsForm.smart_pacing_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => autoSaveBooleanField('smart_pacing_enabled', value)}
+                  options={booleanOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.smartPacingWindows')} description={t('settings.smartPacingWindowsHint')}>
+                <Select
+                  value={settingsForm.smart_pacing_windows || '5h,7d'}
+                  onValueChange={(value) => {
+                    setSettingsForm(f => ({ ...f, smart_pacing_windows: value }))
+                    void autoSaveSettingsPatch({ smart_pacing_windows: value })
+                  }}
+                  options={[
+                    { value: '5h,7d', label: t('settings.smartPacingWindowsBoth') },
+                    { value: '5h', label: t('settings.smartPacingWindows5h') },
+                    { value: '7d', label: t('settings.smartPacingWindows7d') },
+                  ]}
+                />
+              </SettingField>
+              <SettingField label={t('settings.smartPacingMinConcurrency')} description={t('settings.smartPacingMinConcurrencyHint')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  step={1}
+                  inputMode="numeric"
+                  value={settingsForm.smart_pacing_min_concurrency ?? 1}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, smart_pacing_min_concurrency: 1 }))
+                      return
+                    }
+                    const parsed = Number.parseInt(raw, 10)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(1, Math.min(1000, parsed))
+                    setSettingsForm(f => ({ ...f, smart_pacing_min_concurrency: value }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ smart_pacing_min_concurrency: settingsForm.smart_pacing_min_concurrency })
                   }}
                 />
               </SettingField>

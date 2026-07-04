@@ -385,5 +385,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		CodexWSSilentMaxRetries:          2,
 		AutoPause5hGuardBandPercent:      5,
 		AutoPause5hGuardConcurrency:      1,
+		SmartPacingMinConcurrency:        1,
+		SmartPacingWindows:               "5h,7d",
 	}
 }

@@ -887,6 +887,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_min_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1072,13 +1075,15 @@ type APIKeyRow struct {
 // APIKeyLimits 是 API Key 级别的细粒度限流/配额配置。
 // 0 或空字段表示该项不限。落库为 JSON,允许平滑扩展字段。
 //
-// - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
-// - RPM: 每分钟请求数 (滑动 60s 窗口)。
-// - RPD: 每天请求数 (滑动 24h 窗口)。
-// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
-// - MaxClients / ClientWindowMinutes / ClientLimitMode: 按 X-Client-Id 限制同一 API Key 的客户端数量。
-// - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
-// - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
+//   - RPM: 每分钟请求数 (滑动 60s 窗口)。
+//   - RPD: 每天请求数 (滑动 24h 窗口)。
+//   - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
+//   - MaxClients / ClientWindowMinutes / ClientLimitMode: 按 X-Client-Id 限制同一 API Key 的客户端数量。
+//   - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
+//   - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - PlanAllow: 账号套餐白名单(plus/pro/team/...)。非空时该 Key 仅调度命中其一的账号,
+//     语义与 AllowedGroupIDs 类似,均在账号选择阶段过滤。空表示不限套餐。
 const (
 	APIKeyClientLimitModeOff     = "off"
 	APIKeyClientLimitModeObserve = "observe"
@@ -1088,6 +1093,7 @@ const (
 type APIKeyLimits struct {
 	ModelAllow          []string `json:"model_allow,omitempty"`
 	ModelDeny           []string `json:"model_deny,omitempty"`
+	PlanAllow           []string `json:"plan_allow,omitempty"`
 	RPM                 int      `json:"rpm,omitempty"`
 	RPD                 int      `json:"rpd,omitempty"`
 	MaxConcurrency      int      `json:"max_concurrency,omitempty"`
@@ -1104,7 +1110,7 @@ type APIKeyLimits struct {
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
-	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
+	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.MaxClients == 0 && l.ClientWindowMinutes == 0 && strings.TrimSpace(l.ClientLimitMode) == "" &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
@@ -1508,6 +1514,9 @@ type SystemSettings struct {
 	AutoPause7dThreshold               float64
 	AutoPause5hGuardBandPercent        float64
 	AutoPause5hGuardConcurrency        int
+	SmartPacingEnabled                 bool   // issue #312 智能配速总开关
+	SmartPacingMinConcurrency          int    // 配速并发下限
+	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1525,6 +1534,40 @@ func normalizeFirstTokenMode(mode string) string {
 		return "loose"
 	default:
 		return "strict"
+	}
+}
+
+// normalizeSmartPacingMinConcurrencyDB 归一化智能配速并发下限（1..1000，默认 1）。
+func normalizeSmartPacingMinConcurrencyDB(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+// normalizeSmartPacingWindowsDB 归一化配速窗口为 "5h,7d" / "5h" / "7d"，非法回退 "5h,7d"。
+func normalizeSmartPacingWindowsDB(raw string) string {
+	var w5h, w7d bool
+	for _, part := range strings.Split(strings.ToLower(strings.TrimSpace(raw)), ",") {
+		switch strings.TrimSpace(part) {
+		case "5h":
+			w5h = true
+		case "7d":
+			w7d = true
+		}
+	}
+	switch {
+	case w5h && w7d:
+		return "5h,7d"
+	case w5h:
+		return "5h"
+	case w7d:
+		return "7d"
+	default:
+		return "5h,7d"
 	}
 }
 
@@ -1594,7 +1637,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(auto_pause_5h_threshold, 0),
 			       COALESCE(auto_pause_7d_threshold, 0),
 			       COALESCE(auto_pause_5h_guard_band_percent, 5),
-			       COALESCE(auto_pause_5h_guard_concurrency, 1)
+			       COALESCE(auto_pause_5h_guard_concurrency, 1),
+			       COALESCE(smart_pacing_enabled, false),
+			       COALESCE(smart_pacing_min_concurrency, 1),
+			       COALESCE(smart_pacing_windows, '5h,7d')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1631,6 +1677,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoPause7dThreshold,
 		&s.AutoPause5hGuardBandPercent,
 		&s.AutoPause5hGuardConcurrency,
+		&s.SmartPacingEnabled,
+		&s.SmartPacingMinConcurrency,
+		&s.SmartPacingWindows,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1693,9 +1742,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold,
 					auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled,
+					smart_pacing_min_concurrency,
+					smart_pacing_windows
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1769,7 +1821,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
 					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled = EXCLUDED.smart_pacing_enabled,
+					smart_pacing_min_concurrency = EXCLUDED.smart_pacing_min_concurrency,
+					smart_pacing_windows = EXCLUDED.smart_pacing_windows
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1786,7 +1841,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
-		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency)
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
+		s.SmartPacingEnabled, normalizeSmartPacingMinConcurrencyDB(s.SmartPacingMinConcurrency), normalizeSmartPacingWindowsDB(s.SmartPacingWindows))
 	return err
 }
 

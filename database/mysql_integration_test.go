@@ -68,6 +68,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		ReasoningEffortModels:              "[]",
 		ClientCompatMode:                   "responses",
 		CodexMinCLIVersion:                 "0.119.0",
+		CodexUserAgentConfig:               `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
 		UsageLogMode:                       "minimal",
 		UsageLogBatchSize:                  33,
 		UsageLogFlushIntervalSeconds:       9,
@@ -101,6 +102,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.StreamFlushIntervalMS != 44 ||
 		savedSettings.ClientCompatMode != "responses" ||
 		savedSettings.CodexMinCLIVersion != "0.119.0" ||
+		savedSettings.CodexUserAgentConfig != `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}` ||
 		savedSettings.UsageLogMode != "minimal" ||
 		savedSettings.UsageLogBatchSize != 33 ||
 		savedSettings.UsageLogFlushIntervalSeconds != 9 ||

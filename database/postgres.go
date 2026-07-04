@@ -729,6 +729,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
+			test_content       TEXT DEFAULT 'hi',
 			test_concurrency   INT DEFAULT 50,
 			proxy_url          VARCHAR(500) DEFAULT '',
 			pg_max_conns       INT DEFAULT 50,
@@ -754,6 +755,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -1368,6 +1370,7 @@ type SystemSettings struct {
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
+	TestContent                        string
 	TestConcurrency                    int
 	ProxyURL                           string
 	PgMaxConns                         int
@@ -1497,7 +1500,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT COALESCE(site_name, 'CodexProxy'), COALESCE(site_logo, ''),
-		       max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+		       max_concurrency, global_rpm, test_model, COALESCE(test_content, 'hi'), test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
 		       COALESCE(proxy_pool_enabled, false),
 		       COALESCE(fast_scheduler_enabled, false),
@@ -1565,7 +1568,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
-		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
+		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
@@ -1607,6 +1610,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	}
 	s.SiteName = NormalizeSiteName(s.SiteName)
 	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
+	s.TestContent = strings.TrimSpace(s.TestContent)
+	if s.TestContent == "" {
+		s.TestContent = "hi"
+	}
 	if strings.TrimSpace(s.ReasoningEffortModels) == "" {
 		s.ReasoningEffortModels = "[]"
 	}
@@ -1630,9 +1637,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
+	testContent := strings.TrimSpace(s.TestContent)
+	if testContent == "" {
+		testContent = "hi"
+	}
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
-				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
+				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_content, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping, codex_model_mapping,
 					background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
@@ -1668,13 +1679,14 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					smart_pacing_min_concurrency,
 					smart_pacing_windows
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
 				max_concurrency         = EXCLUDED.max_concurrency,
 				global_rpm              = EXCLUDED.global_rpm,
 				test_model              = EXCLUDED.test_model,
+				test_content            = EXCLUDED.test_content,
 				test_concurrency        = EXCLUDED.test_concurrency,
 				proxy_url               = EXCLUDED.proxy_url,
 			pg_max_conns            = EXCLUDED.pg_max_conns,
@@ -1747,7 +1759,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					smart_pacing_min_concurrency = EXCLUDED.smart_pacing_min_concurrency,
 					smart_pacing_windows = EXCLUDED.smart_pacing_windows
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
-		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
+		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,

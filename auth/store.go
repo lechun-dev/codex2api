@@ -43,6 +43,21 @@ const (
 
 const UpstreamOpenAIResponses = "openai_responses"
 
+const (
+	DefaultTestContent  = "hi"
+	MaxTestContentRunes = 8192
+)
+
+// NormalizeTestContent returns the prompt text used by connection tests.
+// Empty content keeps the historical minimal probe behavior.
+func NormalizeTestContent(content string) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return DefaultTestContent
+	}
+	return content
+}
+
 // Account 运行时账号状态
 type Account struct {
 	mu             sync.RWMutex
@@ -2061,6 +2076,7 @@ type Store struct {
 	maxConcurrency                     int64        // 每账号最大并发数
 	testConcurrency                    int64        // 批量测试并发数
 	testModel                          atomic.Value // 测试连接使用的模型（string）
+	testContent                        atomic.Value // 测试连接使用的输入内容（string）
 	db                                 *database.DB
 	tokenCache                         cache.TokenCache
 	apiKeyGroupsMu                     sync.RWMutex
@@ -2508,6 +2524,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			MaxConcurrency:                     2,
 			TestConcurrency:                    50,
 			TestModel:                          "gpt-5.4",
+			TestContent:                        DefaultTestContent,
 			BackgroundRefreshIntervalMinutes:   2,
 			UsageProbeMaxAgeMinutes:            10,
 			UsageProbeConcurrency:              defaultUsageProbeConcurrency,
@@ -2539,6 +2556,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		sessionBindings:         make(map[string]sessionAffinity),
 	}
 	s.testModel.Store(settings.TestModel)
+	s.testContent.Store(NormalizeTestContent(settings.TestContent))
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
 	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
@@ -4235,6 +4253,19 @@ func (s *Store) GetTestModel() string {
 		return v
 	}
 	return "gpt-5.4"
+}
+
+// SetTestContent dynamically updates connection test input text.
+func (s *Store) SetTestContent(content string) {
+	s.testContent.Store(NormalizeTestContent(content))
+}
+
+// GetTestContent returns the input text used by connection tests.
+func (s *Store) GetTestContent() string {
+	if v, ok := s.testContent.Load().(string); ok && strings.TrimSpace(v) != "" {
+		return v
+	}
+	return DefaultTestContent
 }
 
 // SetTestConcurrency 动态更新批量测试并发数

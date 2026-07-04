@@ -793,6 +793,7 @@ export default function Settings() {
     max_concurrency: 2,
     global_rpm: 0,
     test_model: '',
+    test_content: 'hi',
     test_concurrency: 50,
 	    background_refresh_interval_minutes: 2,
 	    usage_probe_max_age_minutes: 10,
@@ -1459,6 +1460,18 @@ export default function Settings() {
                     value={settingsForm.test_model}
                     onValueChange={(value) => autoSaveStringField('test_model', value)}
                     options={textModelOptions}
+                  />
+                </SettingField>
+                <SettingField className="md:col-span-2" label={t('settings.testContent')} description={t('settings.testContentDesc')}>
+                  <textarea
+                    rows={3}
+                    value={settingsForm.test_content}
+                    placeholder={t('settings.testContentPlaceholder')}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setSettingsForm(f => ({ ...f, test_content: e.target.value }))}
+                    onBlur={(e) => autoSaveStringField('test_content', e.currentTarget.value)}
+                    className={cn(
+                      'flex min-h-[92px] w-full resize-y rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
+                    )}
                   />
                 </SettingField>
                 <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>

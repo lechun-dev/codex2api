@@ -1498,7 +1498,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
-	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
+	respCacheOwner := responseCacheOwner(apiKeyID)
+	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 	var openAIResponsesBody []byte
 	resetOpenAIResponsesBody := func() {
 		openAIResponsesBody = nil
@@ -2128,7 +2130,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse([]byte(expandedInputRaw), data)
+					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2187,7 +2189,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse([]byte(expandedInputRaw), data)
+					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -2409,8 +2411,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// compact 强制非流式
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
 
-	// 准备上游请求体
-	codexBody, _ := PrepareCompactResponsesBody(rawBody)
+	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
+	codexBody, _ := PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return

@@ -2221,6 +2221,9 @@ type sessionAffinity struct {
 
 const defaultSessionAffinityTTL = time.Hour
 
+// maxSessionBindings 会话粘性表的软上限。超限时在 bind 路径全量清一轮过期项。
+const maxSessionBindings = 65536
+
 // Bounded affinity 默认阈值。命中任一即触发解绑下次走完整挑号策略。
 const (
 	defaultMaxAffinityRequests = 50
@@ -3897,6 +3900,16 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	s.sessionMu.Lock()
 	if s.sessionBindings == nil {
 		s.sessionBindings = make(map[string]sessionAffinity)
+	}
+	// 有界保护：过期绑定只在同 key 再次命中时才被动删除，对话结束后的绑定
+	// 永远不会再被查询、会静默泄漏。粘性键按内容种子派生（每段对话一个）后
+	// 键数量随对话数增长，超限时全量清一轮过期项。
+	if len(s.sessionBindings) >= maxSessionBindings {
+		for k, b := range s.sessionBindings {
+			if !b.expiresAt.After(now) {
+				delete(s.sessionBindings, k)
+			}
+		}
 	}
 	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 以保持 bounded 上限计数;
 	// 换账号时则按新绑定从 0 开始计。

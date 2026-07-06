@@ -123,6 +123,18 @@ export interface AccountRow {
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 
+// 单张「主动重置次数」券的有效期明细（issue #322）。
+export interface ResetCreditItem {
+  id: string
+  granted_at?: ISODateString
+  expires_at: ISODateString
+}
+
+export interface ResetCreditsDetailResponse {
+  available_count: number
+  credits: ResetCreditItem[]
+}
+
 // AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
 export interface AccountHealthBucket {
   success: number

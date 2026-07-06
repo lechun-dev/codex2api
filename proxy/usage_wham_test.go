@@ -669,6 +669,65 @@ func TestQueryWhamUsage_ParsesRateLimitResetCredits(t *testing.T) {
 	}
 }
 
+// TestQueryWhamResetCredits_ParsesAndFilters 验证重置券列表端点的解析与过滤
+// (issue #322)：只保留 reset_type=codex_rate_limits 且 status=available 且带
+// expires_at 的券，请求形态与 wham 查询一致（Bearer + chatgpt-account-id）。
+func TestQueryWhamResetCredits_ParsesAndFilters(t *testing.T) {
+	body := `{
+		"available_count": 2,
+		"credits": [
+			{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:42:09Z"},
+			{"id": "c2", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-07-21T08:00:00Z"},
+			{"id": "c3", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-06-20T00:00:00Z", "expires_at": "2026-07-10T00:00:00Z"},
+			{"id": "c4", "reset_type": "other_type", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:00:00Z"},
+			{"id": "c5", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": ""}
+		]
+	}`
+
+	var gotMethod, gotAuth, gotAccountID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	oldURL := whamResetCreditsURLForTest
+	whamResetCreditsURLForTest = server.URL
+	defer func() { whamResetCreditsURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	list, _, err := QueryWhamResetCredits(context.Background(), account, "")
+	if err != nil {
+		t.Fatalf("QueryWhamResetCredits error: %v", err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if !strings.HasPrefix(gotAuth, "Bearer ") {
+		t.Errorf("Authorization = %q, want Bearer prefix", gotAuth)
+	}
+	if gotAccountID != "acc-1" {
+		t.Errorf("chatgpt-account-id = %q, want acc-1", gotAccountID)
+	}
+	if list.AvailableCount != 2 {
+		t.Errorf("AvailableCount = %d, want 2", list.AvailableCount)
+	}
+
+	credits := list.AvailableCodexCredits()
+	if len(credits) != 2 {
+		t.Fatalf("AvailableCodexCredits len = %d, want 2 (filter redeemed/other_type/no-expiry)", len(credits))
+	}
+	if credits[0].ID != "c1" || credits[1].ID != "c2" {
+		t.Errorf("credits ids = %s,%s, want c1,c2", credits[0].ID, credits[1].ID)
+	}
+	if credits[0].ExpiresAt != "2026-07-19T00:42:09Z" {
+		t.Errorf("credits[0].ExpiresAt = %q", credits[0].ExpiresAt)
+	}
+}
+
 func TestConsumeResetCredit_PostsRedeemRequestID(t *testing.T) {
 	var gotMethod, gotAuth, gotAccountID, gotRedeemID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

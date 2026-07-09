@@ -583,7 +583,9 @@ export default function Layout({ children }: PropsWithChildren) {
         </aside>
 
         {/* Main content */}
-        <main className="min-w-0 overflow-x-hidden p-5 max-lg:p-3 max-lg:pb-safe-nav max-lg:safe-px">
+        {/* overflow-x-clip (not hidden): clips horizontal overflow without creating a
+            scroll container that would break position:sticky for in-page sidebars (docs TOC). */}
+        <main className="min-w-0 overflow-x-clip p-5 max-lg:p-3 max-lg:pb-safe-nav max-lg:safe-px">
           {/* Mobile topbar */}
           <header
             data-slot="admin-mobile-topbar"

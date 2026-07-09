@@ -1,4 +1,4 @@
-export type ToastType = 'success' | 'error'
+export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 
 export interface ToastState {
@@ -1042,6 +1042,7 @@ export interface APIKeyRow {
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
+  last_used_at?: ISODateString | null
   created_at: ISODateString
 }
 

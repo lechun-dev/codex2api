@@ -32,6 +32,46 @@ import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
+/** Color ramp for reasoning effort: cool/muted → hot/intense. */
+function getReasoningEffortBadgeClassName(effort: string): string {
+  switch (effort.trim().toLowerCase()) {
+    case 'none':
+    case 'off':
+      return 'border-transparent bg-slate-500/12 text-slate-500 dark:bg-slate-500/20 dark:text-slate-400'
+    case 'minimal':
+    case 'min':
+      return 'border-transparent bg-sky-500/12 text-sky-600 dark:bg-sky-500/20 dark:text-sky-400'
+    case 'low':
+      return 'border-transparent bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
+    case 'medium':
+    case 'med':
+      return 'border-transparent bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400'
+    case 'high':
+      return 'border-transparent bg-orange-500/14 text-orange-600 dark:bg-orange-500/22 dark:text-orange-400'
+    case 'xhigh':
+    case 'max':
+      return 'border-transparent bg-rose-500/14 text-rose-600 dark:bg-rose-500/22 dark:text-rose-400'
+    case 'ultra':
+      return 'border-transparent bg-violet-500/14 text-violet-600 dark:bg-violet-500/22 dark:text-violet-300'
+    default:
+      return 'border-transparent bg-muted text-muted-foreground'
+  }
+}
+
+function ReasoningEffortBadge({ effort }: { effort: string }) {
+  const label = effort.trim()
+  if (!label) return null
+  return (
+    <Badge
+      variant="outline"
+      title={`reasoning: ${label}`}
+      className={`text-[11px] font-semibold lowercase tracking-wide ${getReasoningEffortBadgeClassName(label)}`}
+    >
+      {label}
+    </Badge>
+  )
+}
+
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
     return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
@@ -1791,6 +1831,9 @@ export default function Usage() {
                           <Badge variant="outline" className={usageTableBadgeClass}>
                             {log.model || '-'}
                           </Badge>
+                          {log.reasoning_effort ? (
+                            <ReasoningEffortBadge effort={log.reasoning_effort} />
+                          ) : null}
                           {isFastTier(log.billing_service_tier || log.service_tier) ? (
                             <Badge
                               variant="outline"
@@ -1926,20 +1969,9 @@ export default function Usage() {
                                 → {log.effective_model}
                               </Badge>
                             )}
-                            {log.reasoning_effort && (
-                              <Badge
-                                variant="outline"
-                                className={`text-[11px] font-medium border-transparent ${
-                                  log.reasoning_effort === 'ultra' || log.reasoning_effort === 'xhigh' || log.reasoning_effort === 'high'
-                                    ? 'bg-red-500/12 text-red-600 dark:bg-red-500/20 dark:text-red-400'
-                                    : log.reasoning_effort === 'medium'
-                                      ? 'bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400'
-                                      : 'bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
-                                }`}
-                              >
-                                {log.reasoning_effort}
-                              </Badge>
-                            )}
+                            {log.reasoning_effort ? (
+                              <ReasoningEffortBadge effort={log.reasoning_effort} />
+                            ) : null}
                             {isImageUsageLog(log) && (
                               <ImageUsageBadge log={log} />
                             )}

@@ -145,16 +145,32 @@ var (
 
 func GetModelPricing(model string) *ModelPricing {
 	normalized := normalizeBillingModelName(model)
+	canonical := normalized
+	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
+		canonical = codexModel
+	}
+	base := baseModelPricing(normalized, canonical)
+
+	// custom / synced 覆盖：以代码默认为底，合并非 0 字段（部分覆盖）。
+	// 覆盖表拷贝到本地副本再改，绝不改动共享的默认 pricing 指针。
+	if ov, ok := lookupModelPricingOverride(canonical); ok {
+		merged := *base
+		ov.applyNonZero(&merged)
+		return &merged
+	}
+	return base
+}
+
+// baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
+// canonical 为 codex 归一后的规范名（用于规则表查找）。
+func baseModelPricing(normalized, canonical string) *ModelPricing {
 	if pricing := claudeFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
 	if pricing := geminiFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
-	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
-		normalized = codexModel
-	}
-	if pricing := modelRulePricing(normalized); pricing != nil {
+	if pricing := modelRulePricing(canonical); pricing != nil {
 		return pricing
 	}
 	return defaultModelPricing

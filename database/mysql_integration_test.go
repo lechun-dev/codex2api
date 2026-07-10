@@ -86,6 +86,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		CodexWSHideUpstreamErrors:          false,
 		CodexWSSilentRetryEnabled:          false,
 		CodexWSSilentMaxRetries:            4,
+		ModelPricingOverrides:              `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
+		ModelPricingSyncURL:                "https://example.test/pricing.json",
+		IgnoreUsageLimitStatus:             true,
 	}
 	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
 		t.Fatalf("UpdateSystemSettings failed: %v", err)
@@ -113,7 +116,10 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.CodexWSKeepaliveIntervalSec != 66 ||
 		savedSettings.CodexWSHideUpstreamErrors != false ||
 		savedSettings.CodexWSSilentRetryEnabled != false ||
-		savedSettings.CodexWSSilentMaxRetries != 4 {
+		savedSettings.CodexWSSilentMaxRetries != 4 ||
+		savedSettings.ModelPricingOverrides != `{"gpt-5.4":{"input":2.5,"source":"custom"}}` ||
+		savedSettings.ModelPricingSyncURL != "https://example.test/pricing.json" ||
+		!savedSettings.IgnoreUsageLimitStatus {
 		t.Fatalf("system settings were not persisted correctly: %#v", savedSettings)
 	}
 

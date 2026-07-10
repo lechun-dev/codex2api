@@ -8,6 +8,18 @@ import (
 	"time"
 )
 
+type mysqlColumnDefinition struct {
+	table string
+	name  string
+	def   string
+}
+
+var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	{table: "system_settings", name: "model_pricing_overrides", def: "MEDIUMTEXT NULL"},
+	{table: "system_settings", name: "model_pricing_sync_url", def: "TEXT NULL"},
+	{table: "system_settings", name: "ignore_usage_limit_status", def: "TINYINT(1) DEFAULT 0"},
+}
+
 func (db *DB) migrateMySQL(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS accounts (
@@ -235,11 +247,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		}
 	}
 
-	columns := []struct {
-		table string
-		name  string
-		def   string
-	}{
+	columns := []mysqlColumnDefinition{
 		{"accounts", "cooldown_reason", "VARCHAR(50) DEFAULT ''"},
 		{"accounts", "cooldown_until", "DATETIME NULL"},
 		{"accounts", "score_bias_override", "INT NULL"},
@@ -391,6 +399,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"proxies", "test_location", "VARCHAR(255) DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INT DEFAULT 0"},
 	}
+	columns = append(columns, mysql56SystemSettingsColumns...)
 	for _, column := range columns {
 		if err := db.ensureMySQLColumn(ctx, column.table, column.name, column.def); err != nil {
 			return err
@@ -449,7 +458,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 	return db.runDataMigrationsWithTimeout()
 }
 
-// 2026-07-04 lq: 单独抽出 MySQL 的 system_settings DDL，便于测试并避免再次漏掉新字段。
+// 2026-07-04 coder(lq): 单独抽出 MySQL 的 system_settings DDL，便于测试并避免再次漏掉新字段。
 // MySQL 5.6/5.7 不支持 TEXT/BLOB 默认值，因此 JSON 文本配置列统一使用 TEXT NULL，
 // 运行时再由读取逻辑做 COALESCE/兜底。
 func systemSettingsMySQLDDL() string {
@@ -538,7 +547,10 @@ func systemSettingsMySQLDDL() string {
 		transport_retry_policy VARCHAR(20) DEFAULT 'rotate',
 		codex_synced_cli_version VARCHAR(64) DEFAULT '',
 		codex_cli_version_sync_enabled TINYINT(1) DEFAULT 1,
-		codex_cli_version_sync_interval_hours INT DEFAULT 12
+		codex_cli_version_sync_interval_hours INT DEFAULT 12,
+		model_pricing_overrides MEDIUMTEXT NULL,
+		model_pricing_sync_url TEXT NULL,
+		ignore_usage_limit_status TINYINT(1) DEFAULT 0
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

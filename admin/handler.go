@@ -46,6 +46,8 @@ type Handler struct {
 	cache                  cache.TokenCache
 	db                     *database.DB
 	rateLimiter            *proxy.RateLimiter
+	systemUpdate           *systemUpdater
+	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
@@ -72,6 +74,10 @@ type Handler struct {
 	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
+
+	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
+	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
+	mergeDuplicateMu sync.Mutex
 }
 
 type chartCacheEntry struct {
@@ -208,6 +214,11 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 	if h == nil || h.db == nil || h.store == nil {
 		return false
 	}
+	// 串行化合并：并发导入同一身份的多个账号时，两个合并流程若交错执行，
+	// 可能互相把对方选为“已有账号”，导致双方都被软删（账号丢失）。
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -254,13 +265,16 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
 		return false
 	}
-	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
-		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
-	}
+	// 先软删新账号、再重载旧账号：reloadTokenAccount 会异步触发旧账号的
+	// 探针→再合并，若此刻新账号仍活跃，反向查重会把旧账号合并进新账号，
+	// 两边都被软删。软删前置让后续任何查重都看不到新账号。
 	if err := h.db.SoftDeleteAccount(ctx, newID); err != nil {
 		log.Printf("软删重复导入账号 %d 失败: %v", newID, err)
 	}
 	h.store.RemoveAccount(newID)
+	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
+		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
+	}
 	h.db.InsertAccountEventAsync(newID, "deleted", fmt.Sprintf("merged_into_%d", oldID))
 	h.db.InsertAccountEventAsync(oldID, "updated", "rt_upgrade_merge")
 	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
@@ -382,6 +396,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
+	api.GET("/accounts/:id/reset-credits", h.GetResetCredits)
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
@@ -416,6 +431,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
 	api.GET("/runtime-status", h.GetRuntimeStatus)
+	api.GET("/system/update", h.GetSystemUpdate)
+	api.POST("/system/update", h.PerformSystemUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/runtime-status", h.GetRuntimeStatus)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
@@ -433,6 +450,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
+	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
 	api.POST("/image-prompts", h.CreateImagePromptTemplate)
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
@@ -644,6 +662,8 @@ type accountResponse struct {
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
 	Models                   []string                   `json:"models,omitempty"`
+	ModelMapping             string                     `json:"model_mapping,omitempty"`
+	CustomHeaders            map[string]string          `json:"custom_headers,omitempty"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
 	DispatchScore            float64                    `json:"dispatch_score"`
@@ -679,6 +699,8 @@ type accountResponse struct {
 	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
 	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
+	Window7dKind             string                     `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
+	Window7dSeconds          *int64                     `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
 	Billed5h                 *float64                   `json:"billed_5h"`
 	Billed7d                 *float64                   `json:"billed_7d"`
 	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
@@ -811,6 +833,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
+			ModelMapping:             row.GetCredential("model_mapping"),
+			CustomHeaders:            row.GetCredentialStringMap("custom_headers"),
 			ProxyURL:                 row.ProxyURL,
 			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
@@ -887,6 +911,10 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			if t := acc.GetReset7dAt(); !t.IsZero() {
 				resp.Reset7dAt = t.Format(time.RFC3339)
 			}
+			if sec := acc.GetWindow7dSeconds(); sec > 0 {
+				resp.Window7dSeconds = &sec
+				resp.Window7dKind = acc.Window7dKind()
+			}
 			if t := acc.GetLastUsedAt(); !t.IsZero() {
 				resp.LastUsedAt = t.Format(time.RFC3339)
 			}
@@ -962,7 +990,13 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			billing5hWindows[accounts[i].ID] = t.Add(-5 * time.Hour)
 		}
 		if t := acc.GetReset7dAt(); !t.IsZero() {
-			billing7dWindows[accounts[i].ID] = t.AddDate(0, 0, -7)
+			// 长窗口起点 = reset - 真实周期。free/team 是月窗(约 30 天),
+			// 写死减 7 天会把起点算到未来,成本恒为 0 (issue #324)。
+			windowDur := 7 * 24 * time.Hour
+			if sec := acc.GetWindow7dSeconds(); sec > 0 {
+				windowDur = time.Duration(sec) * time.Second
+			}
+			billing7dWindows[accounts[i].ID] = t.Add(-windowDur)
 		}
 	}
 
@@ -1001,6 +1035,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
 	DispatchCountLimit      json.RawMessage `json:"dispatch_count_limit"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
+	CustomHeaders           json.RawMessage `json:"custom_headers"`
 }
 
 type accountSchedulerUpdate struct {
@@ -1016,6 +1051,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dDisabled     database.OptionalBool
 	DispatchCountLimit      database.OptionalNullInt64
 	ProxyURL                database.OptionalString
+	CustomHeaders           optionalCustomHeaders
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -1069,7 +1105,14 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	customHeaders, err := parseOptionalCustomHeadersField(req.CustomHeaders)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	credentialUpdates := make(map[string]interface{})
+	if customHeaders.Set {
+		credentialUpdates["custom_headers"] = cloneCustomHeaders(customHeaders.Values)
+	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
 	}
@@ -1106,6 +1149,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dDisabled:     autoPause7dDisabled,
 		DispatchCountLimit:      dispatchCountLimit,
 		ProxyURL:                proxyURL,
+		CustomHeaders:           customHeaders,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -1278,6 +1322,146 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if update.ProxyURL.Set {
 		h.store.ApplyAccountProxyURL(id, update.ProxyURL.Value)
 	}
+	if update.CustomHeaders.Set {
+		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
+	}
+}
+
+type optionalCustomHeaders struct {
+	Set    bool
+	Values map[string]string
+}
+
+func parseOptionalCustomHeadersField(raw json.RawMessage) (optionalCustomHeaders, error) {
+	if len(raw) == 0 {
+		return optionalCustomHeaders{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalCustomHeaders{Set: true}, nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal(raw, &headers); err != nil {
+		return optionalCustomHeaders{}, fmt.Errorf("custom_headers 必须是对象或 null")
+	}
+	normalized, err := normalizeCustomHeaders(headers)
+	if err != nil {
+		return optionalCustomHeaders{}, err
+	}
+	return optionalCustomHeaders{Set: true, Values: normalized}, nil
+}
+
+func normalizeCustomHeaders(headers map[string]string) (map[string]string, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	if len(headers) > 64 {
+		return nil, fmt.Errorf("custom_headers 最多支持 64 个请求头")
+	}
+	out := make(map[string]string, len(headers))
+	for rawName, rawValue := range headers {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		if len(name) > 128 || !isValidHeaderName(name) {
+			return nil, fmt.Errorf("custom_headers 包含无效请求头名称: %s", name)
+		}
+		value := strings.TrimSpace(rawValue)
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("custom_headers.%s 不能包含换行符", name)
+		}
+		if len(value) > 8192 {
+			return nil, fmt.Errorf("custom_headers.%s 不能超过 8192 字符", name)
+		}
+		out[http.CanonicalHeaderKey(name)] = value
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func normalizeAccountModelMapping(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return "", fmt.Errorf("模型映射必须是 JSON 对象")
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return "", fmt.Errorf("模型映射必须是 JSON 对象")
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", fmt.Errorf("模型映射格式错误")
+		}
+		key, ok := keyTok.(string)
+		if !ok || strings.TrimSpace(key) == "" {
+			return "", fmt.Errorf("模型映射的源模型不能为空")
+		}
+		// 源模型别名会进入 /v1/models 响应、模型校验和使用日志，
+		// 必须与 models 列表同标准校验，防止任意字符串注入。
+		if err := security.ValidateModelName(strings.TrimSpace(key)); err != nil {
+			return "", fmt.Errorf("模型映射的源模型 %q 无效: %w", key, err)
+		}
+		var value string
+		if err := dec.Decode(&value); err != nil {
+			return "", fmt.Errorf("模型映射的目标模型必须是字符串")
+		}
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("模型映射的目标模型不能为空")
+		}
+		if err := security.ValidateModelName(strings.TrimSpace(value)); err != nil {
+			return "", fmt.Errorf("模型映射的目标模型 %q 无效: %w", value, err)
+		}
+	}
+	endTok, err := dec.Token()
+	if err != nil {
+		return "", fmt.Errorf("模型映射格式错误")
+	}
+	end, ok := endTok.(json.Delim)
+	if !ok || end != '}' {
+		return "", fmt.Errorf("模型映射格式错误")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return "", fmt.Errorf("模型映射只能包含一个 JSON 对象")
+	}
+	return raw, nil
+}
+
+func isValidHeaderName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return name != ""
+}
+
+func cloneCustomHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name, value := range headers {
+		out[name] = value
+	}
+	return out
 }
 
 type optionalStringSlice struct {
@@ -1636,11 +1820,12 @@ func (h *Handler) getAccountUsageWindows(ctx context.Context) (map[int64]*databa
 }
 
 type addAccountReq struct {
-	Name           string `json:"name"`
-	RefreshToken   string `json:"refresh_token"`
-	SessionToken   string `json:"session_token"`
-	ProxyURL       string `json:"proxy_url"`
-	AllowDuplicate bool   `json:"allow_duplicate"`
+	Name           string            `json:"name"`
+	RefreshToken   string            `json:"refresh_token"`
+	SessionToken   string            `json:"session_token"`
+	ProxyURL       string            `json:"proxy_url"`
+	CustomHeaders  map[string]string `json:"custom_headers"`
+	AllowDuplicate bool              `json:"allow_duplicate"`
 }
 
 func splitAccountCredentialLines(raw string, sanitize bool) []string {
@@ -1740,6 +1925,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CustomHeaders = customHeaders
 
 	// 按行分割，支持批量添加。refresh_token 与 session_token 同时填写时，
 	// session_token 可填写一行应用到所有 RT，也可与 RT 行数一一对应。
@@ -1756,7 +1947,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	var seeds []tokenCredentialSeed
 	for i := 0; i < total; i++ {
-		seed := tokenCredentialSeed{allowDuplicate: req.AllowDuplicate}
+		seed := tokenCredentialSeed{allowDuplicate: req.AllowDuplicate, customHeaders: customHeaders}
 		if len(refreshTokens) > 0 {
 			seed.refreshToken = refreshTokens[i]
 		}
@@ -1926,10 +2117,11 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 // addATAccountReq AT 模式添加账号请求
 type addATAccountReq struct {
-	Name           string `json:"name"`
-	AccessToken    string `json:"access_token"`
-	ProxyURL       string `json:"proxy_url"`
-	AllowDuplicate bool   `json:"allow_duplicate"`
+	Name           string            `json:"name"`
+	AccessToken    string            `json:"access_token"`
+	ProxyURL       string            `json:"proxy_url"`
+	CustomHeaders  map[string]string `json:"custom_headers"`
+	AllowDuplicate bool              `json:"allow_duplicate"`
 }
 
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
@@ -1962,6 +2154,12 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.CustomHeaders = customHeaders
 
 	// 按行分割，支持批量添加
 	lines := strings.Split(req.AccessToken, "\n")
@@ -2021,6 +2219,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 			accessToken:    at,
 			allowDuplicate: req.AllowDuplicate,
+			customHeaders:  customHeaders,
 		})
 		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
@@ -2140,7 +2339,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
-		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate})
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
 		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
 			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
@@ -2197,11 +2396,13 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 }
 
 type addOpenAIResponsesAccountReq struct {
-	Name     string   `json:"name"`
-	BaseURL  string   `json:"base_url"`
-	APIKey   string   `json:"api_key"`
-	Models   []string `json:"models"`
-	ProxyURL string   `json:"proxy_url"`
+	Name          string            `json:"name"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	Models        []string          `json:"models"`
+	ModelMapping  string            `json:"model_mapping"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
 }
 
 type fetchOpenAIResponsesModelsReq struct {
@@ -2248,6 +2449,16 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	modelMapping, err := normalizeAccountModelMapping(req.ModelMapping)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -2277,8 +2488,12 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		"base_url":      baseURL,
 		"api_key":       req.APIKey,
 		"models":        models,
+		"model_mapping": modelMapping,
 		"plan_type":     "api",
 		"email":         baseURL,
+	}
+	if len(customHeaders) > 0 {
+		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
 	}
 	id, err := h.db.InsertOpenAIResponsesAccount(ctx, name, credentials, req.ProxyURL)
 	if err != nil {
@@ -2288,15 +2503,17 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
 
 	h.store.AddAccount(&auth.Account{
-		DBID:         id,
-		ProxyURL:     req.ProxyURL,
-		HealthTier:   auth.HealthTierHealthy,
-		UpstreamType: auth.UpstreamOpenAIResponses,
-		BaseURL:      baseURL,
-		APIKey:       req.APIKey,
-		Models:       models,
-		Email:        baseURL,
-		PlanType:     "api",
+		DBID:          id,
+		ProxyURL:      req.ProxyURL,
+		HealthTier:    auth.HealthTierHealthy,
+		UpstreamType:  auth.UpstreamOpenAIResponses,
+		BaseURL:       baseURL,
+		APIKey:        req.APIKey,
+		Models:        models,
+		ModelMapping:  modelMapping,
+		CustomHeaders: customHeaders,
+		Email:         baseURL,
+		PlanType:      "api",
 	})
 
 	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
@@ -2418,6 +2635,16 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	modelMapping, err := normalizeAccountModelMapping(req.ModelMapping)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -2434,11 +2661,13 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 
 	credentials := map[string]interface{}{
-		"upstream_type": auth.UpstreamOpenAIResponses,
-		"base_url":      baseURL,
-		"models":        models,
-		"plan_type":     "api",
-		"email":         baseURL,
+		"upstream_type":  auth.UpstreamOpenAIResponses,
+		"base_url":       baseURL,
+		"models":         models,
+		"model_mapping":  modelMapping,
+		"plan_type":      "api",
+		"email":          baseURL,
+		"custom_headers": cloneCustomHeaders(customHeaders),
 	}
 	if req.APIKey != "" {
 		credentials["api_key"] = req.APIKey
@@ -2457,7 +2686,8 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, req.ProxyURL)
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, req.ProxyURL)
+		h.store.ApplyAccountCustomHeaders(id, customHeaders)
 	}
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
 
@@ -2885,16 +3115,21 @@ func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
 	proxyURL := c.PostForm("proxy_url")
 	allowDuplicate := parseBoolForm(c.PostForm("allow_duplicate"))
+	customHeaders, err := parseCustomHeadersForm(c.PostForm("custom_headers"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	switch format {
 	case "json":
-		h.importAccountsJSON(c, proxyURL, allowDuplicate)
+		h.importAccountsJSON(c, proxyURL, allowDuplicate, customHeaders)
 	case "json_at":
-		h.importAccountsJSONPreferAT(c, proxyURL, allowDuplicate)
+		h.importAccountsJSONPreferAT(c, proxyURL, allowDuplicate, customHeaders)
 	case "at_txt":
-		h.importAccountsATTXT(c, proxyURL, allowDuplicate)
+		h.importAccountsATTXT(c, proxyURL, allowDuplicate, customHeaders)
 	default:
-		h.importAccountsTXT(c, proxyURL, allowDuplicate)
+		h.importAccountsTXT(c, proxyURL, allowDuplicate, customHeaders)
 	}
 }
 
@@ -2906,6 +3141,18 @@ func parseBoolForm(v string) bool {
 	default:
 		return false
 	}
+}
+
+func parseCustomHeadersForm(raw string) (map[string]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(trimmed), &headers); err != nil {
+		return nil, fmt.Errorf("custom_headers 必须是 JSON 对象")
+	}
+	return normalizeCustomHeaders(headers)
 }
 
 type uploadedImportFile struct {
@@ -2964,7 +3211,7 @@ func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string
 }
 
 // importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
+func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -2979,11 +3226,11 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplic
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
 }
 
 // importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
-func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDuplicate bool) {
+func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -3029,12 +3276,12 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDupli
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
 }
 
 // importAccountsJSONPreferAT 通过 JSON 文件导入，但只信任 access_token，
 // 用于一些导出工具中 refresh_token / session_token 是占位/重复值的场景。
-func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, allowDuplicate bool) {
+func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -3087,7 +3334,14 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, al
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
+}
+
+func firstCustomHeaders(headers []map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers[0]
 }
 
 // importEvent SSE 导入进度事件
@@ -3127,7 +3381,8 @@ func sendSSEJSON(c *gin.Context, event any) {
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
-func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool) {
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
+	importCustomHeaders := firstCustomHeaders(customHeaders)
 	// 文件内去重：
 	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
@@ -3366,6 +3621,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 			seed := importTokenSeed(tok, conflictingChatGPTIDs)
 			seed.allowDuplicate = allowDuplicate
+			seed.customHeaders = cloneCustomHeaders(importCustomHeaders)
 			importSource := "import"
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
@@ -3503,7 +3759,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
-func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
+func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -3518,7 +3774,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDupl
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate, firstCustomHeaders(customHeaders))
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -4382,7 +4638,7 @@ func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Ac
 	if err != nil {
 		return err
 	}
-	resp, err := proxy.ExecuteRequest(ctx, acc, buildTestPayload(model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	resp, err := proxy.ExecuteRequest(ctx, acc, buildConnectionTestPayload(h.store, model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 	if err != nil {
 		return err
 	}
@@ -4700,6 +4956,7 @@ type opsErrorExportEntry struct {
 	ErrorKind          string    `json:"error_kind"`
 	ErrorMessage       string    `json:"error_message"`
 	AccountID          int64     `json:"account_id"`
+	AccountName        string    `json:"account_name"`
 	AccountEmail       string    `json:"account_email"`
 	APIKeyID           int64     `json:"api_key_id"`
 	APIKeyName         string    `json:"api_key_name"`
@@ -4889,6 +5146,7 @@ func newOpsErrorExportEntry(logRow *database.UsageLog) opsErrorExportEntry {
 		ErrorKind:          logRow.UpstreamErrorKind,
 		ErrorMessage:       logRow.ErrorMessage,
 		AccountID:          logRow.AccountID,
+		AccountName:        logRow.AccountName,
 		AccountEmail:       logRow.AccountEmail,
 		APIKeyID:           logRow.APIKeyID,
 		APIKeyName:         logRow.APIKeyName,
@@ -5121,6 +5379,9 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
 	}
 
+	// 最近使用时间：一次聚合，失败不阻断列表
+	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
+
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
@@ -5137,6 +5398,12 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 				detail.Cost30d = cost30d[k.ID]
 			}
 			mk.WindowUsage = detail
+		}
+		if lastUsedByID != nil {
+			if lastUsed, ok := lastUsedByID[k.ID]; ok && !lastUsed.IsZero() {
+				formatted := lastUsed.Format(time.RFC3339)
+				mk.LastUsedAt = &formatted
+			}
 		}
 		maskedKeys = append(maskedKeys, mk)
 	}
@@ -5450,6 +5717,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit5h:        maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:        maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:       maxInt64(in.TokenLimit30d, 0),
+		DisableImageGeneration: in.DisableImageGeneration,
 	}
 	switch out.ClientLimitMode {
 	case database.APIKeyClientLimitModeObserve, database.APIKeyClientLimitModeEnforce:
@@ -5637,6 +5905,7 @@ type settingsResponse struct {
 	MaxConcurrency                     int     `json:"max_concurrency"`
 	GlobalRPM                          int     `json:"global_rpm"`
 	TestModel                          string  `json:"test_model"`
+	TestContent                        string  `json:"test_content"`
 	TestConcurrency                    int     `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
@@ -5662,10 +5931,17 @@ type settingsResponse struct {
 	CodexWSHideUpstreamErrors          bool    `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   int     `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion              string  `json:"codex_synced_cli_version"`
 	SchedulerMode                      string  `json:"scheduler_mode"`
 	AffinityMode                       string  `json:"affinity_mode"`
 	MaxRetries                         int     `json:"max_retries"`
 	MaxRateLimitRetries                int     `json:"max_rate_limit_retries"`
+	RetryIntervalMS                    int     `json:"retry_interval_ms"`
+	TransportRetryPolicy               string  `json:"transport_retry_policy"`
 	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
 	DatabaseDriver                     string  `json:"database_driver"`
 	DatabaseLabel                      string  `json:"database_label"`
@@ -5734,6 +6010,7 @@ type updateSettingsReq struct {
 	MaxConcurrency                     *int     `json:"max_concurrency"`
 	GlobalRPM                          *int     `json:"global_rpm"`
 	TestModel                          *string  `json:"test_model"`
+	TestContent                        *string  `json:"test_content"`
 	TestConcurrency                    *int     `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes   *int     `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes            *int     `json:"usage_probe_max_age_minutes"`
@@ -5758,10 +6035,16 @@ type updateSettingsReq struct {
 	CodexWSHideUpstreamErrors          *bool    `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   *int     `json:"codex_cli_version_sync_interval_hours"`
 	SchedulerMode                      *string  `json:"scheduler_mode"`
 	AffinityMode                       *string  `json:"affinity_mode"`
 	MaxRetries                         *int     `json:"max_retries"`
 	MaxRateLimitRetries                *int     `json:"max_rate_limit_retries"`
+	RetryIntervalMS                    *int     `json:"retry_interval_ms"`
+	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
@@ -5990,6 +6273,14 @@ func backgroundAssetPath(filename string) (string, bool) {
 
 func backgroundAssetURL(filename string) string {
 	return backgroundAssetURLPrefix + filename
+}
+
+func validateConnectionTestContent(content string) (string, error) {
+	normalized := auth.NormalizeTestContent(content)
+	if len([]rune(normalized)) > auth.MaxTestContentRunes {
+		return "", fmt.Errorf("test_content 不能超过 %d 个字符", auth.MaxTestContentRunes)
+	}
+	return normalized, nil
 }
 
 func randomBackgroundAssetFilename(ext string) string {
@@ -6327,6 +6618,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
@@ -6352,10 +6644,17 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -6553,6 +6852,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: test_model = %s", *req.TestModel)
 	}
 
+	if req.TestContent != nil {
+		testContent, err := validateConnectionTestContent(*req.TestContent)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetTestContent(testContent)
+		log.Printf("设置已更新: test_content (长度=%d)", len([]rune(testContent)))
+	}
+
 	if req.TestConcurrency != nil {
 		v := *req.TestConcurrency
 		if v < 1 {
@@ -6741,6 +7050,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
 	}
 
+	if req.CodexContinueThinkingEnabled != nil {
+		h.store.SetCodexContinueThinkingEnabled(*req.CodexContinueThinkingEnabled)
+		runtimeCfg.CodexContinueThinking = *req.CodexContinueThinkingEnabled
+		log.Printf("设置已更新: codex_continue_thinking_enabled = %t", *req.CodexContinueThinkingEnabled)
+	}
+
+	if req.CodexContinueMaxRounds != nil {
+		v := database.NormalizeCodexContinueMaxRounds(*req.CodexContinueMaxRounds)
+		h.store.SetCodexContinueMaxRounds(v)
+		runtimeCfg.CodexContinueMaxRounds = v
+		log.Printf("设置已更新: codex_continue_max_rounds = %d", v)
+	}
+
+	if req.CodexCLIVersionSyncEnabled != nil {
+		h.store.SetCodexCLIVersionSyncEnabled(*req.CodexCLIVersionSyncEnabled)
+		runtimeCfg.CodexCLIVersionSyncEnabled = *req.CodexCLIVersionSyncEnabled
+		log.Printf("设置已更新: codex_cli_version_sync_enabled = %t", *req.CodexCLIVersionSyncEnabled)
+	}
+
+	if req.CodexCLIVersionSyncIntervalHours != nil {
+		v := database.NormalizeCodexCLIVersionSyncIntervalHours(*req.CodexCLIVersionSyncIntervalHours)
+		h.store.SetCodexCLIVersionSyncIntervalHours(v)
+		runtimeCfg.CodexCLIVersionSyncIntervalHours = v
+		log.Printf("设置已更新: codex_cli_version_sync_interval_hours = %d", v)
+	}
+
 	if req.SchedulerMode != nil {
 		h.store.SetSchedulerMode(*req.SchedulerMode)
 		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
@@ -6773,6 +7108,24 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetMaxRateLimitRetries(v)
 		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
+	}
+
+	if req.RetryIntervalMS != nil {
+		v := *req.RetryIntervalMS
+		if v < 0 {
+			v = 0
+		}
+		if v > 30000 {
+			v = 30000
+		}
+		h.store.SetRetryIntervalMS(v)
+		log.Printf("设置已更新: retry_interval_ms = %d", v)
+	}
+
+	if req.TransportRetryPolicy != nil {
+		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
+		h.store.SetTransportRetryPolicy(v)
+		log.Printf("设置已更新: transport_retry_policy = %s", v)
 	}
 
 	if req.AllowRemoteMigration != nil {
@@ -7087,6 +7440,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
@@ -7111,10 +7465,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
@@ -7189,6 +7550,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
 		GlobalRPM:                          h.rateLimiter.GetRPM(),
 		TestModel:                          h.store.GetTestModel(),
+		TestContent:                        h.store.GetTestContent(),
 		TestConcurrency:                    h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes:   h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:            h.store.GetUsageProbeMaxAgeMinutes(),
@@ -7214,6 +7576,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -7624,6 +7991,24 @@ func (h *Handler) SyncModels(c *gin.Context) {
 	defer cancel()
 
 	result, err := proxy.SyncOfficialCodexModels(ctx, h.db)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SyncCodexCLIVersion 从 openai/codex releases 拉取最新稳定版本，
+// 抬升出站 UA / manifest 的模拟版本（绝不降级），供设置页「立即同步」按钮调用。
+func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncCodexCLIVersion(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

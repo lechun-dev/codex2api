@@ -362,6 +362,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "stream_flush_interval_ms", "INT DEFAULT 20"},
 		{"system_settings", "first_token_mode", "VARCHAR(20) DEFAULT 'strict'"},
 		{"system_settings", "first_token_timeout_seconds", "INT DEFAULT 0"},
+		{"system_settings", "test_content", "TEXT NULL"},
 		{"system_settings", "auto_pause_5h_threshold", "DOUBLE DEFAULT 0"},
 		{"system_settings", "auto_pause_7d_threshold", "DOUBLE DEFAULT 0"},
 		{"system_settings", "auto_pause_5h_guard_band_percent", "DOUBLE DEFAULT 5"},
@@ -369,6 +370,13 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "smart_pacing_enabled", "TINYINT(1) DEFAULT 0"},
 		{"system_settings", "smart_pacing_min_concurrency", "INT DEFAULT 1"},
 		{"system_settings", "smart_pacing_windows", "VARCHAR(16) DEFAULT '5h,7d'"},
+		{"system_settings", "retry_interval_ms", "INT DEFAULT 0"},
+		{"system_settings", "transport_retry_policy", "VARCHAR(20) DEFAULT 'rotate'"},
+		{"system_settings", "codex_continue_thinking_enabled", "TINYINT(1) DEFAULT 0"},
+		{"system_settings", "codex_continue_max_rounds", "INT DEFAULT 8"},
+		{"system_settings", "codex_synced_cli_version", "VARCHAR(64) DEFAULT ''"},
+		{"system_settings", "codex_cli_version_sync_enabled", "TINYINT(1) DEFAULT 1"},
+		{"system_settings", "codex_cli_version_sync_interval_hours", "INT DEFAULT 12"},
 		{"prompt_filter_logs", "review_model", "VARCHAR(100) DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "TINYINT(1) DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT NULL"},
@@ -399,6 +407,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "idx_accounts_cooldown_until", "CREATE INDEX idx_accounts_cooldown_until ON accounts(cooldown_until)"},
 		{"usage_logs", "idx_usage_logs_created_at", "CREATE INDEX idx_usage_logs_created_at ON usage_logs(created_at)"},
 		{"usage_logs", "idx_usage_logs_account_id", "CREATE INDEX idx_usage_logs_account_id ON usage_logs(account_id)"},
+		{"usage_logs", "idx_usage_logs_account_created_at", "CREATE INDEX idx_usage_logs_account_created_at ON usage_logs(account_id, created_at)"},
 		{"usage_logs", "idx_usage_logs_created_status", "CREATE INDEX idx_usage_logs_created_status ON usage_logs(created_at, status_code)"},
 		{"usage_logs", "idx_usage_logs_account_status", "CREATE INDEX idx_usage_logs_account_status ON usage_logs(account_id, status_code)"},
 		{"usage_logs", "idx_usage_logs_api_key_created_at", "CREATE INDEX idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at)"},
@@ -503,6 +512,7 @@ func systemSettingsMySQLDDL() string {
 		stream_flush_interval_ms INT DEFAULT 20,
 		first_token_mode VARCHAR(20) DEFAULT 'strict',
 		first_token_timeout_seconds INT DEFAULT 0,
+		test_content TEXT NULL,
 		billing_tier_policy VARCHAR(20) DEFAULT 'actual',
 		image_storage_config TEXT NULL,
 		show_full_usage_numbers TINYINT(1) DEFAULT 0,
@@ -521,7 +531,14 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_keepalive_interval_sec INT DEFAULT 60,
 		codex_ws_hide_upstream_errors TINYINT(1) DEFAULT 1,
 		codex_ws_silent_retry_enabled TINYINT(1) DEFAULT 1,
-		codex_ws_silent_max_retries INT DEFAULT 2
+		codex_ws_silent_max_retries INT DEFAULT 2,
+		codex_continue_thinking_enabled TINYINT(1) DEFAULT 0,
+		codex_continue_max_rounds INT DEFAULT 8,
+		retry_interval_ms INT DEFAULT 0,
+		transport_retry_policy VARCHAR(20) DEFAULT 'rotate',
+		codex_synced_cli_version VARCHAR(64) DEFAULT '',
+		codex_cli_version_sync_enabled TINYINT(1) DEFAULT 1,
+		codex_cli_version_sync_interval_hours INT DEFAULT 12
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

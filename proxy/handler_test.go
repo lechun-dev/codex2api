@@ -38,7 +38,7 @@ func (r errReadCloser) Close() error {
 }
 
 func TestSupportedModelsIncludeLatestRequestedModels(t *testing.T) {
-	for _, model := range []string{"gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.2", "gpt-image-2", "gpt-image-2-2k", "gpt-image-2-4k"} {
+	for _, model := range []string{"gpt-5.5", "gpt-5.3-codex-spark", "gpt-image-2", "gpt-image-2-2k", "gpt-image-2-4k"} {
 		if !slices.Contains(SupportedModels, model) {
 			t.Fatalf("SupportedModels missing %q", model)
 		}
@@ -46,10 +46,11 @@ func TestSupportedModelsIncludeLatestRequestedModels(t *testing.T) {
 }
 
 func TestSupportedModelsExcludeBelowGPT52(t *testing.T) {
+	// 5.3 只保留 spark；gpt-5.3-codex、gpt-5.2 及更低模型已下线。
 	for _, model := range []string{
 		"gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
 		"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-		"gpt-5.2-codex",
+		"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
 	} {
 		if slices.Contains(SupportedModels, model) {
 			t.Fatalf("SupportedModels should not include %q", model)
@@ -83,7 +84,7 @@ func TestListModelsIncludesLatestRequestedModels(t *testing.T) {
 	for _, model := range payload.Data {
 		ids = append(ids, model.ID)
 	}
-	for _, model := range []string{"gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.2", "gpt-image-2"} {
+	for _, model := range []string{"gpt-5.5", "gpt-5.3-codex-spark", "gpt-image-2"} {
 		if !slices.Contains(ids, model) {
 			t.Fatalf("/v1/models missing %q in %v", model, ids)
 		}
@@ -94,7 +95,7 @@ func TestListModelsIncludesLatestRequestedModels(t *testing.T) {
 		}
 	}
 
-	for _, model := range []string{"gpt-5", "gpt-5.1", "gpt-5.2-codex"} {
+	for _, model := range []string{"gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex"} {
 		if slices.Contains(ids, model) {
 			t.Fatalf("/v1/models should not include %q in %v", model, ids)
 		}

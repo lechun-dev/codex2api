@@ -1478,6 +1478,11 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 			kept = append(kept, rawTool)
 			continue
 		}
+		// 保留工具原样透传，不摊平 function 子对象、不改写字段（issue #342）。
+		if isReservedCodexTool(tool) {
+			kept = append(kept, tool)
+			continue
+		}
 		toolType := strings.TrimSpace(firstNonEmptyAnyString(tool["type"]))
 		if toolType == "" {
 			// 上游对缺失或为 null 的工具 type 返回 400 "Unsupported tool
@@ -1722,6 +1727,11 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		for _, t := range tools {
 			toolMap, ok := t.(map[string]any)
 			if !ok {
+				continue
+			}
+			// 保留工具（collaboration.* 等）原样透传：上游要求其 schema 逐字
+			// 匹配官方配置，任何补描述/清洗都会破坏匹配并被拒（issue #342）。
+			if isReservedCodexTool(toolMap) {
 				continue
 			}
 			// 补充默认描述
@@ -2506,6 +2516,37 @@ func sanitizeStructuredOutputSchema(format map[string]any) bool {
 func isFunctionTool(tool map[string]any) bool {
 	toolType, _ := tool["type"].(string)
 	return strings.TrimSpace(toolType) == "function"
+}
+
+// reservedCodexToolNamePrefixes 列出上游为模型保留的工具命名空间。这类工具
+// （如 gpt-5.6 multi-agent v2 的 collaboration.spawn_agent）要求 schema 与上游
+// 官方配置逐字匹配，代理的通用 schema 清洗（stripUnsupportedSchemaKeys 等）会破坏
+// 匹配，导致上游 400 "reserved for use by this model and must match the configured
+// schema"（issue #342）。这类工具必须原样透传，不补描述、不清洗、不摊平。
+var reservedCodexToolNamePrefixes = []string{"collaboration."}
+
+// isReservedCodexTool 判断工具名是否落在上游保留命名空间。
+// 兼容 Responses 扁平形态（顶层 name）与 Chat Completions 嵌套形态（function.name）。
+func isReservedCodexTool(tool map[string]any) bool {
+	if tool == nil {
+		return false
+	}
+	name := strings.TrimSpace(firstNonEmptyAnyString(tool["name"]))
+	if name == "" {
+		if fn, ok := tool["function"].(map[string]any); ok {
+			name = strings.TrimSpace(firstNonEmptyAnyString(fn["name"]))
+		}
+	}
+	if name == "" {
+		return false
+	}
+	lower := strings.ToLower(name)
+	for _, prefix := range reservedCodexToolNamePrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeFunctionToolParameters(tool map[string]any) {

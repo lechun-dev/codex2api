@@ -2824,3 +2824,87 @@ func TestPrepareResponsesBody_MaxEffortPassthroughByModel(t *testing.T) {
 		t.Fatalf("gpt-5.4 effort = %q, want xhigh; body=%s", effort, got)
 	}
 }
+
+// issue #342: gpt-5.6 multi-agent 保留工具 collaboration.* 必须原样透传，
+// 通用 schema 清洗(剥 format/minItems/pattern 等)会破坏上游要求的逐字匹配。
+func TestPrepareResponsesBody_ReservedCollaborationToolPassthrough(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":"hi",
+		"tools":[
+			{"type":"function","name":"collaboration.spawn_agent","description":"reserved","parameters":{
+				"type":"object",
+				"properties":{
+					"agent":{"type":"string","pattern":"^[a-z]+$","minLength":1},
+					"tasks":{"type":"array","items":{"type":"string"},"minItems":1,"uniqueItems":true}
+				},
+				"required":["agent"],
+				"additionalProperties":false
+			}},
+			{"type":"function","name":"my_tool","parameters":{
+				"type":"object",
+				"properties":{"x":{"type":"string","minLength":2,"format":"email"}}
+			}}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	tools := gjson.GetBytes(got, "tools").Array()
+
+	// 定位两个工具（顺序可能变，按 name 找）。
+	var reserved, normal gjson.Result
+	for _, tl := range tools {
+		switch tl.Get("name").String() {
+		case "collaboration.spawn_agent":
+			reserved = tl
+		case "my_tool":
+			normal = tl
+		}
+	}
+
+	// 保留工具：受限 schema 关键字必须全部保留。
+	if !reserved.Exists() {
+		t.Fatalf("reserved tool missing; body=%s", got)
+	}
+	for _, path := range []string{
+		"parameters.properties.agent.pattern",
+		"parameters.properties.agent.minLength",
+		"parameters.properties.tasks.minItems",
+		"parameters.properties.tasks.uniqueItems",
+	} {
+		if !reserved.Get(path).Exists() {
+			t.Fatalf("reserved tool lost schema key %q (sanitizer mangled it); body=%s", path, got)
+		}
+	}
+	if reserved.Get("parameters.additionalProperties").String() != "false" {
+		t.Fatalf("reserved tool additionalProperties changed; body=%s", got)
+	}
+
+	// 对照：普通工具仍被清洗（受限关键字被剥离）。
+	if !normal.Exists() {
+		t.Fatalf("normal tool missing; body=%s", got)
+	}
+	if normal.Get("parameters.properties.x.minLength").Exists() ||
+		normal.Get("parameters.properties.x.format").Exists() {
+		t.Fatalf("normal function tool should still be sanitized; body=%s", got)
+	}
+}
+
+func TestIsReservedCodexTool(t *testing.T) {
+	cases := []struct {
+		tool map[string]any
+		want bool
+	}{
+		{map[string]any{"type": "function", "name": "collaboration.spawn_agent"}, true},
+		{map[string]any{"type": "function", "name": "Collaboration.Send_Message"}, true},
+		{map[string]any{"type": "function", "function": map[string]any{"name": "collaboration.wait"}}, true},
+		{map[string]any{"type": "function", "name": "my_tool"}, false},
+		{map[string]any{"type": "function", "name": "collaborate_now"}, false},
+		{map[string]any{"type": "function"}, false},
+	}
+	for i, c := range cases {
+		if got := isReservedCodexTool(c.tool); got != c.want {
+			t.Errorf("case %d: isReservedCodexTool = %v, want %v", i, got, c.want)
+		}
+	}
+}

@@ -49,6 +49,10 @@ type WsConnection struct {
 	// 最后使用时间
 	lastUsed atomic.Int64
 
+	// 创建时间（UnixNano），用于连接年龄判断（上游有 60 分钟连接寿命上限）。
+	// 构造后不再修改；为 0 表示未知（测试用字面量构造），视为未到龄。
+	createdAt int64
+
 	// 写操作锁
 	writeMu sync.Mutex
 
@@ -75,9 +79,10 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 // NewWsConnection 创建 WebSocket 连接
 func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsConnection {
 	wc := &WsConnection{
-		conn:    conn,
-		session: session,
-		URL:     wsURL,
+		conn:      conn,
+		session:   session,
+		URL:       wsURL,
+		createdAt: time.Now().UnixNano(),
 	}
 	wc.lastUsed.Store(time.Now().UnixNano())
 	wc.state.Store(int32(StateConnected))
@@ -93,6 +98,16 @@ func (wc *WsConnection) Touch() {
 func (wc *WsConnection) IsExpired() bool {
 	lastUsed := time.Unix(0, wc.lastUsed.Load())
 	return time.Since(lastUsed) > IdleTimeout
+}
+
+// IsOverAge 检查连接是否超过最大寿命（MaxConnLifetime）。到龄连接不能再接新请求：
+// 上游按连接建立时间计 60 分钟寿命，撞线后 response.create 一律报错，但 Ping
+// 探活仍成功，必须按年龄主动识别。
+func (wc *WsConnection) IsOverAge() bool {
+	if wc.createdAt == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, wc.createdAt)) > MaxConnLifetime
 }
 
 // IsConnected 检查是否已连接
@@ -181,12 +196,40 @@ type Manager struct {
 	// pool key 级别串行化，避免同一逻辑 session 在 acquire 阶段竞争同一条连接
 	keyLocks sync.Map
 
+	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
+	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
+	// 的请求必须回到原连接，落到别的槽位会得到 "previous response not found"。
+	// 参考 sub2api openai_ws_state_store 的 BindResponseConn/GetResponseConn。
+	respConnMu       sync.Mutex
+	respConnBindings map[string]responseConnBinding
+
 	// 可选的探活函数（用于测试替换），nil 时使用默认 probeConnection
 	probeFunc func(wc *WsConnection) bool
 
 	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
 	keepalivePingFunc func(wc *WsConnection) error
 }
+
+// responseConnBinding 记录某个 response_id 由哪条连接产出。
+// conn 指针同时用作身份校验：同 poolKey 下连接被重建后旧绑定自动失效。
+// apiKey 为产出该响应的下游 API Key（明文，仅存内存），lookup 时要求匹配，
+// 防止跨 Key 用他人 response_id 定向挤上他人连接（与 response cache 的
+// owner 隔离同一原则）。
+type responseConnBinding struct {
+	conn       *WsConnection
+	sessionKey string
+	accountID  int64
+	apiKey     string
+	expiresAt  time.Time
+}
+
+const (
+	// responseConnBindingTTL 续链绑定的存活时间。上游空闲连接本身在 IdleTimeout
+	// (5min) 后被清理，绑定活得再久也无意义，与其对齐。
+	responseConnBindingTTL = IdleTimeout
+	// responseConnBindingMaxEntries 绑定表上限，防止内存膨胀。
+	responseConnBindingMaxEntries = 4096
+)
 
 // wsWriteBufferPool 在所有上游 WS 连接间共享写缓冲，降低高并发下的内存占用。
 var wsWriteBufferPool = &sync.Pool{}
@@ -230,11 +273,11 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接和会话
+// evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
-		if wc.IsExpired() || !wc.IsConnected() {
+		if wc.IsExpired() || !wc.IsConnected() || isRotatableOverAge(wc) {
 			m.connections.Delete(key)
 			wc.Close()
 		}
@@ -349,10 +392,11 @@ func (m *Manager) AcquireConnection(
 				lock.Unlock()
 				continue
 			}
-			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil {
+			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil && !isRotatableOverAge(wc) {
 				lock.Unlock()
 				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
 				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
+				// 到龄连接也会走到这里等在途请求结束，结束后下一轮循环轮转重建。
 				if waited >= AcquireMaxWait {
 					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", AcquireMaxWait)
 				}
@@ -431,7 +475,7 @@ func (m *Manager) AcquireReusableConnection(
 				m.connections.Delete(key)
 				m.sessions.Delete(key)
 				wc.Close()
-			} else if !wc.IsConnected() || wc.IsExpired() {
+			} else if !wc.IsConnected() || wc.IsExpired() || isRotatableOverAge(wc) {
 				m.connections.Delete(key)
 				m.sessions.Delete(key)
 				wc.Close()
@@ -471,13 +515,23 @@ func canReuseConnection(wc *WsConnection) bool {
 	if wc == nil {
 		return false
 	}
-	if !wc.IsConnected() || wc.IsExpired() {
+	if !wc.IsConnected() || wc.IsExpired() || wc.IsOverAge() {
 		return false
 	}
 	if wc.session == nil {
 		return false
 	}
 	return wc.session.PendingCount() == 0
+}
+
+// isRotatableOverAge 连接已到龄且当前无在途请求，可安全轮转（销毁重建）。
+// 到龄但仍有在途请求的连接不动：50 分钟阈值留了 10 分钟余量，在途流仍能正常
+// 收完，等其结束后再轮转，避免掐断在途响应。
+func isRotatableOverAge(wc *WsConnection) bool {
+	if wc == nil || !wc.IsOverAge() {
+		return false
+	}
+	return wc.session == nil || wc.session.PendingCount() == 0
 }
 
 // probeConnection 发送 Ping 检测连接是否真正存活
@@ -602,6 +656,98 @@ func (m *Manager) DiscardConnection(wc *WsConnection) {
 			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
 		}
 	}
+}
+
+// BindResponseConn 记录 response_id 由哪条连接产出（续链亲和）。
+func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionKey string, accountID int64, apiKey string) {
+	responseID = strings.TrimSpace(responseID)
+	if m == nil || responseID == "" || wc == nil {
+		return
+	}
+	now := time.Now()
+	m.respConnMu.Lock()
+	if m.respConnBindings == nil {
+		m.respConnBindings = make(map[string]responseConnBinding, 64)
+	}
+	// 有界保护：先清一轮过期项，仍超限则拒绝新增（旧绑定比新绑定更可能被续链）。
+	if len(m.respConnBindings) >= responseConnBindingMaxEntries {
+		for k, b := range m.respConnBindings {
+			if now.After(b.expiresAt) {
+				delete(m.respConnBindings, k)
+			}
+		}
+	}
+	if len(m.respConnBindings) < responseConnBindingMaxEntries {
+		m.respConnBindings[responseID] = responseConnBinding{
+			conn:       wc,
+			sessionKey: sessionKey,
+			accountID:  accountID,
+			apiKey:     apiKey,
+			expiresAt:  now.Add(responseConnBindingTTL),
+		}
+	}
+	m.respConnMu.Unlock()
+}
+
+// lookupResponseConn 返回 response_id 绑定的连接及其池内 sessionKey。
+// 绑定过期、账号/API Key 不匹配、连接已断开/被重建（池内同 key 已非同一指针）
+// 时返回 nil。
+func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey string) (*WsConnection, string) {
+	responseID = strings.TrimSpace(responseID)
+	if m == nil || responseID == "" {
+		return nil, ""
+	}
+	now := time.Now()
+	m.respConnMu.Lock()
+	binding, ok := m.respConnBindings[responseID]
+	if ok && (now.After(binding.expiresAt) || binding.accountID != accountID || binding.apiKey != apiKey) {
+		if now.After(binding.expiresAt) {
+			delete(m.respConnBindings, responseID)
+		}
+		ok = false
+	}
+	m.respConnMu.Unlock()
+	if !ok || binding.conn == nil {
+		return nil, ""
+	}
+	// 指针级校验：连接必须仍在池中且是同一条（防止复用已重建槽位的陈旧绑定）。
+	if v, exists := m.connections.Load(binding.conn.PoolKey); !exists || v != binding.conn {
+		return nil, ""
+	}
+	if !binding.conn.IsConnected() || binding.conn.IsExpired() || binding.conn.IsOverAge() {
+		return nil, ""
+	}
+	return binding.conn, binding.sessionKey
+}
+
+// AcquirePreferredConnection 尝试独占 response_id 绑定的原连接（续链亲和）。
+// 成功返回 (连接, pendingRequest, 池内 sessionKey)；绑定失效或连接忙时返回 nil，
+// 调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
+// 阻塞在前一个长响应后面，且该场景（同会话并发续链）极少，退化为缓存 miss 更稳。
+func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string) {
+	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
+	if wc == nil {
+		return nil, nil, ""
+	}
+	lock := m.keyLock(wc.PoolKey)
+	lock.Lock()
+	defer lock.Unlock()
+	// 加锁后复验：期间可能被其他请求占用或销毁。
+	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc {
+		return nil, nil, ""
+	}
+	if !canReuseConnection(wc) {
+		return nil, nil, ""
+	}
+	if !m.probe(wc) {
+		m.connections.Delete(wc.PoolKey)
+		m.sessions.Delete(wc.PoolKey)
+		wc.Close()
+		return nil, nil, ""
+	}
+	pr := wc.session.AddPendingRequest(sessionKey)
+	wc.Touch()
+	return wc, pr, sessionKey
 }
 
 // poolKey 生成连接池键

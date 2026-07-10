@@ -22,4 +22,18 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 	if strings.Contains(ddl, "codex_user_agent_config TEXT DEFAULT '{}'") {
 		t.Fatalf("MySQL 5.6 incompatible TEXT default leaked into DDL: %s", ddl)
 	}
+	for _, needle := range []string{
+		"test_content TEXT NULL",
+		"retry_interval_ms INT DEFAULT 0",
+		"transport_retry_policy VARCHAR(20) DEFAULT 'rotate'",
+		"codex_continue_thinking_enabled TINYINT(1) DEFAULT 0",
+		"codex_continue_max_rounds INT DEFAULT 8",
+		"codex_synced_cli_version VARCHAR(64) DEFAULT ''",
+		"codex_cli_version_sync_enabled TINYINT(1) DEFAULT 1",
+		"codex_cli_version_sync_interval_hours INT DEFAULT 12",
+	} {
+		if !strings.Contains(ddl, needle) {
+			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
+		}
+	}
 }

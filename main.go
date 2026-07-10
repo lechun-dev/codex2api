@@ -76,6 +76,7 @@ func main() {
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",
+			TestContent:                      auth.DefaultTestContent,
 			TestConcurrency:                  50,
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
@@ -110,6 +111,7 @@ func main() {
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			CodexContinueMaxRounds:           8,
 			AutoPause5hGuardBandPercent:      5,
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
@@ -123,6 +125,7 @@ func main() {
 			MaxConcurrency:                   2,
 			GlobalRPM:                        0,
 			TestModel:                        "gpt-5.4",
+			TestContent:                      auth.DefaultTestContent,
 			TestConcurrency:                  50,
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
@@ -154,6 +157,7 @@ func main() {
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			CodexContinueMaxRounds:           8,
 			AutoPause5hGuardBandPercent:      5,
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
@@ -271,6 +275,11 @@ func main() {
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
+
+	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
+	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
+	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
+	proxy.StartCodexCLIVersionSync(context.Background(), db, store.GetProxyURL)
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 

@@ -29,6 +29,27 @@ const (
 	StateClosing      ConnectionState = 3
 )
 
+const (
+	// pumpFrameBuffer 常驻 reader 到消费者之间业务帧的缓冲深度
+	//（与 PendingRequest.StreamChan 对齐）。
+	pumpFrameBuffer = 64
+
+	// pumpReadDeadline 常驻 reader 的单次读截止。空闲连接正常应先被
+	// IdleTimeout(5min) 清理逐出，这里只兜底略长一点；上游 Ping/Pong 到达时顺延。
+	// 活跃请求的"帧间超时"由消费端(ReadStream)按 ReadTimeout 单独计时。
+	pumpReadDeadline = IdleTimeout + 30*time.Second
+)
+
+// errStrayFrame 无在途请求时到达的业务帧：上一响应的残留。该连接的
+// 服务端状态已不可信，绝不能再复用（issue #308 同源）。
+var errStrayFrame = fmt.Errorf("stray data frame on idle websocket connection")
+
+// wsFrame 常驻 reader 转发给消费者的一帧业务数据。
+type wsFrame struct {
+	msgType int
+	data    []byte
+}
+
 // WsConnection WebSocket 连接包装
 type WsConnection struct {
 	// WebSocket 连接
@@ -61,6 +82,20 @@ type WsConnection struct {
 
 	// 连接关闭回调
 	onDisconnected func(accountID int64)
+
+	// ---- 常驻 read pump（issue #349）----
+	// gorilla/websocket 只在读方法运行期间处理 Ping/Pong/Close 控制帧。
+	// 连接空闲期没有 reader 时，上游 keepalive Ping 得不到 Pong 会被判死并
+	// 收到 Close 1011，而本地状态仍是 Connected、写 Ping 探活照样成功，
+	// 复用即首读暴雷。pump 让连接自建立起就有唯一常驻读者：控制帧实时
+	// 消化（Ping 自动回 Pong）、Close/读错误立即翻状态，业务帧经 frames
+	// 转发给当前消费者。
+	frames      chan wsFrame
+	stop        chan struct{}
+	stopOnce    sync.Once
+	pumpStarted atomic.Bool
+	readErrMu   sync.Mutex
+	readErr     error
 }
 
 func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
@@ -76,17 +111,98 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 	return strings.TrimSpace(proxyURL)
 }
 
-// NewWsConnection 创建 WebSocket 连接
+// NewWsConnection 创建 WebSocket 连接并启动常驻 read pump。
 func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsConnection {
 	wc := &WsConnection{
 		conn:      conn,
 		session:   session,
 		URL:       wsURL,
 		createdAt: time.Now().UnixNano(),
+		frames:    make(chan wsFrame, pumpFrameBuffer),
+		stop:      make(chan struct{}),
 	}
 	wc.lastUsed.Store(time.Now().UnixNano())
 	wc.state.Store(int32(StateConnected))
+	wc.startReadPump()
 	return wc
+}
+
+// startReadPump 启动常驻 reader（幂等；测试用字面量构造的连接无 pump，
+// ReadMessage 会回退到直接读）。
+func (wc *WsConnection) startReadPump() {
+	if wc.conn == nil || wc.frames == nil || !wc.pumpStarted.CompareAndSwap(false, true) {
+		return
+	}
+	// Ping 处理：gorilla 默认 handler 已自动回 Pong；这里额外顺延读截止，
+	// 上游 keepalive 活跃说明连接健康，不该被 pump 兜底超时误杀。
+	wc.conn.SetPingHandler(func(appData string) error {
+		_ = wc.conn.SetReadDeadline(time.Now().Add(pumpReadDeadline))
+		err := wc.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(WriteTimeout))
+		if err == websocket.ErrCloseSent {
+			return nil
+		}
+		return err
+	})
+	go wc.readPump()
+}
+
+// readPump 唯一读者：循环 ReadMessage 直到连接死亡。控制帧（Ping/Pong/Close）
+// 在读循环内被 gorilla 实时处理；业务帧转发给当前消费者。
+// 发送阻塞（缓冲 64）：消费慢时 pump 停读，靠 TCP 流控向上游背压，与旧
+// per-request 读循环阻塞在下游写时的行为一致；连接销毁时经 stop 解除阻塞。
+// 无消费者时到达的帧滞留缓冲，复用前由 drainStrayFrames 检出并废弃连接。
+func (wc *WsConnection) readPump() {
+	defer close(wc.frames)
+	for {
+		_ = wc.conn.SetReadDeadline(time.Now().Add(pumpReadDeadline))
+		msgType, data, err := wc.conn.ReadMessage()
+		if err != nil {
+			wc.setReadErr(err)
+			wc.Close()
+			return
+		}
+		wc.Touch()
+		select {
+		case wc.frames <- wsFrame{msgType: msgType, data: data}:
+		case <-wc.stop:
+			return
+		}
+	}
+}
+
+// setReadErr 记录 pump 终止原因（只记第一个）。
+func (wc *WsConnection) setReadErr(err error) {
+	wc.readErrMu.Lock()
+	if wc.readErr == nil {
+		wc.readErr = err
+	}
+	wc.readErrMu.Unlock()
+}
+
+// getReadErr 返回 pump 的终止原因。
+func (wc *WsConnection) getReadErr() error {
+	wc.readErrMu.Lock()
+	defer wc.readErrMu.Unlock()
+	return wc.readErr
+}
+
+// drainStrayFrames 复用前排空池内滞留的业务帧。有帧滞留说明上一响应
+// 在此连接上留了尾巴，连接不可复用；返回 true 表示干净可用。
+func (wc *WsConnection) drainStrayFrames() bool {
+	if wc.frames == nil {
+		return true
+	}
+	select {
+	case _, ok := <-wc.frames:
+		if !ok {
+			return false // pump 已退出，连接已死
+		}
+		wc.setReadErr(errStrayFrame)
+		wc.Close()
+		return false
+	default:
+		return true
+	}
 }
 
 // Touch 更新最后使用时间
@@ -119,6 +235,10 @@ func (wc *WsConnection) IsConnected() bool {
 func (wc *WsConnection) Close() error {
 	if wc.state.CompareAndSwap(int32(StateConnected), int32(StateClosing)) ||
 		wc.state.CompareAndSwap(int32(StateConnecting), int32(StateClosing)) {
+		// 通知 read pump 与消费者退出
+		if wc.stop != nil {
+			wc.stopOnce.Do(func() { close(wc.stop) })
+		}
 		// 调用断开回调
 		if wc.onDisconnected != nil && wc.session != nil {
 			wc.onDisconnected(wc.session.AccountID)
@@ -151,16 +271,42 @@ func (wc *WsConnection) WriteMessage(messageType int, data []byte) error {
 	return wc.conn.WriteMessage(messageType, data)
 }
 
-// ReadMessage 读取消息（带超时）
+// ReadMessage 读取一帧业务消息（带超时）。有 pump 时从 frames 消费——
+// 控制帧已由 pump 在读循环内实时处理；无 pump（测试字面量构造）回退直读。
 func (wc *WsConnection) ReadMessage() (int, []byte, error) {
-	wc.conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-	defer wc.conn.SetReadDeadline(time.Time{})
-
-	msgType, data, err := wc.conn.ReadMessage()
-	if err == nil {
-		wc.Touch()
+	if wc.frames == nil {
+		wc.conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		defer wc.conn.SetReadDeadline(time.Time{})
+		msgType, data, err := wc.conn.ReadMessage()
+		if err == nil {
+			wc.Touch()
+		}
+		return msgType, data, err
 	}
-	return msgType, data, err
+
+	timer := time.NewTimer(ReadTimeout)
+	defer timer.Stop()
+	select {
+	case frame, ok := <-wc.frames:
+		if !ok {
+			// pump 已退出：返回其记录的真实终止原因（如 close 1011）
+			if err := wc.getReadErr(); err != nil {
+				return 0, nil, err
+			}
+			return 0, nil, fmt.Errorf("websocket connection closed")
+		}
+		return frame.msgType, frame.data, nil
+	case <-wc.stop:
+		if err := wc.getReadErr(); err != nil {
+			return 0, nil, err
+		}
+		return 0, nil, fmt.Errorf("websocket connection closed")
+	case <-timer.C:
+		// 帧间超时语义与原 per-read deadline 一致：连接不再可信
+		wc.setReadErr(fmt.Errorf("websocket read timeout after %s", ReadTimeout))
+		wc.Close()
+		return 0, nil, wc.getReadErr()
+	}
 }
 
 // HTTPResponse 返回 HTTP 握手响应
@@ -534,17 +680,15 @@ func isRotatableOverAge(wc *WsConnection) bool {
 	return wc.session == nil || wc.session.PendingCount() == 0
 }
 
-// probeConnection 发送 Ping 检测连接是否真正存活
+// probeConnection 检测连接是否真正存活。
+// 常驻 read pump 让状态实时可信：上游 Close/读错误到达时 pump 已把状态翻成
+// 非 Connected，这里只需检查状态并排空滞留脏帧，无需（也不能）写 Ping 判活——
+// 只写不读的 Ping 探活在对端已发 Close 时照样成功（issue #349）。
 func probeConnection(wc *WsConnection) bool {
-	wc.writeMu.Lock()
-	defer wc.writeMu.Unlock()
-
 	if !wc.IsConnected() || wc.conn == nil {
 		return false
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	err := wc.conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
-	return err == nil
+	return wc.drainStrayFrames()
 }
 
 // probe 调用探活函数���支持测试替换）
@@ -605,17 +749,18 @@ func (m *Manager) createConnection(
 		return nil, fmt.Errorf("websocket handshake failed: %w", err)
 	}
 
-	// 创建连接包装
+	// 创建连接包装（构造内启动常驻 read pump，Ping handler 由 pump 设置）
 	wc := NewWsConnection(conn, session, wsURL)
 	wc.PoolKey = poolKey
 	wc.httpResp = resp
 	wc.onDisconnected = m.getOnDisconnected()
 	session.SetConnected(true)
 
-	// 设置 Pong 处理器
+	// 设置 Pong 处理器（我方主动 Ping 的响应）：刷新活跃时间并顺延 pump 读截止
 	conn.SetPongHandler(func(appData string) error {
 		session.HandlePong()
 		wc.Touch()
+		_ = conn.SetReadDeadline(time.Now().Add(pumpReadDeadline))
 		return nil
 	})
 

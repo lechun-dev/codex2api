@@ -1037,6 +1037,9 @@ type APIKeyLimits struct {
 	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
 	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
 	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
+	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
+	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
+	DisableImageGeneration bool `json:"disable_image_generation,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
@@ -1044,7 +1047,8 @@ func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
-		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
+		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 &&
+		!l.DisableImageGeneration
 }
 
 type APIKeyInput struct {

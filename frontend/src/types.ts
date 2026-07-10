@@ -1021,6 +1021,7 @@ export interface APIKeyLimits {
   token_limit_5h?: number
   token_limit_7d?: number
   token_limit_30d?: number
+  disable_image_generation?: boolean
 }
 
 export interface APIKeyWindowUsage {

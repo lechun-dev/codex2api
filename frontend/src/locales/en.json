@@ -2033,6 +2033,8 @@
       "planAllow": "Account plans",
       "planAllowAll": "Any",
       "planAllowHint": "When selected, this key only dispatches to accounts on the chosen plans (multi-select); leave empty for no plan restriction.",
+      "disableImageGeneration": "Disable image generation",
+      "disableImageGenerationHint": "When on, this key cannot use image models (gpt-image-*) or the image generation chain (image_generation tool, /v1/images endpoints); such requests return 403. Off by default.",
       "rpm": "Requests per minute",
       "rpmSuffix": "/min",
       "rpd": "Requests per day",

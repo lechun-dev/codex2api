@@ -5702,18 +5702,19 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		return out
 	}
 	out := database.APIKeyLimits{
-		ModelAllow:     clean(in.ModelAllow),
-		ModelDeny:      clean(in.ModelDeny),
-		PlanAllow:      cleanPlanAllow(in.PlanAllow),
-		RPM:            maxInt(in.RPM, 0),
-		RPD:            maxInt(in.RPD, 0),
-		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
-		CostLimit5h:    maxFloat(in.CostLimit5h, 0),
-		CostLimit7d:    maxFloat(in.CostLimit7d, 0),
-		CostLimit30d:   maxFloat(in.CostLimit30d, 0),
-		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
-		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
-		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
+		ModelAllow:             clean(in.ModelAllow),
+		ModelDeny:              clean(in.ModelDeny),
+		PlanAllow:              cleanPlanAllow(in.PlanAllow),
+		RPM:                    maxInt(in.RPM, 0),
+		RPD:                    maxInt(in.RPD, 0),
+		MaxConcurrency:         maxInt(in.MaxConcurrency, 0),
+		CostLimit5h:            maxFloat(in.CostLimit5h, 0),
+		CostLimit7d:            maxFloat(in.CostLimit7d, 0),
+		CostLimit30d:           maxFloat(in.CostLimit30d, 0),
+		TokenLimit5h:           maxInt64(in.TokenLimit5h, 0),
+		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
+		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
+		DisableImageGeneration: in.DisableImageGeneration,
 	}
 	return out
 }

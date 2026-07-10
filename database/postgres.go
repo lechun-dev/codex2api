@@ -822,6 +822,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_synced_cli_version TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_interval_hours INT DEFAULT 12;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_overrides TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_sync_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
@@ -1463,6 +1465,11 @@ type SystemSettings struct {
 	CodexCLIVersionSyncEnabled bool
 	// CodexCLIVersionSyncIntervalHours 是定时同步间隔（小时，默认 12，范围 1-720）。
 	CodexCLIVersionSyncIntervalHours int
+	// ModelPricingOverrides 是模型定价覆盖 JSON（model → ModelPricingOverride），
+	// custom/synced 覆盖代码默认；空为 "{}"。
+	ModelPricingOverrides string
+	// ModelPricingSyncURL 是「从 JSON URL 同步定价」的来源地址，空时用内置默认。
+	ModelPricingSyncURL string
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1593,7 +1600,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(NULLIF(TRIM(transport_retry_policy), ''), 'rotate'),
 			       COALESCE(codex_synced_cli_version, ''),
 			       COALESCE(codex_cli_version_sync_enabled, true),
-			       COALESCE(codex_cli_version_sync_interval_hours, 12)
+			       COALESCE(codex_cli_version_sync_interval_hours, 12),
+			       COALESCE(model_pricing_overrides, '{}'),
+			       COALESCE(model_pricing_sync_url, '')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1640,6 +1649,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexSyncedCLIVersion,
 		&s.CodexCLIVersionSyncEnabled,
 		&s.CodexCLIVersionSyncIntervalHours,
+		&s.ModelPricingOverrides,
+		&s.ModelPricingSyncURL,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1655,6 +1666,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	}
 	if strings.TrimSpace(s.CodexUserAgentConfig) == "" {
 		s.CodexUserAgentConfig = "{}"
+	}
+	if strings.TrimSpace(s.ModelPricingOverrides) == "" {
+		s.ModelPricingOverrides = "{}"
 	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1720,9 +1734,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_continue_max_rounds,
 					codex_synced_cli_version,
 					codex_cli_version_sync_enabled,
-					codex_cli_version_sync_interval_hours
+					codex_cli_version_sync_interval_hours,
+					model_pricing_overrides,
+					model_pricing_sync_url
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1807,7 +1823,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_continue_max_rounds = EXCLUDED.codex_continue_max_rounds,
 					codex_synced_cli_version = EXCLUDED.codex_synced_cli_version,
 					codex_cli_version_sync_enabled = EXCLUDED.codex_cli_version_sync_enabled,
-					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours
+					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
+					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
+					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1829,8 +1847,21 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		normalizeRetryIntervalMSDB(s.RetryIntervalMS), NormalizeTransportRetryPolicy(s.TransportRetryPolicy),
 		s.CodexContinueThinkingEnabled, NormalizeCodexContinueMaxRounds(s.CodexContinueMaxRounds),
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
-		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours))
+		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
+		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL))
 	return err
+}
+
+// normalizeModelPricingOverridesJSON 空/非法 JSON 归一为 "{}"。
+func normalizeModelPricingOverridesJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "{}"
+	}
+	if _, err := ParseModelPricingOverridesJSON(s); err != nil {
+		return "{}"
+	}
+	return s
 }
 
 // NormalizeCodexCLIVersionSyncIntervalHours 把定时同步间隔(小时)限制在 1-720，非正值回落默认 12。

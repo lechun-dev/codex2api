@@ -1008,6 +1008,19 @@ export interface ChartAggregation {
   models: ChartModelPoint[]
 }
 
+export interface ModelPricingOverride {
+  source?: string
+  input?: number
+  cached_input?: number
+  output?: number
+  input_priority?: number
+  cached_input_priority?: number
+  output_priority?: number
+  input_long?: number
+  cached_input_long?: number
+  output_long?: number
+}
+
 export interface APIKeyLimits {
   model_allow?: string[]
   model_deny?: string[]

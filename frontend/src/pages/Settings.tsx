@@ -12,6 +12,7 @@ import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
+import { ModelPricingSettings } from './ModelPricingSettings'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -66,7 +67,7 @@ import {
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
-type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
+type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning' | 'pricing'
 
 type ModelMappingEntry = [string, string]
 const EMPTY_MODEL_MAPPING_ENTRIES: ModelMappingEntry[] = []
@@ -2970,6 +2971,13 @@ export default function Settings() {
                 openLabel={t('settings.nav.manage')}
                 onOpen={() => setModelPanel('reasoning')}
               />
+              <ModelSummaryCard
+                title={t('settings.pricing.title')}
+                description={t('settings.pricing.desc')}
+                meta={t('settings.pricing.meta')}
+                openLabel={t('settings.nav.manage')}
+                onOpen={() => setModelPanel('pricing')}
+              />
             </div>
 
             <Sheet open={modelPanel !== null} onOpenChange={(open) => { if (!open) setModelPanel(null) }}>
@@ -2985,7 +2993,9 @@ export default function Settings() {
                         ? t('settings2.anthropicModelMapping')
                         : modelPanel === 'codex'
                           ? t('settings2.codexModelMapping')
-                          : t('settings2.reasoningEffortModels')}
+                          : modelPanel === 'pricing'
+                            ? t('settings.pricing.title')
+                            : t('settings2.reasoningEffortModels')}
                   </SheetTitle>
                   <SheetDescription>
                     {modelPanel === 'registry'
@@ -2994,7 +3004,9 @@ export default function Settings() {
                         ? t('settings2.anthropicModelMappingDesc')
                         : modelPanel === 'codex'
                           ? t('settings2.codexModelMappingDesc')
-                          : t('settings2.reasoningEffortModelsDesc')}
+                          : modelPanel === 'pricing'
+                            ? t('settings.pricing.desc')
+                            : t('settings2.reasoningEffortModelsDesc')}
                   </SheetDescription>
                 </SheetHeader>
                 <SheetBody className="space-y-4">
@@ -3063,6 +3075,9 @@ export default function Settings() {
                       onChange={(v) => setSettingsForm((f) => ({ ...f, reasoning_effort_models: v }))}
                       baseModelOptions={textModelOptions}
                     />
+                  ) : null}
+                  {modelPanel === 'pricing' ? (
+                    <ModelPricingSettings showToast={showToast} />
                   ) : null}
                 </SheetBody>
               </SheetContent>

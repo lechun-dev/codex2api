@@ -562,6 +562,7 @@ export const api = {
       models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
       sync_url: string
       default_sync_url: string
+      models_dev_url: string
     }>('/model-pricing'),
   updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
     request<{ model: string; reset: boolean }>('/model-pricing', {

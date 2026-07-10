@@ -3,7 +3,9 @@ package admin
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +13,72 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
+
+// modelVersionNumberRE 提取模型名中的数字段，用于版本排序（如 gpt-5.6-luna → 5,6）。
+var modelVersionNumberRE = regexp.MustCompile(`\d+`)
+
+// modelVersionParts 从模型 ID 中取出数字序列，供新→旧排序使用。
+func modelVersionParts(model string) []int {
+	matches := modelVersionNumberRE.FindAllString(model, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	parts := make([]int, 0, len(matches))
+	for _, m := range matches {
+		n, err := strconv.Atoi(m)
+		if err != nil {
+			continue
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+// compareModelKeysNewestFirst 比较两个模型键：版本号高的靠前；同版本再按名称字典序。
+// 返回 -1 表示 a 应排在 b 前面，1 表示 a 在 b 后面，0 表示相等。
+func compareModelKeysNewestFirst(a, b string) int {
+	if a == b {
+		return 0
+	}
+	va, vb := modelVersionParts(a), modelVersionParts(b)
+	// 无版本号的模型沉底。
+	if len(va) == 0 && len(vb) == 0 {
+		return strings.Compare(a, b)
+	}
+	if len(va) == 0 {
+		return 1
+	}
+	if len(vb) == 0 {
+		return -1
+	}
+	n := len(va)
+	if len(vb) < n {
+		n = len(vb)
+	}
+	for i := 0; i < n; i++ {
+		if va[i] != vb[i] {
+			if va[i] > vb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	// 公共前缀相同：段更多视为更高版本（5.6 > 5）。
+	if len(va) != len(vb) {
+		if len(va) > len(vb) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+// sortModelKeysNewestFirst 将模型键按版本号从新到旧排序。
+func sortModelKeysNewestFirst(keys []string) {
+	sort.SliceStable(keys, func(i, j int) bool {
+		return compareModelKeysNewestFirst(keys[i], keys[j]) < 0
+	})
+}
 
 // modelPricingRow 是定价管理页每个规范模型的一行：当前生效价 + 来源。
 type modelPricingRow struct {
@@ -37,7 +105,8 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 		seen[key] = struct{}{}
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	// 新版本在前（gpt-5.6 > gpt-5.5 > gpt-5.4 …），避免字典序把旧模型顶到列表顶部。
+	sortModelKeysNewestFirst(keys)
 
 	rows := make([]modelPricingRow, 0, len(keys))
 	for _, key := range keys {
@@ -56,6 +125,7 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 		"models":           rows,
 		"sync_url":         syncURL,
 		"default_sync_url": proxy.DefaultModelPricingSyncURL,
+		"models_dev_url":   proxy.ModelsDevPricingSyncURL,
 	})
 }
 

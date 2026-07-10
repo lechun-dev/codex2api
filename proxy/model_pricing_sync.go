@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 // 自己的镜像/私有列表。格式：{ "<model>": {input,cached_input,output,...}, ... }，
 // 见 database.ModelPricingOverride。
 const DefaultModelPricingSyncURL = "https://raw.githubusercontent.com/james-6-23/codex2api/main/pricing.json"
+
+// ModelsDevPricingSyncURL 是 models.dev 公开定价 API，格式为 provider→models→cost
+// （USD / 1M tokens，含 272K 长上下文分档），同步时自动识别并转换。
+const ModelsDevPricingSyncURL = "https://models.dev/api.json"
 
 // modelPricingSyncURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var modelPricingSyncURLForTest = ""
@@ -116,13 +121,125 @@ func fetchModelPricingJSON(ctx context.Context, syncURL, proxyURL string) (map[s
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("pricing upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read pricing response: %w", err)
+	}
+	return parseModelPricingPayload(body)
+}
+
+// modelsDevCostTier 是 models.dev 单个分档价（顶层与 tiers 元素共用形态）。
+type modelsDevCostTier struct {
+	Input     float64 `json:"input"`
+	Output    float64 `json:"output"`
+	CacheRead float64 `json:"cache_read"`
+	Tier      struct {
+		Type string `json:"type"`
+		Size int64  `json:"size"`
+	} `json:"tier"`
+}
+
+type modelsDevCost struct {
+	modelsDevCostTier
+	Tiers []modelsDevCostTier `json:"tiers"`
+}
+
+type modelsDevProvider struct {
+	Models map[string]struct {
+		Cost *modelsDevCost `json:"cost"`
+	} `json:"models"`
+}
+
+// parseModelPricingPayload 解析定价源 JSON，自动识别两种格式：
+//   - 扁平覆盖表：{ "<model>": {input,cached_input,output,...}, ... }
+//   - models.dev api.json：{ "<provider>": { "models": { "<model>": {cost:...} } }, ... }
+//
+// 扁平格式的值不含 "models" 对象，据此区分。
+func parseModelPricingPayload(body []byte) (map[string]database.ModelPricingOverride, error) {
+	var providers map[string]modelsDevProvider
+	if err := json.Unmarshal(body, &providers); err != nil {
+		return nil, fmt.Errorf("parse pricing json: %w", err)
+	}
+	for _, p := range providers {
+		if len(p.Models) > 0 {
+			return convertModelsDevPricing(providers), nil
+		}
 	}
 	var raw map[string]database.ModelPricingOverride
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse pricing json: %w", err)
 	}
 	return raw, nil
+}
+
+// convertModelsDevPricing 把 models.dev 数据转成覆盖表。只取 openai provider
+// （其余 provider 的同名模型定价可能不同，避免串价）；键归一为规范定价键。
+// 两轮写入：先写模型 ID 即规范键的条目，别名 ID（如 chat-latest 变体）只在
+// 规范键尚无条目时补位，避免别名价覆盖正主价。
+func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]database.ModelPricingOverride {
+	models := providers["openai"].Models
+	if len(models) == 0 {
+		// 自建镜像可能只留了别的 provider 名，退化为合并全部（按名序保证确定性）。
+		providerNames := make([]string, 0, len(providers))
+		for name := range providers {
+			providerNames = append(providerNames, name)
+		}
+		sort.Strings(providerNames)
+		models = map[string]struct {
+			Cost *modelsDevCost `json:"cost"`
+		}{}
+		for _, name := range providerNames {
+			for id, m := range providers[name].Models {
+				if _, ok := models[id]; !ok {
+					models[id] = m
+				}
+			}
+		}
+	}
+
+	ids := make([]string, 0, len(models))
+	for id := range models {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	out := make(map[string]database.ModelPricingOverride, len(models))
+	for _, exactPass := range []bool{true, false} {
+		for _, id := range ids {
+			key := database.CanonicalBillingModelKey(id)
+			if key == "" || models[id].Cost == nil {
+				continue
+			}
+			if exact := key == strings.ToLower(strings.TrimSpace(id)); exact != exactPass {
+				continue
+			}
+			if _, ok := out[key]; ok {
+				continue
+			}
+			ov := modelsDevCostToOverride(*models[id].Cost)
+			if ov.IsEmpty() {
+				continue
+			}
+			out[key] = ov
+		}
+	}
+	return out
+}
+
+func modelsDevCostToOverride(cost modelsDevCost) database.ModelPricingOverride {
+	ov := database.ModelPricingOverride{
+		Input:       cost.Input,
+		CachedInput: cost.CacheRead,
+		Output:      cost.Output,
+	}
+	for _, tier := range cost.Tiers {
+		if tier.Tier.Type != "context" {
+			continue
+		}
+		ov.InputLong = tier.Input
+		ov.CachedInputLong = tier.CacheRead
+		ov.OutputLong = tier.Output
+		break
+	}
+	return ov
 }

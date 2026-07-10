@@ -25,6 +25,7 @@ import type {
   InviteResponse,
   MessageResponse,
   ModelSyncResponse,
+  ModelPricingOverride,
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
@@ -556,6 +557,23 @@ export const api = {
       builtin_version: string
       updated: boolean
     }>('/codex-cli-version/sync', { method: 'POST' }),
+  listModelPricing: () =>
+    request<{
+      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      sync_url: string
+      default_sync_url: string
+      models_dev_url: string
+    }>('/model-pricing'),
+  updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
+    request<{ model: string; reset: boolean }>('/model-pricing', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  syncModelPricing: (url: string) =>
+    request<{ source_url: string; fetched: number; applied: number; skipped: number }>('/model-pricing/sync', {
+      method: 'POST',
+      body: JSON.stringify({ url: url ?? '' }),
+    }),
   batchTestAccounts: (ids?: number[]) =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
       method: 'POST',

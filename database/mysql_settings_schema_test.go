@@ -31,9 +31,26 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_synced_cli_version VARCHAR(64) DEFAULT ''",
 		"codex_cli_version_sync_enabled TINYINT(1) DEFAULT 1",
 		"codex_cli_version_sync_interval_hours INT DEFAULT 12",
+		"model_pricing_overrides MEDIUMTEXT NULL",
+		"model_pricing_sync_url TEXT NULL",
+		"ignore_usage_limit_status TINYINT(1) DEFAULT 0",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
+		}
+	}
+	for _, column := range mysql56SystemSettingsColumns {
+		if column.table != "system_settings" || !strings.Contains(ddl, column.name+" "+column.def) {
+			t.Fatalf("MySQL system_settings upgrade column is inconsistent with create DDL: %+v", column)
+		}
+	}
+	for _, incompatible := range []string{
+		"model_pricing_overrides TEXT DEFAULT",
+		"model_pricing_overrides MEDIUMTEXT DEFAULT",
+		"model_pricing_sync_url TEXT DEFAULT",
+	} {
+		if strings.Contains(ddl, incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
 		}
 	}
 }

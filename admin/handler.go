@@ -5917,6 +5917,9 @@ type settingsResponse struct {
 	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
 	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   int     `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion              string  `json:"codex_synced_cli_version"`
 	SchedulerMode                      string  `json:"scheduler_mode"`
 	AffinityMode                       string  `json:"affinity_mode"`
 	MaxRetries                         int     `json:"max_retries"`
@@ -6018,6 +6021,8 @@ type updateSettingsReq struct {
 	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
 	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   *int     `json:"codex_cli_version_sync_interval_hours"`
 	SchedulerMode                      *string  `json:"scheduler_mode"`
 	AffinityMode                       *string  `json:"affinity_mode"`
 	MaxRetries                         *int     `json:"max_retries"`
@@ -6612,6 +6617,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -7026,6 +7034,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_continue_max_rounds = %d", v)
 	}
 
+	if req.CodexCLIVersionSyncEnabled != nil {
+		h.store.SetCodexCLIVersionSyncEnabled(*req.CodexCLIVersionSyncEnabled)
+		runtimeCfg.CodexCLIVersionSyncEnabled = *req.CodexCLIVersionSyncEnabled
+		log.Printf("设置已更新: codex_cli_version_sync_enabled = %t", *req.CodexCLIVersionSyncEnabled)
+	}
+
+	if req.CodexCLIVersionSyncIntervalHours != nil {
+		v := database.NormalizeCodexCLIVersionSyncIntervalHours(*req.CodexCLIVersionSyncIntervalHours)
+		h.store.SetCodexCLIVersionSyncIntervalHours(v)
+		runtimeCfg.CodexCLIVersionSyncIntervalHours = v
+		log.Printf("设置已更新: codex_cli_version_sync_interval_hours = %d", v)
+	}
+
 	if req.SchedulerMode != nil {
 		h.store.SetSchedulerMode(*req.SchedulerMode)
 		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
@@ -7415,6 +7436,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -7521,6 +7545,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),

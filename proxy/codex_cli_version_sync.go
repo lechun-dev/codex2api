@@ -157,14 +157,13 @@ func SyncCodexCLIVersion(ctx context.Context, db *database.DB, proxyURL string) 
 	return result, nil
 }
 
-// StartCodexCLIVersionSync 在后台按 interval 周期同步 Codex CLI 版本，并在启动时先同步一次。
-// 通过 CODEX_DISABLE_CLI_VERSION_SYNC 关闭。proxyResolver 允许调用方注入出站代理（可为 nil）。
-func StartCodexCLIVersionSync(ctx context.Context, db *database.DB, interval time.Duration, proxyResolver func() string) {
+// StartCodexCLIVersionSync 在后台按系统设置的间隔周期同步 Codex CLI 版本，并在启动时先同步一次。
+// 开关(CodexCLIVersionSyncEnabled)与间隔(CodexCLIVersionSyncIntervalHours)在每个周期实时读取，
+// 改设置即时生效、无需重启。环境变量 CODEX_DISABLE_CLI_VERSION_SYNC 为硬开关，优先级最高。
+// proxyResolver 允许调用方注入出站代理（可为 nil）。
+func StartCodexCLIVersionSync(ctx context.Context, db *database.DB, proxyResolver func() string) {
 	if db == nil || CodexCLIVersionSyncDisabled() {
 		return
-	}
-	if interval <= 0 {
-		interval = 12 * time.Hour
 	}
 	resolveProxy := func() string {
 		if proxyResolver == nil {
@@ -173,26 +172,40 @@ func StartCodexCLIVersionSync(ctx context.Context, db *database.DB, interval tim
 		return proxyResolver()
 	}
 
-	go func() {
-		runOnce := func() {
-			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if res, err := SyncCodexCLIVersion(syncCtx, db, resolveProxy()); err != nil {
-				fmt.Printf("[codex-cli-version-sync] 同步失败（不影响服务）: %v\n", err)
-			} else if res.Updated {
-				fmt.Printf("[codex-cli-version-sync] 模拟版本已更新至 %s\n", res.EffectiveVersion)
-			}
+	runOnce := func() {
+		syncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if res, err := SyncCodexCLIVersion(syncCtx, db, resolveProxy()); err != nil {
+			fmt.Printf("[codex-cli-version-sync] 同步失败（不影响服务）: %v\n", err)
+		} else if res.Updated {
+			fmt.Printf("[codex-cli-version-sync] 模拟版本已更新至 %s\n", res.EffectiveVersion)
 		}
+	}
 
-		runOnce()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+	// 当前配置的同步间隔（小时→时长），钳到 [1h, 720h]。
+	currentInterval := func() time.Duration {
+		hours := CurrentRuntimeSettings().CodexCLIVersionSyncIntervalHours
+		if hours <= 0 {
+			hours = 12
+		}
+		if hours > 720 {
+			hours = 720
+		}
+		return time.Duration(hours) * time.Hour
+	}
+
+	go func() {
+		if CurrentRuntimeSettings().CodexCLIVersionSyncEnabled {
+			runOnce()
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				runOnce()
+			case <-time.After(currentInterval()):
+				if CurrentRuntimeSettings().CodexCLIVersionSyncEnabled {
+					runOnce()
+				}
 			}
 		}
 	}()

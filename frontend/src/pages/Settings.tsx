@@ -1181,6 +1181,8 @@ export default function Settings() {
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.118.0',
+    codex_cli_version_sync_enabled: true,
+    codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
     usage_log_mode: 'full',
     usage_log_batch_size: 200,
@@ -1365,6 +1367,7 @@ export default function Settings() {
     persistedBrandingRef.current = branding
     applyBranding(branding)
     setLoadedAdminSecret(settings.admin_secret ?? '')
+    setSyncedCliVersion(settings.codex_synced_cli_version ?? '')
     setModelList(modelsResp.models ?? [])
     setModelItems(modelsResp.items ?? [])
     setModelsLastSyncedAt(modelsResp.last_synced_at)
@@ -2265,6 +2268,33 @@ export default function Settings() {
                       <span className="font-mono text-xs text-muted-foreground">{syncedCliVersion}</span>
                     )}
                   </div>
+                </SettingField>
+                <SettingField label={t('settings.codexCliVersionAutoSync')} description={t('settings.codexCliVersionAutoSyncDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_cli_version_sync_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_cli_version_sync_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexCliVersionSyncInterval')}
+                  description={t('settings.codexCliVersionSyncIntervalDesc')}
+                  suffix={t('settings.unit.hour')}
+                  className={cn(!settingsForm.codex_cli_version_sync_enabled && 'opacity-60')}
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={720}
+                    disabled={!settingsForm.codex_cli_version_sync_enabled}
+                    value={settingsForm.codex_cli_version_sync_interval_hours}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_cli_version_sync_interval_hours: parseInt(e.target.value) || 12 }))}
+                    onBlur={() => {
+                      if (!settingsForm.codex_cli_version_sync_enabled) return
+                      void autoSaveSettingsPatch({
+                        codex_cli_version_sync_interval_hours: settingsForm.codex_cli_version_sync_interval_hours,
+                      })
+                    }}
+                  />
                 </SettingField>
                 <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
                   <Input

@@ -1,5 +1,5 @@
 import type { ChangeEvent, ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
@@ -329,7 +329,9 @@ function ModelMappingEditor({
   const { t } = useTranslation()
   const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value, fallbackEntries))
   const lastEmittedValueRef = useRef<string | null>(null)
-  const sourceSelectOptions = useMemo(() => {
+  const sourceListId = useId()
+  const targetListId = useId()
+  const sourceSuggestions = useMemo(() => {
     if (!sourceOptions) return []
     const byValue = new Map(sourceOptions.map((option) => [option.value, option]))
     for (const [source] of mappings) {
@@ -340,7 +342,7 @@ function ModelMappingEditor({
     }
     return [...byValue.values()]
   }, [mappings, sourceOptions])
-  const targetSelectOptions = useMemo(() => {
+  const targetSuggestions = useMemo(() => {
     if (!targetOptions) return []
     const byValue = new Map(targetOptions.map((option) => [option.value, option]))
     for (const [, target] of mappings) {
@@ -400,45 +402,25 @@ function ModelMappingEditor({
               <span className="text-[11px] font-semibold text-muted-foreground sm:hidden">
                 {sourceLabel}
               </span>
-              {sourceOptions ? (
-                <Select
-                  compact
-                  value={k.trim()}
-                  options={sourceSelectOptions}
-                  placeholder={sourcePlaceholder}
-                  disabled={sourceSelectOptions.length === 0}
-                  onValueChange={(next) => handleChange(i, 0, next)}
-                />
-              ) : (
-                <Input
-                  className="h-8 px-2 font-mono text-xs"
-                  placeholder={sourcePlaceholder}
-                  value={k}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
-                />
-              )}
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                list={sourceOptions ? sourceListId : undefined}
+                placeholder={sourcePlaceholder}
+                value={k}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+              />
             </div>
             <div className="min-w-0 space-y-1 sm:space-y-0">
               <span className="text-[11px] font-semibold text-muted-foreground sm:hidden">
                 {targetLabel}
               </span>
-              {targetOptions ? (
-                <Select
-                  compact
-                  value={v.trim()}
-                  options={targetSelectOptions}
-                  placeholder={targetPlaceholder}
-                  disabled={targetSelectOptions.length === 0}
-                  onValueChange={(next) => handleChange(i, 1, next)}
-                />
-              ) : (
-                <Input
-                  className="h-8 px-2 font-mono text-xs"
-                  placeholder={targetPlaceholder}
-                  value={v}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
-                />
-              )}
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                list={targetOptions ? targetListId : undefined}
+                placeholder={targetPlaceholder}
+                value={v}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+              />
             </div>
             <button
               type="button"
@@ -451,6 +433,20 @@ function ModelMappingEditor({
           </div>
         ))}
       </div>
+      {sourceOptions ? (
+        <datalist id={sourceListId}>
+          {sourceSuggestions.map((option) => (
+            <option key={option.value} value={option.value} label={option.label} />
+          ))}
+        </datalist>
+      ) : null}
+      {targetOptions ? (
+        <datalist id={targetListId}>
+          {targetSuggestions.map((option) => (
+            <option key={option.value} value={option.value} label={option.label} />
+          ))}
+        </datalist>
+      ) : null}
       <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
         + {t('settings2.addMapping')}
       </Button>

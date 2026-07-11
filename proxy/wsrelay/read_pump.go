@@ -110,6 +110,9 @@ func (wc *WsConnection) installControlHandlers() {
 			return
 		}
 		wc.conn.SetPingHandler(func(appData string) error {
+			// 对端 Ping 到达证明 TCP 入向仍活，计入 inbound 活跃（供 probe 免往返
+			// 判断）；不刷新 lastUsed，空闲逐出语义不变。
+			wc.touchInbound()
 			return wc.conn.WriteControl(
 				websocket.PongMessage,
 				[]byte(appData),
@@ -121,6 +124,7 @@ func (wc *WsConnection) installControlHandlers() {
 				wc.session.HandlePong()
 			}
 			wc.Touch()
+			wc.touchInbound()
 			wc.notifyProbePong(appData)
 			return nil
 		})
@@ -182,6 +186,7 @@ func (wc *WsConnection) runReadPump() {
 		// arrive just before WriteMessage returns; queue it with the captured
 		// commit result so Ping/Pong/Close frames behind it are still processed.
 		wc.Touch()
+		wc.touchInbound()
 		if err := wc.enqueueBusinessFrameForCapturedLease(messageType, payload, captured); err != nil {
 			wc.finishReadPumpForLease(err, captured.leaseID)
 			return

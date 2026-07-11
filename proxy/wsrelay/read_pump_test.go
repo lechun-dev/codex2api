@@ -1270,3 +1270,54 @@ func TestPreservePeerCloseCauseHasBoundedWait(t *testing.T) {
 		t.Fatalf("close-cause wait = %s, want bounded near %s", elapsed, readPumpCloseCauseWait)
 	}
 }
+
+// newProbeDeafTestConnection 建一条"探活失聪"连接：服务端吞掉一切 Ping 不回
+// Pong（覆盖 gorilla 默认自动回复），Ping-Pong 往返 probe 必然超时失败。
+// 用于区分 probe 的两条路径：免往返（近期入站）与完整往返。
+func newProbeDeafTestConnection(t *testing.T) (*Manager, *WsConnection) {
+	t.Helper()
+	return newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		conn.SetPingHandler(func(string) error { return nil }) // 吞 Ping 不回 Pong
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+}
+
+// TestProbeSkipsRoundtripAfterRecentInbound 近期有入站活动的干净连接免
+// Ping-Pong 往返：请求刚完成后的热复用不为探活付一个上游 RTT（锁内串行）。
+func TestProbeSkipsRoundtripAfterRecentInbound(t *testing.T) {
+	manager, wc := newProbeDeafTestConnection(t)
+
+	wc.touchInbound()
+	if !manager.probe(wc) {
+		t.Fatal("probe must trust a clean connection with recent inbound activity without a ping roundtrip")
+	}
+}
+
+// TestProbeRoundtripsWhenInboundStale 入站活动过期后 probe 回退完整往返；
+// 对端不回 Pong 时按超时判死，不能凭旧活跃放行。
+func TestProbeRoundtripsWhenInboundStale(t *testing.T) {
+	manager, wc := newProbeDeafTestConnection(t)
+
+	wc.lastInbound.Store(time.Now().Add(-2 * probeRecencyWindow).UnixNano())
+	if manager.probe(wc) {
+		t.Fatal("probe must fall back to a full ping roundtrip once inbound activity is stale")
+	}
+}
+
+// TestProbeRecentInboundDoesNotMaskDirtyLease 近期活跃不豁免 lease/队列检查：
+// 有在途 lease 的连接即便刚有入站也不能被判定为可复用。
+func TestProbeRecentInboundDoesNotMaskDirtyLease(t *testing.T) {
+	manager, wc := newProbeDeafTestConnection(t)
+
+	wc.touchInbound()
+	if err := wc.BeginReadLease("in-flight-request"); err != nil {
+		t.Fatalf("BeginReadLease: %v", err)
+	}
+	if manager.probe(wc) {
+		t.Fatal("recent inbound must not bypass the lease/queue cleanliness check")
+	}
+}

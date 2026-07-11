@@ -49,6 +49,11 @@ type WsConnection struct {
 	// 最后使用时间
 	lastUsed atomic.Int64
 
+	// 最近入站活动时间（数据帧/对端 Ping/Pong 回执，UnixNano）。仅供 probe
+	// 免往返判断：近期有入站即 TCP 双向可证活。0 表示尚无入站，probe 走完整
+	// 往返。刻意不并入 lastUsed，避免对端 Ping 顺带延长空闲逐出。
+	lastInbound atomic.Int64
+
 	// 创建时间（UnixNano），用于连接年龄判断（上游有 60 分钟连接寿命上限）。
 	// 构造后不再修改；为 0 表示未知（测试用字面量构造），视为未到龄。
 	createdAt int64
@@ -115,6 +120,20 @@ func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsCo
 // Touch 更新最后使用时间
 func (wc *WsConnection) Touch() {
 	wc.lastUsed.Store(time.Now().UnixNano())
+}
+
+// touchInbound 记录一次入站活动（数据帧/对端 Ping/我方 Ping 的 Pong 回执）。
+func (wc *WsConnection) touchInbound() {
+	wc.lastInbound.Store(time.Now().UnixNano())
+}
+
+// recentInboundWithin 最近 window 内是否有入站活动。
+func (wc *WsConnection) recentInboundWithin(window time.Duration) bool {
+	ts := wc.lastInbound.Load()
+	if ts == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, ts)) <= window
 }
 
 // IsExpired 检查连接是否过期
@@ -625,13 +644,23 @@ func probeConnection(wc *WsConnection) bool {
 	return probeConnectionWithTimeout(wc, defaultProbeTimeout)
 }
 
-// probe 调用探活函数���支持测试替换）
+// probeRecencyWindow 内有入站活动（数据帧/对端 Ping/Pong 回执）的连接免
+// Ping-Pong 往返探活。往返探活在 keyLock 内串行、每次复用叠加一个上游 RTT，
+// 请求刚完成后的热复用（最常见路径）不该为此买单；近期入站已证明 TCP 双向
+// 存活，且 lease/队列干净由 readPumpReusable 另行把关。窗口取心跳间隔：
+// 半开连接最坏在窗口过期后的下一次 probe 或 send 失败重试中被识别。
+const probeRecencyWindow = HeartbeatPingInterval
+
+// probe 调用探活函数（支持测试替换）
 func (m *Manager) probe(wc *WsConnection) bool {
 	m.mu.RLock()
 	fn := m.probeFunc
 	m.mu.RUnlock()
 	if fn != nil {
 		return fn(wc)
+	}
+	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
+		return true
 	}
 	return probeConnection(wc)
 }

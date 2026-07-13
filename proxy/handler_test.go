@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -294,6 +295,88 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	case <-bodyCh:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for second upstream request")
+	}
+}
+
+func TestResponsesWebSocketSuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+	})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	})
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		started <- struct{}{}
+		go func() {
+			<-release
+			_, _ = io.WriteString(pw, `data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+			_ = pw.Close()
+		}()
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: pr}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         1,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","input":"hi"}`)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream request")
+	}
+
+	store.MarkCooldown(account, time.Hour, "rate_limited")
+	release <- struct{}{}
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, completed, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read terminal event: %v", err)
+	}
+	if eventType := gjson.GetBytes(completed, "type").String(); eventType != "response.completed" {
+		t.Fatalf("terminal event type = %q body=%s", eventType, completed)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt64(&account.ActiveRequests) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+		t.Fatalf("ActiveRequests = %d after completed response, want 0", got)
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("a stale WebSocket success must not clear a newer usage-limit cooldown")
 	}
 }
 
@@ -3079,7 +3162,7 @@ func TestResponses_PlainRequestNotPromotedOnRelayOnlyPool(t *testing.T) {
 	}
 }
 
-func TestResponsesRelaySuccessClearsUsageLimitCooldown(t *testing.T) {
+func TestResponsesRelaySuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var store *auth.Store
@@ -3091,7 +3174,7 @@ func TestResponsesRelaySuccessClearsUsageLimitCooldown(t *testing.T) {
 		PlanType:     "api",
 	}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		store.MarkCooldown(account, time.Hour, "usage_limit")
+		store.MarkCooldown(account, time.Hour, "rate_limited")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_success_clears_limit",
@@ -3126,8 +3209,8 @@ func TestResponsesRelaySuccessClearsUsageLimitCooldown(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if account.HasActiveCooldown() || !account.IsAvailable() {
-		t.Fatal("successful relay Responses request should clear a concurrent usage-limit cooldown")
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("a stale successful relay request must not clear a newer usage-limit cooldown")
 	}
 }
 

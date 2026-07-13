@@ -242,10 +242,19 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 }
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
-	return accountFilterForResponsesModelCandidates(compactModelMappingCandidates(originalModel, effectiveModel), effectiveModel, allowCodexAccounts)
+	candidates := compactMappingCandidates(originalModel, effectiveModel)
+	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
+		return resolveAccountCompactModelMappingForCandidates(account, candidates)
+	})
 }
 
 func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
+		return resolveAccountModelMappingForCandidates(account, modelCandidates...)
+	})
+}
+
+func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAccounts bool, resolveMapping func(*auth.Account) (string, bool)) auth.AccountFilter {
 	effectiveModel = strings.TrimSpace(effectiveModel)
 	codexFilter := accountFilterForModel(effectiveModel)
 	return func(account *auth.Account) bool {
@@ -254,7 +263,7 @@ func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiv
 		}
 		if account.IsOpenAIResponsesAPI() {
 			routedModel := effectiveModel
-			if mappedModel, ok := resolveAccountModelMappingForCandidates(account, modelCandidates...); ok && mappedModel != "" {
+			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
 			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
@@ -1328,6 +1337,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// manifest 格式；client_version 是 Codex 客户端的天然指纹，普通 OpenAI
 	// 客户端不携带，其余请求保持 OpenAI 格式列表不变。
 	v1.GET("/models", h.listModelsOrManifest)
+	// Codex CLI web_search = "live" 的 standalone 联网搜索端点 (issue #359)
+	v1.POST("/alpha/search", h.CodexAlphaSearchHandler)
 
 	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
 	r.POST("/chat/completions", auth, h.ChatCompletions)
@@ -1340,12 +1351,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/messages/count_tokens", auth, h.CountTokens)
 	r.POST("/responses/input_tokens", auth, h.ResponsesInputTokens)
 	r.GET("/models", auth, h.listModelsOrManifest)
+	r.POST("/alpha/search", auth, h.CodexAlphaSearchHandler)
 
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(auth)
 	codexDirect.POST("/responses", h.Responses)
 	codexDirect.GET("/responses", h.ResponsesWebSocket)
 	codexDirect.GET("/models", h.CodexModelsManifestHandler)
+	codexDirect.POST("/alpha/search", h.CodexAlphaSearchHandler)
 	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
 		subpath := strings.TrimSpace(c.Param("subpath"))
 		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
@@ -1658,18 +1671,26 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 不接受，会 400 或返回非压缩响应导致客户端报
 	// "expected exactly one compaction output item"。
 	// 处理：池中还有可用官方账号时，把这类请求钉在官方账号上保持原生透传；
-	// 官方账号全不可用（如纯中转部署）时整体提升到 compact 专用链路——
-	// 该链路对两类账号都能正确完成压缩。
-	pinBodySignalToCodexAccounts := requestBodyHasCompactionTrigger(rawBody)
-	if pinBodySignalToCodexAccounts {
-		if !h.storeHasAvailableCodexAccount() {
-			h.ResponsesCompact(c)
-			return
-		}
+	// 纯中转池的流式请求也必须继续走 /responses SSE，否则 ResponsesCompact 的
+	// 一次性 JSON 会让客户端在收到 response.completed 前遇到 EOF（issue #361）。
+	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
+	// 中转兼容性。
+	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
+	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount()
+	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
+	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
+		h.ResponsesCompact(c)
+		return
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
-	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	var requestModel, mappedModel string
+	var mappingApplied bool
+	if streamingRelayBodySignal {
+		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
+	} else {
+		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	}
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -1759,7 +1780,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	var accountFilter auth.AccountFilter
+	if streamingRelayBodySignal {
+		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+	} else {
+		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	if pinBodySignalToCodexAccounts {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
@@ -1844,7 +1871,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
 			upstreamBody := getOpenAIResponsesBody()
-			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+			var mappedBody []byte
+			var mappedModel string
+			var accountMappingApplied bool
+			if streamingRelayBodySignal {
+				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
+			} else {
+				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
+			}
+			if accountMappingApplied {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
@@ -2754,9 +2789,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
-	logModel := requestModel
-	if logModel == "" {
-		logModel = model
+	// routingModel 保留客户端原始模型名（可能带 -openai-compact 后缀），供账号级
+	// compact 映射与账号过滤匹配别名规则；logModel 用于统计与日志展示，别名后缀
+	// 只是端点路由约定，展示时一律折算成基础模型名（仅剥后缀不算映射，不显示箭头）。
+	routingModel := requestModel
+	if routingModel == "" {
+		routingModel = model
+	}
+	logModel := routingModel
+	if baseModel, stripped := stripCompactModelSuffix(logModel); stripped {
+		logModel = baseModel
 	}
 	if err := security.ValidateModelName(model); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -2813,7 +2855,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
-	accountFilter := accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
@@ -2861,7 +2903,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
 			upstreamBody := openAIResponsesBody
-			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, compactModelMappingCandidates(logModel, effectiveModel)...); ok {
+			if mappedBody, mappedModel, ok := h.applyAccountCompactModelMappingToBody(upstreamBody, account, routingModel, effectiveModel); ok {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
@@ -4355,7 +4397,12 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 		return result
 	}
 	if store != nil {
-		store.UpdateAccountPlanType(account, resp.Header.Get("x-codex-plan-type"))
+		planHeader := resp.Header.Get("x-codex-plan-type")
+		store.UpdateAccountPlanType(account, planHeader)
+		// 权威付费 plan_type 与「订阅已过期」互斥，借每次响应校正陈旧到期时间。(issue #360)
+		if planHeader != "" {
+			store.ClearStaleSubscriptionExpiresAt(account)
+		}
 	}
 	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 

@@ -130,9 +130,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 
 	db := &DB{conn: conn, driver: "mysql"}
 	settings := &SystemSettings{
-		ModelPricingOverrides:  `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
-		ModelPricingSyncURL:    "https://example.test/pricing.json",
-		IgnoreUsageLimitStatus: true,
+		ModelPricingOverrides:           `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
+		ModelPricingSyncURL:             "https://example.test/pricing.json",
+		IgnoreUsageLimitStatus:          true,
+		AutoResetCreditsEnabled:         true,
+		AutoResetCreditsBeforeExpiryMin: 75,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -143,24 +145,26 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"ON DUPLICATE KEY UPDATE",
-		"model_pricing_overrides = VALUES(model_pricing_overrides)",
-		"model_pricing_sync_url = VALUES(model_pricing_sync_url)",
 		"ignore_usage_limit_status = VALUES(ignore_usage_limit_status)",
+		"auto_reset_credits_enabled = VALUES(auto_reset_credits_enabled)",
+		"auto_reset_credits_before_expiry_min = VALUES(auto_reset_credits_before_expiry_min)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 87 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 87", got)
+	if got := strings.Count(capture.query, "?"); got != 89 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 89", got)
 	}
-	if len(capture.args) != 87 {
-		t.Fatalf("rewritten settings argument count = %d, want 87", len(capture.args))
+	if len(capture.args) != 89 {
+		t.Fatalf("rewritten settings argument count = %d, want 89", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
 		settings.ModelPricingSyncURL,
 		settings.IgnoreUsageLimitStatus,
+		settings.AutoResetCreditsEnabled,
+		int64(settings.AutoResetCreditsBeforeExpiryMin),
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
@@ -170,9 +174,40 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 	}
 }
 
+func TestCreateAccountGroupUsesMySQL56InsertPath(t *testing.T) {
+	capture := &mysqlCaptureDriver{lastInsertID: 42}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	id, err := db.CreateAccountGroup(context.Background(), "mysql56", "", "", 0, 0, sql.NullInt64{Int64: 6, Valid: true})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup() error = %v", err)
+	}
+	if id != 42 {
+		t.Fatalf("CreateAccountGroup() id = %d, want 42", id)
+	}
+	if strings.Contains(strings.ToUpper(capture.query), "RETURNING") {
+		t.Fatalf("PostgreSQL RETURNING leaked into MySQL query: %s", capture.query)
+	}
+	if !strings.Contains(capture.query, "base_concurrency_override") || strings.Count(capture.query, "?") != 7 {
+		t.Fatalf("unexpected MySQL account group insert: %s", capture.query)
+	}
+	if len(capture.args) != 7 || capture.args[6].Value != int64(6) {
+		t.Fatalf("unexpected MySQL account group args: %#v", capture.args)
+	}
+}
+
 type mysqlCaptureDriver struct {
-	query string
-	args  []driver.NamedValue
+	query        string
+	args         []driver.NamedValue
+	lastInsertID int64
 }
 
 func (d *mysqlCaptureDriver) Open(string) (driver.Conn, error) {
@@ -196,8 +231,16 @@ func (c *mysqlCaptureConn) Begin() (driver.Tx, error) {
 func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.capture.query = query
 	c.capture.args = append([]driver.NamedValue(nil), args...)
-	return driver.RowsAffected(1), nil
+	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: 1}, nil
 }
+
+type mysqlCaptureResult struct {
+	lastInsertID int64
+	rowsAffected int64
+}
+
+func (r mysqlCaptureResult) LastInsertId() (int64, error) { return r.lastInsertID, nil }
+func (r mysqlCaptureResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
 type mysqlCaptureTx struct{}
 

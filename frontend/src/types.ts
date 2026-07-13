@@ -93,6 +93,7 @@ export interface AccountRow {
   ignore_usage_limit_status_override?: boolean | null
   ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean
@@ -258,6 +259,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_status_override?: boolean | null
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
 }
 
@@ -274,6 +276,7 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  base_concurrency_override: number | null
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   created_at: ISODateString
@@ -289,6 +292,7 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -298,6 +302,7 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -606,6 +611,8 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_enabled: boolean
+  auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean

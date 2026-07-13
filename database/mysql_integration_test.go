@@ -89,9 +89,14 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		ModelPricingOverrides:              `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
 		ModelPricingSyncURL:                "https://example.test/pricing.json",
 		IgnoreUsageLimitStatus:             true,
+		AutoResetCreditsEnabled:            true,
+		AutoResetCreditsBeforeExpiryMin:    75,
 	}
 	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
 		t.Fatalf("UpdateSystemSettings failed: %v", err)
+	}
+	if err := db.UpdateModelPricingSettings(ctx, settings.ModelPricingOverrides, settings.ModelPricingSyncURL); err != nil {
+		t.Fatalf("UpdateModelPricingSettings failed: %v", err)
 	}
 	savedSettings, err := db.GetSystemSettings(ctx)
 	if err != nil {
@@ -119,7 +124,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.CodexWSSilentMaxRetries != 4 ||
 		savedSettings.ModelPricingOverrides != `{"gpt-5.4":{"input":2.5,"source":"custom"}}` ||
 		savedSettings.ModelPricingSyncURL != "https://example.test/pricing.json" ||
-		!savedSettings.IgnoreUsageLimitStatus {
+		!savedSettings.IgnoreUsageLimitStatus ||
+		!savedSettings.AutoResetCreditsEnabled ||
+		savedSettings.AutoResetCreditsBeforeExpiryMin != 75 {
 		t.Fatalf("system settings were not persisted correctly: %#v", savedSettings)
 	}
 
@@ -144,12 +151,28 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		t.Fatalf("unexpected API key row: %#v", row)
 	}
 
-	groupID, err := db.CreateAccountGroup(ctx, groupName, "integration", "#123456", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(ctx, groupName, "integration", "#123456", 0, 0, sql.NullInt64{Int64: 6, Valid: true})
 	if err != nil {
 		t.Fatalf("CreateAccountGroup failed: %v", err)
 	}
 	if groupID <= 0 {
 		t.Fatalf("groupID = %d, want positive", groupID)
+	}
+	groups, err := db.ListAccountGroups(ctx)
+	if err != nil {
+		t.Fatalf("ListAccountGroups failed: %v", err)
+	}
+	var foundGroup bool
+	for _, group := range groups {
+		if group.ID == groupID {
+			foundGroup = true
+			if !group.BaseConcurrencyOverride.Valid || group.BaseConcurrencyOverride.Int64 != 6 {
+				t.Fatalf("group base_concurrency_override = %+v, want 6", group.BaseConcurrencyOverride)
+			}
+		}
+	}
+	if !foundGroup {
+		t.Fatalf("created account group %d not found", groupID)
 	}
 
 	accountID, err := db.InsertAccountWithCredentials(ctx, "mysql smoke account "+suffix, map[string]interface{}{

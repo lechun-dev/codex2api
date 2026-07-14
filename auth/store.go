@@ -5820,16 +5820,26 @@ func isUsageLimitCooldownReason(reason string) bool {
 	}
 }
 
-// ConfirmResponsesAvailable clears only a usage/rate-limit cooldown after a
-// completed Responses request succeeds. Authentication and unrelated error
-// states are intentionally untouched.
+// ConfirmResponsesAvailable preserves the original API for callers whose
+// success evidence is current at call time.
 func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
+	return s.ConfirmResponsesAvailableSince(acc, time.Now())
+}
+
+// ConfirmResponsesAvailableSince clears only a usage/rate-limit cooldown when
+// a completed Responses request started after the latest rate-limit evidence.
+// A stale in-flight success must not undo a newer usage_limit_reached result.
+// Authentication and unrelated error states are intentionally untouched.
+func (s *Store) ConfirmResponsesAvailableSince(acc *Account, requestStartedAt time.Time) bool {
 	if s == nil || acc == nil {
 		return false
 	}
 
 	acc.mu.Lock()
-	if !acc.ignoreUsageLimitStatus || acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) {
+	if !acc.ignoreUsageLimitStatus ||
+		acc.Status != StatusCooldown ||
+		!isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && !requestStartedAt.After(acc.LastRateLimitedAt)) {
 		acc.mu.Unlock()
 		return false
 	}

@@ -34,6 +34,8 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"model_pricing_overrides MEDIUMTEXT NULL",
 		"model_pricing_sync_url TEXT NULL",
 		"ignore_usage_limit_status TINYINT(1) DEFAULT 0",
+		"auto_reset_credits_enabled TINYINT(1) DEFAULT 0",
+		"auto_reset_credits_before_expiry_min INT DEFAULT 60",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -52,5 +54,12 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
 		}
+	}
+}
+
+func TestMySQLAccountGroupSchemaIncludesBaseConcurrencyOverride(t *testing.T) {
+	ddl := accountGroupsMySQLDDL()
+	if !strings.Contains(ddl, "base_concurrency_override INT NULL") {
+		t.Fatalf("MySQL account_groups DDL missing base_concurrency_override: %s", ddl)
 	}
 }

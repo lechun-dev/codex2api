@@ -18,6 +18,8 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "model_pricing_overrides", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "model_pricing_sync_url", def: "TEXT NULL"},
 	{table: "system_settings", name: "ignore_usage_limit_status", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "auto_reset_credits_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "auto_reset_credits_before_expiry_min", def: "INT DEFAULT 60"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -111,17 +113,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			expires_at DATETIME NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
-		`CREATE TABLE IF NOT EXISTS account_groups (
-			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-			name VARCHAR(80) NOT NULL UNIQUE,
-			description VARCHAR(1024) DEFAULT '',
-			color VARCHAR(20) DEFAULT '',
-			sort_order INT DEFAULT 0,
-			auto_pause_5h_threshold DOUBLE DEFAULT 0,
-			auto_pause_7d_threshold DOUBLE DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		accountGroupsMySQLDDL(),
 		`CREATE TABLE IF NOT EXISTS account_group_members (
 			account_id BIGINT NOT NULL,
 			group_id BIGINT NOT NULL,
@@ -308,6 +300,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"account_groups", "description", "VARCHAR(1024) DEFAULT ''"},
 		{"account_groups", "color", "VARCHAR(20) DEFAULT ''"},
 		{"account_groups", "sort_order", "INT DEFAULT 0"},
+		{"account_groups", "base_concurrency_override", "INT NULL"},
 		{"account_groups", "created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"},
 		{"account_groups", "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"},
 		{"account_groups", "auto_pause_5h_threshold", "DOUBLE DEFAULT 0"},
@@ -458,6 +451,22 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 	return db.runDataMigrationsWithTimeout()
 }
 
+// 2026-07-13 coder(lq): 单独维护 MySQL 5.6 账号组 DDL，确保新建库与旧库补列定义一致。
+func accountGroupsMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS account_groups (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(80) NOT NULL UNIQUE,
+		description VARCHAR(1024) DEFAULT '',
+		color VARCHAR(20) DEFAULT '',
+		sort_order INT DEFAULT 0,
+		auto_pause_5h_threshold DOUBLE DEFAULT 0,
+		auto_pause_7d_threshold DOUBLE DEFAULT 0,
+		base_concurrency_override INT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
 // 2026-07-04 coder(lq): 单独抽出 MySQL 的 system_settings DDL，便于测试并避免再次漏掉新字段。
 // MySQL 5.6/5.7 不支持 TEXT/BLOB 默认值，因此 JSON 文本配置列统一使用 TEXT NULL，
 // 运行时再由读取逻辑做 COALESCE/兜底。
@@ -550,7 +559,9 @@ func systemSettingsMySQLDDL() string {
 		codex_cli_version_sync_interval_hours INT DEFAULT 12,
 		model_pricing_overrides MEDIUMTEXT NULL,
 		model_pricing_sync_url TEXT NULL,
-		ignore_usage_limit_status TINYINT(1) DEFAULT 0
+		ignore_usage_limit_status TINYINT(1) DEFAULT 0,
+		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
+		auto_reset_credits_before_expiry_min INT DEFAULT 60
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

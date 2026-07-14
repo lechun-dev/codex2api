@@ -147,6 +147,7 @@ func TestExchangeOAuthCodeTriggersUsageProbe(t *testing.T) {
 	store := auth.NewStore(db, cache.NewMemory(1), nil)
 	probed := make(chan int64, 1)
 	handler := &Handler{db: db, store: store}
+	defer handler.waitForImportedAccountProbes()
 	handler.probeUsage = func(_ context.Context, account *auth.Account) error {
 		probed <- account.DBID
 		return nil
@@ -273,6 +274,7 @@ func TestOAuthCallbackTriggersUsageProbe(t *testing.T) {
 	store := auth.NewStore(db, cache.NewMemory(1), nil)
 	probed := make(chan int64, 1)
 	handler := &Handler{db: db, store: store}
+	defer handler.waitForImportedAccountProbes()
 	handler.probeUsage = func(_ context.Context, account *auth.Account) error {
 		probed <- account.DBID
 		return nil
@@ -587,6 +589,7 @@ func TestUpdateOAuthAccountCodeUpdatesExistingAccountInPlace(t *testing.T) {
 	store := auth.NewStore(db, cache.NewMemory(1), nil)
 	probed := make(chan int64, 1)
 	handler := &Handler{db: db, store: store}
+	defer handler.waitForImportedAccountProbes()
 	handler.probeUsage = func(_ context.Context, account *auth.Account) error {
 		probed <- account.DBID
 		return nil

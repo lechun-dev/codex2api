@@ -50,6 +50,7 @@ type Handler struct {
 	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
+	importedAccountProbeWg sync.WaitGroup
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
@@ -191,7 +192,20 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 }
 
 func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
-	go h.probeImportedAccountUsage(context.Background(), accountID, source)
+	if h == nil {
+		return
+	}
+	h.importedAccountProbeWg.Add(1)
+	go func() {
+		defer h.importedAccountProbeWg.Done()
+		h.probeImportedAccountUsage(context.Background(), accountID, source)
+	}()
+}
+
+func (h *Handler) waitForImportedAccountProbes() {
+	if h != nil {
+		h.importedAccountProbeWg.Wait()
+	}
 }
 
 func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {

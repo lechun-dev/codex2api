@@ -196,6 +196,10 @@ type DB struct {
 	logStop chan struct{}
 	logWg   sync.WaitGroup
 
+	asyncMu     sync.Mutex
+	asyncClosed bool
+	asyncWg     sync.WaitGroup
+
 	usageLogMode                 atomic.Value // string: full|errors|off
 	usageLogBatchSize            int64
 	usageLogFlushInterval        int64        // ns
@@ -514,11 +518,33 @@ func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error 
 
 // Close 关闭数据库连接
 func (db *DB) Close() error {
+	// 2026-07-14 coder(lq): Coordinate detached account-event writes with database shutdown so SQLite files are not recreated after cleanup.
+	db.asyncMu.Lock()
+	db.asyncClosed = true
+	db.asyncMu.Unlock()
+	db.asyncWg.Wait()
+
 	// 停止批量写入并刷完缓冲
 	close(db.logStop)
 	db.logWg.Wait()
 	db.flushLogs() // 最后一次 flush
 	return db.conn.Close()
+}
+
+func (db *DB) startAsyncWrite(fn func()) {
+	if db == nil || fn == nil {
+		return
+	}
+	db.asyncMu.Lock()
+	defer db.asyncMu.Unlock()
+	if db.asyncClosed {
+		return
+	}
+	db.asyncWg.Add(1)
+	go func() {
+		defer db.asyncWg.Done()
+		fn()
+	}()
 }
 
 func (db *DB) SetUsageLogConfig(mode string, batchSize int, flushIntervalSeconds int) {
@@ -5428,7 +5454,7 @@ func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
 
 // BatchInsertAccountEventsAsync 批量异步插入账号事件
 func (db *DB) BatchInsertAccountEventsAsync(ids []int64, eventType string, source string) {
-	go func() {
+	db.startAsyncWrite(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
@@ -5458,7 +5484,7 @@ func (db *DB) BatchInsertAccountEventsAsync(ids []int64, eventType string, sourc
 				log.Printf("[账号事件] 批量插入失败 (%d 条): %v", len(batch), err)
 			}
 		}
-	}()
+	})
 }
 
 // ClearError 清除账号错误状态
@@ -5754,7 +5780,7 @@ func (db *DB) InsertAccountEvent(ctx context.Context, accountID int64, eventType
 
 // InsertAccountEventAsync 异步插入账号事件（不阻塞调用方，SQLite 下带重试）
 func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source string) {
-	go func() {
+	db.startAsyncWrite(func() {
 		var err error
 		for attempt := 0; attempt < 3; attempt++ {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -5768,7 +5794,7 @@ func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source 
 		if err != nil {
 			log.Printf("[账号事件] 记录失败（已重试3次）: account=%d type=%s source=%s err=%v", accountID, eventType, source, err)
 		}
-	}()
+	})
 }
 
 // GetAccountEventTrend 按时间桶聚合账号增删事件

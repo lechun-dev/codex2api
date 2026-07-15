@@ -1410,7 +1410,8 @@
       "overview": "Overview",
       "logs": "Hit Logs",
       "rules": "Rules",
-      "intelligence": "Intelligence"
+      "intelligence": "Intelligence",
+      "docs": "Guide"
     },
     "loadingTitle": "Loading Prompt Filter",
     "loadingDesc": "Syncing rule settings and hit logs.",
@@ -1540,6 +1541,10 @@
     "ruleCategory": "Category",
     "ruleWeight": "Weight",
     "rulePattern": "Regex",
+    "rulePreviewDesc": "Inspect the full regular expression, copy it, or test matches below.",
+    "rulePreviewHint": "Click to preview full regex",
+    "copyPattern": "Copy Regex",
+    "patternCopied": "Copied",
     "ruleStrict": "Strict",
     "builtinRule": "Built-in",
     "customRule": "Custom",
@@ -1643,6 +1648,144 @@
       "autoAdd": "Auto Add or Update",
       "queries": "Search Queries (one per line)",
       "builtinQueries": "Built-in Queries (always included)"
+    },
+    "docs": {
+      "title": "Prompt Filter Guide",
+      "description": "How the Prompt Filter works, what each tab is for, recommended rollout steps, and how to use advanced protection, secondary review, intelligence, and NewAPI identity forwarding.",
+      "toc": "Contents",
+      "tocHint": "Jump to a section",
+      "badge": "Product Docs",
+      "metaSections": "{{count}} sections",
+      "metaAudience": "Ops / Security / Eng",
+      "groups": {
+        "intro": "Concepts",
+        "setup": "Getting started",
+        "core": "Core capabilities",
+        "ops": "Operations"
+      },
+      "what": {
+        "title": "What this module does",
+        "p1": "Prompt Filter inspects user prompts before they reach upstream models. It aims to catch jailbreaks, injection, malware help, credential theft, reverse engineering, and similar high-risk content while limiting false positives.",
+        "p2": "It is a gateway policy layer: deterministic local rules score the request first, then the selected mode decides monitor / warn / block. Optional layers add decoding, cumulative risk, output scanning, and identity-linked bans.",
+        "b1": "Local rules: built-in patterns + sensitive words + custom regex, scored by weight.",
+        "b2": "Modes: monitor logs only, warn can pass through, block rejects the request.",
+        "b3": "Terminal rules: strict hits or terminal categories cannot be discounted or downgraded by review.",
+        "b4": "Observability: hit logs store action, score, matched rules, and content preview for triage."
+      },
+      "pipeline": {
+        "title": "Request pipeline",
+        "p1": "A request is processed roughly in this order (advanced layers are off by default):",
+        "s1": "Accept the request and extract text up to the configured max length.",
+        "s2": "Optional: normalize input and decode URL / HTML / Base64 encodings.",
+        "s3": "Match local rules: sensitive words, built-in rules, and custom rules.",
+        "s4": "Evaluate score thresholds, strict threshold, terminal strict, and terminal categories.",
+        "s5": "Optional: accumulate user / IP / session risk, or call secondary Moderations-compatible review.",
+        "s6": "Emit allow / warn / block; with NewAPI identity verification, violations may return 503 plus ban instructions.",
+        "s7": "Optional: buffer and scan SSE / WebSocket output so risky content in model replies is still caught."
+      },
+      "pages": {
+        "title": "How to use each tab",
+        "p1": "There are five tabs. A good order is configure → rules → verify → operate → intelligence.",
+        "colPage": "Tab",
+        "colUse": "Purpose",
+        "overview": "Master switch, mode, thresholds, sensitive words, advanced protection, secondary review, tester, and recent hits.",
+        "logs": "Search all hit records by action, source, endpoint, model, and API key.",
+        "rules": "Enable/disable built-in rules, manage custom rules, and test regex hits.",
+        "intelligence": "Search public signals for candidate rules and add them after human review.",
+        "docs": "This usage guide and rollout checklist."
+      },
+      "quickstart": {
+        "title": "Quick start (recommended)",
+        "p1": "Roll out monitor-first, then block. Avoid full block mode before you understand false positives.",
+        "s1": "On Overview, enable the filter, set mode to Monitor, and turn on match logging.",
+        "s2": "Choose sensible thresholds (for example 50 / 90) and watch score distribution in logs.",
+        "s3": "On Rules, keep critical built-in rules enabled; add business-specific sensitive words (one per line).",
+        "s4": "Use the rule tester with real production prompts and confirm false positives are acceptable.",
+        "s5": "After 1–3 days of logs, switch mode to Warn or Block.",
+        "s6": "Only then enable terminal strict blocking, secondary review, and advanced layers as needed.",
+        "callout": "Production baseline: enabled + block mode + terminal strict + fail-closed secondary review. Mark strict only on very low false-positive patterns."
+      },
+      "modes": {
+        "title": "Processing modes",
+        "p1": "Mode controls gateway behavior after scoring; it does not disable scoring itself.",
+        "colMode": "Mode",
+        "colEffect": "Effect",
+        "monitor": "Log only; do not change request allow path. Best for initial tuning.",
+        "warn": "Log and mark a warning; request usually continues upstream. Good for canary.",
+        "block": "Reject when thresholds or terminal hits fire. Use for production hard enforcement.",
+        "callout": "With terminal strict blocking on, any strict:true hit blocks immediately—even in monitor/warn—and cannot be downgraded by secondary review."
+      },
+      "scoring": {
+        "title": "Scoring, thresholds, and terminal hits",
+        "p1": "Each matched rule adds its weight. Ordinary decisions use the block threshold; strict rules also use the strict threshold.",
+        "p2": "Terminal paths outrank normal thresholds: terminal strict and terminal categories are not discounted by context and cannot be allowed by review.",
+        "b1": "Block threshold: cumulative score that triggers the mode action (block in block mode).",
+        "b2": "Strict threshold: cumulative strict-rule score that can also trigger handling.",
+        "b3": "Terminal strict blocking: a single strict hit blocks immediately.",
+        "b4": "Terminal categories: e.g. reverse_engineering blocks on category match immediately."
+      },
+      "advanced": {
+        "title": "Advanced protection",
+        "p1": "All advanced layers default to off. Each sub-module has its own switch—enable gradually.",
+        "b1": "Normalization & decoding: full-width/confusable cleanup and URL/HTML/Base64 unwrapping.",
+        "b2": "Terminal categories: veto specific categories immediately.",
+        "b3": "User / IP / session risk: catch split-across-requests attacks.",
+        "b4": "SSE / WebSocket output scan: inspect streamed model output; can limit to terminal rules only.",
+        "b5": "NewAPI audit identity: verify HMAC identity headers and emit ban instructions on policy hits.",
+        "b6": "Scheduled intelligence: periodic public search and optional candidate rule generation.",
+        "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency."
+      },
+      "review": {
+        "title": "Secondary review",
+        "p1": "Secondary review runs only after a local rule match, calling an OpenAI Moderations-compatible endpoint. Clean local requests never call the review API, which controls cost and latency.",
+        "p2": "Configure base URL, model, timeout, multiple API keys (auto-failover on rate limits), and failure policy.",
+        "b1": "Block on failure: conservative production default when review times out or errors.",
+        "b2": "Allow on failure: keep traffic flowing if review is unavailable (canary).",
+        "b3": "Terminal strict hits are never downgraded to allow by review."
+      },
+      "rules": {
+        "title": "Working with the rule set",
+        "p1": "Built-in rules can be toggled by category in batch. Extra rules live in system settings and can be added, edited, or removed independently.",
+        "p2": "Custom rules use Go regex. Names must be unique; weight is the score on match; strict marks a strong rule; prefer stable English categories.",
+        "b1": "Use strict or terminal categories only for very low false-positive high-risk patterns.",
+        "b2": "Dual-use phrases should stay non-strict with moderate weight, relying on thresholds and review.",
+        "b3": "Validate with both the rules regex tester and the overview prompt tester before relying on a rule.",
+        "b4": "Advanced composite rules may use all_patterns / any_patterns / exclude_patterns."
+      },
+      "logs": {
+        "title": "Reading hit logs",
+        "p1": "Logs support tuning and incident review. Overview shows the latest five hits; full search is on the Hit Logs tab.",
+        "b1": "Action: allow / warn / block is the final decision.",
+        "b2": "Source: local rules, upstream cyber_policy, intelligence jobs (intel_*), etc.",
+        "b3": "Score and matches: which rules contributed to the score.",
+        "b4": "Filter by endpoint, model, API key, and keyword; open full request text when needed."
+      },
+      "intelligence": {
+        "title": "Rule intelligence",
+        "p1": "The intelligence tab searches public GitHub-style sources for jailbreak/injection signals and can optionally use a pool model to draft candidate regex rules.",
+        "b1": "Candidates are not auto-added by default—review then add/update.",
+        "b2": "Scheduled search and model calls must be explicitly enabled under Advanced Protection.",
+        "b3": "Search, model analysis, and rule adds are audited as intel_search / intel_model / intel_rule_add.",
+        "callout": "Enable auto_add only if you explicitly accept unattended rule writes; keep it off otherwise."
+      },
+      "newapi": {
+        "title": "NewAPI identity forwarding and bans",
+        "p1": "When traffic is relayed by NewAPI into Codex2API, enable audit identity forwarding: NewAPI signs user ID, IP, request ID, and related fields with a shared secret; Codex2API verifies and may return auditable 503 plus ban instructions on violations.",
+        "p2": "Secrets are injected via env or generated once in admin UI—never sent in normal request bodies. Header and signature details are in Overview → Advanced Protection → NewAPI protocol.",
+        "b1": "Secrets on both sides must match exactly; environment variables override database secrets.",
+        "b2": "Prefer ban_after=2 (warn then ban); protect admin accounts with allowlists.",
+        "b3": "NewAPI needs custom work: sign headers, handle 503, persist audits and IP bans."
+      },
+      "checklist": {
+        "title": "Go-live checklist",
+        "p1": "Run through this list before production cutover to reduce false blocks and misses.",
+        "s1": "Master switch on; mode graduated from monitor to block.",
+        "s2": "Thresholds, terminal strict, sensitive words, and core built-in rules reviewed.",
+        "s3": "Tester coverage includes normal business samples and attack samples.",
+        "s4": "Secondary review keys/timeout/fail policy configured and failure-path exercised.",
+        "s5": "Enable decoding, cumulative risk, and output scan only as needed; multi-replica cache ready.",
+        "s6": "Logs are searchable and review workflows are clear; NewAPI secrets and ban policy aligned if used."
+      }
     }
   },
   "themeSettings": {
@@ -2940,6 +3083,111 @@
     "copyFailed": "Copy failed",
     "formModelsSelected": "{{count}} selected",
     "formModelsAll": "All models",
-    "formModelsHint": "Multi-select or type a wildcard (e.g. gpt-*). Leave empty to apply to all models."
+    "formModelsHint": "Multi-select or type a wildcard (e.g. gpt-*). Leave empty to apply to all models.",
+    "views": {
+      "editor": "Rules",
+      "docs": "Guide"
+    },
+    "docs": {
+      "title": "Payload Rewrite Guide",
+      "description": "How to rewrite upstream JSON request bodies before they reach the model: system prompts, service_tier, reasoning effort, and arbitrary field paths.",
+      "toc": "Contents",
+      "tocHint": "Jump to a section",
+      "badge": "Product Docs",
+      "groupLabels": {
+        "intro": "Concepts",
+        "setup": "Getting started",
+        "core": "Core capabilities",
+        "ops": "Operations"
+      },
+      "what": {
+        "title": "What this module does",
+        "p1": "Payload rewrite mutates the client JSON body after it hits the gateway and before it is sent upstream. Typical uses include appending or replacing instructions, forcing service_tier, and remapping reasoning.effort.",
+        "p2": "Rules apply immediately after save. The gateway has no default system prompt of its own—instructions are client-provided, and rules layer on top of that pass-through.",
+        "b1": "Visual editor with templates, plus a full JSON source mode.",
+        "b2": "Rule groups control write semantics: set-if-missing, override, string append, or field removal.",
+        "b3": "Match gates filter by model, headers, field presence, and field values.",
+        "b4": "Observed samples show pre-rewrite client instructions for reference."
+      },
+      "pipeline": {
+        "title": "Request pipeline",
+        "p1": "A request roughly flows through the engine as follows:",
+        "s1": "Parse the client body (chat/responses-style endpoints; image generation is not affected).",
+        "s2": "Select rules that pass their group configuration and match gates.",
+        "s3": "Apply writes using default / override / append / filter (and raw variants).",
+        "s4": "Skip protected fields so routing and streaming stay intact.",
+        "s5": "Forward the rewritten body upstream; optionally record original instructions samples."
+      },
+      "groups": {
+        "title": "Choosing a rule group",
+        "p1": "Each rule belongs to a group that defines how fields are written.",
+        "default": "Write only when the field is missing; never overwrite client values.",
+        "override": "Always set the target value, replacing any existing one.",
+        "append": "Concatenate onto string fields (e.g. append text to instructions).",
+        "filter": "Remove the listed field paths.",
+        "raw": "Raw variants parse the value as JSON before writing—useful for nested objects.",
+        "callout": "Overriding instructions replaces the official Codex CLI system prompt and may affect tool calling. It also invalidates upstream prompt cache—keep rule text stable."
+      },
+      "gates": {
+        "title": "Match gates",
+        "p1": "A rule runs only when every configured gate matches. Empty means unrestricted.",
+        "b1": "models: names or wildcards (e.g. gpt-*); empty = all models.",
+        "b2": "headers: require specific request header values.",
+        "b3": "match / not_match: body field paths equal / not equal given values.",
+        "b4": "exist / not_exist: field paths must be present / absent.",
+        "b5": "Multiple gates combine with AND semantics."
+      },
+      "templates": {
+        "title": "Built-in templates",
+        "p1": "When adding a rule, start from a template and refine as needed.",
+        "b1": "Append system prompt: keep the original text and append yours.",
+        "b2": "Override system prompt: replace instructions entirely.",
+        "b3": "Override service_tier: force a tier such as priority.",
+        "b4": "Reasoning effort mapping: e.g. lift medium to high.",
+        "b5": "Custom rule: set/override/append/remove any path with full gates.",
+        "callout": "If you are unsure what clients send, inspect Observed samples first, then choose append vs override."
+      },
+      "quickstart": {
+        "title": "Quick start",
+        "p1": "Prefer a low-risk append rule first, then add conditions and overrides.",
+        "s1": "Open Rules, click Add Rule, pick Append System Prompt.",
+        "s2": "Enter the text to append; optionally limit target models.",
+        "s3": "Save and send a couple of real client requests to verify.",
+        "s4": "Compare Observed samples with expected rewrite behavior.",
+        "s5": "Add tier/effort mappings or custom field rules as needed."
+      },
+      "protected": {
+        "title": "Protected fields",
+        "p1": "These fields cannot be rewritten, so scheduling and protocol stay safe:",
+        "b1": "model, stream, input, store, prompt_cache_key.",
+        "b2": "Rewrite business fields instead (instructions, service_tier, reasoning.effort, text.verbosity, …).",
+        "b3": "Use dotted paths for nested fields, e.g. reasoning.effort.",
+        "callout": "If a rule seems ignored, check protected fields, overly strict gates, and whether you clicked Save."
+      },
+      "samples": {
+        "title": "Using observed samples",
+        "p1": "The bottom of the editor lists recently captured client instructions (before rewrite).",
+        "b1": "Compare against official/client system prompts before overriding.",
+        "b2": "Copy snippets into your append text.",
+        "b3": "If empty, wait for real traffic through the gateway."
+      },
+      "json": {
+        "title": "JSON source mode",
+        "p1": "Visual and JSON modes convert both ways. Shape is { group: [rule objects…] }.",
+        "p2": "Invalid JSON or structure blocks switching back to visual until fixed.",
+        "b1": "Rule fields: models, headers, match, not_match, exist, not_exist, params.",
+        "b2": "For filter, params is an array of paths; for other groups, params is a path→value object.",
+        "b3": "After save, the server uses the new rules immediately—no restart."
+      },
+      "checklist": {
+        "title": "Go-live checklist",
+        "p1": "Before enabling critical rewrites, verify:",
+        "s1": "Choose append vs override deliberately and assess Codex tool-calling impact.",
+        "s2": "Scope non-global rules with models or match gates.",
+        "s3": "Never target protected fields.",
+        "s4": "Regression-test with observed samples and real clients.",
+        "s5": "Confirm Save succeeded; optionally audit the JSON source."
+      }
+    }
   }
 }

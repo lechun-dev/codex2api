@@ -1,20 +1,27 @@
-import type { ChangeEvent } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { NavLink, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
+  BookOpen,
   Braces,
   Check,
+  CheckCircle2,
+  ClipboardList,
   Copy,
   FilePlus2,
   FileText,
   Filter,
   Gauge,
+  GitBranch,
+  Layers,
   ListPlus,
   Pencil,
   Plus,
   RefreshCw,
   Save,
+  ShieldAlert,
   Sparkles,
   Trash2,
   Wand2,
@@ -423,9 +430,18 @@ function KVRowsEditor({
 
 // ==================== 主页面 ====================
 
+const PAYLOAD_RULES_VIEWS = ['editor', 'docs'] as const
+type PayloadRulesView = (typeof PAYLOAD_RULES_VIEWS)[number]
+
+function normalizePayloadRulesView(value?: string): PayloadRulesView {
+  return PAYLOAD_RULES_VIEWS.includes(value as PayloadRulesView) ? (value as PayloadRulesView) : 'editor'
+}
+
 export default function PayloadRules() {
   const { t } = useTranslation()
   const { showToast } = useToast()
+  const { view } = useParams()
+  const activeView = normalizePayloadRulesView(view)
 
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -610,20 +626,28 @@ export default function PayloadRules() {
       <PageHeader
         title={t('settings2.payloadRules')}
         description={t('settings2.payloadRulesDesc')}
-        onRefresh={() => void load()}
+        onRefresh={activeView === 'editor' ? () => void load() : undefined}
         actions={
-          <Button
-            size="sm"
-            className="gap-1.5"
-            disabled={saving || !dirty || Boolean(jsonError)}
-            onClick={() => void saveRules()}
-          >
-            <Save className="size-3.5" />
-            {saving ? t('common.saving') : t('common.save')}
-          </Button>
+          activeView === 'editor' ? (
+            <Button
+              size="sm"
+              className="gap-1.5"
+              disabled={saving || !dirty || Boolean(jsonError)}
+              onClick={() => void saveRules()}
+            >
+              <Save className="size-3.5" />
+              {saving ? t('common.saving') : t('common.save')}
+            </Button>
+          ) : null
         }
       />
 
+      <PayloadRulesTabs activeView={activeView} />
+
+      {activeView === 'docs' ? <PayloadRulesDocsView /> : null}
+
+      {activeView === 'editor' ? (
+        <>
       <StateShell variant="page" loading={loading} error={loadError} onRetry={() => void load()}>
         <div className="space-y-4">
           {/* 统计磁贴 */}
@@ -1000,6 +1024,453 @@ export default function PayloadRules() {
           ) : null}
         </DialogContent>
       </Dialog>
+        </>
+      ) : null}
+    </div>
+  )
+}
+
+function PayloadRulesTabs({ activeView }: { activeView: PayloadRulesView }) {
+  const { t } = useTranslation()
+  const tabs = [
+    { view: 'editor' as const, label: t('payloadRules.views.editor'), to: '/payload-rules/editor' },
+    { view: 'docs' as const, label: t('payloadRules.views.docs'), to: '/payload-rules/docs' },
+  ]
+  const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.view === activeView))
+  return (
+    <div className="mb-5 flex justify-center">
+      <div className="relative grid w-full max-w-[420px] grid-cols-2 rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg" role="tablist">
+        <div
+          className="pointer-events-none absolute left-1 top-1 h-[calc(100%-0.5rem)] rounded-xl border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out"
+          style={{ width: 'calc((100% - 0.5rem) / 2)', transform: `translateX(${activeIndex * 100}%)` }}
+        />
+        {tabs.map((tab) => (
+          <NavLink
+            key={tab.view}
+            to={tab.to}
+            role="tab"
+            aria-selected={activeView === tab.view}
+            className={cn(
+              'relative z-10 flex h-9 items-center justify-center rounded-xl px-3 text-sm font-semibold transition-colors',
+              activeView === tab.view ? 'text-primary' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {tab.label}
+          </NavLink>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+type PayloadDocsSectionKind = 'default' | 'pipeline' | 'modes' | 'features' | 'checklist'
+
+type PayloadDocsSection = {
+  id: string
+  group: 'intro' | 'setup' | 'core' | 'ops'
+  kind: PayloadDocsSectionKind
+  title: string
+  icon: ReactNode
+  paragraphs?: string[]
+  bullets?: string[]
+  steps?: string[]
+  callout?: string
+  table?: { headers: string[]; rows: string[][] }
+  cards?: { title: string; body: string; tone?: 'neutral' | 'warn' | 'danger' | 'success' }[]
+}
+
+const PAYLOAD_DOCS_GROUPS = ['intro', 'setup', 'core', 'ops'] as const
+
+function PayloadRulesDocsView() {
+  const { t } = useTranslation()
+  const [activeId, setActiveId] = useState('what')
+  const activeLockRef = useRef(false)
+  const activeLockTimerRef = useRef<number | null>(null)
+
+  const sections = useMemo<PayloadDocsSection[]>(() => [
+    {
+      id: 'what',
+      group: 'intro',
+      kind: 'features',
+      icon: <Braces className="size-4" />,
+      title: t('payloadRules.docs.what.title'),
+      paragraphs: [t('payloadRules.docs.what.p1'), t('payloadRules.docs.what.p2')],
+      bullets: [
+        t('payloadRules.docs.what.b1'),
+        t('payloadRules.docs.what.b2'),
+        t('payloadRules.docs.what.b3'),
+        t('payloadRules.docs.what.b4'),
+      ],
+    },
+    {
+      id: 'pipeline',
+      group: 'intro',
+      kind: 'pipeline',
+      icon: <GitBranch className="size-4" />,
+      title: t('payloadRules.docs.pipeline.title'),
+      paragraphs: [t('payloadRules.docs.pipeline.p1')],
+      steps: [
+        t('payloadRules.docs.pipeline.s1'),
+        t('payloadRules.docs.pipeline.s2'),
+        t('payloadRules.docs.pipeline.s3'),
+        t('payloadRules.docs.pipeline.s4'),
+        t('payloadRules.docs.pipeline.s5'),
+      ],
+    },
+    {
+      id: 'groups',
+      group: 'core',
+      kind: 'modes',
+      icon: <Layers className="size-4" />,
+      title: t('payloadRules.docs.groups.title'),
+      paragraphs: [t('payloadRules.docs.groups.p1')],
+      cards: [
+        { title: t('payloadRules.groupDefault'), body: t('payloadRules.docs.groups.default'), tone: 'neutral' },
+        { title: t('payloadRules.groupOverride'), body: t('payloadRules.docs.groups.override'), tone: 'warn' },
+        { title: t('payloadRules.groupAppend'), body: t('payloadRules.docs.groups.append'), tone: 'success' },
+        { title: t('payloadRules.groupFilter'), body: t('payloadRules.docs.groups.filter'), tone: 'danger' },
+        { title: t('payloadRules.groupDefaultRaw'), body: t('payloadRules.docs.groups.raw'), tone: 'neutral' },
+        { title: t('payloadRules.groupOverrideRaw'), body: t('payloadRules.docs.groups.raw'), tone: 'warn' },
+      ],
+      callout: t('payloadRules.docs.groups.callout'),
+    },
+    {
+      id: 'gates',
+      group: 'core',
+      kind: 'default',
+      icon: <Filter className="size-4" />,
+      title: t('payloadRules.docs.gates.title'),
+      paragraphs: [t('payloadRules.docs.gates.p1')],
+      bullets: [
+        t('payloadRules.docs.gates.b1'),
+        t('payloadRules.docs.gates.b2'),
+        t('payloadRules.docs.gates.b3'),
+        t('payloadRules.docs.gates.b4'),
+        t('payloadRules.docs.gates.b5'),
+      ],
+    },
+    {
+      id: 'templates',
+      group: 'setup',
+      kind: 'features',
+      icon: <Sparkles className="size-4" />,
+      title: t('payloadRules.docs.templates.title'),
+      paragraphs: [t('payloadRules.docs.templates.p1')],
+      bullets: [
+        t('payloadRules.docs.templates.b1'),
+        t('payloadRules.docs.templates.b2'),
+        t('payloadRules.docs.templates.b3'),
+        t('payloadRules.docs.templates.b4'),
+        t('payloadRules.docs.templates.b5'),
+      ],
+      callout: t('payloadRules.docs.templates.callout'),
+    },
+    {
+      id: 'quickstart',
+      group: 'setup',
+      kind: 'checklist',
+      icon: <Wand2 className="size-4" />,
+      title: t('payloadRules.docs.quickstart.title'),
+      paragraphs: [t('payloadRules.docs.quickstart.p1')],
+      steps: [
+        t('payloadRules.docs.quickstart.s1'),
+        t('payloadRules.docs.quickstart.s2'),
+        t('payloadRules.docs.quickstart.s3'),
+        t('payloadRules.docs.quickstart.s4'),
+        t('payloadRules.docs.quickstart.s5'),
+      ],
+    },
+    {
+      id: 'protected',
+      group: 'core',
+      kind: 'default',
+      icon: <ShieldAlert className="size-4" />,
+      title: t('payloadRules.docs.protected.title'),
+      paragraphs: [t('payloadRules.docs.protected.p1')],
+      bullets: [
+        t('payloadRules.docs.protected.b1'),
+        t('payloadRules.docs.protected.b2'),
+        t('payloadRules.docs.protected.b3'),
+      ],
+      callout: t('payloadRules.docs.protected.callout'),
+    },
+    {
+      id: 'samples',
+      group: 'ops',
+      kind: 'default',
+      icon: <FileText className="size-4" />,
+      title: t('payloadRules.docs.samples.title'),
+      paragraphs: [t('payloadRules.docs.samples.p1')],
+      bullets: [
+        t('payloadRules.docs.samples.b1'),
+        t('payloadRules.docs.samples.b2'),
+        t('payloadRules.docs.samples.b3'),
+      ],
+    },
+    {
+      id: 'json',
+      group: 'ops',
+      kind: 'default',
+      icon: <ClipboardList className="size-4" />,
+      title: t('payloadRules.docs.json.title'),
+      paragraphs: [t('payloadRules.docs.json.p1'), t('payloadRules.docs.json.p2')],
+      bullets: [
+        t('payloadRules.docs.json.b1'),
+        t('payloadRules.docs.json.b2'),
+        t('payloadRules.docs.json.b3'),
+      ],
+    },
+    {
+      id: 'checklist',
+      group: 'ops',
+      kind: 'checklist',
+      icon: <CheckCircle2 className="size-4" />,
+      title: t('payloadRules.docs.checklist.title'),
+      paragraphs: [t('payloadRules.docs.checklist.p1')],
+      steps: [
+        t('payloadRules.docs.checklist.s1'),
+        t('payloadRules.docs.checklist.s2'),
+        t('payloadRules.docs.checklist.s3'),
+        t('payloadRules.docs.checklist.s4'),
+        t('payloadRules.docs.checklist.s5'),
+      ],
+    },
+  ], [t])
+
+  const groups = useMemo(
+    () =>
+      PAYLOAD_DOCS_GROUPS.map((group) => ({
+        id: group,
+        label: t(`payloadRules.docs.groupLabels.${group}`),
+        items: sections.filter((section) => section.group === group),
+      })).filter((group) => group.items.length > 0),
+    [sections, t],
+  )
+
+  const sectionIds = useMemo(() => sections.map((section) => section.id), [sections])
+
+  useEffect(() => {
+    const SPY_OFFSET = 120
+    const resolveActiveSection = () => {
+      if (activeLockRef.current) return
+      let current = sectionIds[0] ?? 'what'
+      for (const id of sectionIds) {
+        const el = document.getElementById(`pr-docs-${id}`)
+        if (!el) continue
+        if (el.getBoundingClientRect().top - SPY_OFFSET <= 0) current = id
+        else break
+      }
+      setActiveId((prev) => (prev === current ? prev : current))
+    }
+    let frame = 0
+    const onScroll = () => {
+      if (frame) return
+      frame = window.requestAnimationFrame(() => {
+        frame = 0
+        resolveActiveSection()
+      })
+    }
+    resolveActiveSection()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll)
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+      if (activeLockTimerRef.current != null) {
+        window.clearTimeout(activeLockTimerRef.current)
+        activeLockTimerRef.current = null
+      }
+    }
+  }, [sectionIds])
+
+  const scrollTo = (id: string) => {
+    const el = document.getElementById(`pr-docs-${id}`)
+    if (!el) return
+    activeLockRef.current = true
+    setActiveId(id)
+    if (activeLockTimerRef.current != null) window.clearTimeout(activeLockTimerRef.current)
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    activeLockTimerRef.current = window.setTimeout(() => {
+      activeLockRef.current = false
+      activeLockTimerRef.current = null
+    }, 900)
+  }
+
+  return (
+    <div className="grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
+      <aside className="h-fit xl:sticky xl:top-3">
+        <div className="overflow-hidden rounded-xl border border-foreground/12 bg-card shadow-sm">
+          <div className="border-b border-foreground/10 bg-muted/30 px-4 py-3">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+              {t('payloadRules.docs.toc')}
+            </div>
+            <div className="mt-1 text-sm font-semibold text-foreground">{t('payloadRules.docs.tocHint')}</div>
+          </div>
+          <nav className="max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
+            {groups.map((group) => (
+              <div key={group.id}>
+                <div className="mb-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                  {group.label}
+                </div>
+                <div className="space-y-0.5">
+                  {group.items.map((section) => {
+                    const active = activeId === section.id
+                    return (
+                      <button
+                        key={section.id}
+                        type="button"
+                        onClick={() => scrollTo(section.id)}
+                        className={cn(
+                          'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors',
+                          active
+                            ? 'bg-primary/10 font-medium text-primary shadow-sm ring-1 ring-primary/15'
+                            : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+                        )}
+                      >
+                        <span className={cn(
+                          'flex size-7 shrink-0 items-center justify-center rounded-md border',
+                          active ? 'border-primary/20 bg-primary/10 text-primary' : 'border-foreground/10 bg-background text-muted-foreground',
+                        )}>
+                          {section.icon}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate leading-snug">{section.title}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </div>
+      </aside>
+
+      <article className="overflow-hidden rounded-xl border border-foreground/12 bg-card shadow-sm">
+        <header className="relative overflow-hidden border-b border-foreground/10 bg-gradient-to-br from-primary/[0.07] via-card to-card px-6 py-7 sm:px-8 sm:py-8">
+          <div className="pointer-events-none absolute -right-16 -top-20 size-56 rounded-full bg-primary/10 blur-3xl" />
+          <div className="relative max-w-3xl">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/8 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-primary">
+              <BookOpen className="size-3.5" />
+              {t('payloadRules.docs.badge')}
+            </div>
+            <h1 className="text-2xl font-semibold tracking-tight text-foreground sm:text-[1.75rem]">
+              {t('payloadRules.docs.title')}
+            </h1>
+            <p className="mt-2.5 text-sm leading-7 text-muted-foreground sm:text-[15px]">
+              {t('payloadRules.docs.description')}
+            </p>
+          </div>
+        </header>
+
+        <div className="divide-y divide-foreground/10">
+          {sections.map((section, index) => (
+            <section key={section.id} id={`pr-docs-${section.id}`} className="scroll-mt-24 px-6 py-7 sm:px-8 sm:py-8">
+              <div className="mb-4 flex items-start gap-3">
+                <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-lg border border-foreground/12 bg-muted/40 text-foreground">
+                  {section.icon}
+                </div>
+                <div className="min-w-0">
+                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[11px] font-medium tracking-wide text-muted-foreground">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                    <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                      {t(`payloadRules.docs.groupLabels.${section.group}`)}
+                    </span>
+                  </div>
+                  <h2 className="text-lg font-semibold tracking-tight text-foreground sm:text-xl">{section.title}</h2>
+                </div>
+              </div>
+
+              <div className="space-y-4 pl-0 sm:pl-12">
+                {section.paragraphs?.map((paragraph) => (
+                  <p key={paragraph} className="text-sm leading-7 text-muted-foreground sm:text-[15px]">{paragraph}</p>
+                ))}
+
+                {section.kind === 'pipeline' && section.steps?.length ? (
+                  <div className="relative space-y-0">
+                    <div className="absolute bottom-3 left-[15px] top-3 w-px bg-border" />
+                    {section.steps.map((step, stepIndex) => (
+                      <div key={step} className="relative flex gap-3 py-2.5">
+                        <div className="relative z-10 flex size-8 shrink-0 items-center justify-center rounded-full border border-foreground/15 bg-background text-xs font-semibold shadow-sm">
+                          {stepIndex + 1}
+                        </div>
+                        <div className="min-w-0 flex-1 rounded-lg border border-foreground/10 bg-muted/20 px-3.5 py-2.5 text-sm leading-6 text-foreground/90">
+                          {step}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.kind === 'checklist' && section.steps?.length ? (
+                  <ol className="space-y-2.5">
+                    {section.steps.map((step, stepIndex) => (
+                      <li key={step} className="flex gap-3 rounded-lg border border-foreground/10 bg-background px-3.5 py-3 text-sm leading-6 shadow-sm">
+                        <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-semibold text-primary">
+                          {stepIndex + 1}
+                        </span>
+                        <span className="pt-0.5 text-foreground/90">{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+
+                {section.kind === 'features' && section.bullets?.length ? (
+                  <div className="grid gap-2.5 sm:grid-cols-2">
+                    {section.bullets.map((bullet, bulletIndex) => (
+                      <div key={bullet} className="rounded-lg border border-foreground/10 bg-muted/15 px-3.5 py-3 text-sm leading-6 text-foreground/90">
+                        <div className="mb-1.5 font-mono text-[11px] font-medium text-muted-foreground">
+                          {String(bulletIndex + 1).padStart(2, '0')}
+                        </div>
+                        {bullet}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.kind !== 'features' && section.bullets?.length ? (
+                  <ul className="space-y-2.5">
+                    {section.bullets.map((bullet) => (
+                      <li key={bullet} className="flex gap-2.5 text-sm leading-6 text-foreground/90">
+                        <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary/80" />
+                        <span>{bullet}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+
+                {section.kind === 'modes' && section.cards?.length ? (
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {section.cards.map((card) => (
+                      <div
+                        key={card.title}
+                        className={cn(
+                          'rounded-xl border p-4 shadow-sm',
+                          card.tone === 'warn' && 'border-amber-500/25 bg-amber-500/[0.06]',
+                          card.tone === 'danger' && 'border-rose-500/25 bg-rose-500/[0.06]',
+                          card.tone === 'success' && 'border-emerald-500/25 bg-emerald-500/[0.06]',
+                          (!card.tone || card.tone === 'neutral') && 'border-foreground/10 bg-muted/20',
+                        )}
+                      >
+                        <div className="mb-2 text-sm font-semibold text-foreground">{card.title}</div>
+                        <p className="text-sm leading-6 text-muted-foreground">{card.body}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.callout ? (
+                  <div className="flex gap-3 rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-4 py-3.5">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <p className="text-sm leading-6 text-foreground/85">{section.callout}</p>
+                  </div>
+                ) : null}
+              </div>
+            </section>
+          ))}
+        </div>
+      </article>
     </div>
   )
 }

@@ -130,11 +130,15 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 
 	db := &DB{conn: conn, driver: "mysql"}
 	settings := &SystemSettings{
-		ModelPricingOverrides:           `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
-		ModelPricingSyncURL:             "https://example.test/pricing.json",
-		IgnoreUsageLimitStatus:          true,
-		AutoResetCreditsEnabled:         true,
-		AutoResetCreditsBeforeExpiryMin: 75,
+		PayloadRules:                      `{"override":[{"path":"service_tier","value":"priority"}]}`,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterAdvancedConfig:        `{"normalization":{"enabled":true}}`,
+		PublicImageStudioPageEnabled:      true,
+		ModelPricingOverrides:             `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
+		ModelPricingSyncURL:               "https://example.test/pricing.json",
+		IgnoreUsageLimitStatus:            true,
+		AutoResetCreditsEnabled:           true,
+		AutoResetCreditsBeforeExpiryMin:   75,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -145,6 +149,10 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"ON DUPLICATE KEY UPDATE",
+		"payload_rules = VALUES(payload_rules)",
+		"prompt_filter_strict_terminal_enabled = VALUES(prompt_filter_strict_terminal_enabled)",
+		"prompt_filter_advanced_config = VALUES(prompt_filter_advanced_config)",
+		"public_image_studio_page_enabled = VALUES(public_image_studio_page_enabled)",
 		"ignore_usage_limit_status = VALUES(ignore_usage_limit_status)",
 		"auto_reset_credits_enabled = VALUES(auto_reset_credits_enabled)",
 		"auto_reset_credits_before_expiry_min = VALUES(auto_reset_credits_before_expiry_min)",
@@ -153,11 +161,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 89 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 89", got)
+	if got := strings.Count(capture.query, "?"); got != 93 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 93", got)
 	}
-	if len(capture.args) != 89 {
-		t.Fatalf("rewritten settings argument count = %d, want 89", len(capture.args))
+	if len(capture.args) != 93 {
+		t.Fatalf("rewritten settings argument count = %d, want 93", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -165,12 +173,49 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.IgnoreUsageLimitStatus,
 		settings.AutoResetCreditsEnabled,
 		int64(settings.AutoResetCreditsBeforeExpiryMin),
+		settings.PromptFilterStrictTerminalEnabled,
+		settings.PromptFilterAdvancedConfig,
+		settings.PayloadRules,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
 		if got != want {
 			t.Fatalf("settings tail argument %d = %#v, want %#v", i, got, want)
 		}
+	}
+}
+
+func TestSetPromptFilterNewAPISecretRewritesUpsertForMySQL56(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	const secret = "prompt-filter-test-secret"
+	if err := db.SetPromptFilterNewAPISecret(context.Background(), secret); err != nil {
+		t.Fatalf("SetPromptFilterNewAPISecret() error = %v", err)
+	}
+
+	if strings.Contains(strings.ToUpper(capture.query), "ON CONFLICT") {
+		t.Fatalf("PostgreSQL ON CONFLICT leaked into MySQL query: %s", capture.query)
+	}
+	for _, fragment := range []string{
+		"ON DUPLICATE KEY UPDATE",
+		"newapi_secret = VALUES(newapi_secret)",
+		"updated_at = NOW()",
+	} {
+		if !strings.Contains(capture.query, fragment) {
+			t.Fatalf("rewritten prompt-filter secret query missing %q: %s", fragment, capture.query)
+		}
+	}
+	if len(capture.args) != 1 || capture.args[0].Value != secret {
+		t.Fatalf("rewritten prompt-filter secret args = %#v, want %q", capture.args, secret)
 	}
 }
 

@@ -108,6 +108,7 @@ func main() {
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
+			PublicImageStudioPageEnabled:     true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -155,6 +156,7 @@ func main() {
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
+			PublicImageStudioPageEnabled:     true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -304,6 +306,7 @@ func main() {
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
+	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
 	r.Use(api.CORSMiddleware())
 	r.Use(api.SecurityHeadersMiddleware())
@@ -335,6 +338,7 @@ func main() {
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterExternalImageRoutes(r, handler)
+	adminHandler.StartPromptIntelligence(backgroundCtx)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -381,6 +385,22 @@ func main() {
 			}
 			serveFrontend(c)
 		}
+		serveImageStudioFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicImageStudioPageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取生图门户开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
 
 		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
 		r.GET("/admin", serveFrontend)
@@ -391,6 +411,10 @@ func main() {
 		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
 		r.HEAD("/key-usage", serveKeyUsageFrontend)
 		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
+		r.GET("/image-studio", serveImageStudioFrontend)
+		r.GET("/image-studio/*filepath", serveImageStudioFrontend)
+		r.HEAD("/image-studio", serveImageStudioFrontend)
+		r.HEAD("/image-studio/*filepath", serveImageStudioFrontend)
 	}
 
 	var externalDownloadsFS http.FileSystem
@@ -450,6 +474,7 @@ func main() {
 	log.Printf("  HTTP:   http://%s:%d", displayHost, cfg.Port)
 	log.Printf("  管理台: http://%s:%d/admin/", displayHost, cfg.Port)
 	log.Printf("  Key用量: http://%s:%d/key-usage", displayHost, cfg.Port)
+	log.Printf("  生图门户: http://%s:%d/image-studio", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")

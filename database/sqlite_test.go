@@ -1107,59 +1107,62 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         "CodexProxy",
-		MaxConcurrency:                   2,
-		GlobalRPM:                        0,
-		TestModel:                        "gpt-5.4",
-		TestContent:                      "say pong",
-		TestConcurrency:                  50,
-		BackgroundRefreshIntervalMinutes: 2,
-		UsageProbeMaxAgeMinutes:          10,
-		UsageProbeConcurrency:            16,
-		RecoveryProbeIntervalMinutes:     30,
-		PgMaxConns:                       50,
-		RedisPoolSize:                    30,
-		MaxRetries:                       2,
-		MaxRateLimitRetries:              1,
-		ModelMapping:                     "{}",
-		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
-		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
-		PromptFilterMode:                 "monitor",
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        81920,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "sk-review-test",
-		PromptFilterReviewBaseURL:        "https://review.example.com",
-		PromptFilterReviewModel:          "review-model",
-		PromptFilterReviewTimeoutSeconds: 7,
-		PromptFilterReviewFailClosed:     false,
-		ClientCompatMode:                 "preserve",
-		CodexMinCLIVersion:               "0.118.0",
-		CodexUserAgentConfig:             `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
-		UsageLogMode:                     "full",
-		UsageLogBatchSize:                200,
-		UsageLogFlushIntervalSeconds:     5,
-		StreamFlushPolicy:                "immediate",
-		StreamFlushIntervalMS:            20,
-		FirstTokenMode:                   "loose",
-		FirstTokenTimeoutSeconds:         17,
-		BillingTierPolicy:                "requested",
-		ImageStorageConfig:               "{}",
-		SchedulerMode:                    "round_robin",
-		AffinityMode:                     "bounded",
-		BackgroundConfig:                 "{}",
-		ShowFullUsageNumbers:             true,
-		PublicKeyUsagePageEnabled:        true,
-		CodexWSHideUpstreamErrors:        true,
-		CodexWSSilentRetryEnabled:        true,
-		CodexWSSilentMaxRetries:          4,
-		IgnoreUsageLimitStatus:           true,
-		AutoResetCreditsEnabled:          true,
-		AutoResetCreditsBeforeExpiryMin:  75,
+		SiteName:                          "CodexProxy",
+		MaxConcurrency:                    2,
+		GlobalRPM:                         0,
+		TestModel:                         "gpt-5.4",
+		TestContent:                       "say pong",
+		TestConcurrency:                   50,
+		BackgroundRefreshIntervalMinutes:  2,
+		UsageProbeMaxAgeMinutes:           10,
+		UsageProbeConcurrency:             16,
+		RecoveryProbeIntervalMinutes:      30,
+		PgMaxConns:                        50,
+		RedisPoolSize:                     30,
+		MaxRetries:                        2,
+		MaxRateLimitRetries:               1,
+		ModelMapping:                      "{}",
+		CodexModelMapping:                 `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:             `[{"model":"gpt-5.5","effort":"xhigh"}]`,
+		PromptFilterMode:                  "monitor",
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterAdvancedConfig:        `{"normalization":{"enabled":true}}`,
+		PromptFilterLogMatches:            true,
+		PromptFilterMaxTextLength:         81920,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterReviewEnabled:         true,
+		PromptFilterReviewAPIKey:          "sk-review-test",
+		PromptFilterReviewBaseURL:         "https://review.example.com",
+		PromptFilterReviewModel:           "review-model",
+		PromptFilterReviewTimeoutSeconds:  7,
+		PromptFilterReviewFailClosed:      false,
+		ClientCompatMode:                  "preserve",
+		CodexMinCLIVersion:                "0.118.0",
+		CodexUserAgentConfig:              `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
+		UsageLogMode:                      "full",
+		UsageLogBatchSize:                 200,
+		UsageLogFlushIntervalSeconds:      5,
+		StreamFlushPolicy:                 "immediate",
+		StreamFlushIntervalMS:             20,
+		FirstTokenMode:                    "loose",
+		FirstTokenTimeoutSeconds:          17,
+		BillingTierPolicy:                 "requested",
+		ImageStorageConfig:                "{}",
+		SchedulerMode:                     "round_robin",
+		AffinityMode:                      "bounded",
+		BackgroundConfig:                  "{}",
+		ShowFullUsageNumbers:              true,
+		PublicKeyUsagePageEnabled:         true,
+		PublicImageStudioPageEnabled:      true,
+		CodexWSHideUpstreamErrors:         true,
+		CodexWSSilentRetryEnabled:         true,
+		CodexWSSilentMaxRetries:           4,
+		IgnoreUsageLimitStatus:            true,
+		AutoResetCreditsEnabled:           true,
+		AutoResetCreditsBeforeExpiryMin:   75,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1173,6 +1176,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.PromptFilterStrictTerminalEnabled {
+		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig = %q", settings.PromptFilterAdvancedConfig)
 	}
 	if !settings.IgnoreUsageLimitStatus {
 		t.Fatal("IgnoreUsageLimitStatus = false, want true")
@@ -1194,6 +1203,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
+	}
+	if !settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = false, want true")
 	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
@@ -1245,6 +1257,18 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
+	}
+
+	settings.PublicImageStudioPageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = true, want false")
 	}
 }
 

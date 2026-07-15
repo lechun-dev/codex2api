@@ -54,7 +54,9 @@ const (
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
-	MaxImageEditInputCount = 10
+	// 与官方 Images API 对 gpt-image 系列的上限一致（16 张）；上游 responses
+	// 通道已实测可接受 16 张 input_image（issue #275）。
+	MaxImageEditInputCount = 16
 
 	imageStreamConnectedComment = ": connected\n\n"
 	imageStreamKeepaliveComment = ": keepalive\n\n"
@@ -1654,7 +1656,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
@@ -1796,6 +1798,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		return true
 	})
 	stopKeepalive()
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	if err != nil {
 		if streamErr := getReadErr(); streamErr != nil {
 			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
@@ -1819,6 +1826,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 		setReadErr(err)
 	}
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
 }
 

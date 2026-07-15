@@ -397,6 +397,17 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
 	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 
+	imageStudioPortal := r.Group("/api/image-studio")
+	imageStudioPortal.Use(h.imageStudioPortalAuthMiddleware())
+	imageStudioPortal.POST("/jobs", h.CreatePortalImageJob)
+	imageStudioPortal.POST("/edit-jobs", h.CreatePortalImageEditJob)
+	imageStudioPortal.GET("/jobs", h.ListPortalImageJobs)
+	imageStudioPortal.GET("/jobs/:id", h.GetPortalImageJob)
+	imageStudioPortal.DELETE("/jobs/:id", h.DeletePortalImageJob)
+	imageStudioPortal.GET("/assets", h.ListPortalImageAssets)
+	imageStudioPortal.GET("/assets/:id/file", h.GetPortalImageAssetFile)
+	imageStudioPortal.DELETE("/assets/:id", h.DeletePortalImageAsset)
+
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
 	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)
@@ -473,6 +484,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -481,6 +493,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
+	api.GET("/prompt-filter/newapi-secret", h.GetPromptFilterNewAPISecretStatus)
+	api.POST("/prompt-filter/newapi-secret/generate", h.GeneratePromptFilterNewAPISecret)
+	api.PUT("/prompt-filter/newapi-secret", h.ReplacePromptFilterNewAPISecret)
+	api.POST("/prompt-filter/intelligence/run", h.RunPromptIntelligence)
+	api.GET("/prompt-filter/intelligence/history", h.ListPromptIntelligenceHistory)
+	api.POST("/prompt-filter/intelligence/rules", h.AddPromptIntelligenceCandidate)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
@@ -6097,6 +6115,7 @@ type settingsResponse struct {
 	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
 	ModelMapping                       string  `json:"model_mapping"`
 	CodexModelMapping                  string  `json:"codex_model_mapping"`
+	PayloadRules                       string  `json:"payload_rules"`
 	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
 	ResinURL                           string  `json:"resin_url"`
 	ResinPlatformName                  string  `json:"resin_platform_name"`
@@ -6104,6 +6123,8 @@ type settingsResponse struct {
 	PromptFilterMode                   string  `json:"prompt_filter_mode"`
 	PromptFilterThreshold              int     `json:"prompt_filter_threshold"`
 	PromptFilterStrictThreshold        int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled  bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig         string  `json:"prompt_filter_advanced_config"`
 	PromptFilterLogMatches             bool    `json:"prompt_filter_log_matches"`
 	PromptFilterMaxTextLength          int     `json:"prompt_filter_max_text_length"`
 	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
@@ -6129,6 +6150,7 @@ type settingsResponse struct {
 	BillingTierPolicy                  string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled       bool    `json:"public_image_studio_page_enabled"`
 	ImageStorageBackend                string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
 	ImageS3Region                      string  `json:"image_s3_region"`
@@ -6198,6 +6220,7 @@ type updateSettingsReq struct {
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
+	PayloadRules                       *string  `json:"payload_rules"`
 	ReasoningEffortModels              *string  `json:"reasoning_effort_models"`
 	ResinURL                           *string  `json:"resin_url"`
 	ResinPlatformName                  *string  `json:"resin_platform_name"`
@@ -6205,6 +6228,8 @@ type updateSettingsReq struct {
 	PromptFilterMode                   *string  `json:"prompt_filter_mode"`
 	PromptFilterThreshold              *int     `json:"prompt_filter_threshold"`
 	PromptFilterStrictThreshold        *int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled  *bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig         *string  `json:"prompt_filter_advanced_config"`
 	PromptFilterLogMatches             *bool    `json:"prompt_filter_log_matches"`
 	PromptFilterMaxTextLength          *int     `json:"prompt_filter_max_text_length"`
 	PromptFilterSensitiveWords         *string  `json:"prompt_filter_sensitive_words"`
@@ -6229,6 +6254,7 @@ type updateSettingsReq struct {
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled       *bool    `json:"public_image_studio_page_enabled"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -6731,6 +6757,12 @@ func (h *Handler) GetBranding(c *gin.Context) {
 }
 
 // GetSettings 获取当前系统设置
+// GetObservedInstructions 返回最近观测到的客户端透传 instructions 样本，
+// 供管理端在配置 payload 重写规则时查看客户端实际发来的系统提示词原文。
+func (h *Handler) GetObservedInstructions(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"samples": proxy.ObservedInstructions()})
+}
+
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
@@ -6741,6 +6773,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
+	publicImageStudioPageEnabled := true
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -6749,6 +6782,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
+		publicImageStudioPageEnabled = dbSettings.PublicImageStudioPageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -6821,6 +6855,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheLabel:                         h.cacheLabel,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -6828,6 +6863,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -6853,6 +6890,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -6933,6 +6971,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
+	publicImageStudioPageEnabled := true
 	modelPricingOverrides := "{}"
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
@@ -6949,6 +6988,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
+		publicImageStudioPageEnabled = existingSettings.PublicImageStudioPageEnabled
 		modelPricingOverrides = existingSettings.ModelPricingOverrides
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
@@ -7335,6 +7375,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexModelMapping(*req.CodexModelMapping)
 		log.Printf("设置已更新: codex_model_mapping")
 	}
+	if req.PayloadRules != nil {
+		normalized, err := proxy.NormalizePayloadRulesJSON(*req.PayloadRules)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := proxy.SetPayloadRulesJSON(normalized); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetPayloadRules(normalized)
+		log.Printf("设置已更新: payload_rules")
+	}
 	if req.ReasoningEffortModels != nil {
 		normalized, err := proxy.NormalizeReasoningEffortModelsJSON(*req.ReasoningEffortModels, proxy.SupportedModelIDs(c.Request.Context(), h.db))
 		if err != nil {
@@ -7389,6 +7442,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.PublicKeyUsagePageEnabled != nil {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
 		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
+	}
+	if req.PublicImageStudioPageEnabled != nil {
+		publicImageStudioPageEnabled = *req.PublicImageStudioPageEnabled
+		log.Printf("设置已更新: public_image_studio_page_enabled = %t", publicImageStudioPageEnabled)
 	}
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
 		t5h := h.store.GetGlobalAutoPause5hThreshold()
@@ -7490,6 +7547,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		promptFilterCfg.StrictThreshold = *req.PromptFilterStrictThreshold
 		promptFilterChanged = true
 	}
+	if req.PromptFilterStrictTerminalEnabled != nil {
+		promptFilterCfg.StrictTerminalEnabled = *req.PromptFilterStrictTerminalEnabled
+		promptFilterChanged = true
+	}
+	if req.PromptFilterAdvancedConfig != nil {
+		advanced, err := promptfilter.ParseAdvancedConfig(*req.PromptFilterAdvancedConfig)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "prompt_filter_advanced_config JSON 无效: " + err.Error()})
+			return
+		}
+		promptFilterCfg.Advanced = advanced
+		promptFilterChanged = true
+	}
 	if req.PromptFilterLogMatches != nil {
 		promptFilterCfg.LogMatches = *req.PromptFilterLogMatches
 		promptFilterChanged = true
@@ -7560,8 +7630,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "Prompt 检查规则无效: "+err.Error())
 			return
 		}
-		h.store.SetPromptFilterConfig(promptFilterCfg)
-		log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
 	}
 
 	// Resin 粘性代理池配置
@@ -7694,6 +7762,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7701,6 +7770,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -7725,6 +7796,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
@@ -7740,12 +7812,23 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if promptFilterChanged {
+			writeError(c, http.StatusInternalServerError, "保存 Prompt 检查设置失败，设置未生效")
+			return
+		}
 		if autoResetCreditsChanged {
 			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
+			return
 		}
 		writeError(c, http.StatusInternalServerError, "设置保存失败: "+err.Error())
 		return
-	} else if autoResetCreditsChanged {
+	}
+	if promptFilterChanged {
+		h.store.SetPromptFilterConfig(promptFilterCfg)
+		log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
+	}
+	if autoResetCreditsChanged {
 		runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 			runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
 			return runtimeCfg
@@ -7824,6 +7907,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ExpiredCleaned:                     expiredCleaned,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7831,6 +7915,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,

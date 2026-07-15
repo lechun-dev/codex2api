@@ -33,6 +33,10 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_cli_version_sync_interval_hours INT DEFAULT 12",
 		"model_pricing_overrides MEDIUMTEXT NULL",
 		"model_pricing_sync_url TEXT NULL",
+		"payload_rules MEDIUMTEXT NULL",
+		"prompt_filter_strict_terminal_enabled TINYINT(1) DEFAULT 0",
+		"prompt_filter_advanced_config MEDIUMTEXT NULL",
+		"public_image_studio_page_enabled TINYINT(1) DEFAULT 1",
 		"ignore_usage_limit_status TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_enabled TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_before_expiry_min INT DEFAULT 60",
@@ -50,9 +54,32 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"model_pricing_overrides TEXT DEFAULT",
 		"model_pricing_overrides MEDIUMTEXT DEFAULT",
 		"model_pricing_sync_url TEXT DEFAULT",
+		"payload_rules TEXT DEFAULT",
+		"payload_rules MEDIUMTEXT DEFAULT",
+		"prompt_filter_advanced_config TEXT DEFAULT",
+		"prompt_filter_advanced_config MEDIUMTEXT DEFAULT",
 	} {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
+		}
+	}
+}
+
+func TestMySQLPromptFilterSecretsSchemaIsMySQL56Compatible(t *testing.T) {
+	ddl := promptFilterSecretsMySQLDDL()
+	for _, needle := range []string{
+		"id INT NOT NULL PRIMARY KEY",
+		"newapi_secret TEXT NOT NULL",
+		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+		"ENGINE=InnoDB",
+	} {
+		if !strings.Contains(ddl, needle) {
+			t.Fatalf("MySQL prompt_filter_secrets DDL missing %q: %s", needle, ddl)
+		}
+	}
+	for _, incompatible := range []string{"TIMESTAMPTZ", "ON CONFLICT", "TEXT NOT NULL DEFAULT"} {
+		if strings.Contains(strings.ToUpper(ddl), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 incompatible syntax leaked into prompt_filter_secrets DDL: %q", incompatible)
 		}
 	}
 }

@@ -15,6 +15,10 @@ type mysqlColumnDefinition struct {
 }
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	{table: "system_settings", name: "payload_rules", def: "MEDIUMTEXT NULL"},
+	{table: "system_settings", name: "prompt_filter_strict_terminal_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "prompt_filter_advanced_config", def: "MEDIUMTEXT NULL"},
+	{table: "system_settings", name: "public_image_studio_page_enabled", def: "TINYINT(1) DEFAULT 1"},
 	{table: "system_settings", name: "model_pricing_overrides", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "model_pricing_sync_url", def: "TEXT NULL"},
 	{table: "system_settings", name: "ignore_usage_limit_status", def: "TINYINT(1) DEFAULT 0"},
@@ -232,6 +236,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			review_error TEXT NULL,
 			full_text MEDIUMTEXT NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		promptFilterSecretsMySQLDDL(),
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -509,6 +514,8 @@ func systemSettingsMySQLDDL() string {
 		prompt_filter_mode VARCHAR(20) DEFAULT 'monitor',
 		prompt_filter_threshold INT DEFAULT 50,
 		prompt_filter_strict_threshold INT DEFAULT 90,
+		prompt_filter_strict_terminal_enabled TINYINT(1) DEFAULT 0,
+		prompt_filter_advanced_config MEDIUMTEXT NULL,
 		prompt_filter_log_matches TINYINT(1) DEFAULT 1,
 		prompt_filter_max_text_length INT DEFAULT 81920,
 		prompt_filter_sensitive_words TEXT NULL,
@@ -535,6 +542,7 @@ func systemSettingsMySQLDDL() string {
 		image_storage_config TEXT NULL,
 		show_full_usage_numbers TINYINT(1) DEFAULT 0,
 		public_key_usage_page_enabled TINYINT(1) DEFAULT 1,
+		public_image_studio_page_enabled TINYINT(1) DEFAULT 1,
 		auto_pause_5h_threshold DOUBLE DEFAULT 0,
 		auto_pause_7d_threshold DOUBLE DEFAULT 0,
 		auto_pause_5h_guard_band_percent DOUBLE DEFAULT 5,
@@ -559,9 +567,18 @@ func systemSettingsMySQLDDL() string {
 		codex_cli_version_sync_interval_hours INT DEFAULT 12,
 		model_pricing_overrides MEDIUMTEXT NULL,
 		model_pricing_sync_url TEXT NULL,
+		payload_rules MEDIUMTEXT NULL,
 		ignore_usage_limit_status TINYINT(1) DEFAULT 0,
 		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
 		auto_reset_credits_before_expiry_min INT DEFAULT 60
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
+func promptFilterSecretsMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS prompt_filter_secrets (
+		id INT NOT NULL PRIMARY KEY,
+		newapi_secret TEXT NOT NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

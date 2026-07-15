@@ -2385,6 +2385,7 @@ type Store struct {
 	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping          atomic.Value // 模型映射 JSON 字符串
 	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules          atomic.Value // Payload 请求体重写规则 JSON 字符串
 	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
@@ -2844,10 +2845,19 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.CodexModelMapping != "" {
 		s.codexModelMapping.Store(settings.CodexModelMapping)
 	}
+	if settings.PayloadRules != "" {
+		s.payloadRules.Store(settings.PayloadRules)
+	}
 	if settings.ReasoningEffortModels != "" {
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
-	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
+	promptFilterCfg := promptFilterConfigFromSettings(settings)
+	if s.db != nil {
+		if secret, err := s.db.GetPromptFilterNewAPISecret(context.Background()); err == nil {
+			promptFilterCfg.Advanced.NewAPI.Secret = secret
+		}
+	}
+	s.SetPromptFilterConfig(promptFilterCfg)
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -4726,6 +4736,19 @@ func (s *Store) GetCodexModelMapping() string {
 	return "{}"
 }
 
+// SetPayloadRules 动态更新 Payload 请求体重写规则 JSON
+func (s *Store) SetPayloadRules(rules string) {
+	s.payloadRules.Store(rules)
+}
+
+// GetPayloadRules 获取当前 Payload 请求体重写规则 JSON
+func (s *Store) GetPayloadRules() string {
+	if v, ok := s.payloadRules.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
 // SetReasoningEffortModels 动态更新带思考强度的模型别名 JSON 数组。
 func (s *Store) SetReasoningEffortModels(value string) {
 	s.reasoningEffortModels.Store(value)
@@ -4789,6 +4812,10 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfil
 	cfg.Mode = settings.PromptFilterMode
 	cfg.Threshold = settings.PromptFilterThreshold
 	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
+	cfg.StrictTerminalEnabled = settings.PromptFilterStrictTerminalEnabled
+	if advanced, err := promptfilter.ParseAdvancedConfig(settings.PromptFilterAdvancedConfig); err == nil {
+		cfg.Advanced = advanced
+	}
 	cfg.LogMatches = settings.PromptFilterLogMatches
 	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
 	cfg.SensitiveWords = settings.PromptFilterSensitiveWords

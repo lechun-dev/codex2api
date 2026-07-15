@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -31,11 +32,21 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemSettings before smoke failed: %v", err)
 	}
+	previousPromptFilterSecret, secretErr := db.GetPromptFilterNewAPISecret(ctx)
+	hadPromptFilterSecret := secretErr == nil
+	if secretErr != nil && !errors.Is(secretErr, sql.ErrNoRows) {
+		t.Fatalf("GetPromptFilterNewAPISecret before smoke failed: %v", secretErr)
+	}
 	t.Cleanup(func() {
 		if previousSettings != nil {
 			_ = db.UpdateSystemSettings(ctx, previousSettings)
 		} else {
 			_, _ = db.conn.ExecContext(ctx, "DELETE FROM system_settings WHERE id = 1")
+		}
+		if hadPromptFilterSecret {
+			_ = db.SetPromptFilterNewAPISecret(ctx, previousPromptFilterSecret)
+		} else {
+			_, _ = db.conn.ExecContext(ctx, "DELETE FROM prompt_filter_secrets WHERE id = 1")
 		}
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id IN (SELECT id FROM account_groups WHERE name = ?)", groupName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM image_prompt_templates WHERE name = ?", templateName)
@@ -65,7 +76,10 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		RecoveryProbeIntervalMinutes:       8,
 		ModelMapping:                       "{}",
 		CodexModelMapping:                  "{}",
+		PayloadRules:                       `{"append":[{"path":"instructions","value":"mysql smoke"}]}`,
 		ReasoningEffortModels:              "[]",
+		PromptFilterStrictTerminalEnabled:  true,
+		PromptFilterAdvancedConfig:         `{"normalization":{"enabled":true}}`,
 		ClientCompatMode:                   "responses",
 		CodexMinCLIVersion:                 "0.119.0",
 		CodexUserAgentConfig:               `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
@@ -78,6 +92,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		BillingTierPolicy:                  "requested",
 		ImageStorageConfig:                 `{"backend":"local"}`,
 		ShowFullUsageNumbers:               true,
+		PublicImageStudioPageEnabled:       true,
 		SchedulerMode:                      "weighted",
 		AffinityMode:                       "strict",
 		CodexForceWebsocket:                true,
@@ -111,6 +126,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.ClientCompatMode != "responses" ||
 		savedSettings.CodexMinCLIVersion != "0.119.0" ||
 		savedSettings.CodexUserAgentConfig != `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}` ||
+		savedSettings.PayloadRules != `{"append":[{"path":"instructions","value":"mysql smoke"}]}` ||
+		!savedSettings.PromptFilterStrictTerminalEnabled ||
+		savedSettings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` ||
 		savedSettings.UsageLogMode != "minimal" ||
 		savedSettings.UsageLogBatchSize != 33 ||
 		savedSettings.UsageLogFlushIntervalSeconds != 9 ||
@@ -124,10 +142,23 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.CodexWSSilentMaxRetries != 4 ||
 		savedSettings.ModelPricingOverrides != `{"gpt-5.4":{"input":2.5,"source":"custom"}}` ||
 		savedSettings.ModelPricingSyncURL != "https://example.test/pricing.json" ||
+		!savedSettings.PublicImageStudioPageEnabled ||
 		!savedSettings.IgnoreUsageLimitStatus ||
 		!savedSettings.AutoResetCreditsEnabled ||
 		savedSettings.AutoResetCreditsBeforeExpiryMin != 75 {
 		t.Fatalf("system settings were not persisted correctly: %#v", savedSettings)
+	}
+
+	promptFilterSecret := "mysql-smoke-prompt-filter-" + suffix
+	if err := db.SetPromptFilterNewAPISecret(ctx, promptFilterSecret); err != nil {
+		t.Fatalf("SetPromptFilterNewAPISecret failed: %v", err)
+	}
+	savedPromptFilterSecret, err := db.GetPromptFilterNewAPISecret(ctx)
+	if err != nil {
+		t.Fatalf("GetPromptFilterNewAPISecret failed: %v", err)
+	}
+	if savedPromptFilterSecret != promptFilterSecret {
+		t.Fatalf("prompt filter secret = %q, want %q", savedPromptFilterSecret, promptFilterSecret)
 	}
 
 	keyID, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{

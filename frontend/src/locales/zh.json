@@ -2818,6 +2818,9 @@
     "chars": "字符",
     "truncated": "已截断",
     "samplesCopy": "复制原文",
-    "copyFailed": "复制失败"
+    "copyFailed": "复制失败",
+    "formModelsSelected": "已选 {{count}} 个",
+    "formModelsAll": "全部模型",
+    "formModelsHint": "可多选或输入通配符（如 gpt-*）；留空表示对全部模型生效。"
   }
 }

@@ -2818,6 +2818,9 @@
     "chars": "chars",
     "truncated": "truncated",
     "samplesCopy": "Copy original",
-    "copyFailed": "Copy failed"
+    "copyFailed": "Copy failed",
+    "formModelsSelected": "{{count}} selected",
+    "formModelsAll": "All models",
+    "formModelsHint": "Multi-select or type a wildcard (e.g. gpt-*). Leave empty to apply to all models."
   }
 }

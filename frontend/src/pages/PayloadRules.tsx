@@ -866,11 +866,11 @@ export default function PayloadRules() {
                     </span>
                   </div>
                   <textarea
-                    rows={12}
+                    rows={9}
                     value={form.promptText}
                     placeholder={t('payloadRules.formTextPlaceholder')}
                     onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setForm({ ...form, promptText: e.target.value })}
-                    className="flex min-h-[220px] w-full resize-y rounded-md border border-input bg-background px-3 py-2.5 text-[13px] leading-relaxed text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                    className="flex min-h-[180px] w-full resize-y rounded-xl border border-input bg-background px-3 py-2.5 text-[13px] leading-relaxed text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
                   />
                 </div>
               ) : null}
@@ -960,15 +960,24 @@ export default function PayloadRules() {
               ) : null}
 
               {form.template !== 'custom' ? (
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-foreground">{t('payloadRules.formModels')}</label>
+                <div className="space-y-1.5 rounded-xl border border-border/70 bg-muted/15 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-xs font-semibold text-foreground">{t('payloadRules.formModels')}</label>
+                    <span className="text-[11px] text-muted-foreground">
+                      {form.models.length > 0
+                        ? t('payloadRules.formModelsSelected', { count: form.models.length })
+                        : t('payloadRules.formModelsAll')}
+                    </span>
+                  </div>
                   <ChipInput
                     value={form.models}
                     onChange={(models) => setForm({ ...form, models })}
                     options={modelOptions}
                     placeholder={t('payloadRules.formModelsPlaceholder')}
-                    dropUp
                   />
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    {t('payloadRules.formModelsHint')}
+                  </p>
                 </div>
               ) : null}
             </div>

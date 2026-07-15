@@ -18,6 +18,8 @@ export interface ChipInputProps {
   disabled?: boolean;
   maxVisible?: number;
   className?: string;
+  /** Open the options dropdown above the input (for inputs near the bottom of a clipped container) */
+  dropUp?: boolean;
 }
 
 /**
@@ -35,6 +37,7 @@ export default function ChipInput({
   disabled = false,
   maxVisible = 3,
   className = "",
+  dropUp = false,
 }: ChipInputProps) {
   const [draft, setDraft] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
@@ -198,7 +201,11 @@ export default function ChipInput({
 
       {/* Dropdown for select-from-list mode */}
       {hasOptions && showDropdown && availableOptions.length > 0 && (
-        <div className="absolute z-50 mt-1 w-full max-h-48 overflow-auto rounded-md border border-border bg-popover shadow-md">
+        <div
+          className={`absolute z-50 w-full max-h-48 overflow-auto rounded-md border border-border bg-popover shadow-md ${
+            dropUp ? "bottom-full mb-1" : "mt-1"
+          }`}
+        >
           {availableOptions.map((opt) => (
             <button
               key={opt}

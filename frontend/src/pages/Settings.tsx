@@ -8,6 +8,7 @@ import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
+import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
@@ -65,7 +66,7 @@ import {
   Wrench,
   X,
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
 
@@ -1051,6 +1052,7 @@ async function compressSiteLogoFile(file: File, mimeType: string) {
 
 export default function Settings() {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { applyBranding } = useBranding()
   const defaultClaudeModelMappingEntries = useMemo(() => getDefaultModelMappingEntries(), [])
   const schedulerModeOptions = [
@@ -1159,6 +1161,7 @@ export default function Settings() {
     cache_label: 'Redis',
     model_mapping: '{}',
     codex_model_mapping: '{}',
+    payload_rules: '{}',
     reasoning_effort_models: '[]',
     resin_url: '',
     resin_platform_name: '',
@@ -1644,6 +1647,10 @@ export default function Settings() {
   const reasoningEffortCount = useMemo(
     () => parseReasoningEffortModelEntries(settingsForm.reasoning_effort_models).length,
     [settingsForm.reasoning_effort_models],
+  )
+  const payloadRuleCount = useMemo(
+    () => countPayloadRules(settingsForm.payload_rules),
+    [settingsForm.payload_rules],
   )
   const showInitialSkeleton = loading && !health
   const codexUserAgentConfig = useMemo(
@@ -3073,6 +3080,13 @@ export default function Settings() {
                 meta={t('settings.nav.mappingCount', { count: reasoningEffortCount })}
                 openLabel={t('settings.nav.manage')}
                 onOpen={() => setModelPanel('reasoning')}
+              />
+              <ModelSummaryCard
+                title={t('settings2.payloadRules')}
+                description={t('settings2.payloadRulesDesc')}
+                meta={t('settings.nav.mappingCount', { count: payloadRuleCount })}
+                openLabel={t('settings.nav.manage')}
+                onOpen={() => navigate('/payload-rules')}
               />
             </div>
 

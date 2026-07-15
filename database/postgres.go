@@ -774,6 +774,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS lazy_mode BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_model_mapping TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS payload_rules TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS reasoning_effort_models TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
@@ -1415,6 +1416,7 @@ type SystemSettings struct {
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
+	PayloadRules                       string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
 	ReasoningEffortModels              string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
 	BackgroundRefreshIntervalMinutes   int
 	UsageProbeMaxAgeMinutes            int
@@ -1644,7 +1646,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(model_pricing_sync_url, ''),
 			       COALESCE(ignore_usage_limit_status, false),
 			       COALESCE(auto_reset_credits_enabled, false),
-			       COALESCE(auto_reset_credits_before_expiry_min, 60)
+			       COALESCE(auto_reset_credits_before_expiry_min, 60),
+			       COALESCE(payload_rules, '{}')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1697,6 +1700,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.IgnoreUsageLimitStatus,
 		&s.AutoResetCreditsEnabled,
 		&s.AutoResetCreditsBeforeExpiryMin,
+		&s.PayloadRules,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1716,6 +1720,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if strings.TrimSpace(s.ModelPricingOverrides) == "" {
 		s.ModelPricingOverrides = "{}"
 	}
+	if strings.TrimSpace(s.PayloadRules) == "" {
+		s.PayloadRules = "{}"
+	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
@@ -1733,6 +1740,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	codexUserAgentConfig := strings.TrimSpace(s.CodexUserAgentConfig)
 	if codexUserAgentConfig == "" {
 		codexUserAgentConfig = "{}"
+	}
+	payloadRules := strings.TrimSpace(s.PayloadRules)
+	if payloadRules == "" {
+		payloadRules = "{}"
 	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1791,9 +1802,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_reset_credits_enabled,
 					auto_reset_credits_before_expiry_min,
 					prompt_filter_strict_terminal_enabled,
-					prompt_filter_advanced_config
+					prompt_filter_advanced_config,
+					payload_rules
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1883,7 +1895,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_reset_credits_enabled = EXCLUDED.auto_reset_credits_enabled,
 					auto_reset_credits_before_expiry_min = EXCLUDED.auto_reset_credits_before_expiry_min,
 					prompt_filter_strict_terminal_enabled = EXCLUDED.prompt_filter_strict_terminal_enabled,
-					prompt_filter_advanced_config = EXCLUDED.prompt_filter_advanced_config
+					prompt_filter_advanced_config = EXCLUDED.prompt_filter_advanced_config,
+					payload_rules = EXCLUDED.payload_rules
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1908,7 +1921,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
 		s.IgnoreUsageLimitStatus, s.AutoResetCreditsEnabled,
-		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin), s.PromptFilterStrictTerminalEnabled, s.PromptFilterAdvancedConfig)
+		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin),
+		s.PromptFilterStrictTerminalEnabled, s.PromptFilterAdvancedConfig, payloadRules)
 	return err
 }
 

@@ -637,6 +637,7 @@ export interface SystemSettings {
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
+  payload_rules: string
   reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
@@ -1369,4 +1370,17 @@ export interface OAuthExchangeResponse {
   id: number
   email: string
   plan_type: string
+}
+
+export interface ObservedInstructionsSample {
+  model: string
+  originator: string
+  instructions: string
+  length: number
+  truncated: boolean
+  observed_at: string
+}
+
+export interface ObservedInstructionsResponse {
+  samples: ObservedInstructionsSample[]
 }

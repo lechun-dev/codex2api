@@ -2385,6 +2385,7 @@ type Store struct {
 	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping          atomic.Value // 模型映射 JSON 字符串
 	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules          atomic.Value // Payload 请求体重写规则 JSON 字符串
 	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
@@ -2843,6 +2844,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	if settings.CodexModelMapping != "" {
 		s.codexModelMapping.Store(settings.CodexModelMapping)
+	}
+	if settings.PayloadRules != "" {
+		s.payloadRules.Store(settings.PayloadRules)
 	}
 	if settings.ReasoningEffortModels != "" {
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
@@ -4727,6 +4731,19 @@ func (s *Store) SetCodexModelMapping(mapping string) {
 // GetCodexModelMapping 获取当前 Codex 模型映射 JSON
 func (s *Store) GetCodexModelMapping() string {
 	if v, ok := s.codexModelMapping.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
+// SetPayloadRules 动态更新 Payload 请求体重写规则 JSON
+func (s *Store) SetPayloadRules(rules string) {
+	s.payloadRules.Store(rules)
+}
+
+// GetPayloadRules 获取当前 Payload 请求体重写规则 JSON
+func (s *Store) GetPayloadRules() string {
+	if v, ok := s.payloadRules.Load().(string); ok && v != "" {
 		return v
 	}
 	return "{}"

@@ -470,6 +470,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -6085,6 +6086,7 @@ type settingsResponse struct {
 	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
 	ModelMapping                       string  `json:"model_mapping"`
 	CodexModelMapping                  string  `json:"codex_model_mapping"`
+	PayloadRules                       string  `json:"payload_rules"`
 	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
 	ResinURL                           string  `json:"resin_url"`
 	ResinPlatformName                  string  `json:"resin_platform_name"`
@@ -6189,6 +6191,7 @@ type updateSettingsReq struct {
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
+	PayloadRules                       *string  `json:"payload_rules"`
 	ReasoningEffortModels              *string  `json:"reasoning_effort_models"`
 	ResinURL                           *string  `json:"resin_url"`
 	ResinPlatformName                  *string  `json:"resin_platform_name"`
@@ -6712,6 +6715,12 @@ func (h *Handler) GetBranding(c *gin.Context) {
 }
 
 // GetSettings 获取当前系统设置
+// GetObservedInstructions 返回最近观测到的客户端透传 instructions 样本，
+// 供管理端在配置 payload 重写规则时查看客户端实际发来的系统提示词原文。
+func (h *Handler) GetObservedInstructions(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"samples": proxy.ObservedInstructions()})
+}
+
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
@@ -6804,6 +6813,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheLabel:                         h.cacheLabel,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7323,6 +7333,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexModelMapping(*req.CodexModelMapping)
 		log.Printf("设置已更新: codex_model_mapping")
 	}
+	if req.PayloadRules != nil {
+		normalized, err := proxy.NormalizePayloadRulesJSON(*req.PayloadRules)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := proxy.SetPayloadRulesJSON(normalized); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetPayloadRules(normalized)
+		log.Printf("设置已更新: payload_rules")
+	}
 	if req.ReasoningEffortModels != nil {
 		normalized, err := proxy.NormalizeReasoningEffortModelsJSON(*req.ReasoningEffortModels, proxy.SupportedModelIDs(c.Request.Context(), h.db))
 		if err != nil {
@@ -7695,6 +7718,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7838,6 +7862,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ExpiredCleaned:                     expiredCleaned,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,

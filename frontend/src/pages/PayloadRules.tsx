@@ -24,6 +24,7 @@ import {
 import { api } from '@/api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
+import ChipInput from '../components/ChipInput'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -200,7 +201,7 @@ interface KVRow {
 interface RuleFormState {
   template: TemplateKey
   group: RuleGroup
-  models: string
+  models: string[]
   promptText: string
   tierValue: string
   effortFrom: string
@@ -214,7 +215,7 @@ function emptyFormState(template: TemplateKey): RuleFormState {
   return {
     template,
     group: template === 'appendPrompt' ? 'append' : 'override',
-    models: '',
+    models: [],
     promptText: '',
     tierValue: 'priority',
     effortFrom: 'medium',
@@ -229,7 +230,7 @@ function formStateFromEntry(entry: RuleEntry): RuleFormState {
   return {
     template: 'custom',
     group: entry.group,
-    models: entry.models.join(', '),
+    models: entry.models,
     promptText: '',
     tierValue: 'priority',
     effortFrom: 'medium',
@@ -250,7 +251,7 @@ function splitList(text: string): string[] {
 }
 
 function formStateToEntry(form: RuleFormState): RuleEntry | null {
-  const models = splitList(form.models)
+  const models = form.models.map((model) => model.trim()).filter(Boolean)
   const base: RuleEntry = { group: form.group, models, headers: {}, match: {}, notMatch: {}, exist: [], notExist: [], params: {} }
   switch (form.template) {
     case 'appendPrompt': {
@@ -444,6 +445,7 @@ export default function PayloadRules() {
   const [samplesLoading, setSamplesLoading] = useState(false)
   const [expandedSample, setExpandedSample] = useState<number | null>(null)
   const [copiedSample, setCopiedSample] = useState<number | null>(null)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
 
   const visualJSON = useMemo(() => serializeRuleEntries(entries), [entries])
   const currentJSON = viewMode === 'json' ? jsonDraft : visualJSON
@@ -512,6 +514,17 @@ export default function PayloadRules() {
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const resp = await api.getModels()
+        setModelOptions(resp.models || [])
+      } catch {
+        setModelOptions([])
+      }
+    })()
+  }, [])
 
   const saveRules = useCallback(async () => {
     if (jsonError) return
@@ -903,11 +916,12 @@ export default function PayloadRules() {
                     </div>
                     <div className="space-y-1.5">
                       <label className="text-xs font-semibold text-foreground">{t('payloadRules.formModels')}</label>
-                      <Input
+                      <ChipInput
                         value={form.models}
+                        onChange={(models) => setForm({ ...form, models })}
+                        options={modelOptions}
                         placeholder={t('payloadRules.formModelsPlaceholder')}
-                        className="h-9 font-mono text-xs"
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setForm({ ...form, models: e.target.value })}
+                        dropUp
                       />
                     </div>
                   </div>
@@ -949,11 +963,12 @@ export default function PayloadRules() {
               {form.template !== 'custom' ? (
                 <div className="space-y-1.5">
                   <label className="text-xs font-semibold text-foreground">{t('payloadRules.formModels')}</label>
-                  <Input
+                  <ChipInput
                     value={form.models}
+                    onChange={(models) => setForm({ ...form, models })}
+                    options={modelOptions}
                     placeholder={t('payloadRules.formModelsPlaceholder')}
-                    className="h-9 font-mono text-xs"
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setForm({ ...form, models: e.target.value })}
+                    dropUp
                   />
                 </div>
               ) : null}

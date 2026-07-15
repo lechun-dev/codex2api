@@ -2800,7 +2800,7 @@
     "formMatch": "Match conditions (optional)",
     "formAddRow": "Add row",
     "formModels": "Target models (optional)",
-    "formModelsPlaceholder": "gpt-* (comma separated, empty = all models)",
+    "formModelsPlaceholder": "Pick models or type a wildcard (e.g. gpt-*), empty = all models",
     "formFilterPaths": "Field paths to remove (comma separated)",
     "groupDefault": "Set when missing",
     "groupDefaultRaw": "Set when missing · raw",

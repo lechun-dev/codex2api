@@ -2800,7 +2800,7 @@
     "formMatch": "匹配条件(可选)",
     "formAddRow": "添加一行",
     "formModels": "生效模型(可选)",
-    "formModelsPlaceholder": "gpt-*(逗号分隔,留空 = 全部模型)",
+    "formModelsPlaceholder": "选择模型或输入通配符(如 gpt-*),留空 = 全部模型",
     "formFilterPaths": "要删除的字段路径(逗号分隔)",
     "groupDefault": "缺失时写入",
     "groupDefaultRaw": "缺失时写入 · raw",

@@ -921,7 +921,6 @@ export default function PayloadRules() {
                         onChange={(models) => setForm({ ...form, models })}
                         options={modelOptions}
                         placeholder={t('payloadRules.formModelsPlaceholder')}
-                        dropUp
                       />
                     </div>
                   </div>

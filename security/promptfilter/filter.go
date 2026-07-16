@@ -717,10 +717,16 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 
 	switch endpoint {
 	case "chat", "chat_completions", "/v1/chat/completions":
-		addResultText(gjson.GetBytes(body, "messages"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
 	case "messages", "anthropic", "/v1/messages":
-		addResultText(gjson.GetBytes(body, "system"))
-		addResultText(gjson.GetBytes(body, "messages"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
+	case "response", "responses", "responses_compact", "/v1/responses", "/v1/responses/compact":
+		// Top-level instructions and non-user roles are application-owned
+		// context. Scanning them attributes platform safety and tool instructions
+		// to the end user, so only actual user prompt fields participate.
+		collectUserMessageText(gjson.GetBytes(body, "input"), &parts)
+		addResultText(gjson.GetBytes(body, "prompt"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
 	case "image", "images", "images_generations", "images_edits", "/v1/images/generations", "/v1/images/edits":
 		addResultText(gjson.GetBytes(body, "prompt"))
 		addResultText(gjson.GetBytes(body, "style"))
@@ -731,6 +737,31 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 		addResultText(gjson.GetBytes(body, "messages"))
 	}
 	return limitScanText(strings.Join(parts, "\n"), maxLen)
+}
+
+func collectUserMessageText(result gjson.Result, parts *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if !result.IsArray() {
+		if result.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(result.Get("role").String()))
+			if role != "" && role != "user" {
+				return
+			}
+		}
+		collectGJSONText(result, parts)
+		return
+	}
+	for _, item := range result.Array() {
+		if item.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "" && role != "user" {
+				continue
+			}
+		}
+		collectGJSONText(item, parts)
+	}
 }
 
 func Preview(text string, maxRunes int) string {

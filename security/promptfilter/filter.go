@@ -717,6 +717,47 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 
 	switch endpoint {
 	case "chat", "chat_completions", "/v1/chat/completions":
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
+	case "messages", "anthropic", "/v1/messages":
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
+	case "response", "responses", "responses_compact", "/v1/responses", "/v1/responses/compact":
+		// Top-level instructions and non-user roles are application-owned
+		// context. Scanning them attributes platform safety and tool instructions
+		// to the end user, so only actual user prompt fields participate.
+		collectUserMessageText(gjson.GetBytes(body, "input"), &parts)
+		addResultText(gjson.GetBytes(body, "prompt"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
+	case "image", "images", "images_generations", "images_edits", "/v1/images/generations", "/v1/images/edits":
+		addResultText(gjson.GetBytes(body, "prompt"))
+		addResultText(gjson.GetBytes(body, "style"))
+	default:
+		addResultText(gjson.GetBytes(body, "instructions"))
+		addResultText(gjson.GetBytes(body, "input"))
+		addResultText(gjson.GetBytes(body, "prompt"))
+		addResultText(gjson.GetBytes(body, "messages"))
+	}
+	return limitScanText(strings.Join(parts, "\n"), maxLen)
+}
+
+// ExtractConversationText extracts the complete conversational text for
+// observability. Prompt filtering must continue to use ExtractText so
+// application-owned instructions and assistant history are not attributed to
+// the end user.
+func ExtractConversationText(body []byte, endpoint string, maxLen int) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+	var parts []string
+	endpoint = strings.ToLower(strings.TrimSpace(endpoint))
+
+	addResultText := func(result gjson.Result) {
+		if result.Exists() {
+			collectGJSONText(result, &parts)
+		}
+	}
+
+	switch endpoint {
+	case "chat", "chat_completions", "/v1/chat/completions":
 		addResultText(gjson.GetBytes(body, "messages"))
 	case "messages", "anthropic", "/v1/messages":
 		addResultText(gjson.GetBytes(body, "system"))
@@ -731,6 +772,31 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 		addResultText(gjson.GetBytes(body, "messages"))
 	}
 	return limitScanText(strings.Join(parts, "\n"), maxLen)
+}
+
+func collectUserMessageText(result gjson.Result, parts *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if !result.IsArray() {
+		if result.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(result.Get("role").String()))
+			if role != "" && role != "user" {
+				return
+			}
+		}
+		collectGJSONText(result, parts)
+		return
+	}
+	for _, item := range result.Array() {
+		if item.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "" && role != "user" {
+				continue
+			}
+		}
+		collectGJSONText(item, parts)
+	}
 }
 
 func Preview(text string, maxRunes int) string {

@@ -28,6 +28,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	proxyURL := "http://127.0.0.1:18080/" + suffix
 	modelID := "mysql-smoke-model-" + suffix
 	templateName := "mysql-smoke-template-" + suffix
+	clientUserAgent := "mysql-smoke-client/" + suffix
 	previousSettings, err := db.GetSystemSettings(ctx)
 	if err != nil {
 		t.Fatalf("GetSystemSettings before smoke failed: %v", err)
@@ -48,6 +49,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		} else {
 			_, _ = db.conn.ExecContext(ctx, "DELETE FROM prompt_filter_secrets WHERE id = 1")
 		}
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM usage_logs WHERE client_user_agent = ?", clientUserAgent)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id IN (SELECT id FROM account_groups WHERE name = ?)", groupName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM image_prompt_templates WHERE name = ?", templateName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM model_registry WHERE id = ?", modelID)
@@ -93,6 +95,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		ImageStorageConfig:                 `{"backend":"local"}`,
 		ShowFullUsageNumbers:               true,
 		PublicImageStudioPageEnabled:       true,
+		PublicAccountPortalPageEnabled:     true,
 		SchedulerMode:                      "weighted",
 		AffinityMode:                       "strict",
 		CodexForceWebsocket:                true,
@@ -143,6 +146,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.ModelPricingOverrides != `{"gpt-5.4":{"input":2.5,"source":"custom"}}` ||
 		savedSettings.ModelPricingSyncURL != "https://example.test/pricing.json" ||
 		!savedSettings.PublicImageStudioPageEnabled ||
+		!savedSettings.PublicAccountPortalPageEnabled ||
 		!savedSettings.IgnoreUsageLimitStatus ||
 		!savedSettings.AutoResetCreditsEnabled ||
 		savedSettings.AutoResetCreditsBeforeExpiryMin != 75 {
@@ -224,6 +228,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	); err != nil {
 		t.Fatalf("UpdateAccountSchedulerMetadata failed: %v", err)
 	}
+	if err := db.UpdateAccountNote(ctx, accountID, "mysql smoke note"); err != nil {
+		t.Fatalf("UpdateAccountNote failed: %v", err)
+	}
 	account, err := db.GetAccountByID(ctx, accountID)
 	if err != nil {
 		t.Fatalf("GetAccountByID failed: %v", err)
@@ -232,10 +239,40 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		!account.BaseConcurrencyOverride.Valid || account.BaseConcurrencyOverride.Int64 != 19 ||
 		!account.SkipWarmTier ||
 		account.ProxyURL != proxyURL+"/updated" ||
+		account.Note != "mysql smoke note" ||
 		!account.GetCredentialBool("auto_pause_5h_disabled") ||
 		len(account.GetCredentialInt64Slice("allowed_api_key_ids")) != 1 ||
 		account.GetCredentialInt64Slice("allowed_api_key_ids")[0] != keyID {
 		t.Fatalf("account metadata was not persisted correctly: %#v", account)
+	}
+
+	if err := db.batchInsertLogs(ctx, []usageLogEntry{{
+		AccountID:           accountID,
+		ClientIP:            "127.0.0.1",
+		SessionID:           "mysql-smoke-session",
+		ConversationID:      "mysql-smoke-conversation",
+		PreviousResponseID:  "mysql-smoke-response",
+		RequestText:         "mysql smoke request",
+		ClientUserAgent:     clientUserAgent,
+		UpstreamUserAgent:   "mysql-smoke-upstream/" + suffix,
+		UserAgentOverridden: true,
+		Endpoint:            "/v1/responses",
+		Model:               "gpt-5.4",
+		StatusCode:          200,
+	}}); err != nil {
+		t.Fatalf("batchInsertLogs failed: %v", err)
+	}
+	var savedClientUA, savedUpstreamUA string
+	var savedOverridden bool
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT client_user_agent, upstream_user_agent, user_agent_overridden
+		FROM usage_logs
+		WHERE client_user_agent = ?
+	`, clientUserAgent).Scan(&savedClientUA, &savedUpstreamUA, &savedOverridden); err != nil {
+		t.Fatalf("query usage-log audit fields failed: %v", err)
+	}
+	if savedClientUA != clientUserAgent || savedUpstreamUA != "mysql-smoke-upstream/"+suffix || !savedOverridden {
+		t.Fatalf("unexpected usage-log audit fields: client=%q upstream=%q overridden=%v", savedClientUA, savedUpstreamUA, savedOverridden)
 	}
 
 	responsesID, err := db.InsertOpenAIResponsesAccount(ctx, "mysql smoke responses "+suffix, map[string]interface{}{

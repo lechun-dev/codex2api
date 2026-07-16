@@ -39,7 +39,7 @@ func populateRequestContentUsageMeta(c *gin.Context, input *database.UsageLogInp
 		if endpoint == "" {
 			endpoint = strings.TrimSpace(c.FullPath())
 		}
-		input.RequestText = strings.TrimSpace(promptfilter.ExtractText(body, endpoint, usageLogRequestTextMaxLen))
+		input.RequestText = strings.TrimSpace(promptfilter.ExtractConversationText(body, endpoint, usageLogRequestTextMaxLen))
 	}
 }
 

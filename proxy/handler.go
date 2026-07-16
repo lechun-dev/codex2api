@@ -636,6 +636,7 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
+	populateUserAgentMetaFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	if h != nil && h.cfg != nil && h.cfg.UsageLogCaptureContent {
 		populateRequestContentUsageMeta(c, input)
@@ -1397,6 +1398,7 @@ func (h *Handler) APIKeyAuthMiddleware() gin.HandlerFunc {
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
+		attachUserAgentAudit(c)
 		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
 			if allowAnonymous {
@@ -1499,9 +1501,15 @@ const (
 	logStatusUpstreamStreamBreak = 598
 )
 
-// isRetryableStatus 检查是否可重试的上游状态码
+// isRetryableStatus 检查是否可重试的上游状态码。
+// 403 也视为可重试：Codex 上游 403 全是账号侧问题（payment_required /
+// deactivated_workspace / codex_access_restricted 等 OAuth/套餐/工作区维度），
+// 非请求内容问题，换到号池里其他健康账号即可继续（issue #396）。
 func isRetryableStatus(code int) bool {
-	return code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+	return code == http.StatusServiceUnavailable ||
+		code == http.StatusUnauthorized ||
+		code == http.StatusInternalServerError ||
+		code == http.StatusForbidden
 }
 
 func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
@@ -1756,6 +1764,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -2276,6 +2285,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图产生大体积
@@ -2284,6 +2294,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
+		// 按尝试重算：不同尝试的生效模型可能不同，规则若按模型匹配则结果随之变化。
+		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -2557,6 +2570,7 @@ func (h *Handler) Responses(c *gin.Context) {
 							lastUpstreamCancel()
 						}
 						rctx, rcancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+						rctx = WithPayloadRuleIdentity(rctx, ruleIdentity)
 						lastUpstreamCancel = rcancel
 						roundBody := body
 						if useWebsocket {
@@ -3378,6 +3392,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
+	ruleIdentity := h.payloadRuleIdentity(c)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
@@ -3481,6 +3496,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
+		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
+		// 仅 Codex 路径（ExecuteRequest）套用规则；relay 账号不套用，保持原值。
+		// 按尝试重算：不同尝试的生效模型可能不同，规则若按模型匹配则结果随之变化。
+		if !isRelayAccount {
+			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+		}
+
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
@@ -3490,6 +3512,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
@@ -4662,6 +4685,20 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 				"message": "账号池暂无可用账号（上游账号鉴权失效），请稍后重试",
 				"type":    "server_error",
 				"code":    "account_pool_unauthorized",
+			},
+		})
+		return
+	}
+
+	// 上游账号 403（payment_required / deactivated_workspace / codex_access_restricted）
+	// 同样是账号侧问题：重试已换过号仍拿到 403 说明池内暂无可用账号。原样透传 403 会让
+	// 客户端（如 Claude Code）误判为自身无权限而直接停工（issue #396），改写为 503 池级错误。
+	if statusCode == http.StatusForbidden {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": "账号池暂无可用账号（上游账号被拒绝访问：额度/套餐或工作区受限），请稍后重试",
+				"type":    "server_error",
+				"code":    "account_pool_forbidden",
 			},
 		})
 		return

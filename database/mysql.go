@@ -14,11 +14,19 @@ type mysqlColumnDefinition struct {
 	def   string
 }
 
+const (
+	mysql56AccountNoteDefinition         = "TEXT NULL"
+	mysql56ClientUserAgentDefinition     = "TEXT NULL"
+	mysql56UpstreamUserAgentDefinition   = "TEXT NULL"
+	mysql56UserAgentOverriddenDefinition = "TINYINT(1) DEFAULT 0"
+)
+
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "payload_rules", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "prompt_filter_strict_terminal_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "prompt_filter_advanced_config", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "public_image_studio_page_enabled", def: "TINYINT(1) DEFAULT 1"},
+	{table: "system_settings", name: "public_account_portal_page_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "model_pricing_overrides", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "model_pricing_sync_url", def: "TEXT NULL"},
 	{table: "system_settings", name: "ignore_usage_limit_status", def: "TINYINT(1) DEFAULT 0"},
@@ -41,6 +49,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			score_bias_override INT NULL,
 			base_concurrency_override INT NULL,
 			skip_warm_tier TINYINT(1) DEFAULT 0,
+			note ` + mysql56AccountNoteDefinition + `,
 			error_message VARCHAR(2048) DEFAULT '',
 			deleted_at DATETIME NULL,
 			tags TEXT NULL,
@@ -63,6 +72,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			conversation_id VARCHAR(255) DEFAULT '',
 			previous_response_id VARCHAR(255) DEFAULT '',
 			request_text MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL,
+			client_user_agent ` + mysql56ClientUserAgentDefinition + `,
+			upstream_user_agent ` + mysql56UpstreamUserAgentDefinition + `,
+			user_agent_overridden ` + mysql56UserAgentOverriddenDefinition + `,
 			endpoint VARCHAR(100) DEFAULT '',
 			model VARCHAR(100) DEFAULT '',
 			prompt_tokens INT DEFAULT 0,
@@ -250,6 +262,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "score_bias_override", "INT NULL"},
 		{"accounts", "base_concurrency_override", "INT NULL"},
 		{"accounts", "tags", "TEXT NULL"},
+		{"accounts", "note", mysql56AccountNoteDefinition},
 		{"accounts", "deleted_at", "DATETIME NULL"},
 		{"accounts", "enabled", "TINYINT(1) DEFAULT 1"},
 		{"accounts", "locked", "TINYINT(1) DEFAULT 0"},
@@ -285,6 +298,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "conversation_id", "VARCHAR(255) DEFAULT ''"},
 		{"usage_logs", "previous_response_id", "VARCHAR(255) DEFAULT ''"},
 		{"usage_logs", "request_text", "MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"},
+		{"usage_logs", "client_user_agent", mysql56ClientUserAgentDefinition},
+		{"usage_logs", "upstream_user_agent", mysql56UpstreamUserAgentDefinition},
+		{"usage_logs", "user_agent_overridden", mysql56UserAgentOverriddenDefinition},
 		{"usage_logs", "image_width", "INT DEFAULT 0"},
 		{"usage_logs", "image_height", "INT DEFAULT 0"},
 		{"usage_logs", "image_bytes", "INT DEFAULT 0"},
@@ -543,6 +559,7 @@ func systemSettingsMySQLDDL() string {
 		show_full_usage_numbers TINYINT(1) DEFAULT 0,
 		public_key_usage_page_enabled TINYINT(1) DEFAULT 1,
 		public_image_studio_page_enabled TINYINT(1) DEFAULT 1,
+		public_account_portal_page_enabled TINYINT(1) DEFAULT 0,
 		auto_pause_5h_threshold DOUBLE DEFAULT 0,
 		auto_pause_7d_threshold DOUBLE DEFAULT 0,
 		auto_pause_5h_guard_band_percent DOUBLE DEFAULT 5,

@@ -37,6 +37,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"prompt_filter_strict_terminal_enabled TINYINT(1) DEFAULT 0",
 		"prompt_filter_advanced_config MEDIUMTEXT NULL",
 		"public_image_studio_page_enabled TINYINT(1) DEFAULT 1",
+		"public_account_portal_page_enabled TINYINT(1) DEFAULT 0",
 		"ignore_usage_limit_status TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_enabled TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_before_expiry_min INT DEFAULT 60",
@@ -58,9 +59,29 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"payload_rules MEDIUMTEXT DEFAULT",
 		"prompt_filter_advanced_config TEXT DEFAULT",
 		"prompt_filter_advanced_config MEDIUMTEXT DEFAULT",
+		"note TEXT DEFAULT",
+		"client_user_agent TEXT DEFAULT",
+		"upstream_user_agent TEXT DEFAULT",
 	} {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
+		}
+	}
+}
+
+func TestMySQL56AccountAndUsageAuditColumns(t *testing.T) {
+	definitions := map[string]string{
+		"accounts.note":                    mysql56AccountNoteDefinition,
+		"usage_logs.client_user_agent":     mysql56ClientUserAgentDefinition,
+		"usage_logs.upstream_user_agent":   mysql56UpstreamUserAgentDefinition,
+		"usage_logs.user_agent_overridden": mysql56UserAgentOverriddenDefinition,
+	}
+	for column, definition := range definitions {
+		if strings.Contains(strings.ToUpper(definition), "TEXT DEFAULT") {
+			t.Fatalf("MySQL 5.6 incompatible definition for %s: %s", column, definition)
+		}
+		if definition == "" {
+			t.Fatalf("MySQL 5.6 definition for %s is empty", column)
 		}
 	}
 }

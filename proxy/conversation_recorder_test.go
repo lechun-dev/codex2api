@@ -43,13 +43,15 @@ func (s *fakeConversationRecordStore) FindConversationByResponseID(_ context.Con
 	return nil, nil
 }
 
-func (s *fakeConversationRecordStore) FindLatestPartialConversation(_ context.Context, apiKeyID int64, sessionID, clientID string) (*database.ConversationRecord, error) {
+func (s *fakeConversationRecordStore) FindLatestPendingConversation(_ context.Context, apiKeyID int64, sessionID, clientID string) (*database.ConversationRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index := len(s.saved) - 1; index >= 0; index-- {
 		input := s.saved[index]
 		if input.APIKeyID == apiKeyID && input.SessionID == sessionID &&
-			input.ClientID == clientID && input.Status == database.ConversationStatusPartial {
+			input.ClientID == clientID &&
+			(input.Status == database.ConversationStatusPartial ||
+				(input.Status == database.ConversationStatusCompleted && input.AssistantMessage == "")) {
 			return conversationTestRecord(input), nil
 		}
 	}
@@ -85,6 +87,12 @@ func (s *fakeConversationRecordStore) snapshots() []database.ConversationRecordI
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]database.ConversationRecordInput(nil), s.saved...)
+}
+
+func (s *fakeConversationRecordStore) recordCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.records)
 }
 
 func TestExtractCurrentConversationUserMessage(t *testing.T) {
@@ -140,6 +148,74 @@ func TestConversationTurnReusesParsedResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestConversationTurnKeepsOnlyFinalAnswerPhase(t *testing.T) {
+	turn := &conversationTurn{}
+	for _, payload := range []string{
+		`{"type":"response.output_text.delta","output_index":0,"delta":"I will inspect the code."}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the code."}]}}`,
+		`{"type":"response.output_text.delta","output_index":1,"delta":"The deployment is healthy."}`,
+		`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The deployment is healthy."}]}}`,
+		`{"type":"response.completed","response":{"id":"resp-final","status":"completed","output":[
+			{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the code."}]},
+			{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The deployment is healthy."}]}
+		]}}`,
+	} {
+		parsed := gjson.Parse(payload)
+		turn.observeResponsesEvent(parsed.Get("type").String(), parsed)
+	}
+
+	if turn.finalAssistant != "The deployment is healthy." {
+		t.Fatalf("final assistant = %q", turn.finalAssistant)
+	}
+	if !turn.nonFinalAssistant || turn.awaitingToolOutput || !turn.terminal {
+		t.Fatalf("turn metadata = %#v", turn)
+	}
+}
+
+func TestConversationTurnDoesNotPersistCommentaryOnlyResponse(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	turn := &conversationTurn{
+		recorder:          recorder,
+		startedAt:         time.Now().UTC(),
+		apiKeyID:          9,
+		clientID:          "client",
+		explicitSessionID: "session",
+		userMessage:       "inspect the deployment",
+	}
+	for _, payload := range []string{
+		`{"type":"response.output_text.delta","output_index":0,"delta":"I will inspect the deployment."}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the deployment."}]}}`,
+		`{"type":"response.completed","response":{"id":"resp-commentary","status":"completed","output":[
+			{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect the deployment."}]}
+		]}}`,
+	} {
+		parsed := gjson.Parse(payload)
+		turn.observeResponsesEvent(parsed.Get("type").String(), parsed)
+	}
+	turn.finish(&database.UsageLogInput{
+		InboundEndpoint: "/v1/responses",
+		Model:           "gpt-5.6-sol",
+		StatusCode:      http.StatusOK,
+	}, nil)
+	recorder.Close()
+
+	snapshots := store.snapshots()
+	if len(snapshots) != 1 || snapshots[0].AssistantMessage != "" {
+		t.Fatalf("commentary-only response was persisted as an answer: %#v", snapshots)
+	}
+}
+
+func TestResponseOutputAwaitsToolAfterCommentary(t *testing.T) {
+	output := gjson.Parse(`[
+		{"type":"function_call","call_id":"call-1","name":"shell"},
+		{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Running the command."}]}
+	]`)
+	if !responseOutputAwaitsToolOutput(output) {
+		t.Fatal("commentary after a tool call must still leave the turn awaiting tool output")
+	}
+}
+
 func TestConversationTurnFallbackRecordsEarlyFailureOnce(t *testing.T) {
 	store := newFakeConversationRecordStore()
 	recorder := newConversationRecorder(store)
@@ -181,16 +257,18 @@ func TestConversationRecorderFoldsToolContinuationsAndDrainsOnClose(t *testing.T
 		{
 			StartedAt: start, APIKeyID: 9, APIKeyName: "key", ClientID: "client",
 			ExplicitSessionID: "session", UserMessage: "run the tests", ResponseID: "resp-1",
-			Terminal: true, AwaitingToolOutput: true, StatusCode: 200, DurationMs: 100,
+			AssistantMessage: "I will run the tests.", Terminal: true,
+			AwaitingToolOutput: true, StatusCode: 200, DurationMs: 100,
 		},
 		{
 			StartedAt: start.Add(time.Second), APIKeyID: 9, ClientID: "client",
-			PreviousResponseID: "resp-1", ResponseID: "resp-2", Terminal: true,
+			ExplicitSessionID: "session", ResponseID: "resp-2",
+			AssistantMessage: "The test command is still running.", Terminal: true,
 			AwaitingToolOutput: true, StatusCode: 200, DurationMs: 50,
 		},
 		{
 			StartedAt: start.Add(2 * time.Second), APIKeyID: 9, ClientID: "client",
-			PreviousResponseID: "resp-2", AssistantMessage: "all tests passed", ResponseID: "resp-3",
+			ExplicitSessionID: "session", AssistantMessage: "all tests passed", ResponseID: "resp-3",
 			Terminal: true, StatusCode: 200, OutputTokens: 4, DurationMs: 75,
 		},
 		{
@@ -226,6 +304,32 @@ func TestConversationRecorderFoldsToolContinuationsAndDrainsOnClose(t *testing.T
 	}
 	if snapshots[3].RequestID == firstRequestID || snapshots[3].SessionID != "session" {
 		t.Fatalf("next user turn was not a new row in the same session: %#v", snapshots[3])
+	}
+	if got := store.recordCount(); got != 2 {
+		t.Fatalf("stored row count = %d, want one row per user interaction", got)
+	}
+}
+
+func TestConversationRecorderSkipsOrphanEmptyInternalTurns(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	for range 10 {
+		if !recorder.enqueue(conversationTurnResult{
+			StartedAt:         time.Now().UTC(),
+			APIKeyID:          9,
+			ClientID:          "client",
+			ExplicitSessionID: "internal-session",
+			ResponseID:        "empty-response",
+			Terminal:          true,
+			StatusCode:        http.StatusOK,
+		}) {
+			t.Fatal("enqueue returned false")
+		}
+	}
+	recorder.Close()
+
+	if got := store.recordCount(); got != 0 {
+		t.Fatalf("orphan empty internal turns created %d rows", got)
 	}
 }
 
@@ -288,9 +392,25 @@ func TestConversationCacheStoresOnlyLightweightSessionLink(t *testing.T) {
 
 func TestResolveConversationSessionIDUsesStableRequestIdentity(t *testing.T) {
 	headers := make(http.Header)
+	headers.Set("Session_id", "explicit-session")
+	if got := resolveConversationSessionIDFromHeaders(headers, []byte(`{"input":"hello"}`)); got != "explicit-session" {
+		t.Fatalf("explicit session = %q", got)
+	}
+
+	headers = make(http.Header)
 	headers.Set("Idempotency-Key", "request-session")
-	if got := resolveConversationSessionIDFromHeaders(headers, []byte(`{"input":"hello"}`)); got != "request-session" {
-		t.Fatalf("idempotency session = %q", got)
+	if got := resolveConversationSessionIDFromHeaders(headers, []byte(`{}`)); got != "request-session" {
+		t.Fatalf("idempotency fallback session = %q", got)
+	}
+
+	firstHeaders := make(http.Header)
+	firstHeaders.Set("Idempotency-Key", "internal-request-1")
+	secondHeaders := make(http.Header)
+	secondHeaders.Set("Idempotency-Key", "internal-request-2")
+	stableBody := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"inspect upstream"}]}`)
+	if firstID, secondID := resolveConversationSessionIDFromHeaders(firstHeaders, stableBody),
+		resolveConversationSessionIDFromHeaders(secondHeaders, stableBody); firstID == "" || firstID != secondID {
+		t.Fatalf("rotating idempotency keys split one content session: %q / %q", firstID, secondID)
 	}
 
 	first := []byte(`{"model":"gpt-5.4","messages":[

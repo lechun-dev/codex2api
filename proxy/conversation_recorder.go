@@ -32,7 +32,7 @@ const (
 type conversationRecordStore interface {
 	SaveConversationRecord(context.Context, database.ConversationRecordInput) error
 	FindConversationByResponseID(context.Context, int64, string) (*database.ConversationRecord, error)
-	FindLatestPartialConversation(context.Context, int64, string, string) (*database.ConversationRecord, error)
+	FindLatestPendingConversation(context.Context, int64, string, string) (*database.ConversationRecord, error)
 }
 
 // conversationRecorder keeps all database work off the request path. Request
@@ -77,6 +77,8 @@ type conversationTurn struct {
 
 	assistant          strings.Builder
 	fallbackAssistant  string
+	finalAssistant     string
+	nonFinalAssistant  bool
 	responseID         string
 	terminal           bool
 	failed             bool
@@ -309,6 +311,12 @@ func (t *conversationTurn) observeResponsesEvent(eventType string, parsed gjson.
 		if isConversationToolCallType(item.Get("type").String()) {
 			t.awaitingToolOutput = true
 		}
+		if isConversationNonFinalAssistantItem(item) {
+			t.nonFinalAssistant = true
+		}
+		if text := visibleResponseItemText(item); text != "" {
+			t.finalAssistant = appendConversationText(t.finalAssistant, text)
+		}
 		if t.assistant.Len() == 0 {
 			t.fallbackAssistant = appendConversationText(t.fallbackAssistant, visibleResponseItemText(item))
 		}
@@ -318,18 +326,20 @@ func (t *conversationTurn) observeResponsesEvent(eventType string, parsed gjson.
 		t.failed = false
 		t.incomplete = strings.EqualFold(response.Get("status").String(), "incomplete")
 		t.setResponseID(response.Get("id").String())
-		if t.assistant.Len() == 0 && t.fallbackAssistant == "" {
-			t.fallbackAssistant = visibleResponseOutputText(response.Get("output"))
+		if text := visibleResponseOutputText(response.Get("output")); text != "" {
+			t.finalAssistant = text
 		}
+		t.nonFinalAssistant = t.nonFinalAssistant || responseOutputHasNonFinalAssistant(response.Get("output"))
 		t.awaitingToolOutput = responseOutputAwaitsToolOutput(response.Get("output"))
 	case "response.incomplete":
 		response := parsed.Get("response")
 		t.terminal = true
 		t.incomplete = true
 		t.setResponseID(response.Get("id").String())
-		if t.assistant.Len() == 0 && t.fallbackAssistant == "" {
-			t.fallbackAssistant = visibleResponseOutputText(response.Get("output"))
+		if text := visibleResponseOutputText(response.Get("output")); text != "" {
+			t.finalAssistant = text
 		}
+		t.nonFinalAssistant = t.nonFinalAssistant || responseOutputHasNonFinalAssistant(response.Get("output"))
 	case "response.failed", "error":
 		t.terminal = true
 		t.failed = true
@@ -345,9 +355,10 @@ func (t *conversationTurn) observeResponsesObject(response gjson.Result) {
 	t.failed = strings.EqualFold(response.Get("status").String(), "failed")
 	t.incomplete = strings.EqualFold(response.Get("status").String(), "incomplete")
 	t.setResponseID(response.Get("id").String())
-	if t.assistant.Len() == 0 && t.fallbackAssistant == "" {
-		t.fallbackAssistant = visibleResponseOutputText(response.Get("output"))
+	if text := visibleResponseOutputText(response.Get("output")); text != "" {
+		t.finalAssistant = text
 	}
+	t.nonFinalAssistant = t.nonFinalAssistant || responseOutputHasNonFinalAssistant(response.Get("output"))
 	t.awaitingToolOutput = responseOutputAwaitsToolOutput(response.Get("output"))
 }
 
@@ -365,9 +376,15 @@ func (t *conversationTurn) finish(input *database.UsageLogInput, requestErr erro
 		return
 	}
 	t.finished = true
-	assistant := t.assistant.String()
-	if strings.TrimSpace(assistant) == "" {
+	assistant := t.finalAssistant
+	if strings.TrimSpace(assistant) == "" && !t.nonFinalAssistant {
+		assistant = t.assistant.String()
+	}
+	if strings.TrimSpace(assistant) == "" && !t.nonFinalAssistant {
 		assistant = t.fallbackAssistant
+	}
+	if !t.terminal || t.failed || t.incomplete || t.awaitingToolOutput {
+		assistant = ""
 	}
 	if t.userMessage == "" && assistant == "" && t.previousResponseID == "" && t.responseID == "" {
 		return
@@ -443,6 +460,9 @@ func (r *conversationRecorder) persistTurn(parent context.Context, result conver
 	}
 	result.PreviousResponseID = normalizeConversationIdentifier(result.PreviousResponseID, 255, "resp")
 	result.ResponseID = normalizeConversationIdentifier(result.ResponseID, 255, "resp")
+	if !result.Terminal || result.Failed || result.Incomplete || result.AwaitingToolOutput {
+		result.AssistantMessage = ""
+	}
 
 	cachedLink := r.cachedByResponse(result.APIKeyID, result.PreviousResponseID)
 	var linkedState *conversationInteractionState
@@ -476,13 +496,17 @@ func (r *conversationRecorder) persistTurn(parent context.Context, result conver
 
 	if linkedState == nil && result.UserMessage == "" && sessionKnown {
 		ctx, cancel := context.WithTimeout(parent, conversationLookupTimeout)
-		record, err := r.store.FindLatestPartialConversation(ctx, result.APIKeyID, sessionID, result.ClientID)
+		record, err := r.store.FindLatestPendingConversation(ctx, result.APIKeyID, sessionID, result.ClientID)
 		cancel()
 		if err != nil {
 			log.Printf("[会话记录] 查询待续会话失败: %v", err)
 		} else if record != nil {
 			linkedState = conversationStateFromRecord(record)
 		}
+	}
+
+	if result.UserMessage == "" && result.AssistantMessage == "" && linkedState == nil {
+		return
 	}
 
 	var state *conversationInteractionState
@@ -707,19 +731,25 @@ func resolveConversationSessionID(body []byte) string {
 
 func resolveConversationSessionIDFromHeaders(headers http.Header, body []byte) string {
 	if headers != nil {
-		for _, name := range []string{"Session_id", "Conversation_id", "Idempotency-Key"} {
+		for _, name := range []string{"Session_id", "Conversation_id"} {
 			if normalized := normalizeConversationIdentifier(headers.Get(name), 255, "session"); normalized != "" {
 				return normalized
 			}
-		}
-		if affinity := resolveDownstreamAffinityID(headers); affinity != "" {
-			return normalizeConversationIdentifier(affinity, 255, "session")
 		}
 	}
 	if explicit := resolveConversationSessionID(body); explicit != "" {
 		return explicit
 	}
-	return normalizeConversationIdentifier(deriveContentSessionSeed(body), 255, "session")
+	if contentSeed := normalizeConversationIdentifier(deriveContentSessionSeed(body), 255, "session"); contentSeed != "" {
+		return contentSeed
+	}
+	if headers != nil {
+		if affinity := resolveDownstreamAffinityID(headers); affinity != "" {
+			return normalizeConversationIdentifier(affinity, 255, "session")
+		}
+		return normalizeConversationIdentifier(headers.Get("Idempotency-Key"), 255, "session")
+	}
+	return ""
 }
 
 func extractCurrentConversationUserMessage(body []byte) string {
@@ -813,11 +843,17 @@ func isConversationToolCallType(itemType string) bool {
 func responseOutputAwaitsToolOutput(output gjson.Result) bool {
 	items := output.Array()
 	for index := len(items) - 1; index >= 0; index-- {
-		itemType := strings.ToLower(strings.TrimSpace(items[index].Get("type").String()))
-		if itemType == "" || itemType == "reasoning" {
+		item := items[index]
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		if itemType == "" || itemType == "reasoning" || isConversationCommentaryItem(item) {
 			continue
 		}
-		return isConversationToolCallType(itemType)
+		if isConversationToolCallType(itemType) {
+			return true
+		}
+		if itemType == "message" || strings.EqualFold(item.Get("role").String(), "assistant") {
+			return false
+		}
 	}
 	return false
 }
@@ -836,6 +872,10 @@ func visibleResponseItemText(item gjson.Result) string {
 	if item.Get("type").String() != "message" && item.Get("role").String() != "assistant" {
 		return ""
 	}
+	phase := strings.ToLower(strings.TrimSpace(item.Get("phase").String()))
+	if phase != "" && phase != "final_answer" && phase != "final" {
+		return ""
+	}
 	parts := make([]string, 0, 2)
 	for _, content := range item.Get("content").Array() {
 		contentType := strings.ToLower(content.Get("type").String())
@@ -847,4 +887,26 @@ func visibleResponseItemText(item gjson.Result) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+func responseOutputHasNonFinalAssistant(output gjson.Result) bool {
+	for _, item := range output.Array() {
+		if isConversationNonFinalAssistantItem(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func isConversationNonFinalAssistantItem(item gjson.Result) bool {
+	if item.Get("type").String() != "message" && !strings.EqualFold(item.Get("role").String(), "assistant") {
+		return false
+	}
+	phase := strings.ToLower(strings.TrimSpace(item.Get("phase").String()))
+	return phase != "" && phase != "final_answer" && phase != "final"
+}
+
+func isConversationCommentaryItem(item gjson.Result) bool {
+	phase := strings.ToLower(strings.TrimSpace(item.Get("phase").String()))
+	return phase == "commentary" || phase == "analysis" || phase == "reasoning"
 }

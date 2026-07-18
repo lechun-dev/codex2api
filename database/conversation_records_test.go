@@ -130,9 +130,28 @@ func TestConversationRecordsSQLiteSaveUpdateAndLookup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("partial SaveConversationRecord error: %v", err)
 	}
-	partial, err := db.FindLatestPartialConversation(ctx, 7, "session-partial", "client-1")
+	partial, err := db.FindLatestPendingConversation(ctx, 7, "session-partial", "client-1")
 	if err != nil || partial == nil || partial.RequestID != "request-partial" {
-		t.Fatalf("FindLatestPartialConversation = %#v, err=%v", partial, err)
+		t.Fatalf("FindLatestPendingConversation = %#v, err=%v", partial, err)
+	}
+
+	if err := db.SaveConversationRecord(ctx, ConversationRecordInput{
+		RequestID:   "request-completed-empty",
+		SessionID:   "session-completed-empty",
+		APIKeyID:    7,
+		ClientID:    "client-1",
+		ResponseID:  "resp-completed-empty",
+		UserMessage: "run another tool",
+		Status:      ConversationStatusCompleted,
+		StatusCode:  200,
+		CreatedAt:   completedAt,
+		UpdatedAt:   completedAt,
+	}); err != nil {
+		t.Fatalf("completed empty SaveConversationRecord error: %v", err)
+	}
+	pending, err := db.FindLatestPendingConversation(ctx, 7, "session-completed-empty", "client-1")
+	if err != nil || pending == nil || pending.RequestID != "request-completed-empty" {
+		t.Fatalf("completed empty pending conversation = %#v, err=%v", pending, err)
 	}
 }
 

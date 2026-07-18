@@ -472,16 +472,21 @@ func (db *DB) FindConversationByResponseID(ctx context.Context, apiKeyID int64, 
 	return record, err
 }
 
-func (db *DB) FindLatestPartialConversation(ctx context.Context, apiKeyID int64, sessionID, clientID string) (*ConversationRecord, error) {
+// FindLatestPendingConversation finds the interaction that should receive a
+// tool continuation. A completed row without assistant text is included
+// because some Responses variants omit enough tool metadata to mark the
+// intermediate turn partial.
+func (db *DB) FindLatestPendingConversation(ctx context.Context, apiKeyID int64, sessionID, clientID string) (*ConversationRecord, error) {
 	if db == nil || strings.TrimSpace(sessionID) == "" {
 		return nil, nil
 	}
 	query := conversationRecordSelect + `
-		WHERE api_key_id=$1 AND session_id=$2 AND status=$3
+		WHERE api_key_id=$1 AND session_id=$2
+		  AND (status=$3 OR (status=$4 AND COALESCE(assistant_message, '')=''))
 	`
-	args := []interface{}{apiKeyID, sessionID, ConversationStatusPartial}
+	args := []interface{}{apiKeyID, sessionID, ConversationStatusPartial, ConversationStatusCompleted}
 	if strings.TrimSpace(clientID) != "" {
-		query += ` AND client_id=$4`
+		query += ` AND client_id=$5`
 		args = append(args, clientID)
 	}
 	query += ` ORDER BY id DESC LIMIT 1`

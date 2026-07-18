@@ -330,7 +330,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `REDIS_TLS` | 是否为 `host:port` 形式的 Redis 启用 TLS；使用 `rediss://` 时会自动启用 |
 | `REDIS_INSECURE_SKIP_VERIFY` | 跳过 Redis TLS 证书校验，默认 `false`，仅用于自签证书或排障 |
 | `CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT` | 是否把 `session_id` / `conversation_id` / `previous_response_id` / `request_text` 写入 `usage_logs`；默认 `false` |
-| `CODEX_CONVERSATION_RECORDING_ENABLED` | 是否把用户消息与 AI 可见回复明文写入独立 `conversation_records` 表；默认 `true`，记录不会自动过期 |
+| `CODEX_CONVERSATION_RECORDING_ENABLED` | 是否把用户消息与 AI 最终回复明文写入独立 `conversation_records` 表；默认 `true`，不记录 commentary/工具调用中间输出，记录不会自动过期 |
 | `CODEX_USAGE_LOG_MASTER_KEY` | 可选；`usage_logs.request_text` 写库前加密用的 base64 编码 32 字节密钥 |
 | `CODEX_DOWNLOADS_DIR` | 工具包物理目录；配置后 `/downloads/*.zip` 优先从该目录读取，推荐 `/deploy/codex2api/downloads` |
 | `TZ` | 时区，例如 `Asia/Shanghai` |

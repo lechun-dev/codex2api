@@ -2,8 +2,12 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -157,5 +161,63 @@ func TestConversationMySQLDDLIsMySQL56Compatible(t *testing.T) {
 		if !strings.Contains(ddl, required) {
 			t.Fatalf("MySQL DDL missing %q", required)
 		}
+	}
+}
+
+func TestConversationMySQLDDLMatchesStandaloneScript(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_conversation_records.sql"))
+	if err != nil {
+		t.Fatalf("read standalone MySQL DDL: %v", err)
+	}
+	normalize := func(value string) string {
+		return strings.Join(strings.Fields(value), " ")
+	}
+	if !strings.Contains(normalize(string(script)), normalize(strings.TrimSpace(conversationRecordsMySQLDDL))) {
+		t.Fatal("standalone MySQL DDL differs from the embedded conversation_records DDL")
+	}
+}
+
+func TestSaveConversationRecordUsesMySQL56PlaceholderRewrite(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-conversation-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	now := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
+	if err := db.SaveConversationRecord(context.Background(), ConversationRecordInput{
+		RequestID:        "request-mysql56",
+		SessionID:        "session-mysql56",
+		APIKeyID:         8,
+		APIKeyName:       "production",
+		ClientID:         "client-mysql56",
+		ClientIP:         "127.0.0.1",
+		ResponseID:       "resp-mysql56",
+		Endpoint:         "/v1/responses",
+		Model:            "gpt-5.4",
+		UserMessage:      "user message",
+		AssistantMessage: "assistant message",
+		Status:           ConversationStatusCompleted,
+		StatusCode:       200,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		CompletedAt:      &now,
+	}); err != nil {
+		t.Fatalf("SaveConversationRecord() error = %v", err)
+	}
+
+	if strings.Contains(capture.query, "$1") || strings.Count(capture.query, "?") != 20 {
+		t.Fatalf("unexpected rewritten MySQL query: %s", capture.query)
+	}
+	if len(capture.args) != 20 {
+		t.Fatalf("rewritten MySQL argument count = %d, want 20", len(capture.args))
+	}
+	if capture.args[0].Value != "session-mysql56" || capture.args[19].Value != "request-mysql56" {
+		t.Fatalf("rewritten MySQL argument order is wrong: first=%#v last=%#v", capture.args[0].Value, capture.args[19].Value)
 	}
 }

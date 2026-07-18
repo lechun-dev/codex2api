@@ -20,11 +20,13 @@ import (
 )
 
 const (
-	conversationWorkQueueSize  = 4096
-	conversationLinkTTL        = 24 * time.Hour
-	conversationLinkMaxEntries = 50000
-	conversationLookupTimeout  = 3 * time.Second
-	conversationWriteTimeout   = 15 * time.Second
+	conversationWorkQueueSize     = 4096
+	conversationWorkQueueMaxBytes = 64 * 1024 * 1024
+	conversationLinkTTL           = 24 * time.Hour
+	conversationLinkMaxEntries    = 50000
+	conversationLookupTimeout     = 3 * time.Second
+	conversationWriteTimeout      = 15 * time.Second
+	conversationCloseDrainTimeout = 15 * time.Second
 )
 
 type conversationRecordStore interface {
@@ -44,14 +46,14 @@ type conversationRecorder struct {
 	closed bool
 	wg     sync.WaitGroup
 
-	byResponse map[string]conversationCachedLink
-	bySession  map[string]conversationCachedLink
-	dropLogAt  atomic.Int64
+	byResponse     map[string]*conversationCachedLink
+	queueByteLimit int64
+	queuedBytes    atomic.Int64
+	dropLogAt      atomic.Int64
 }
 
 type conversationCachedLink struct {
-	state     *conversationInteractionState
-	status    string
+	sessionID string
 	expiresAt time.Time
 }
 
@@ -105,6 +107,7 @@ type conversationTurnResult struct {
 	OutputTokens       int
 	DurationMs         int
 	RequestErr         error
+	queuedBytes        int64
 }
 
 func newConversationRecorder(store conversationRecordStore) *conversationRecorder {
@@ -112,11 +115,11 @@ func newConversationRecorder(store conversationRecordStore) *conversationRecorde
 		return nil
 	}
 	r := &conversationRecorder{
-		store:      store,
-		workCh:     make(chan conversationTurnResult, conversationWorkQueueSize),
-		stopCh:     make(chan struct{}),
-		byResponse: make(map[string]conversationCachedLink),
-		bySession:  make(map[string]conversationCachedLink),
+		store:          store,
+		workCh:         make(chan conversationTurnResult, conversationWorkQueueSize),
+		stopCh:         make(chan struct{}),
+		byResponse:     make(map[string]*conversationCachedLink),
+		queueByteLimit: conversationWorkQueueMaxBytes,
 	}
 	r.wg.Add(1)
 	go r.run()
@@ -139,18 +142,58 @@ func (r *conversationRecorder) Close() {
 func (r *conversationRecorder) run() {
 	defer r.wg.Done()
 	for {
+		// Prioritize shutdown before taking another queued item so a full queue
+		// cannot postpone the bounded drain phase indefinitely.
+		select {
+		case <-r.stopCh:
+			r.drainPending()
+			return
+		default:
+		}
 		select {
 		case result := <-r.workCh:
-			r.persistTurn(result)
+			r.processTurn(context.Background(), result)
 		case <-r.stopCh:
-			for {
-				select {
-				case result := <-r.workCh:
-					r.persistTurn(result)
-				default:
-					return
-				}
+			r.drainPending()
+			return
+		}
+	}
+}
+
+func (r *conversationRecorder) drainPending() {
+	drainCtx, cancel := context.WithTimeout(context.Background(), conversationCloseDrainTimeout)
+	defer cancel()
+	for {
+		if drainCtx.Err() != nil {
+			r.discardPending()
+			return
+		}
+		select {
+		case result := <-r.workCh:
+			r.processTurn(drainCtx, result)
+		default:
+			return
+		}
+	}
+}
+
+func (r *conversationRecorder) processTurn(ctx context.Context, result conversationTurnResult) {
+	defer r.queuedBytes.Add(-result.queuedBytes)
+	r.persistTurn(ctx, result)
+}
+
+func (r *conversationRecorder) discardPending() {
+	dropped := 0
+	for {
+		select {
+		case result := <-r.workCh:
+			r.queuedBytes.Add(-result.queuedBytes)
+			dropped++
+		default:
+			if dropped > 0 {
+				log.Printf("[会话记录] 关闭排空超时，已跳过 %d 条待写记录", dropped)
 			}
+			return
 		}
 	}
 }
@@ -159,18 +202,52 @@ func (r *conversationRecorder) enqueue(result conversationTurnResult) bool {
 	if r == nil {
 		return false
 	}
+	result.queuedBytes = conversationResultPayloadBytes(result)
+	if !r.reserveQueueBytes(result.queuedBytes) {
+		r.logQueueDrop()
+		return false
+	}
 	r.close.Lock()
 	defer r.close.Unlock()
 	if r.closed {
+		r.queuedBytes.Add(-result.queuedBytes)
 		return false
 	}
 	select {
 	case r.workCh <- result:
 		return true
 	default:
+		r.queuedBytes.Add(-result.queuedBytes)
 		r.logQueueDrop()
 		return false
 	}
+}
+
+func (r *conversationRecorder) reserveQueueBytes(size int64) bool {
+	if size <= 0 {
+		size = 1
+	}
+	limit := r.queueByteLimit
+	if limit <= 0 {
+		limit = conversationWorkQueueMaxBytes
+	}
+	for {
+		current := r.queuedBytes.Load()
+		if size > limit-current {
+			return false
+		}
+		if r.queuedBytes.CompareAndSwap(current, current+size) {
+			return true
+		}
+	}
+}
+
+func conversationResultPayloadBytes(result conversationTurnResult) int64 {
+	size := len(result.UserMessage) + len(result.AssistantMessage)
+	if size == 0 {
+		return 1
+	}
+	return int64(size)
 }
 
 func (r *conversationRecorder) logQueueDrop() {
@@ -335,47 +412,81 @@ func (t *conversationTurn) finish(input *database.UsageLogInput, requestErr erro
 	})
 }
 
-func (r *conversationRecorder) persistTurn(result conversationTurnResult) {
+// finishFallback records valid requests that leave the handler before the
+// normal usage-log completion path, such as account exhaustion or a transport
+// failure before the first upstream event. A normal finish sets t.finished and
+// makes this method a no-op.
+func (t *conversationTurn) finishFallback(c *gin.Context) {
+	if t == nil || t.finished || c == nil {
+		return
+	}
+	statusCode := c.Writer.Status()
+	if statusCode <= 0 {
+		statusCode = http.StatusInternalServerError
+	}
+	var requestErr error
+	if c.Request != nil {
+		requestErr = c.Request.Context().Err()
+	}
+	t.finish(&database.UsageLogInput{
+		Endpoint:        t.endpoint,
+		InboundEndpoint: t.endpoint,
+		Model:           t.model,
+		StatusCode:      statusCode,
+		DurationMs:      int(time.Since(t.startedAt).Milliseconds()),
+	}, requestErr)
+}
+
+func (r *conversationRecorder) persistTurn(parent context.Context, result conversationTurnResult) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	result.PreviousResponseID = normalizeConversationIdentifier(result.PreviousResponseID, 255, "resp")
 	result.ResponseID = normalizeConversationIdentifier(result.ResponseID, 255, "resp")
 
-	link := r.cachedByResponse(result.APIKeyID, result.PreviousResponseID)
-	if link == nil && result.PreviousResponseID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), conversationLookupTimeout)
+	cachedLink := r.cachedByResponse(result.APIKeyID, result.PreviousResponseID)
+	var linkedState *conversationInteractionState
+	if result.PreviousResponseID != "" && (cachedLink == nil || result.UserMessage == "") {
+		ctx, cancel := context.WithTimeout(parent, conversationLookupTimeout)
 		record, err := r.store.FindConversationByResponseID(ctx, result.APIKeyID, result.PreviousResponseID)
 		cancel()
 		if err != nil {
 			log.Printf("[会话记录] 查询响应链失败: %v", err)
 		} else if record != nil {
-			link = conversationStateFromRecord(record)
+			cachedLink = &conversationCachedLink{
+				sessionID: record.SessionID,
+				expiresAt: time.Now().Add(conversationLinkTTL),
+			}
+			if result.UserMessage == "" && record.Status == database.ConversationStatusPartial {
+				linkedState = conversationStateFromRecord(record)
+			}
 		}
 	}
 
 	sessionID := result.ExplicitSessionID
-	if link != nil {
-		sessionID = link.record.SessionID
+	sessionKnown := sessionID != ""
+	if cachedLink != nil {
+		sessionID = cachedLink.sessionID
+		sessionKnown = true
 	}
 	if sessionID == "" {
 		sessionID = uuid.NewString()
 	}
 	sessionID = normalizeConversationIdentifier(sessionID, 255, "session")
 
-	if link == nil && result.UserMessage == "" {
-		link = r.cachedBySession(result.APIKeyID, sessionID, result.ClientID)
-	}
-	if link == nil && result.UserMessage == "" && result.ExplicitSessionID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), conversationLookupTimeout)
+	if linkedState == nil && result.UserMessage == "" && sessionKnown {
+		ctx, cancel := context.WithTimeout(parent, conversationLookupTimeout)
 		record, err := r.store.FindLatestPartialConversation(ctx, result.APIKeyID, sessionID, result.ClientID)
 		cancel()
 		if err != nil {
 			log.Printf("[会话记录] 查询待续会话失败: %v", err)
 		} else if record != nil {
-			link = conversationStateFromRecord(record)
+			linkedState = conversationStateFromRecord(record)
 		}
 	}
 
 	var state *conversationInteractionState
-	if result.UserMessage != "" || link == nil {
+	if result.UserMessage != "" || linkedState == nil {
 		state = &conversationInteractionState{record: database.ConversationRecordInput{
 			RequestID:   uuid.NewString(),
 			SessionID:   sessionID,
@@ -389,7 +500,7 @@ func (r *conversationRecorder) persistTurn(result conversationTurnResult) {
 			CreatedAt:   result.StartedAt,
 		}}
 	} else {
-		state = link
+		state = linkedState
 	}
 
 	now := time.Now().UTC()
@@ -430,22 +541,36 @@ func (r *conversationRecorder) persistTurn(result conversationTurnResult) {
 		record.CompletedAt = &completedAt
 	}
 
+	r.saveRecord(parent, *record)
 	r.cacheState(state, result.PreviousResponseID, result.ResponseID)
-	r.saveRecord(*record)
 }
 
-func (r *conversationRecorder) saveRecord(input database.ConversationRecordInput) {
+func (r *conversationRecorder) saveRecord(parent context.Context, input database.ConversationRecordInput) bool {
+	ctx, cancel := context.WithTimeout(parent, conversationWriteTimeout)
+	defer cancel()
 	var err error
+	attempts := 0
+retryLoop:
 	for attempt := 0; attempt < 3; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), conversationWriteTimeout)
+		attempts++
 		err = r.store.SaveConversationRecord(ctx, input)
-		cancel()
 		if err == nil {
-			return
+			return true
 		}
-		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+		if ctx.Err() != nil {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			err = ctx.Err()
+			break retryLoop
+		case <-timer.C:
+		}
 	}
-	log.Printf("[会话记录] 写入失败（已重试3次）: request_id=%s err=%v", input.RequestID, err)
+	log.Printf("[会话记录] 写入失败（已尝试%d次）: request_id=%s err=%v", attempts, input.RequestID, err)
+	return false
 }
 
 func conversationTurnStatus(result conversationTurnResult) string {
@@ -498,49 +623,35 @@ func conversationStateFromRecord(record *database.ConversationRecord) *conversat
 	}}
 }
 
-func (r *conversationRecorder) cachedByResponse(apiKeyID int64, responseID string) *conversationInteractionState {
+func (r *conversationRecorder) cachedByResponse(apiKeyID int64, responseID string) *conversationCachedLink {
 	if responseID == "" {
 		return nil
 	}
 	key := conversationResponseCacheKey(apiKeyID, responseID)
 	link, ok := r.byResponse[key]
-	if !ok || time.Now().After(link.expiresAt) {
+	if !ok || link == nil || time.Now().After(link.expiresAt) {
 		delete(r.byResponse, key)
 		return nil
 	}
-	return link.state
-}
-
-func (r *conversationRecorder) cachedBySession(apiKeyID int64, sessionID, clientID string) *conversationInteractionState {
-	if sessionID == "" {
-		return nil
-	}
-	key := conversationSessionCacheKey(apiKeyID, sessionID, clientID)
-	link, ok := r.bySession[key]
-	if !ok || time.Now().After(link.expiresAt) {
-		delete(r.bySession, key)
-		return nil
-	}
-	if link.state == nil || link.status != database.ConversationStatusPartial {
-		return nil
-	}
-	return link.state
+	return link
 }
 
 func (r *conversationRecorder) cacheState(state *conversationInteractionState, responseIDs ...string) {
 	expiresAt := time.Now().Add(conversationLinkTTL)
-	link := conversationCachedLink{state: state, status: state.record.Status, expiresAt: expiresAt}
+	link := &conversationCachedLink{
+		sessionID: state.record.SessionID,
+		expiresAt: expiresAt,
+	}
 	for _, responseID := range responseIDs {
 		if responseID = strings.TrimSpace(responseID); responseID != "" {
 			r.byResponse[conversationResponseCacheKey(state.record.APIKeyID, responseID)] = link
 		}
 	}
-	r.bySession[conversationSessionCacheKey(state.record.APIKeyID, state.record.SessionID, state.record.ClientID)] = link
 	r.pruneCache()
 }
 
 func (r *conversationRecorder) pruneCache() {
-	if len(r.byResponse)+len(r.bySession) <= conversationLinkMaxEntries {
+	if len(r.byResponse) <= conversationLinkMaxEntries {
 		return
 	}
 	now := time.Now()
@@ -549,31 +660,16 @@ func (r *conversationRecorder) pruneCache() {
 			delete(r.byResponse, key)
 		}
 	}
-	for key, link := range r.bySession {
-		if now.After(link.expiresAt) {
-			delete(r.bySession, key)
-		}
-	}
-	for len(r.byResponse)+len(r.bySession) > conversationLinkMaxEntries {
+	for len(r.byResponse) > conversationLinkMaxEntries {
 		for key := range r.byResponse {
 			delete(r.byResponse, key)
 			break
-		}
-		if len(r.byResponse) == 0 {
-			for key := range r.bySession {
-				delete(r.bySession, key)
-				break
-			}
 		}
 	}
 }
 
 func conversationResponseCacheKey(apiKeyID int64, responseID string) string {
 	return strings.Join([]string{strconv.FormatInt(apiKeyID, 10), responseID}, "\x00")
-}
-
-func conversationSessionCacheKey(apiKeyID int64, sessionID, clientID string) string {
-	return strings.Join([]string{strconv.FormatInt(apiKeyID, 10), sessionID, clientID}, "\x00")
 }
 
 func normalizeConversationIdentifier(value string, maxLen int, prefix string) string {
@@ -611,7 +707,7 @@ func resolveConversationSessionID(body []byte) string {
 
 func resolveConversationSessionIDFromHeaders(headers http.Header, body []byte) string {
 	if headers != nil {
-		for _, name := range []string{"Session_id", "Conversation_id"} {
+		for _, name := range []string{"Session_id", "Conversation_id", "Idempotency-Key"} {
 			if normalized := normalizeConversationIdentifier(headers.Get(name), 255, "session"); normalized != "" {
 				return normalized
 			}
@@ -620,7 +716,10 @@ func resolveConversationSessionIDFromHeaders(headers http.Header, body []byte) s
 			return normalizeConversationIdentifier(affinity, 255, "session")
 		}
 	}
-	return resolveConversationSessionID(body)
+	if explicit := resolveConversationSessionID(body); explicit != "" {
+		return explicit
+	}
+	return normalizeConversationIdentifier(deriveContentSessionSeed(body), 255, "session")
 }
 
 func extractCurrentConversationUserMessage(body []byte) string {

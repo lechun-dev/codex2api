@@ -1774,6 +1774,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	conversation := h.beginConversationTurn(c, rawBody)
+	defer conversation.finishFallback(c)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
@@ -3411,6 +3412,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	conversation := h.beginConversationTurn(c, rawBody)
+	defer conversation.finishFallback(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	serviceTier := extractServiceTier(rawBody)

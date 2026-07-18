@@ -115,6 +115,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	conversation := h.beginConversationTurn(c, rawBody)
+	defer conversation.finishFallback(c)
 
 	// 2. 翻译请求: Anthropic → Codex
 	modelMappingJSON := h.store.GetModelMapping()

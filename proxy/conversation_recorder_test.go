@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"sync"
@@ -139,6 +140,38 @@ func TestConversationTurnReusesParsedResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestConversationTurnFallbackRecordsEarlyFailureOnce(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(writer)
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no account"})
+
+	turn := &conversationTurn{
+		recorder:    recorder,
+		startedAt:   time.Now().UTC(),
+		apiKeyID:    4,
+		endpoint:    "/v1/responses",
+		model:       "gpt-5.4",
+		userMessage: "please answer",
+	}
+	turn.finishFallback(c)
+	turn.finishFallback(c)
+	recorder.Close()
+
+	snapshots := store.snapshots()
+	if len(snapshots) != 1 {
+		t.Fatalf("saved snapshots = %d, want one", len(snapshots))
+	}
+	if snapshots[0].UserMessage != "please answer" ||
+		snapshots[0].Status != database.ConversationStatusFailed ||
+		snapshots[0].StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("fallback snapshot = %#v", snapshots[0])
+	}
+}
+
 func TestConversationRecorderFoldsToolContinuationsAndDrainsOnClose(t *testing.T) {
 	store := newFakeConversationRecordStore()
 	recorder := newConversationRecorder(store)
@@ -197,7 +230,7 @@ func TestConversationRecorderFoldsToolContinuationsAndDrainsOnClose(t *testing.T
 }
 
 func TestConversationRecorderQueueFullDoesNotBlock(t *testing.T) {
-	recorder := &conversationRecorder{workCh: make(chan conversationTurnResult, 1)}
+	recorder := &conversationRecorder{workCh: make(chan conversationTurnResult, 1), queueByteLimit: 1024}
 	if !recorder.enqueue(conversationTurnResult{}) {
 		t.Fatal("first enqueue returned false")
 	}
@@ -207,6 +240,73 @@ func TestConversationRecorderQueueFullDoesNotBlock(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
 		t.Fatalf("full queue blocked for %s", elapsed)
+	}
+}
+
+func TestConversationRecorderQueuePayloadLimitDoesNotBlock(t *testing.T) {
+	recorder := &conversationRecorder{
+		workCh:         make(chan conversationTurnResult, 2),
+		queueByteLimit: 10,
+	}
+	if !recorder.enqueue(conversationTurnResult{UserMessage: "12345"}) {
+		t.Fatal("first enqueue returned false")
+	}
+	start := time.Now()
+	if recorder.enqueue(conversationTurnResult{AssistantMessage: "123456"}) {
+		t.Fatal("enqueue should be dropped when queued payload bytes exceed the limit")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("payload-limited queue blocked for %s", elapsed)
+	}
+	if got := recorder.queuedBytes.Load(); got != 5 {
+		t.Fatalf("queued bytes = %d, want 5", got)
+	}
+}
+
+func TestConversationCacheStoresOnlyLightweightSessionLink(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	if !recorder.enqueue(conversationTurnResult{
+		StartedAt:         time.Now().UTC(),
+		APIKeyID:          3,
+		ExplicitSessionID: "session-lightweight",
+		UserMessage:       "sensitive user content",
+		AssistantMessage:  "large assistant content",
+		ResponseID:        "resp-lightweight",
+		Terminal:          true,
+		StatusCode:        200,
+	}) {
+		t.Fatal("enqueue returned false")
+	}
+	recorder.Close()
+
+	link := recorder.byResponse[conversationResponseCacheKey(3, "resp-lightweight")]
+	if link == nil || link.sessionID != "session-lightweight" {
+		t.Fatalf("cached link = %#v", link)
+	}
+}
+
+func TestResolveConversationSessionIDUsesStableRequestIdentity(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("Idempotency-Key", "request-session")
+	if got := resolveConversationSessionIDFromHeaders(headers, []byte(`{"input":"hello"}`)); got != "request-session" {
+		t.Fatalf("idempotency session = %q", got)
+	}
+
+	first := []byte(`{"model":"gpt-5.4","messages":[
+		{"role":"user","content":"first question"},
+		{"role":"assistant","content":"first answer"},
+		{"role":"user","content":"follow up one"}
+	]}`)
+	second := []byte(`{"model":"gpt-5.4","messages":[
+		{"role":"user","content":"first question"},
+		{"role":"assistant","content":"first answer"},
+		{"role":"user","content":"follow up two"}
+	]}`)
+	firstID := resolveConversationSessionIDFromHeaders(nil, first)
+	secondID := resolveConversationSessionIDFromHeaders(nil, second)
+	if firstID == "" || firstID != secondID {
+		t.Fatalf("derived session IDs = %q / %q, want one stable non-empty ID", firstID, secondID)
 	}
 }
 

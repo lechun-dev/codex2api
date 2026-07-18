@@ -50,7 +50,10 @@ func main() {
 	}
 	defer db.Close()
 	if cfg.ConversationRecording {
-		if err := db.EnsureConversationRecords(context.Background()); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := db.EnsureConversationRecords(ctx)
+		cancel()
+		if err != nil {
 			log.Fatalf("初始化会话记录表失败: %v", err)
 		}
 	}
@@ -538,6 +541,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
+	handler.Close()
 	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()
 	store.Stop()

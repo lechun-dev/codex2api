@@ -144,6 +144,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	c.Set("raw_body", rawBody)
 	conversation := h.beginConversationTurn(c, rawBody)
+	defer conversation.finishFallback(c)
 	if mappedModel != "" {
 		model = mappedModel
 	}

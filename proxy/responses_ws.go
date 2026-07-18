@@ -143,6 +143,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	c.Set("raw_body", rawBody)
+	conversation := h.beginConversationTurn(c, rawBody)
 	if mappedModel != "" {
 		model = mappedModel
 	}
@@ -458,7 +459,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			fallbackLog = &wsHTTPFallback
 		}
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, conversation); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -519,6 +520,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	viaWebsocket bool,
 	fallbackLog *websocketHTTPFallbackState,
 	fallbackAttempt int,
+	conversation *conversationTurn,
 ) error {
 	SyncCodexUsageState(h.store, account, resp)
 
@@ -575,6 +577,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
+		conversation.observeResponsesEvent(eventType, parsed)
 		ttftGuard.MarkProgress(eventType)
 		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 		if !ttftRecorded && isFirstToken {
@@ -749,6 +752,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		logInput.CachedTokens = usage.CachedTokens
 	}
 	applyImageUsageLogInfo(logInput, imageLogInfo)
+	conversation.finish(logInput, c.Request.Context().Err())
 	h.logUsageForRequest(c, logInput)
 
 	resp.Body.Close()

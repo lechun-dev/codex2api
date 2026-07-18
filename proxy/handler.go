@@ -54,6 +54,7 @@ type Handler struct {
 	apiKeyGateMu sync.Mutex
 	promptRiskMu sync.Mutex
 	apiKeyGate   *apiKeyConcurrencyLimiter
+	convRecorder *conversationRecorder
 }
 
 const (
@@ -430,13 +431,24 @@ func noAvailableAnthropicAccountMessage(model string) string {
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
-	return &Handler{
+	handler := &Handler{
 		store:      store,
 		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
 		db:         db,
 		cfg:        cfg,
 		deviceCfg:  deviceCfg,
 		apiKeyGate: newAPIKeyConcurrencyLimiter(),
+	}
+	if db != nil && cfg != nil && cfg.ConversationRecording {
+		handler.convRecorder = newConversationRecorder(db)
+	}
+	return handler
+}
+
+// Close drains pending conversation records before the database is closed.
+func (h *Handler) Close() {
+	if h != nil && h.convRecorder != nil {
+		h.convRecorder.Close()
 	}
 }
 
@@ -1761,6 +1773,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	conversation := h.beginConversationTurn(c, rawBody)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
@@ -2090,6 +2103,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
+					conversation.observeResponsesEvent(eventType, parsed)
 					ttftGuard.MarkProgress(eventType)
 					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 					if !ttftRecorded && isFirstToken {
@@ -2145,6 +2159,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					conversation.observeResponsesObject(gjson.ParseBytes(respBody))
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
@@ -2260,6 +2275,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logInput.CachedTokens = usage.CachedTokens
 			}
 			applyImageUsageLogInfo(logInput, imageLogInfo)
+			conversation.finish(logInput, c.Request.Context().Err())
 			h.logUsageForRequest(c, logInput)
 
 			resp.Body.Close()
@@ -2487,6 +2503,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			forward := func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 
 				// TTFT: 记录第一个实际内容事件的时间
 				ttftGuard.MarkProgress(eventType)
@@ -2622,6 +2639,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
 					outputItems = append(outputItems, outputItem)
 				}
@@ -2790,6 +2808,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
+		conversation.finish(logInput, c.Request.Context().Err())
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
@@ -3391,6 +3410,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	conversation := h.beginConversationTurn(c, rawBody)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	serviceTier := extractServiceTier(rawBody)
@@ -3705,6 +3725,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				chunk, done := streamTranslator.TranslateParsed(parsed)
 
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 				ttftGuard.MarkProgress(eventType)
 				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 				if !ttftRecorded && isFirstToken {
@@ -3792,6 +3813,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 				ttftGuard.MarkProgress(eventType)
 				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
@@ -3947,6 +3969,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		conversation.finish(logInput, c.Request.Context().Err())
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

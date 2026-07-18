@@ -126,6 +126,7 @@ type Config struct {
 	MaxRequestBodySize     int
 	UsageLogCaptureContent bool   // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
 	UsageLogMasterKey      []byte // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
+	ConversationRecording  bool   // 是否把用户消息和 AI 可见回复明文写入独立会话记录表；默认 true
 	DownloadsDir           string // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
 	Database               DatabaseConfig
 	Cache                  CacheConfig
@@ -143,8 +144,9 @@ func Load(envPath string) (*Config, error) {
 	_ = godotenv.Load(envPath)
 
 	cfg := &Config{
-		Port:               8080,
-		MaxRequestBodySize: 48 * 1024 * 1024,
+		Port:                  8080,
+		MaxRequestBodySize:    48 * 1024 * 1024,
+		ConversationRecording: true,
 	}
 
 	// Web服务端口
@@ -168,6 +170,9 @@ func Load(envPath string) (*Config, error) {
 		}
 	}
 	cfg.UsageLogCaptureContent = parseBoolEnv(os.Getenv("CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT"))
+	if value, exists := os.LookupEnv("CODEX_CONVERSATION_RECORDING_ENABLED"); exists && strings.TrimSpace(value) != "" {
+		cfg.ConversationRecording = parseBoolEnv(value)
+	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_USAGE_LOG_MASTER_KEY")); v != "" {
 		key, err := parseUsageLogMasterKeyEnv(v)
 		if err != nil {

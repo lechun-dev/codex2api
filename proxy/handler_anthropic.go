@@ -114,6 +114,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	conversation := h.beginConversationTurn(c, rawBody)
 
 	// 2. 翻译请求: Anthropic → Codex
 	modelMappingJSON := h.store.GetModelMapping()
@@ -404,6 +405,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 
 				// TTFT 跟踪
 				ttftGuard.MarkProgress(eventType)
@@ -487,6 +489,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				conversation.observeResponsesEvent(eventType, parsed)
 				accumulator.apply(translator.translateEvent(data))
 
 				ttftGuard.MarkProgress(eventType)
@@ -623,6 +626,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		conversation.finish(logInput, c.Request.Context().Err())
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()

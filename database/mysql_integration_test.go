@@ -21,6 +21,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		t.Fatalf("New(mysql) failed: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	if err := db.EnsureConversationRecords(ctx); err != nil {
+		t.Fatalf("EnsureConversationRecords failed: %v", err)
+	}
 
 	suffix := time.Now().UTC().Format("20060102150405.000000000")
 	smokeKey := "sk-mysql-smoke-" + suffix
@@ -29,6 +32,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	modelID := "mysql-smoke-model-" + suffix
 	templateName := "mysql-smoke-template-" + suffix
 	clientUserAgent := "mysql-smoke-client/" + suffix
+	conversationRequestID := "mysql-smoke-conversation-" + suffix
 	previousSettings, err := db.GetSystemSettings(ctx)
 	if err != nil {
 		t.Fatalf("GetSystemSettings before smoke failed: %v", err)
@@ -50,6 +54,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 			_, _ = db.conn.ExecContext(ctx, "DELETE FROM prompt_filter_secrets WHERE id = 1")
 		}
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM usage_logs WHERE client_user_agent = ?", clientUserAgent)
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM conversation_records WHERE request_id = ?", conversationRequestID)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id IN (SELECT id FROM account_groups WHERE name = ?)", groupName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM image_prompt_templates WHERE name = ?", templateName)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM model_registry WHERE id = ?", modelID)
@@ -273,6 +278,34 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	}
 	if savedClientUA != clientUserAgent || savedUpstreamUA != "mysql-smoke-upstream/"+suffix || !savedOverridden {
 		t.Fatalf("unexpected usage-log audit fields: client=%q upstream=%q overridden=%v", savedClientUA, savedUpstreamUA, savedOverridden)
+	}
+
+	conversationNow := time.Now().UTC()
+	if err := db.SaveConversationRecord(ctx, ConversationRecordInput{
+		RequestID:        conversationRequestID,
+		SessionID:        "mysql-smoke-session-" + suffix,
+		APIKeyID:         keyID,
+		APIKeyName:       "mysql smoke key",
+		ClientID:         "mysql-smoke-client",
+		ResponseID:       "resp-mysql-smoke-" + suffix,
+		Endpoint:         "/v1/responses",
+		Model:            "gpt-5.4",
+		UserMessage:      "MySQL 5.6 user message",
+		AssistantMessage: "MySQL 5.6 assistant message",
+		Status:           ConversationStatusCompleted,
+		StatusCode:       200,
+		CreatedAt:        conversationNow,
+		UpdatedAt:        conversationNow,
+		CompletedAt:      &conversationNow,
+	}); err != nil {
+		t.Fatalf("SaveConversationRecord failed: %v", err)
+	}
+	savedConversation, err := db.FindConversationByResponseID(ctx, keyID, "resp-mysql-smoke-"+suffix)
+	if err != nil {
+		t.Fatalf("FindConversationByResponseID failed: %v", err)
+	}
+	if savedConversation == nil || savedConversation.AssistantMessage != "MySQL 5.6 assistant message" {
+		t.Fatalf("unexpected conversation record: %#v", savedConversation)
 	}
 
 	responsesID, err := db.InsertOpenAIResponsesAccount(ctx, "mysql smoke responses "+suffix, map[string]interface{}{

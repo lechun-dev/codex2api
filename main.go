@@ -49,6 +49,11 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if cfg.ConversationRecording {
+		if err := db.EnsureConversationRecords(context.Background()); err != nil {
+			log.Fatalf("初始化会话记录表失败: %v", err)
+		}
+	}
 	if err := db.SetUsageLogRequestTextMasterKey(cfg.UsageLogMasterKey); err != nil {
 		log.Fatalf("usage log request_text 加密配置失败: %v", err)
 	}
@@ -317,6 +322,7 @@ func main() {
 	// 从环境变量读取 Codex 画像与 Beta 配置。
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
+	defer handler.Close()
 	handler.SetRuntimeCache(tc)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）

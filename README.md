@@ -279,6 +279,7 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | `REDIS_TLS` | Enable TLS for `host:port` Redis addresses |
 | `REDIS_INSECURE_SKIP_VERIFY` | Skip Redis TLS certificate verification, default `false` |
 | `CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT` | Capture `session_id` / `conversation_id` / `previous_response_id` / `request_text` into `usage_logs`; default `false` |
+| `CODEX_CONVERSATION_RECORDING_ENABLED` | Store user messages and visible assistant replies as plaintext in the independent `conversation_records` table; default `true`, records do not expire automatically |
 | `CODEX_USAGE_LOG_MASTER_KEY` | Optional base64-encoded 32-byte key for encrypting `usage_logs.request_text` before storage |
 | `CODEX_DOWNLOADS_DIR` | Physical toolkit directory; when set, `/downloads/*.zip` is served from this path first, recommended: `/deploy/codex2api/downloads` |
 | `TZ` | Timezone, for example `Asia/Shanghai` |

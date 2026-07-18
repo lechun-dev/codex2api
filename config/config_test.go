@@ -11,6 +11,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",
@@ -63,6 +64,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
 	}
+	if !cfg.ConversationRecording {
+		t.Fatal("ConversationRecording = false, want default true")
+	}
 	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
 		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)
 	}
@@ -73,6 +77,7 @@ func TestLoadAllowsExplicitSQLiteAndMemory(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",
@@ -123,6 +128,7 @@ func TestLoadAllowsExplicitMySQL(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",
@@ -179,6 +185,7 @@ func TestLoadReadsAdminSecretFromEnv(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",
@@ -222,6 +229,7 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",
@@ -289,6 +297,22 @@ func TestLoadReadsUsageLogCaptureContentFromEnv(t *testing.T) {
 	}
 	if !cfg.UsageLogCaptureContent {
 		t.Fatal("UsageLogCaptureContent = false, want true")
+	}
+}
+
+func TestLoadCanDisableConversationRecording(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_CONVERSATION_RECORDING_ENABLED", "false")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.ConversationRecording {
+		t.Fatal("ConversationRecording = true, want false")
 	}
 }
 
@@ -389,6 +413,7 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
 		"CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT",
+		"CODEX_CONVERSATION_RECORDING_ENABLED",
 		"CODEX_USAGE_LOG_MASTER_KEY",
 		"CODEX_DOWNLOADS_DIR",
 		"PORT",

@@ -109,6 +109,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		CodexWSHideUpstreamErrors:          false,
 		CodexWSSilentRetryEnabled:          false,
 		CodexWSSilentMaxRetries:            4,
+		CodexWSSizeRouterEnabled:           true,
 		ModelPricingOverrides:              `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
 		ModelPricingSyncURL:                "https://example.test/pricing.json",
 		IgnoreUsageLimitStatus:             true,
@@ -148,6 +149,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		savedSettings.CodexWSHideUpstreamErrors != false ||
 		savedSettings.CodexWSSilentRetryEnabled != false ||
 		savedSettings.CodexWSSilentMaxRetries != 4 ||
+		!savedSettings.CodexWSSizeRouterEnabled ||
 		savedSettings.ModelPricingOverrides != `{"gpt-5.4":{"input":2.5,"source":"custom"}}` ||
 		savedSettings.ModelPricingSyncURL != "https://example.test/pricing.json" ||
 		!savedSettings.PublicImageStudioPageEnabled ||

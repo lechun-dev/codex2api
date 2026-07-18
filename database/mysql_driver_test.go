@@ -140,6 +140,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		IgnoreUsageLimitStatus:            true,
 		AutoResetCreditsEnabled:           true,
 		AutoResetCreditsBeforeExpiryMin:   75,
+		CodexWSSizeRouterEnabled:          true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -158,16 +159,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"ignore_usage_limit_status = VALUES(ignore_usage_limit_status)",
 		"auto_reset_credits_enabled = VALUES(auto_reset_credits_enabled)",
 		"auto_reset_credits_before_expiry_min = VALUES(auto_reset_credits_before_expiry_min)",
+		"codex_ws_size_router_enabled = VALUES(codex_ws_size_router_enabled)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 94 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 94", got)
+	if got := strings.Count(capture.query, "?"); got != 95 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 95", got)
 	}
-	if len(capture.args) != 94 {
-		t.Fatalf("rewritten settings argument count = %d, want 94", len(capture.args))
+	if len(capture.args) != 95 {
+		t.Fatalf("rewritten settings argument count = %d, want 95", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -179,6 +181,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.PromptFilterAdvancedConfig,
 		settings.PayloadRules,
 		settings.PublicAccountPortalPageEnabled,
+		settings.CodexWSSizeRouterEnabled,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value

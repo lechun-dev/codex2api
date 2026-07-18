@@ -41,6 +41,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"ignore_usage_limit_status TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_enabled TINYINT(1) DEFAULT 0",
 		"auto_reset_credits_before_expiry_min INT DEFAULT 60",
+		"codex_ws_size_router_enabled TINYINT(1) DEFAULT 1",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)

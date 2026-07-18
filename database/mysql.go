@@ -32,6 +32,7 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "ignore_usage_limit_status", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "auto_reset_credits_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "auto_reset_credits_before_expiry_min", def: "INT DEFAULT 60"},
+	{table: "system_settings", name: "codex_ws_size_router_enabled", def: "TINYINT(1) DEFAULT 1"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -575,6 +576,7 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_hide_upstream_errors TINYINT(1) DEFAULT 1,
 		codex_ws_silent_retry_enabled TINYINT(1) DEFAULT 1,
 		codex_ws_silent_max_retries INT DEFAULT 2,
+		codex_ws_size_router_enabled TINYINT(1) DEFAULT 1,
 		codex_continue_thinking_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_max_rounds INT DEFAULT 8,
 		retry_interval_ms INT DEFAULT 0,

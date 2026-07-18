@@ -1146,6 +1146,7 @@ export default function Settings() {
     codex_ws_hide_upstream_errors: true,
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
+    codex_ws_size_router_enabled: true,
     codex_continue_thinking_enabled: false,
     codex_continue_max_rounds: 8,
     scheduler_mode: 'round_robin',
@@ -1199,6 +1200,7 @@ export default function Settings() {
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
     public_image_studio_page_enabled: true,
+    public_account_portal_page_enabled: false,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -2275,6 +2277,12 @@ export default function Settings() {
                   <Switch
                     checked={settingsForm.codex_ws_silent_retry_enabled}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_silent_retry_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.codexWSSizeRouterEnabled')} description={t('settings.codexWSSizeRouterEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_size_router_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_size_router_enabled', checked)}
                   />
                 </SettingField>
               </div>

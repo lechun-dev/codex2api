@@ -1856,7 +1856,7 @@
       "newapiEnv": "NewAPI 环境变量",
       "newapiEnvExample": "CODEX2API_POLICY_ENABLED=true\nCODEX2API_POLICY_TARGETS=http://127.0.0.1:18095\nCODEX2API_POLICY_SECRET=与Codex2API完全相同的密钥\nCODEX2API_POLICY_BAN_AFTER=2\nCODEX2API_POLICY_WINDOW_SECONDS=86400",
       "headersTitle": "NewAPI 请求头与审核档案",
-      "headersExample": "X-NewAPI-User-ID: <用户ID>\nX-NewAPI-Client-IP: <真实用户IP>\nX-NewAPI-Request-ID: <唯一请求ID>\nX-NewAPI-Timestamp: <Unix秒>\nX-NewAPI-Method: <HTTP方法>\nX-NewAPI-Path: <实际转发路径>\nX-NewAPI-Body-SHA256: <请求体SHA-256十六进制>\nX-NewAPI-Signature-Version: 1\nX-NewAPI-Original-Endpoint: <客户端原始端点>\nX-NewAPI-Original-Protocol: <客户端原始协议>\nX-NewAPI-Provider: <上游提供商>\nX-NewAPI-Signature: <V1身份HMAC-SHA256>\nX-NewAPI-Policy-Meta: <Base64URL审核档案JSON>\nX-NewAPI-Policy-Meta-Signature: <档案HMAC-SHA256>",
+      "headersExample": "X-NewAPI-User-ID: <用户ID>\nX-NewAPI-Client-IP: <真实用户IP>\nX-NewAPI-Request-ID: <唯一请求ID>\nX-NewAPI-Timestamp: <Unix秒>\nX-NewAPI-Method: <HTTP方法>\nX-NewAPI-Path: <实际转发路径>\nX-NewAPI-Body-SHA256: <请求体SHA-256十六进制>\nX-NewAPI-Signature-Version: 1\nX-NewAPI-Signature: <V1身份HMAC-SHA256>\nX-NewAPI-Policy-Meta: <Base64URL审核档案JSON>\nX-NewAPI-Policy-Meta-Signature: <档案HMAC-SHA256>",
       "signatureHint": "身份请求继续使用稳定的 V1 签名。客户端原始端点、协议、提供商和审核档位放入独立的 policy-meta-v1 档案，并使用同一共享密钥单独签名；返回决策和事件也分别验签。",
       "revealTitle": "请立即保存 NewAPI 审计密钥",
       "revealDescription": "密钥已写入 Codex2API 数据库。为了安全，明文只在本弹窗中展示一次。",

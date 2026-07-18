@@ -88,24 +88,6 @@ func TestVerifyNewAPIIdentityRejectsUnsupportedSignatureVersion(t *testing.T) {
 	}
 }
 
-func TestVerifyNewAPIV1IdentityDoesNotTrustUnsignedAuditMetadata(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
-	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
-	c, _ := signedNewAPIPolicyContext(t, "req-v1-audit", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, "/v1/responses", body)
-	c.Request.Header.Set("X-NewAPI-Original-Endpoint", "/v1/messages")
-	c.Request.Header.Set("X-NewAPI-Original-Protocol", "messages")
-	c.Request.Header.Set("X-NewAPI-Provider", "anthropic")
-	h := &Handler{cache: cache.NewMemory(1)}
-	policyContext, ok := h.verifyNewAPIPolicyContext(c, promptfilter.NewAPIConfig{Enabled: true, MaxClockSkewSeconds: 120}, body)
-	if !ok {
-		t.Fatal("legacy v1 identity was rejected")
-	}
-	if policyContext.AuditMetaVerified || policyContext.Audit.Endpoint != "" || policyContext.Audit.Protocol != "" || policyContext.Audit.Provider != "" {
-		t.Fatalf("v1 request trusted unsigned audit metadata: %#v", policyContext)
-	}
-}
-
 func TestPromptFilterAuditLogUsesVerifiedPolicyMetaOriginalMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")

@@ -34,9 +34,8 @@ type newAPIIdentity struct {
 }
 
 type verifiedNewAPIIdentityContext struct {
-	Identity         newAPIIdentity
-	BodySHA256       string
-	SignatureVersion string
+	Identity   newAPIIdentity
+	BodySHA256 string
 }
 
 type newAPIOriginalAuditMeta struct {
@@ -108,10 +107,8 @@ func (h *Handler) verifyNewAPIIdentity(c *gin.Context, cfg promptfilter.NewAPICo
 	if method != strings.ToUpper(c.Request.Method) || path != requestPath || bodyDigest != hex.EncodeToString(digest[:]) {
 		return newAPIIdentity{}, false
 	}
-	signatureVersion := strings.TrimSpace(c.GetHeader("X-NewAPI-Signature-Version"))
-	switch signatureVersion {
+	switch strings.TrimSpace(c.GetHeader("X-NewAPI-Signature-Version")) {
 	case "", newAPISignatureVersionV1:
-		signatureVersion = newAPISignatureVersionV1
 	default:
 		return newAPIIdentity{}, false
 	}
@@ -139,7 +136,7 @@ func (h *Handler) verifyNewAPIIdentity(c *gin.Context, cfg promptfilter.NewAPICo
 		return newAPIIdentity{}, false
 	}
 	c.Set(newAPIIdentityContextKey, verifiedNewAPIIdentityContext{
-		Identity: identity, BodySHA256: actualBodyDigest, SignatureVersion: signatureVersion,
+		Identity: identity, BodySHA256: actualBodyDigest,
 	})
 	return identity, true
 }

@@ -196,7 +196,7 @@ func TestAcquireConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.T) {
 		t.Fatal("different pool-key acquire was blocked by another connection's network probe")
 	}
 	releaseSlow()
-	slow := <-slowResult
+	slow := receiveTestValue(t, slowResult, 2*time.Second, "slow connection result")
 	if slow.err != nil || slow.wc != slowConn || slow.pending == nil {
 		t.Fatalf("slow acquire after probe release = (%p, %v, %v)", slow.wc, slow.pending, slow.err)
 	}
@@ -525,7 +525,7 @@ func TestAcquireConnectionCountsPendingDialTowardAccountCap(t *testing.T) {
 	}
 
 	close(release)
-	result := <-firstResult
+	result := receiveTestValue(t, firstResult, 2*time.Second, "first connection result")
 	if result.err != nil {
 		t.Fatalf("first AcquireConnection error = %v", result.err)
 	}
@@ -625,7 +625,7 @@ func TestAcquireReusableConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.T
 		t.Fatal("different reusable pool key was blocked by another connection's network probe")
 	}
 	releaseSlow()
-	slow := <-slowResult
+	slow := receiveTestValue(t, slowResult, 2*time.Second, "slow reusable connection result")
 	if slow.err != nil || slow.wc != slowConn || slow.pending == nil || slow.key != "slow-cache#0" {
 		t.Fatalf("slow reusable acquire after probe release = (%p, %v, %q, %v)", slow.wc, slow.pending, slow.key, slow.err)
 	}
@@ -799,7 +799,7 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 		t.Fatal("different preferred pool key was blocked by another connection's network probe")
 	}
 	releaseSlow()
-	slow := <-slowResult
+	slow := receiveTestValue(t, slowResult, 2*time.Second, "slow preferred connection result")
 	if slow.wc != slowConn || slow.pending == nil || slow.key != "slow#0" {
 		t.Fatalf("slow preferred acquire after probe release = (%p, %v, %q)", slow.wc, slow.pending, slow.key)
 	}

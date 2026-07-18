@@ -352,7 +352,7 @@ func newClosedTestWebsocketConn(t *testing.T) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("create test websocket client: %v", err)
 	}
-	<-handshakeDone
+	waitForTestSignal(t, handshakeDone, time.Second, "test websocket handshake")
 	return conn
 }
 
@@ -437,7 +437,7 @@ func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
 		t.Fatalf("sendRequest: %v", err)
 	}
 
-	got := <-received
+	got := receiveTestValue(t, received, time.Second, "websocket request payload")
 	if string(got) != string(body) {
 		t.Fatalf("sent payload = %s, want %s", got, body)
 	}

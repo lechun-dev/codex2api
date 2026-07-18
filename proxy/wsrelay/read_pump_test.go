@@ -308,7 +308,7 @@ func TestReadPumpProbeDoesNotWaitForDataWriteLock(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		wc.writeMu.Unlock()
 		locked = false
-		<-resultCh
+		receiveTestValue(t, resultCh, readPumpTestTimeout, "timed-out probe result")
 		t.Fatal("probe Ping was blocked by the data-message write lock")
 	}
 	select {
@@ -326,7 +326,7 @@ func TestReadPumpProbeDoesNotWaitForDataWriteLock(t *testing.T) {
 }
 
 func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
-	firstFragmentFlushed := make(chan struct{})
+	firstFragmentFlushed := make(chan error, 1)
 	finishMessage := make(chan struct{})
 	pongSeen := make(chan struct{}, 1)
 
@@ -342,24 +342,26 @@ func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
 
 		writer, err := conn.NextWriter(websocket.TextMessage)
 		if err != nil {
-			t.Errorf("NextWriter: %v", err)
+			firstFragmentFlushed <- err
 			return
 		}
 		payload := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("stale", 2048) + `"}`
 		if _, err := writer.Write([]byte(payload)); err != nil {
-			t.Errorf("write first fragmented payload: %v", err)
+			firstFragmentFlushed <- err
 			return
 		}
 		if err := conn.WriteControl(websocket.PingMessage, []byte("between-fragments"), time.Now().Add(time.Second)); err != nil {
-			t.Errorf("write interleaved ping: %v", err)
+			firstFragmentFlushed <- err
 			return
 		}
-		close(firstFragmentFlushed)
+		firstFragmentFlushed <- nil
 		<-finishMessage
 		_ = writer.Close()
 	})
 
-	<-firstFragmentFlushed
+	if err := receiveTestValue(t, firstFragmentFlushed, readPumpTestTimeout, "first fragmented payload"); err != nil {
+		t.Fatalf("write first fragmented payload: %v", err)
+	}
 	waitForReadPumpCondition(t, func() bool {
 		select {
 		case <-pongSeen:
@@ -560,7 +562,7 @@ func TestReadPumpProcessesPingWhileResponseWaitsForWriteCommit(t *testing.T) {
 
 func TestReadPumpProcessesPingAfterCompleteEarlyResponseBeforeWriteCommit(t *testing.T) {
 	startResponse := make(chan struct{})
-	responseSent := make(chan struct{})
+	responseSent := make(chan error, 1)
 	finishServer := make(chan struct{})
 	pongSeen := make(chan struct{}, 1)
 	var finishOnce sync.Once
@@ -577,10 +579,10 @@ func TestReadPumpProcessesPingAfterCompleteEarlyResponseBeforeWriteCommit(t *tes
 		go func() { _, _, _ = conn.ReadMessage() }()
 		<-startResponse
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"early"}`)); err != nil {
-			t.Errorf("write complete early response: %v", err)
+			responseSent <- err
 			return
 		}
-		close(responseSent)
+		responseSent <- nil
 		if err := conn.WriteControl(websocket.PingMessage, []byte("after-complete-message"), time.Now().Add(time.Second)); err != nil {
 			t.Errorf("write ping after complete response: %v", err)
 			return
@@ -597,7 +599,9 @@ func TestReadPumpProcessesPingAfterCompleteEarlyResponseBeforeWriteCommit(t *tes
 		t.Fatalf("beginReadLeaseWrite: %v", err)
 	}
 	close(startResponse)
-	<-responseSent
+	if err := receiveTestValue(t, responseSent, readPumpTestTimeout, "complete early response"); err != nil {
+		t.Fatalf("write complete early response: %v", err)
+	}
 
 	select {
 	case <-pongSeen:
@@ -1182,7 +1186,7 @@ func TestProvisionalFrameDoesNotMaskPeerCloseAfterTransportWriteError(t *testing
 		Text: "message too big",
 	}, true)
 
-	resolvedWriteErr := <-writeResult
+	resolvedWriteErr := receiveTestValue(t, writeResult, readPumpTestTimeout, "failed write result")
 	var closeErr *websocket.CloseError
 	if !errors.As(resolvedWriteErr, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
 		t.Fatalf("resolved write error = %v, want peer CloseError 1009", resolvedWriteErr)
@@ -1237,7 +1241,7 @@ func TestReadPumpPreservesPeerCloseCauseDuringSocketWrite(t *testing.T) {
 	}
 	payload := []byte(strings.Repeat("x", 8*1024*1024))
 	err := wc.WriteMessage(websocket.TextMessage, payload)
-	if sendErr := <-closeSent; sendErr != nil {
+	if sendErr := receiveTestValue(t, closeSent, readPumpTestTimeout, "peer close frame"); sendErr != nil {
 		t.Fatalf("server close 1009: %v", sendErr)
 	}
 

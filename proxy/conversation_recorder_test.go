@@ -172,7 +172,7 @@ func TestConversationTurnKeepsOnlyFinalAnswerPhase(t *testing.T) {
 	}
 }
 
-func TestConversationTurnDoesNotPersistCommentaryOnlyResponse(t *testing.T) {
+func TestConversationTurnKeepsCommentaryOnlyResponseAsPartial(t *testing.T) {
 	store := newFakeConversationRecordStore()
 	recorder := newConversationRecorder(store)
 	turn := &conversationTurn{
@@ -201,8 +201,60 @@ func TestConversationTurnDoesNotPersistCommentaryOnlyResponse(t *testing.T) {
 	recorder.Close()
 
 	snapshots := store.snapshots()
-	if len(snapshots) != 1 || snapshots[0].AssistantMessage != "" {
-		t.Fatalf("commentary-only response was persisted as an answer: %#v", snapshots)
+	if len(snapshots) != 1 || snapshots[0].AssistantMessage != "" ||
+		snapshots[0].Status != database.ConversationStatusPartial {
+		t.Fatalf("commentary-only response = %#v", snapshots)
+	}
+}
+
+func TestBeginConversationTurnWritesPartialThenUpdatesSameRecord(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	c.Request.Header.Set("Session_id", "session-start")
+	c.Set(contextAPIKeyID, int64(9))
+
+	handler := &Handler{convRecorder: recorder}
+	turn := handler.beginConversationTurn(c, []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"role":"user","content":"keep this request"}]
+	}`))
+	for _, payload := range []string{
+		`{"type":"response.created","response":{"id":"resp-start"}}`,
+		`{"type":"response.completed","response":{"id":"resp-start","status":"completed","output":[
+			{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"kept final answer"}]}
+		]}}`,
+	} {
+		parsed := gjson.Parse(payload)
+		turn.observeResponsesEvent(parsed.Get("type").String(), parsed)
+	}
+	turn.finish(&database.UsageLogInput{
+		InboundEndpoint: "/v1/responses",
+		Model:           "gpt-5.6-sol",
+		StatusCode:      http.StatusOK,
+	}, nil)
+	recorder.Close()
+
+	snapshots := store.snapshots()
+	if len(snapshots) != 2 {
+		t.Fatalf("saved snapshots = %d, want initial and final", len(snapshots))
+	}
+	initial, final := snapshots[0], snapshots[1]
+	if initial.RequestID == "" || initial.RequestID != final.RequestID {
+		t.Fatalf("request IDs = %q / %q", initial.RequestID, final.RequestID)
+	}
+	if initial.UserMessage != "keep this request" || initial.AssistantMessage != "" ||
+		initial.Status != database.ConversationStatusPartial || initial.CompletedAt != nil {
+		t.Fatalf("initial snapshot = %#v", initial)
+	}
+	if final.UserMessage != "keep this request" || final.AssistantMessage != "kept final answer" ||
+		final.Status != database.ConversationStatusCompleted || final.CompletedAt == nil {
+		t.Fatalf("final snapshot = %#v", final)
+	}
+	if got := store.recordCount(); got != 1 {
+		t.Fatalf("stored row count = %d, want one", got)
 	}
 }
 
@@ -216,7 +268,7 @@ func TestResponseOutputAwaitsToolAfterCommentary(t *testing.T) {
 	}
 }
 
-func TestConversationTurnFallbackRecordsEarlyFailureOnce(t *testing.T) {
+func TestConversationTurnFallbackKeepsEarlyFailureWithoutAnswer(t *testing.T) {
 	store := newFakeConversationRecordStore()
 	recorder := newConversationRecorder(store)
 	gin.SetMode(gin.TestMode)
@@ -238,13 +290,93 @@ func TestConversationTurnFallbackRecordsEarlyFailureOnce(t *testing.T) {
 	recorder.Close()
 
 	snapshots := store.snapshots()
-	if len(snapshots) != 1 {
-		t.Fatalf("saved snapshots = %d, want one", len(snapshots))
-	}
-	if snapshots[0].UserMessage != "please answer" ||
-		snapshots[0].Status != database.ConversationStatusFailed ||
+	if len(snapshots) != 1 || snapshots[0].UserMessage != "please answer" ||
+		snapshots[0].AssistantMessage != "" || snapshots[0].Status != database.ConversationStatusFailed ||
 		snapshots[0].StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("fallback snapshot = %#v", snapshots[0])
+		t.Fatalf("early failure = %#v", snapshots)
+	}
+}
+
+func TestConversationRecorderKeepsIncompleteAndInterruptedTurnsWithoutAnswer(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	start := time.Now().UTC()
+
+	for _, result := range []conversationTurnResult{
+		{
+			StartedAt: start, APIKeyID: 9, ClientID: "client",
+			ExplicitSessionID: "session-incomplete", UserMessage: "too much context",
+			ResponseID: "resp-incomplete", Terminal: true, Incomplete: true,
+			StatusCode: http.StatusOK,
+		},
+		{
+			StartedAt: start.Add(time.Second), APIKeyID: 9, ClientID: "client",
+			ExplicitSessionID: "session-interrupted", UserMessage: "interrupted request",
+			ResponseID: "resp-interrupted", Terminal: false,
+			StatusCode: http.StatusOK,
+		},
+	} {
+		if !recorder.enqueue(result) {
+			t.Fatal("enqueue returned false")
+		}
+	}
+	recorder.Close()
+
+	snapshots := store.snapshots()
+	if len(snapshots) != 2 {
+		t.Fatalf("saved snapshots = %d, want two", len(snapshots))
+	}
+	if snapshots[0].Status != database.ConversationStatusIncomplete || snapshots[0].AssistantMessage != "" {
+		t.Fatalf("incomplete snapshot = %#v", snapshots[0])
+	}
+	if snapshots[1].Status != database.ConversationStatusPartial || snapshots[1].AssistantMessage != "" {
+		t.Fatalf("interrupted snapshot = %#v", snapshots[1])
+	}
+}
+
+func TestConversationTurnStatusRequiresFinalAnswerForCompleted(t *testing.T) {
+	if got := conversationTurnStatus(conversationTurnResult{Terminal: true, StatusCode: http.StatusOK}); got != database.ConversationStatusPartial {
+		t.Fatalf("terminal response without answer status = %q", got)
+	}
+	if got := conversationTurnStatus(conversationTurnResult{
+		Terminal: true, StatusCode: http.StatusOK, AssistantMessage: "final",
+	}); got != database.ConversationStatusCompleted {
+		t.Fatalf("terminal response with answer status = %q", got)
+	}
+	if got := conversationTurnStatus(conversationTurnResult{RequestErr: context.DeadlineExceeded}); got != database.ConversationStatusIncomplete {
+		t.Fatalf("deadline status = %q", got)
+	}
+}
+
+func TestConversationRecorderKeepsPartialInteractionWhenChainEndsWithoutAnswer(t *testing.T) {
+	store := newFakeConversationRecordStore()
+	recorder := newConversationRecorder(store)
+	start := time.Now().UTC()
+
+	if !recorder.enqueue(conversationTurnResult{
+		StartedAt: start, APIKeyID: 9, ClientID: "client",
+		ExplicitSessionID: "session", UserMessage: "run the tool", ResponseID: "resp-1",
+		Terminal: true, AwaitingToolOutput: true, StatusCode: http.StatusOK,
+	}) {
+		t.Fatal("enqueue partial interaction returned false")
+	}
+	if !recorder.enqueue(conversationTurnResult{
+		StartedAt: start.Add(time.Second), APIKeyID: 9, ClientID: "client",
+		ExplicitSessionID: "session", PreviousResponseID: "resp-1", ResponseID: "resp-2",
+		Terminal: true, Failed: true, StatusCode: http.StatusBadGateway,
+	}) {
+		t.Fatal("enqueue failed continuation returned false")
+	}
+	recorder.Close()
+
+	snapshots := store.snapshots()
+	if len(snapshots) != 2 || snapshots[0].RequestID != snapshots[1].RequestID {
+		t.Fatalf("tool chain snapshots = %#v", snapshots)
+	}
+	final := snapshots[1]
+	if final.UserMessage != "run the tool" || final.AssistantMessage != "" ||
+		final.Status != database.ConversationStatusFailed {
+		t.Fatalf("failed tool chain = %#v", final)
 	}
 }
 
@@ -310,16 +442,21 @@ func TestConversationRecorderFoldsToolContinuationsAndDrainsOnClose(t *testing.T
 	}
 }
 
-func TestConversationRecorderSkipsOrphanEmptyInternalTurns(t *testing.T) {
+func TestConversationRecorderSkipsOrphanInternalTurns(t *testing.T) {
 	store := newFakeConversationRecordStore()
 	recorder := newConversationRecorder(store)
-	for range 10 {
+	for index := range 10 {
+		assistant := ""
+		if index%2 != 0 {
+			assistant = "orphan assistant output"
+		}
 		if !recorder.enqueue(conversationTurnResult{
 			StartedAt:         time.Now().UTC(),
 			APIKeyID:          9,
 			ClientID:          "client",
 			ExplicitSessionID: "internal-session",
 			ResponseID:        "empty-response",
+			AssistantMessage:  assistant,
 			Terminal:          true,
 			StatusCode:        http.StatusOK,
 		}) {
@@ -329,7 +466,7 @@ func TestConversationRecorderSkipsOrphanEmptyInternalTurns(t *testing.T) {
 	recorder.Close()
 
 	if got := store.recordCount(); got != 0 {
-		t.Fatalf("orphan empty internal turns created %d rows", got)
+		t.Fatalf("orphan internal turns created %d rows", got)
 	}
 }
 

@@ -36,7 +36,7 @@ type conversationRecordStore interface {
 }
 
 // conversationRecorder keeps all database work off the request path. Request
-// handlers only append already-parsed text and enqueue one small turn snapshot.
+// handlers only append already-parsed text and enqueue turn snapshots.
 type conversationRecorder struct {
 	store conversationRecordStore
 
@@ -64,6 +64,7 @@ type conversationInteractionState struct {
 type conversationTurn struct {
 	recorder *conversationRecorder
 
+	requestID          string
 	startedAt          time.Time
 	apiKeyID           int64
 	apiKeyName         string
@@ -88,6 +89,7 @@ type conversationTurn struct {
 }
 
 type conversationTurnResult struct {
+	RequestID          string
 	StartedAt          time.Time
 	APIKeyID           int64
 	APIKeyName         string
@@ -276,7 +278,7 @@ func (h *Handler) beginConversationTurn(c *gin.Context, requestBody []byte) *con
 	if row != nil {
 		apiKeyName = strings.TrimSpace(row.Name)
 	}
-	return &conversationTurn{
+	turn := &conversationTurn{
 		recorder:           h.convRecorder,
 		startedAt:          time.Now().UTC(),
 		apiKeyID:           requestAPIKeyID(c),
@@ -289,6 +291,23 @@ func (h *Handler) beginConversationTurn(c *gin.Context, requestBody []byte) *con
 		previousResponseID: normalizeConversationIdentifier(gjson.GetBytes(requestBody, "previous_response_id").String(), 255, "resp"),
 		userMessage:        extractCurrentConversationUserMessage(requestBody),
 	}
+	if turn.userMessage != "" {
+		turn.requestID = uuid.NewString()
+		turn.recorder.enqueue(conversationTurnResult{
+			RequestID:          turn.requestID,
+			StartedAt:          turn.startedAt,
+			APIKeyID:           turn.apiKeyID,
+			APIKeyName:         turn.apiKeyName,
+			ClientID:           turn.clientID,
+			ClientIP:           turn.clientIP,
+			Endpoint:           turn.endpoint,
+			Model:              turn.model,
+			ExplicitSessionID:  turn.explicitSessionID,
+			PreviousResponseID: turn.previousResponseID,
+			UserMessage:        turn.userMessage,
+		})
+	}
+	return turn
 }
 
 // observeResponsesEvent reuses the gjson value already parsed by the proxy's
@@ -405,6 +424,7 @@ func (t *conversationTurn) finish(input *database.UsageLogInput, requestErr erro
 		model = t.model
 	}
 	t.recorder.enqueue(conversationTurnResult{
+		RequestID:          t.requestID,
 		StartedAt:          t.startedAt,
 		APIKeyID:           t.apiKeyID,
 		APIKeyName:         t.apiKeyName,
@@ -505,14 +525,18 @@ func (r *conversationRecorder) persistTurn(parent context.Context, result conver
 		}
 	}
 
-	if result.UserMessage == "" && result.AssistantMessage == "" && linkedState == nil {
+	if result.UserMessage == "" && linkedState == nil {
 		return
 	}
 
 	var state *conversationInteractionState
 	if result.UserMessage != "" || linkedState == nil {
+		requestID := normalizeConversationIdentifier(result.RequestID, 64, "request")
+		if requestID == "" {
+			requestID = uuid.NewString()
+		}
 		state = &conversationInteractionState{record: database.ConversationRecordInput{
-			RequestID:   uuid.NewString(),
+			RequestID:   requestID,
 			SessionID:   sessionID,
 			APIKeyID:    result.APIKeyID,
 			APIKeyName:  result.APIKeyName,
@@ -605,6 +629,9 @@ func conversationTurnStatus(result conversationTurnResult) string {
 		if errors.Is(result.RequestErr, context.Canceled) {
 			return database.ConversationStatusCanceled
 		}
+		if errors.Is(result.RequestErr, context.DeadlineExceeded) {
+			return database.ConversationStatusIncomplete
+		}
 		return database.ConversationStatusFailed
 	}
 	if result.Failed || result.StatusCode >= http.StatusBadRequest {
@@ -613,7 +640,10 @@ func conversationTurnStatus(result conversationTurnResult) string {
 		}
 		return database.ConversationStatusFailed
 	}
-	if result.Incomplete || result.AwaitingToolOutput || !result.Terminal {
+	if result.Incomplete {
+		return database.ConversationStatusIncomplete
+	}
+	if result.AwaitingToolOutput || !result.Terminal || strings.TrimSpace(result.AssistantMessage) == "" {
 		return database.ConversationStatusPartial
 	}
 	return database.ConversationStatusCompleted

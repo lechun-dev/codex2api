@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	ConversationStatusCompleted = "completed"
-	ConversationStatusPartial   = "partial"
-	ConversationStatusFailed    = "failed"
-	ConversationStatusCanceled  = "canceled"
+	ConversationStatusCompleted  = "completed"
+	ConversationStatusPartial    = "partial"
+	ConversationStatusFailed     = "failed"
+	ConversationStatusCanceled   = "canceled"
+	ConversationStatusIncomplete = "incomplete"
 )
 
 // ConversationRecordInput is a complete snapshot of one user interaction.
@@ -202,6 +203,8 @@ func normalizeConversationStatus(status string) string {
 		return ConversationStatusFailed
 	case ConversationStatusCanceled:
 		return ConversationStatusCanceled
+	case ConversationStatusIncomplete:
+		return ConversationStatusIncomplete
 	default:
 		return ConversationStatusCompleted
 	}

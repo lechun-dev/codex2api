@@ -230,6 +230,9 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if model != "" && account.IsModelRateLimited(model) {
 			return false
 		}
+		if !account.SupportsCodexModel(model) {
+			return false
+		}
 		if isProOnlyModel(model) {
 			return isSparkPlanCandidate(account.GetPlanType())
 		}
@@ -1053,11 +1056,13 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 			kind = "client"
 		}
 	}
+	// 400 中"账号不支持该模型"属账号权益问题，冷却后换号重试有意义，视同可重试故障。
+	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(responseFailedErrorBody(payload))
 	return streamOutcome{
 		logStatusCode:  statusCode,
 		failureKind:    kind,
 		failureMessage: message,
-		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500 || modelUnsupported,
 	}
 }
 
@@ -1551,7 +1556,7 @@ func isRetryableStatus(code int) bool {
 		code == http.StatusForbidden
 }
 
-func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
 	if statusCode == http.StatusTooManyRequests {
 		if rateLimitRetries == nil || *rateLimitRetries >= maxRateLimitRetries {
 			return false
@@ -1559,7 +1564,10 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 		*rateLimitRetries++
 		return true
 	}
-	if !isRetryableStatus(statusCode) {
+	// 400 一般是请求内容问题不重试；唯独"账号不支持该模型"是账号权益问题，
+	// 该账号已被模型冷却排除，换号重试可成功（issue #408）。
+	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(body)
+	if !isRetryableStatus(statusCode) && !modelUnsupported {
 		return false
 	}
 	if generalRetries == nil || *generalRetries >= maxGeneralRetries {
@@ -1821,13 +1829,15 @@ func (h *Handler) Responses(c *gin.Context) {
 	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
+	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	var openAIResponsesBody []byte
 	resetOpenAIResponsesBody := func() {
 		openAIResponsesBody = nil
 	}
 	getOpenAIResponsesBody := func() []byte {
 		if openAIResponsesBody == nil {
-			openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
+			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
 		}
 		return openAIResponsesBody
 	}
@@ -2067,7 +2077,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2344,7 +2354,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图产生大体积
@@ -2354,8 +2366,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
-		// 按尝试重算：不同尝试的生效模型可能不同，规则若按模型匹配则结果随之变化。
-		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
+		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -2459,7 +2471,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2631,7 +2643,8 @@ func (h *Handler) Responses(c *gin.Context) {
 							lastUpstreamCancel()
 						}
 						rctx, rcancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-						rctx = WithPayloadRuleIdentity(rctx, ruleIdentity)
+						// 续想轮复用同一账号，沿用带账号维度的 attempt 身份。
+						rctx = WithPayloadRuleIdentity(rctx, attemptIdentity)
 						lastUpstreamCancel = rcancel
 						roundBody := body
 						if useWebsocket {
@@ -2952,6 +2965,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
 	codexBody, _ := PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
+	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -3080,7 +3095,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3270,7 +3285,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3569,11 +3584,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		// 仅 Codex 路径（ExecuteRequest）套用规则；relay 账号不套用，保持原值。
-		// 按尝试重算：不同尝试的生效模型可能不同，规则若按模型匹配则结果随之变化。
+		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
 		if !isRelayAccount {
-			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 		}
 
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
@@ -3585,7 +3602,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
@@ -3687,7 +3704,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -4180,6 +4197,36 @@ func parseUsageLimitResetAt(body []byte, now time.Time) (time.Time, bool) {
 	return parseRetryAfterResetAt(body, now)
 }
 
+// IsCodexModelUnsupportedError 是 isCodexModelUnsupportedError 的导出包装，
+// 供管理端模型探测复用同一套"账号不支持该模型"识别逻辑。
+func IsCodexModelUnsupportedError(body []byte) bool {
+	return isCodexModelUnsupportedError(body)
+}
+
+// isCodexModelUnsupportedError 判断 400 响应是否为"当前账号不支持该模型"。
+// 该错误由账号套餐权益决定而非请求内容，换到支持该模型的账号即可成功，
+// 因此按 (账号, 模型) 维度冷却并换号重试，而不是原样透传给客户端（issue #408）。
+func isCodexModelUnsupportedError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "model is not supported when using codex") {
+			return true
+		}
+	}
+	return false
+}
+
 func isCodexModelCapacityError(body []byte) bool {
 	if len(body) == 0 {
 		return false
@@ -4427,6 +4474,21 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		return decision
 	}
 	switch statusCode {
+	case http.StatusBadRequest:
+		// 账号套餐不支持该模型：按 (账号, 模型) 冷却，调度器随后会跳过该组合；
+		// 其余 400 属请求内容问题，不动账号状态。
+		if model != "" && isCodexModelUnsupportedError(body) {
+			cooldown := h.store.MarkModelCooldown(account, model, 30*time.Minute, "model_not_supported")
+			log.Printf("账号 %d (plan=%s) 不支持模型 %s，该模型冷却到 %s", account.ID(), account.GetPlanType(), model, cooldown.ResetAt.Format(time.RFC3339))
+			return codex429Decision{
+				Scope:    rateLimitScopeModel,
+				Reason:   "model_not_supported",
+				Model:    model,
+				ResetAt:  cooldown.ResetAt,
+				Cooldown: time.Until(cooldown.ResetAt),
+			}
+		}
+		return codex429Decision{}
 	case http.StatusTooManyRequests:
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		if decision.Scope == rateLimitScopeModel {

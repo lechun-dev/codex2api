@@ -178,8 +178,9 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		QuotaLimit:      123.5,
 		AllowedGroupIDs: []int64{2, 1, 2},
 		Limits: APIKeyLimits{
-			ModelAllow: []string{"gpt-5.4"},
-			RPM:        10,
+			ModelAllow:            []string{"gpt-5.4"},
+			RPM:                   10,
+			ImageGenerationPolicy: ImageGenerationPolicyStrip,
 		},
 	})
 	if err != nil {
@@ -189,7 +190,8 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAPIKeyByValue failed: %v", err)
 	}
-	if row.ID != keyID || row.Key != smokeKey || len(row.AllowedGroupIDs) != 3 || row.Limits.RPM != 10 {
+	if row.ID != keyID || row.Key != smokeKey || len(row.AllowedGroupIDs) != 3 || row.Limits.RPM != 10 ||
+		row.Limits.ResolveImageGenerationPolicy() != ImageGenerationPolicyStrip {
 		t.Fatalf("unexpected API key row: %#v", row)
 	}
 
@@ -223,6 +225,11 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials failed: %v", err)
 	}
+	if err := db.UpdateCredentials(ctx, accountID, map[string]interface{}{
+		"models": []string{"gpt-5.4", "gpt-5.5"},
+	}); err != nil {
+		t.Fatalf("UpdateCredentials account models failed: %v", err)
+	}
 	if err := db.UpdateAccountSchedulerMetadata(ctx, accountID,
 		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 17, Valid: true}},
 		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 19, Valid: true}},
@@ -249,7 +256,8 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		account.Note != "mysql smoke note" ||
 		!account.GetCredentialBool("auto_pause_5h_disabled") ||
 		len(account.GetCredentialInt64Slice("allowed_api_key_ids")) != 1 ||
-		account.GetCredentialInt64Slice("allowed_api_key_ids")[0] != keyID {
+		account.GetCredentialInt64Slice("allowed_api_key_ids")[0] != keyID ||
+		len(account.GetCredentialStringSlice("models")) != 2 {
 		t.Fatalf("account metadata was not persisted correctly: %#v", account)
 	}
 

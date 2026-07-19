@@ -359,17 +359,25 @@ func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
 		_ = writer.Close()
 	})
 
-	if err := receiveTestValue(t, firstFragmentFlushed, readPumpTestTimeout, "first fragmented payload"); err != nil {
-		t.Fatalf("write first fragmented payload: %v", err)
+	writeErr := receiveTestValue(t, firstFragmentFlushed, readPumpTestTimeout, "first fragmented payload")
+	if writeErr == nil {
+		waitForReadPumpCondition(t, func() bool {
+			select {
+			case <-pongSeen:
+				return true
+			default:
+				return !wc.IsConnected()
+			}
+		}, "fragmented message was not observed by the client reader")
 	}
 	waitForReadPumpCondition(t, func() bool {
-		select {
-		case <-pongSeen:
-			return true
-		default:
-			return !wc.IsConnected()
-		}
-	}, "fragmented message was not observed by the client reader")
+		state := wc.ensureReadState()
+		state.mu.Lock()
+		readerErr := state.readerErr
+		state.mu.Unlock()
+		_, exists := manager.connections.Load(wc.PoolKey)
+		return errors.Is(readerErr, errReadPumpIdleFrame) && !wc.IsConnected() && !exists
+	}, "idle fragmented message did not discard the connection")
 
 	beginErr := wc.BeginReadLease("new-request")
 	close(finishMessage)
@@ -380,10 +388,6 @@ func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
 		}
 		t.Fatal("connection accepted a lease after an idle fragmented message had started")
 	}
-	waitForReadPumpCondition(t, func() bool {
-		_, exists := manager.connections.Load(wc.PoolKey)
-		return !wc.IsConnected() && !exists
-	}, "idle fragmented message did not discard the connection")
 }
 
 func TestReadPumpRejectsFrameBeforeRequestCommit(t *testing.T) {

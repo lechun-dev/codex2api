@@ -413,7 +413,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
-				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{

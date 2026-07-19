@@ -309,7 +309,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),

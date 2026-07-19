@@ -1364,7 +1364,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,

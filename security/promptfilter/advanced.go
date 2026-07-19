@@ -10,9 +10,11 @@ import (
 	"html"
 	"io"
 	"net/url"
+	"regexp/syntax"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -599,35 +601,70 @@ func normalizeGuardProfileName(name string, fallback string) string {
 	}
 }
 
-func scanViews(text string, cfg NormalizationConfig) []string {
+type scanView struct {
+	Text                    string
+	ReviewOnly              bool
+	Compacted               bool
+	NormalizationIncomplete bool
+}
+
+func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) []scanView {
 	base := normalizeForScan(text)
 	if !cfg.Enabled {
-		return []string{base}
+		return []scanView{{Text: base}}
 	}
 
 	const (
 		maxNormalizationViews   = 64
 		maxNormalizationSources = 32
-		maxEncodedFragmentBytes = 16 * 1024
+		maxDerivedViewBytesCap  = 4 * 1024 * 1024
 	)
-
-	views := []string{base}
-	viewSet := map[string]struct{}{base: {}}
-	addOne := func(value string) {
-		value = normalizeForScan(value)
-		if value == "" || len(value) > DefaultMaxTextLength*4 || len(views) >= maxNormalizationViews {
-			return
-		}
-		if _, exists := viewSet[value]; exists {
-			return
-		}
-		viewSet[value] = struct{}{}
-		views = append(views, value)
+	maxEncodedFragmentBytes := len(text)
+	if maxEncodedFragmentBytes < 16*1024 {
+		maxEncodedFragmentBytes = 16 * 1024
 	}
-	add := func(value string) {
-		canonical := norm.NFKC.String(stripInvisible(value))
-		addOne(canonical)
-		addOne(compactForScan(canonical))
+	if maxEncodedFragmentBytes > 1024*1024 {
+		maxEncodedFragmentBytes = 1024 * 1024
+	}
+	maxDerivedViewBytes := DefaultMaxTextLength * 4
+	if sourceBound := len(text) * 4; sourceBound > maxDerivedViewBytes {
+		maxDerivedViewBytes = sourceBound
+	}
+	if maxDerivedViewBytes > maxDerivedViewBytesCap {
+		maxDerivedViewBytes = maxDerivedViewBytesCap
+	}
+	if cfg.DecodeBase64 || cfg.DecodeHex {
+		base = normalizeForScan(collapseRecognizedEncodedPayloads(text, cfg, maxEncodedFragmentBytes, nil))
+	}
+
+	views := []scanView{{Text: base}}
+	viewIndex := map[string]int{base: 0}
+	addOne := func(value string, reviewOnly, compacted bool) {
+		value = normalizeForScan(value)
+		if value == "" || len(value) > maxDerivedViewBytes || len(views) >= maxNormalizationViews {
+			return
+		}
+		if index, exists := viewIndex[value]; exists {
+			// An executable occurrence must win when the same normalized text is
+			// also seen inside a quoted, explicitly non-executing review sample.
+			if views[index].ReviewOnly && !reviewOnly {
+				views[index].ReviewOnly = false
+			}
+			views[index].Compacted = views[index].Compacted || compacted
+			return
+		}
+		viewIndex[value] = len(views)
+		views = append(views, scanView{Text: value, ReviewOnly: reviewOnly, Compacted: compacted})
+	}
+	add := func(value string, reviewOnly bool) {
+		sourceCanonical := norm.NFKC.String(value)
+		canonical := stripInvisible(sourceCanonical)
+		addOne(canonical, reviewOnly, false)
+		// Compact matching scans the cleaned value, while its enablement keeps
+		// evidence from the pre-strip source (for example zero-width separators).
+		if minorSafetyShouldInspectCompact(sourceCanonical) {
+			addOne(compactForScan(canonical), reviewOnly, true)
+		}
 	}
 
 	maxDecodedBytes := cfg.MaxDecodedBytes
@@ -639,72 +676,172 @@ func scanViews(text string, cfg NormalizationConfig) []string {
 		maxEncodedBlocks = 16
 	}
 	budget := decodeBudget{remainingBytes: maxDecodedBytes, maxBlocks: maxEncodedBlocks}
-	normalized := norm.NFKC.String(stripInvisible(text))
-	add(normalized)
-	sourceSet := map[string]struct{}{normalized: {}}
-	frontier := []string{normalized}
+	sourceNormalized := norm.NFKC.String(text)
+	normalized := stripInvisible(sourceNormalized)
+	baseSource := sourceNormalized
+	if cfg.DecodeBase64 || cfg.DecodeHex {
+		baseSource = collapseRecognizedEncodedPayloads(sourceNormalized, cfg, maxEncodedFragmentBytes, nil)
+	}
+	add(baseSource, false)
+	sourceKey := func(value string, reviewOnly bool) string {
+		if reviewOnly {
+			return value + "\x00review"
+		}
+		return value + "\x00active"
+	}
+	sourceSet := map[string]struct{}{sourceKey(normalized, false): {}}
+	frontier := []scanView{{Text: normalized}}
+	activeNormalizationIncomplete := false
 
 	for run := 0; run < cfg.MaxDecodeRuns && len(frontier) > 0 && budget.remainingBytes > 0; run++ {
-		next := make([]string, 0, len(frontier))
-		enqueue := func(value string, encodedBlock bool) bool {
-			if value == "" || len(value) > DefaultMaxTextLength*4 || len(sourceSet) >= maxNormalizationSources {
+		next := make([]scanView, 0, len(frontier))
+		enqueue := func(value string, encodedBlock bool, reviewOnly bool) bool {
+			if value == "" || len(value) > maxDerivedViewBytes || len(sourceSet) >= maxNormalizationSources {
 				return false
 			}
-			if _, exists := sourceSet[value]; exists {
+			key := sourceKey(value, reviewOnly)
+			if _, exists := sourceSet[key]; exists {
 				return false
 			}
 			if !budget.accept(len(value), encodedBlock) {
 				return false
 			}
-			sourceSet[value] = struct{}{}
-			add(value)
-			next = append(next, value)
+			sourceSet[key] = struct{}{}
+			add(value, reviewOnly)
+			next = append(next, scanView{Text: value, ReviewOnly: reviewOnly})
+			return true
+		}
+		enqueueAcceptedDecoded := func(values []string, reviewOnly bool) {
+			if len(values) == 0 {
+				return
+			}
+			value := values[0]
+			if len(values) > 1 {
+				value = strings.Join(values, " ")
+			}
+			if value == "" || len(value) > maxDerivedViewBytes {
+				return
+			}
+			key := sourceKey(value, reviewOnly)
+			if _, exists := sourceSet[key]; !exists {
+				if len(sourceSet) >= maxNormalizationSources {
+					return
+				}
+				sourceSet[key] = struct{}{}
+			}
+			add(value, reviewOnly)
+			next = append(next, scanView{Text: value, ReviewOnly: reviewOnly})
+		}
+		addScanOnly := func(value string, reviewOnly bool) {
+			if value == "" || len(value) > maxDerivedViewBytes {
+				return
+			}
+			key := sourceKey(value, reviewOnly)
+			if _, exists := sourceSet[key]; !exists {
+				if len(sourceSet) >= maxNormalizationSources {
+					return
+				}
+				sourceSet[key] = struct{}{}
+			}
+			add(value, reviewOnly)
+		}
+		acceptDecodedBlock := func(value string, reviewOnly bool) bool {
+			if value == "" || len(value) > maxDerivedViewBytes || len(sourceSet) >= maxNormalizationSources {
+				return false
+			}
+			key := sourceKey(value, reviewOnly)
+			if _, exists := sourceSet[key]; exists {
+				return false
+			}
+			if !budget.accept(len(value), true) {
+				return false
+			}
+			sourceSet[key] = struct{}{}
 			return true
 		}
 
 		for _, source := range frontier {
 			if cfg.DecodeURL {
-				if decoded, err := url.QueryUnescape(source); err == nil && decoded != source {
-					enqueue(decoded, false)
+				if decoded, err := url.QueryUnescape(source.Text); err == nil && decoded != source.Text {
+					enqueue(decoded, false, source.ReviewOnly)
 				}
 			}
 			if cfg.DecodeHTML {
-				if decoded := html.UnescapeString(source); decoded != source {
-					enqueue(decoded, false)
+				if decoded := html.UnescapeString(source.Text); decoded != source.Text {
+					enqueue(decoded, false, source.ReviewOnly)
 				}
 			}
 			if cfg.DecodeEscapes {
-				if decoded, changed := decodeEscapedText(source); changed {
-					enqueue(decoded, false)
+				if decoded, changed := decodeEscapedText(source.Text); changed {
+					enqueue(decoded, false, source.ReviewOnly)
 				}
 			}
 			if cfg.DecodeBase64 || cfg.DecodeHex {
-				decodedBlocks := decodeEmbeddedBlocks(source, cfg, budget.remainingBytes, budget.maxBlocks-budget.blocks, maxEncodedFragmentBytes)
-				joined := make([]string, 0, len(decodedBlocks))
-				accepted := make([]decodedBlock, 0, len(decodedBlocks))
+				decodedBatch := decodeEmbeddedBlockBatch(source.Text, cfg, budget.remainingBytes, budget.maxBlocks-budget.blocks, maxEncodedFragmentBytes, currentEngines...)
+				// A derived review-only source must never turn an opaque or
+				// truncated fixture into an active warning. Its incomplete state
+				// remains non-enforcing review provenance.
+				if !source.ReviewOnly && decodedBatch.activeIncomplete {
+					activeNormalizationIncomplete = true
+				}
+				decodedBlocks := decodedBatch.blocks
+				reviewContext := newMinorSafetyScanContext(source.Text)
+				activeJoined := make([]string, 0, len(decodedBlocks))
+				reviewJoined := make([]string, 0, len(decodedBlocks))
+				activeAccepted := make([]decodedBlock, 0, len(decodedBlocks))
+				reviewAccepted := make([]decodedBlock, 0, len(decodedBlocks))
 				for _, block := range decodedBlocks {
-					if enqueue(block.value, true) {
-						accepted = append(accepted, block)
-						joined = append(joined, block.value)
+					reviewOnly := source.ReviewOnly || encodedBlockReviewOnlyWithContext(reviewContext, block.start, block.end)
+					if acceptDecodedBlock(block.value, reviewOnly) {
+						if reviewOnly {
+							reviewAccepted = append(reviewAccepted, block)
+							reviewJoined = append(reviewJoined, block.value)
+						} else {
+							activeAccepted = append(activeAccepted, block)
+							activeJoined = append(activeJoined, block.value)
+						}
 					}
 				}
-				if len(joined) > 1 {
-					enqueue(strings.Join(joined, " "), false)
+				// Scan one aggregate per provenance instead of one Engine view per
+				// ordinary block. The decoded byte/block budget was already charged
+				// above; aggregation adds no new decoded material. This prevents a
+				// large decoy list from multiplying full-source policy scans while
+				// retaining every accepted fragment and multi-block matching.
+				enqueueAcceptedDecoded(activeJoined, false)
+				enqueueAcceptedDecoded(reviewJoined, true)
+				// Oversized decoded candidates cannot enter the ordinary decoded-byte
+				// budget. Preserve a small, rule-matching evidence window instead of
+				// replacing a real match with a generic overflow label. Review-only
+				// provenance remains non-enforcing exactly like ordinary decoded views.
+				if source.ReviewOnly {
+					addScanOnly(strings.TrimSpace(decodedBatch.activeEvidenceText+" "+decodedBatch.reviewEvidenceText), true)
+				} else {
+					addScanOnly(decodedBatch.activeEvidenceText, false)
+					addScanOnly(decodedBatch.reviewEvidenceText, true)
 				}
-				if len(accepted) > 0 {
-					enqueue(replaceDecodedBlocks(source, accepted), false)
+				if len(activeAccepted) > 0 {
+					enqueue(collapseRecognizedEncodedPayloads(source.Text, cfg, maxEncodedFragmentBytes, activeAccepted), false, source.ReviewOnly)
+				}
+				if len(reviewAccepted) > 0 {
+					enqueue(collapseRecognizedEncodedPayloads(source.Text, cfg, maxEncodedFragmentBytes, reviewAccepted), false, true)
 				}
 			}
 			// ROT13 is intentionally last: unlike the structured decoders it can
 			// transform any ordinary English text, so it must not consume the
 			// shared byte budget before Base64/hex/compressed payloads are handled.
 			if cfg.DecodeROT13 {
-				if decoded, ok := decodeROT13Text(source); ok {
-					enqueue(decoded, false)
+				if decoded, ok := decodeROT13Text(source.Text); ok {
+					enqueue(decoded, false, source.ReviewOnly)
 				}
 			}
 		}
 		frontier = next
+	}
+	if activeNormalizationIncomplete && len(views) > 0 {
+		// Carry analysis state separately from rule evidence. The Engine may emit
+		// a non-terminal review warning, but must never invent a malicious match
+		// merely because a bounded decoder did not reach EOF.
+		views[0].NormalizationIncomplete = true
 	}
 	return views
 }
@@ -742,56 +879,704 @@ type encodedCandidate struct {
 	kind  string
 }
 
+type decodedCandidate struct {
+	decodedBlock
+	priority int
+}
+
+type decodedCandidateKey struct {
+	start int
+	end   int
+	value string
+}
+
+type encodedCandidateKey struct {
+	start int
+	end   int
+	kind  string
+}
+
+type compressedSafetyCandidate struct {
+	candidate  encodedCandidate
+	raw        []byte
+	decoded    string
+	reviewOnly bool
+}
+
+type decodedBlockBatch struct {
+	blocks             []decodedBlock
+	activeEvidenceText string
+	reviewEvidenceText string
+	activeIncomplete   bool
+	reviewIncomplete   bool
+}
+
 func decodeEmbeddedBlocks(text string, cfg NormalizationConfig, remainingBytes, remainingBlocks, maxFragmentBytes int) []decodedBlock {
+	return decodeEmbeddedBlockBatch(text, cfg, remainingBytes, remainingBlocks, maxFragmentBytes).blocks
+}
+
+func decodeEmbeddedBlockBatch(text string, cfg NormalizationConfig, remainingBytes, remainingBlocks, maxFragmentBytes int, currentEngines ...*Engine) decodedBlockBatch {
 	if remainingBytes <= 0 || remainingBlocks <= 0 {
-		return nil
+		return decodedBlockBatch{}
 	}
-	candidates := encodedCandidates(text, cfg, maxFragmentBytes)
-	decoded := make([]decodedBlock, 0, min(remainingBlocks, 4))
-	for _, candidate := range candidates {
-		if len(decoded) >= remainingBlocks || remainingBytes <= 0 {
+	// The acceptance budget remains authoritative. Ordinary decoding stays on a
+	// bounded head/tail pool, while every direct-text candidate receives a cheap
+	// safety pre-scan from the current Engine. Compressed candidates are discovered
+	// across the complete input and receive fair, bounded streaming scan budgets.
+	allCandidates := encodedCandidates(text, cfg, maxFragmentBytes)
+	priorityScanner := builtinDecodedSafetyPriorityScanner()
+	if len(currentEngines) > 0 && currentEngines[0] != nil {
+		priorityScanner = decodedSafetyPriorityScannerForEngine(currentEngines[0])
+	}
+	// A deliberately tiny administrator budget is an explicit resource policy,
+	// not permission for an out-of-budget safety probe. At normal production
+	// budgets, direct Base64/hex text remains bounded by the request size and can
+	// be inspected without decompression; compressed expansion has a separate cap.
+	allowOutOfBudgetSafetyProbe := remainingBytes >= 1024
+	var activeEvidence, reviewEvidence strings.Builder
+	appendEvidence := func(value string, reviewOnly bool) bool {
+		if value == "" {
+			return false
+		}
+		builder := &activeEvidence
+		if reviewOnly {
+			builder = &reviewEvidence
+		}
+		if builder.Len()+len(value)+1 > 8*1024 {
+			return false
+		}
+		if builder.Len() > 0 {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(value)
+		return true
+	}
+	ordinaryCandidates := boundedEncodedCandidates(allCandidates, 64)
+	inspected := make([]decodedCandidate, 0, len(ordinaryCandidates)+remainingBlocks*2)
+	indexes := make(map[decodedCandidateKey]int, cap(inspected))
+	appendCandidate := func(candidate encodedCandidate, value string, priority int) {
+		if value == "" || len(value) > remainingBytes {
+			return
+		}
+		key := decodedCandidateKey{start: candidate.start, end: candidate.end, value: value}
+		if index, exists := indexes[key]; exists {
+			if priority > inspected[index].priority {
+				inspected[index].priority = priority
+			}
+			return
+		}
+		indexes[key] = len(inspected)
+		inspected = append(inspected, decodedCandidate{
+			decodedBlock: decodedBlock{start: candidate.start, end: candidate.end, value: value},
+			priority:     priority,
+		})
+	}
+	ordinary := make(map[encodedCandidateKey]struct{}, len(ordinaryCandidates))
+	for _, candidate := range ordinaryCandidates {
+		ordinary[encodedCandidateKey{start: candidate.start, end: candidate.end, kind: candidate.kind}] = struct{}{}
+	}
+	reviewContext := newMinorSafetyScanContext(text)
+	riskPoolLimit := remainingBlocks * 8
+	if riskPoolLimit < 128 {
+		riskPoolLimit = 128
+	}
+	if riskPoolLimit > 512 {
+		riskPoolLimit = 512
+	}
+	riskCandidates := make([]decodedCandidate, 0, min(riskPoolLimit, len(allCandidates)))
+	riskIndexes := make(map[decodedCandidateKey]int, cap(riskCandidates))
+	appendRiskCandidate := func(candidate encodedCandidate, value string, priority int, reviewOnly bool) {
+		if priority <= 0 {
+			return
+		}
+		if !reviewOnly {
+			// Active high-risk material outranks quoted non-execution samples when
+			// both compete for the same final decode budget.
+			priority += 1000
+		}
+		key := decodedCandidateKey{start: candidate.start, end: candidate.end, value: value}
+		if index, exists := riskIndexes[key]; exists {
+			if priority > riskCandidates[index].priority {
+				riskCandidates[index].priority = priority
+			}
+			return
+		}
+		entry := decodedCandidate{
+			decodedBlock: decodedBlock{start: candidate.start, end: candidate.end, value: value},
+			priority:     priority,
+		}
+		if len(riskCandidates) < riskPoolLimit {
+			riskIndexes[key] = len(riskCandidates)
+			riskCandidates = append(riskCandidates, entry)
+			return
+		}
+		worst := 0
+		for index := 1; index < len(riskCandidates); index++ {
+			if riskCandidates[index].priority < riskCandidates[worst].priority ||
+				(riskCandidates[index].priority == riskCandidates[worst].priority && riskCandidates[index].start > riskCandidates[worst].start) {
+				worst = index
+			}
+		}
+		if entry.priority < riskCandidates[worst].priority ||
+			(entry.priority == riskCandidates[worst].priority && entry.start >= riskCandidates[worst].start) {
+			return
+		}
+		delete(riskIndexes, decodedCandidateKey{
+			start: riskCandidates[worst].start,
+			end:   riskCandidates[worst].end,
+			value: riskCandidates[worst].value,
+		})
+		riskCandidates[worst] = entry
+		riskIndexes[key] = worst
+	}
+	activeIncomplete, reviewIncomplete := false, false
+	const maxCompressedSafetyCandidates = 512
+	compressedCandidates := make([]compressedSafetyCandidate, 0, min(len(allCandidates), maxCompressedSafetyCandidates))
+	for _, candidate := range allCandidates {
+		raw, ok := decodeEncodedCandidateRaw(candidate)
+		if !ok {
+			continue
+		}
+		reviewOnly := encodedBlockReviewOnlyWithContext(reviewContext, candidate.start, candidate.end)
+		var ordinaryDecoded string
+		if _, shouldDecode := ordinary[encodedCandidateKey{start: candidate.start, end: candidate.end, kind: candidate.kind}]; shouldDecode {
+			if value, decoded := decodedPayloadText(raw, cfg.DecodeCompression, remainingBytes); decoded {
+				ordinaryDecoded = value
+				appendCandidate(candidate, value, 0)
+			}
+		}
+		// Plain decoded text is cheap to inspect, so every candidate—not only the
+		// bounded ordinary pool—gets ranked against the current Engine's built-in and
+		// custom decision rules. Oversized matches retain a small real evidence view;
+		// an unrepresentable match is marked incomplete instead of being invented.
+		if allowOutOfBudgetSafetyProbe {
+			if value, decoded := decodedPayloadText(raw, false, len(raw)); decoded {
+				priority, evidence := decodedSafetyPriority(value, priorityScanner)
+				if priority > 0 && len(value) > remainingBytes {
+					if !appendEvidence(evidence, reviewOnly) {
+						if reviewOnly {
+							reviewIncomplete = true
+						} else {
+							activeIncomplete = true
+						}
+					}
+				} else if priority > 0 {
+					appendRiskCandidate(candidate, value, priority, reviewOnly)
+				}
+			}
+		}
+		if cfg.DecodeCompression && compressedPayload(raw) {
+			compressed := compressedSafetyCandidate{
+				candidate:  candidate,
+				raw:        raw,
+				decoded:    ordinaryDecoded,
+				reviewOnly: reviewOnly,
+			}
+			if len(compressedCandidates) < maxCompressedSafetyCandidates {
+				compressedCandidates = append(compressedCandidates, compressed)
+			} else if reviewOnly {
+				reviewIncomplete = true
+			} else {
+				activeIncomplete = true
+			}
+		}
+	}
+	// Compression is opaque until expanded. Give every candidate a fair share of
+	// one global expansion budget, and scan each share as a bounded stream with
+	// overlap. A bomb or a large legitimate archive therefore cannot consume the
+	// whole budget before a later candidate is inspected. Exhaustion is recorded
+	// as incomplete analysis; it is never converted into fabricated malicious
+	// evidence or a terminal decision.
+	compressionExpansionBudget := remainingBytes * 16
+	if compressionExpansionBudget > 1024*1024 {
+		compressionExpansionBudget = 1024 * 1024
+	}
+	for index, compressed := range compressedCandidates {
+		if !allowOutOfBudgetSafetyProbe {
+			continue
+		}
+		if compressionExpansionBudget <= 0 {
+			if compressed.reviewOnly {
+				reviewIncomplete = true
+			} else {
+				activeIncomplete = true
+			}
+			continue
+		}
+		remainingCandidates := len(compressedCandidates) - index
+		candidateBudget := compressionExpansionBudget / remainingCandidates
+		if candidateBudget < 1 {
+			candidateBudget = 1
+		}
+		if candidateBudget > 384*1024 {
+			candidateBudget = 384 * 1024
+		}
+		value := compressed.decoded
+		if value != "" {
+			accounted := min(len(value), candidateBudget)
+			compressionExpansionBudget -= accounted
+			priority, evidence := decodedSafetyPriority(value, priorityScanner)
+			if priority > 0 && len(value) > remainingBytes {
+				if !appendEvidence(evidence, compressed.reviewOnly) {
+					if compressed.reviewOnly {
+						reviewIncomplete = true
+					} else {
+						activeIncomplete = true
+					}
+				}
+				continue
+			}
+			appendRiskCandidate(compressed.candidate, value, priority, compressed.reviewOnly)
+			continue
+		}
+		priority, evidence, expanded, complete, decoded := scanCompressedPayload(compressed.raw, candidateBudget, priorityScanner)
+		compressionExpansionBudget -= expanded
+		if !decoded {
+			continue
+		}
+		if priority > 0 && !appendEvidence(evidence, compressed.reviewOnly) {
+			complete = false
+		}
+		if !complete {
+			if compressed.reviewOnly {
+				reviewIncomplete = true
+			} else {
+				activeIncomplete = true
+			}
+		}
+	}
+	for _, candidate := range riskCandidates {
+		appendCandidate(encodedCandidate{start: candidate.start, end: candidate.end}, candidate.value, candidate.priority)
+	}
+	sort.SliceStable(inspected, func(i, j int) bool {
+		if inspected[i].priority == inspected[j].priority {
+			return inspected[i].start < inspected[j].start
+		}
+		return inspected[i].priority > inspected[j].priority
+	})
+	decoded := make([]decodedBlock, 0, min(remainingBlocks, len(inspected)))
+	for _, candidate := range inspected {
+		if len(decoded) >= remainingBlocks {
 			break
 		}
-		var value string
-		var ok bool
-		if candidate.kind == "hex" {
-			if raw, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(candidate.value, "0x"), "0X")); err == nil {
-				value, ok = decodedPayloadText(raw, cfg.DecodeCompression, remainingBytes)
+		if len(candidate.value) > remainingBytes {
+			continue
+		}
+		decoded = append(decoded, candidate.decodedBlock)
+		remainingBytes -= len(candidate.value)
+	}
+	// Replacement and multi-block reassembly rely on source order, not risk
+	// order. Ranking only chooses the bounded accepted set.
+	sort.Slice(decoded, func(i, j int) bool { return decoded[i].start < decoded[j].start })
+	return decodedBlockBatch{
+		blocks:             decoded,
+		activeEvidenceText: activeEvidence.String(),
+		reviewEvidenceText: reviewEvidence.String(),
+		activeIncomplete:   activeIncomplete,
+		reviewIncomplete:   reviewIncomplete,
+	}
+}
+
+func decodeEncodedCandidateRaw(candidate encodedCandidate) ([]byte, bool) {
+	if candidate.kind == "hex" {
+		raw, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(candidate.value, "0x"), "0X"))
+		return raw, err == nil
+	}
+	if candidate.kind != "base64" {
+		return nil, false
+	}
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		raw, err := encoding.DecodeString(candidate.value)
+		if err == nil {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+func boundedEncodedCandidates(candidates []encodedCandidate, limit int) []encodedCandidate {
+	if limit <= 0 || len(candidates) <= limit {
+		return candidates
+	}
+	head := limit / 2
+	tail := limit - head
+	bounded := make([]encodedCandidate, 0, limit)
+	bounded = append(bounded, candidates[:head]...)
+	bounded = append(bounded, candidates[len(candidates)-tail:]...)
+	return bounded
+}
+
+type decodedSafetyPriorityPattern struct {
+	pattern compiledPattern
+	hints   []string
+}
+
+type decodedSafetyPriorityScanner struct {
+	patterns []decodedSafetyPriorityPattern
+}
+
+var (
+	decodedSafetyPriorityOnce    sync.Once
+	decodedSafetyPriorityBuiltin decodedSafetyPriorityScanner
+)
+
+func builtinDecodedSafetyPriorityScanner() decodedSafetyPriorityScanner {
+	decodedSafetyPriorityOnce.Do(func() {
+		// Initialize lazily so defaultPatternConfigs has completed package
+		// initialization before NewEngine reads it.
+		cfg := DefaultConfig()
+		cfg.Enabled = true
+		cfg.Advanced.Normalization.Enabled = false
+		engine, err := NewEngine(cfg)
+		if err != nil {
+			return
+		}
+		decodedSafetyPriorityBuiltin = decodedSafetyPriorityScannerForEngine(engine)
+	})
+	return decodedSafetyPriorityBuiltin
+}
+
+func decodedSafetyPriorityScannerForEngine(engine *Engine) decodedSafetyPriorityScanner {
+	if engine == nil {
+		return decodedSafetyPriorityScanner{}
+	}
+	return engine.decodedPriorityScanner
+}
+
+func buildDecodedSafetyPriorityScanner(compiled []compiledPattern) decodedSafetyPriorityScanner {
+	patterns := make([]decodedSafetyPriorityPattern, 0, len(compiled))
+	for _, pattern := range compiled {
+		// Signal-only vocabulary is useful audit evidence but must not crowd
+		// enforceable candidates out of the decode budget. Strict rules and
+		// standalone decision rules cover every built-in high-risk family.
+		if pattern.cfg.SignalOnly || (!pattern.cfg.Strict && pattern.cfg.Weight < DefaultThreshold) {
+			continue
+		}
+		patterns = append(patterns, decodedSafetyPriorityPattern{
+			pattern: pattern,
+			hints:   decodedSafetyMandatoryHints(pattern),
+		})
+	}
+	return decodedSafetyPriorityScanner{patterns: patterns}
+}
+
+func decodedSafetyPriority(value string, scanner decodedSafetyPriorityScanner) (int, string) {
+	normalized := normalizeForScan(value)
+	priority := 0
+	evidence := ""
+	decisionScore := 0
+	decisionEvidence := make([]string, 0, 4)
+	decisionEvidenceComplete := true
+	for _, candidatePattern := range scanner.patterns {
+		if len(candidatePattern.hints) > 0 && !containsDecodedSafetyHint(normalized, candidatePattern.hints) {
+			continue
+		}
+		pattern := candidatePattern.pattern
+		if !patternShouldRun(normalized, pattern, nil) ||
+			patternSuppressedForQuotedPolicyReview(normalized, pattern) ||
+			patternSuppressedForDefensiveRuleArtifact(normalized, pattern) {
+			continue
+		}
+		loc := compiledPatternMatchIndex(normalized, pattern)
+		if loc == nil {
+			continue
+		}
+		patternEvidence := decodedSafetyPatternEvidence(normalized, pattern, loc)
+		if pattern.cfg.Strict {
+			candidatePriority := 300 + min(pattern.cfg.Weight, 99)
+			if candidatePriority > priority {
+				priority = candidatePriority
+				evidence = patternEvidence
 			}
-		} else if candidate.kind == "base64" {
-			for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-				raw, err := encoding.DecodeString(candidate.value)
-				if err != nil {
-					continue
-				}
-				if value, ok = decodedPayloadText(raw, cfg.DecodeCompression, remainingBytes); ok {
+			continue
+		}
+		decisionScore += pattern.cfg.Weight
+		if patternEvidence == "" {
+			decisionEvidenceComplete = false
+		} else {
+			decisionEvidence = append(decisionEvidence, patternEvidence)
+		}
+	}
+	if decisionScore >= DefaultThreshold {
+		candidatePriority := 200 + min(decisionScore, 99)
+		if candidatePriority > priority {
+			priority = candidatePriority
+			if decisionEvidenceComplete {
+				evidence = strings.Join(decisionEvidence, " ")
+			} else {
+				evidence = ""
+			}
+		}
+	}
+	canonical := norm.NFKC.String(value)
+	if minorSafetyShouldInspectCompact(canonical) && minorSafetyCompactMaterialMatchIndex(compactForScan(stripInvisible(canonical))) != nil {
+		if priority < 399 {
+			priority = 399
+			// Compact offsets do not map safely back to the original fragmented
+			// source. Let the caller mark an oversized candidate incomplete rather
+			// than manufacture evidence that the main Engine cannot reproduce.
+			evidence = ""
+		}
+	}
+	return priority, evidence
+}
+
+func decodedSafetyPatternEvidence(text string, pattern compiledPattern, fallbackLoc []int) string {
+	const (
+		evidencePadding  = 192
+		maxEvidenceBytes = 6 * 1024
+	)
+	locations := make([][]int, 0, 2+len(pattern.all)+len(pattern.any))
+	appendLocation := func(loc []int) bool {
+		if len(loc) != 2 || loc[0] < 0 || loc[1] <= loc[0] || loc[1] > len(text) {
+			return false
+		}
+		locations = append(locations, []int{loc[0], loc[1]})
+		return true
+	}
+	if isBuiltinMinorSafetyPattern(pattern) {
+		appendLocation(fallbackLoc)
+	} else {
+		if pattern.re != nil && !appendLocation(pattern.re.FindStringIndex(text)) {
+			return ""
+		}
+		for _, re := range pattern.all {
+			if !appendLocation(re.FindStringIndex(text)) {
+				return ""
+			}
+		}
+		minimum := pattern.cfg.MinMatches
+		if minimum <= 0 && len(pattern.any) > 0 {
+			minimum = 1
+		}
+		matchedAny := 0
+		for _, re := range pattern.any {
+			if loc := re.FindStringIndex(text); loc != nil {
+				appendLocation(loc)
+				matchedAny++
+				if matchedAny >= minimum {
 					break
 				}
 			}
 		}
-		if !ok || len(value) > remainingBytes {
+		if matchedAny < minimum {
+			return ""
+		}
+	}
+	if len(locations) == 0 && !appendLocation(fallbackLoc) {
+		return ""
+	}
+	sort.Slice(locations, func(i, j int) bool {
+		if locations[i][0] == locations[j][0] {
+			return locations[i][1] < locations[j][1]
+		}
+		return locations[i][0] < locations[j][0]
+	})
+	spans := make([][2]int, 0, len(locations))
+	for _, loc := range locations {
+		start := loc[0] - evidencePadding
+		if start < 0 {
+			start = 0
+		}
+		end := loc[1] + evidencePadding
+		if end > len(text) {
+			end = len(text)
+		}
+		if len(spans) > 0 && start <= spans[len(spans)-1][1] {
+			if end > spans[len(spans)-1][1] {
+				spans[len(spans)-1][1] = end
+			}
 			continue
 		}
-		decoded = append(decoded, decodedBlock{start: candidate.start, end: candidate.end, value: value})
-		remainingBytes -= len(value)
+		spans = append(spans, [2]int{start, end})
 	}
-	return decoded
+	var output strings.Builder
+	for _, span := range spans {
+		if output.Len() > 0 {
+			output.WriteByte(' ')
+		}
+		if output.Len()+span[1]-span[0] > maxEvidenceBytes {
+			return ""
+		}
+		output.WriteString(text[span[0]:span[1]])
+	}
+	evidence := strings.TrimSpace(output.String())
+	if evidence == "" || !patternShouldRun(evidence, pattern, nil) ||
+		patternSuppressedForQuotedPolicyReview(evidence, pattern) ||
+		patternSuppressedForDefensiveRuleArtifact(evidence, pattern) ||
+		compiledPatternMatchIndex(evidence, pattern) == nil {
+		return ""
+	}
+	return evidence
+}
+
+func decodedSafetyMandatoryHints(pattern compiledPattern) []string {
+	sets := make([][]string, 0, 1+len(pattern.all))
+	if pattern.cfg.Pattern != "" {
+		if hints, guaranteed := decodedSafetyRegexpMandatoryHints(pattern.cfg.Pattern); guaranteed {
+			sets = append(sets, hints)
+		}
+	}
+	for _, expression := range pattern.cfg.AllPatterns {
+		if hints, guaranteed := decodedSafetyRegexpMandatoryHints(expression); guaranteed {
+			sets = append(sets, hints)
+		}
+	}
+	// At least MinMatches AnyPatterns must match. Requiring one hint from their
+	// union is safe only when every eligible branch has a mandatory literal.
+	if len(pattern.cfg.AnyPatterns) > 0 {
+		anyHints := make([]string, 0, len(pattern.cfg.AnyPatterns))
+		allGuaranteed := true
+		for _, expression := range pattern.cfg.AnyPatterns {
+			hints, guaranteed := decodedSafetyRegexpMandatoryHints(expression)
+			if !guaranteed {
+				allGuaranteed = false
+				break
+			}
+			anyHints = append(anyHints, hints...)
+		}
+		if allGuaranteed {
+			sets = append(sets, anyHints)
+		}
+	}
+	if len(sets) == 0 {
+		// These broad multilingual alternations do not expose one literal that is
+		// common to every branch, but their policy targets are still finite and
+		// cheap to screen before running the full expression.
+		switch pattern.cfg.Name {
+		case "prompt_unrestricted_activation_request":
+			return []string{"jailbreak", "unrestricted", "developer mode", "破限", "破甲", "越狱", "无限制", "开发者"}
+		}
+		return nil
+	}
+	seen := make(map[string]struct{})
+	hints := make([]string, 0, 8)
+	for _, set := range sets {
+		for _, hint := range set {
+			if _, exists := seen[hint]; exists {
+				continue
+			}
+			seen[hint] = struct{}{}
+			hints = append(hints, hint)
+		}
+	}
+	return hints
+}
+
+func decodedSafetyRegexpMandatoryHints(expression string) ([]string, bool) {
+	parsed, err := syntax.Parse(expression, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	hints, guaranteed := decodedSafetySyntaxMandatoryHints(parsed.Simplify())
+	if !guaranteed || len(hints) == 0 {
+		return nil, false
+	}
+	out := make([]string, 0, len(hints))
+	for hint := range hints {
+		out = append(out, hint)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i]) == len(out[j]) {
+			return out[i] < out[j]
+		}
+		return len(out[i]) > len(out[j])
+	})
+	return out, true
+}
+
+func decodedSafetySyntaxMandatoryHints(expression *syntax.Regexp) (map[string]struct{}, bool) {
+	if expression == nil {
+		return nil, false
+	}
+	switch expression.Op {
+	case syntax.OpLiteral:
+		hint := normalizeForScan(string(expression.Rune))
+		if utf8.RuneCountInString(hint) < 2 {
+			return nil, false
+		}
+		return map[string]struct{}{hint: {}}, true
+	case syntax.OpCapture, syntax.OpPlus:
+		return decodedSafetySyntaxMandatoryHints(expression.Sub[0])
+	case syntax.OpRepeat:
+		if expression.Min < 1 {
+			return nil, false
+		}
+		return decodedSafetySyntaxMandatoryHints(expression.Sub[0])
+	case syntax.OpConcat:
+		out := make(map[string]struct{})
+		guaranteed := false
+		for _, child := range expression.Sub {
+			hints, childGuaranteed := decodedSafetySyntaxMandatoryHints(child)
+			if !childGuaranteed {
+				continue
+			}
+			guaranteed = true
+			for hint := range hints {
+				out[hint] = struct{}{}
+			}
+		}
+		return out, guaranteed
+	case syntax.OpAlternate:
+		out := make(map[string]struct{})
+		for _, child := range expression.Sub {
+			hints, childGuaranteed := decodedSafetySyntaxMandatoryHints(child)
+			if !childGuaranteed {
+				return nil, false
+			}
+			for hint := range hints {
+				out[hint] = struct{}{}
+			}
+		}
+		return out, len(out) > 0
+	default:
+		return nil, false
+	}
+}
+
+func containsDecodedSafetyHint(text string, hints []string) bool {
+	for _, hint := range hints {
+		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 func encodedCandidates(text string, cfg NormalizationConfig, maxFragmentBytes int) []encodedCandidate {
-	candidates := make([]encodedCandidate, 0, 8)
+	var hexCandidates []encodedCandidate
+	var base64Candidates []encodedCandidate
 	if cfg.DecodeHex {
-		candidates = append(candidates, embeddedHexCandidates(text, maxFragmentBytes)...)
+		hexCandidates = embeddedHexCandidates(text, maxFragmentBytes)
 	}
 	if cfg.DecodeBase64 {
-		candidates = append(candidates, embeddedBase64Candidates(text, maxFragmentBytes)...)
+		base64Candidates = embeddedBase64Candidates(text, maxFragmentBytes)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].start == candidates[j].start {
-			return candidates[i].end < candidates[j].end
+	if len(hexCandidates) == 0 {
+		return base64Candidates
+	}
+	if len(base64Candidates) == 0 {
+		return hexCandidates
+	}
+	candidates := make([]encodedCandidate, 0, len(hexCandidates)+len(base64Candidates))
+	hexIndex, base64Index := 0, 0
+	less := func(left, right encodedCandidate) bool {
+		if left.start == right.start {
+			return left.end < right.end
 		}
-		return candidates[i].start < candidates[j].start
-	})
+		return left.start < right.start
+	}
+	for hexIndex < len(hexCandidates) && base64Index < len(base64Candidates) {
+		if less(hexCandidates[hexIndex], base64Candidates[base64Index]) {
+			candidates = append(candidates, hexCandidates[hexIndex])
+			hexIndex++
+		} else {
+			candidates = append(candidates, base64Candidates[base64Index])
+			base64Index++
+		}
+	}
+	candidates = append(candidates, hexCandidates[hexIndex:]...)
+	candidates = append(candidates, base64Candidates[base64Index:]...)
 	return candidates
 }
 
@@ -870,18 +1655,81 @@ func overlapsEncodedCandidate(candidates []encodedCandidate, start, end int) boo
 	return false
 }
 
-func replaceDecodedBlocks(source string, blocks []decodedBlock) string {
-	var output strings.Builder
-	last := 0
-	for _, block := range blocks {
-		if block.start < last || block.start < 0 || block.end > len(source) || block.end <= block.start {
+type recognizedEncodedSpan struct {
+	start       int
+	end         int
+	replacement string
+}
+
+// collapseRecognizedEncodedPayloads removes only tokens that successfully
+// decode to printable text (or carry a supported compression header). This
+// keeps surrounding request intent visible while preventing thousands of
+// opaque encoded characters from being rescanned once per derived view.
+// Accepted blocks are substituted with their decoded value; all other
+// recognized blocks collapse to whitespace.
+func collapseRecognizedEncodedPayloads(source string, cfg NormalizationConfig, maxFragmentBytes int, accepted []decodedBlock) string {
+	if source == "" || (!cfg.DecodeBase64 && !cfg.DecodeHex) {
+		return source
+	}
+	acceptedValues := make(map[[2]int]string, len(accepted))
+	for _, block := range accepted {
+		if block.start >= 0 && block.end > block.start && block.end <= len(source) {
+			acceptedValues[[2]int{block.start, block.end}] = block.value
+		}
+	}
+	candidates := encodedCandidates(source, cfg, maxFragmentBytes)
+	spans := make([]recognizedEncodedSpan, 0, len(candidates))
+	for _, candidate := range candidates {
+		replacement, selected := acceptedValues[[2]int{candidate.start, candidate.end}]
+		// Slash/underscore-separated plaintext can also satisfy the Base64
+		// alphabet. Keep explicit fragmentation evidence in the source view so
+		// compact minor-safety matching is not erased as an "encoded" token.
+		if !selected && minorSafetyShouldInspectCompact(candidate.value) {
 			continue
 		}
-		output.WriteString(source[last:block.start])
-		output.WriteString(block.value)
-		last = block.end
+		raw, ok := decodeEncodedCandidateRaw(candidate)
+		if !ok {
+			continue
+		}
+		if !selected {
+			if _, printable := decodedPayloadText(raw, false, maxFragmentBytes); !printable && !(cfg.DecodeCompression && compressedPayload(raw)) {
+				continue
+			}
+		}
+		spans = append(spans, recognizedEncodedSpan{start: candidate.start, end: candidate.end, replacement: replacement})
 	}
-	output.WriteString(source[last:])
+	if len(spans) == 0 {
+		return source
+	}
+	var output strings.Builder
+	output.Grow(len(source))
+	cursor := 0
+	for index := 0; index < len(spans); {
+		span := spans[index]
+		if span.start < cursor {
+			index++
+			continue
+		}
+		groupEnd := span.end
+		replacement := span.replacement
+		index++
+		for index < len(spans) && spans[index].start < groupEnd {
+			if spans[index].end > groupEnd {
+				groupEnd = spans[index].end
+			}
+			if replacement == "" && spans[index].replacement != "" {
+				replacement = spans[index].replacement
+			}
+			index++
+		}
+		output.WriteString(source[cursor:span.start])
+		if replacement != "" {
+			output.WriteString(replacement)
+		}
+		output.WriteByte(' ')
+		cursor = groupEnd
+	}
+	output.WriteString(source[cursor:])
 	return output.String()
 }
 
@@ -944,9 +1792,47 @@ func decodedPayloadText(raw []byte, allowCompression bool, limit int) (string, b
 	return string(raw), true
 }
 
+func compressedPayload(raw []byte) bool {
+	if len(raw) < 2 {
+		return false
+	}
+	if raw[0] == 0x1f && raw[1] == 0x8b {
+		return true
+	}
+	return raw[0]&0x0f == 8 && ((int(raw[0])<<8)|int(raw[1]))%31 == 0
+}
+
 func decompressSmallPayload(raw []byte, limit int) (string, bool) {
+	value, _, overflow, ok := decompressSmallPayloadAccounted(raw, limit)
+	return value, ok && !overflow
+}
+
+func decompressSmallPayloadAccounted(raw []byte, limit int) (value string, expanded int, overflow bool, ok bool) {
 	if len(raw) < 2 || limit <= 0 {
-		return "", false
+		return "", 0, false, false
+	}
+	reader, opened := openCompressedPayload(raw)
+	if !opened {
+		return "", 0, false, false
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+	expanded = len(decoded)
+	if err != nil {
+		return "", expanded, false, false
+	}
+	if len(decoded) > limit {
+		return "", expanded, true, false
+	}
+	if !utf8.Valid(decoded) || !mostlyPrintable(string(decoded)) {
+		return "", expanded, false, false
+	}
+	return string(decoded), expanded, false, true
+}
+
+func openCompressedPayload(raw []byte) (io.ReadCloser, bool) {
+	if len(raw) < 2 {
+		return nil, false
 	}
 	var (
 		reader io.ReadCloser
@@ -957,17 +1843,78 @@ func decompressSmallPayload(raw []byte, limit int) (string, bool) {
 	} else if raw[0]&0x0f == 8 && ((int(raw[0])<<8)|int(raw[1]))%31 == 0 {
 		reader, err = zlib.NewReader(bytes.NewReader(raw))
 	} else {
-		return "", false
+		return nil, false
 	}
 	if err != nil {
-		return "", false
+		if reader != nil {
+			_ = reader.Close()
+		}
+		return nil, false
+	}
+	return reader, true
+}
+
+// scanCompressedPayload scans a fair, bounded share of one compressed stream.
+// Overlap preserves policy phrases split across read boundaries, while the
+// caller's global/fair-share budgets keep aggregate expansion and CPU bounded.
+// Incomplete means the cap or a stream error prevented reaching EOF; callers
+// may audit that state but must not turn it into fabricated policy evidence.
+func scanCompressedPayload(raw []byte, limit int, scanner decodedSafetyPriorityScanner) (priority int, evidence string, expanded int, complete bool, decoded bool) {
+	if limit <= 0 {
+		return 0, "", 0, false, false
+	}
+	reader, opened := openCompressedPayload(raw)
+	if !opened {
+		return 0, "", 0, false, false
 	}
 	defer reader.Close()
-	decoded, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
-	if err != nil || len(decoded) > limit || !utf8.Valid(decoded) || !mostlyPrintable(string(decoded)) {
-		return "", false
+	decoded = true
+	const (
+		chunkBytes   = 16 * 1024
+		overlapBytes = 8 * 1024
+	)
+	bufferSize := min(chunkBytes, limit)
+	if bufferSize <= 0 {
+		return 0, "", 0, false, true
 	}
-	return string(decoded), true
+	buffer := make([]byte, bufferSize)
+	tail := make([]byte, 0, min(overlapBytes, limit))
+	zeroReads := 0
+	for expanded < limit {
+		readSize := min(len(buffer), limit-expanded)
+		n, err := reader.Read(buffer[:readSize])
+		if n > 0 {
+			zeroReads = 0
+			expanded += n
+			window := make([]byte, len(tail)+n)
+			copy(window, tail)
+			copy(window[len(tail):], buffer[:n])
+			windowText := string(window)
+			if !utf8.Valid(window) {
+				windowText = string(bytes.ToValidUTF8(window, []byte(" ")))
+			}
+			if mostlyPrintable(windowText) {
+				candidatePriority, candidateEvidence := decodedSafetyPriority(windowText, scanner)
+				if candidatePriority > priority || candidatePriority == priority && evidence == "" && candidateEvidence != "" {
+					priority = candidatePriority
+					evidence = candidateEvidence
+				}
+			}
+			tailSize := min(overlapBytes, len(window))
+			tail = append(tail[:0], window[len(window)-tailSize:]...)
+		} else {
+			zeroReads++
+		}
+		if err == io.EOF {
+			return priority, evidence, expanded, true, true
+		}
+		if err != nil || zeroReads >= 3 {
+			return priority, evidence, expanded, false, true
+		}
+	}
+	var extra [1]byte
+	n, err := reader.Read(extra[:])
+	return priority, evidence, expanded, n == 0 && err == io.EOF, true
 }
 
 func decodeROT13Text(text string) (string, bool) {
@@ -1051,6 +1998,7 @@ func stripInvisible(text string) string {
 
 var commonHomoglyphs = map[rune]rune{
 	'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'х': 'x', 'у': 'y', 'і': 'i', 'ј': 'j',
+	'А': 'a', 'Е': 'e', 'О': 'o', 'Р': 'p', 'С': 'c', 'Х': 'x', 'У': 'y', 'І': 'i', 'Ј': 'j',
 	'Α': 'a', 'Β': 'b', 'Ε': 'e', 'Ζ': 'z', 'Η': 'h', 'Ι': 'i', 'Κ': 'k', 'Μ': 'm', 'Ν': 'n', 'Ο': 'o', 'Ρ': 'p', 'Τ': 't', 'Χ': 'x',
 }
 

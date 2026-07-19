@@ -175,7 +175,7 @@ const (
 	memoryPromptPrefix     = "Analyze this rollout and produce JSON with `raw_memory`, `rollout_summary`, and `rollout_slug`"
 	ambientPromptPrefix    = "You are an expert at upholding safety and compliance standards for Codex ambient suggestions."
 	approvalPromptPrefix   = "The following is the Codex agent history added since your last approval assessment."
-	checkpointPrompt       = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task."
+	checkpointPrompt       = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work."
 )
 
 // Codex application tasks such as compaction, memory extraction, ambient
@@ -433,6 +433,13 @@ func (DefaultGuardPolicy) Decide(request GuardRequest, detectionContext Detectio
 }
 
 func actionForGuardProfile(action string, signal Signal, profile GuardProfile) string {
+	// An incomplete active encoded/compressed scan is not proof of abuse. The
+	// balanced profile therefore forwards it as a warning. Operators selecting
+	// the strict profile explicitly choose fail-closed handling, but the signal
+	// remains non-terminal and never qualifies for a user/IP strike.
+	if profile.Name == GuardProfileStrict && signal.Origin == OriginCurrentUser && action == ActionWarn && signalHasMatch(signal, encodedScanIncompleteMatch) {
+		return ActionBlock
+	}
 	// Research mode keeps terminal current-user abuse enforceable, while
 	// downgrading non-terminal current-user matches to a warning so legitimate
 	// security research can proceed to secondary review with fewer false blocks.
@@ -440,6 +447,15 @@ func actionForGuardProfile(action string, signal Signal, profile GuardProfile) s
 		return ActionWarn
 	}
 	return action
+}
+
+func signalHasMatch(signal Signal, name string) bool {
+	for _, match := range signal.Matches {
+		if match.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func DeduplicateSignals(signals []Signal) []Signal {

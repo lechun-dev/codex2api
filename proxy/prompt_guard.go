@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/codex2api/security/promptfilter"
@@ -20,6 +21,7 @@ type promptGuardEvaluation struct {
 func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
 	cfg := h.store.GetPromptFilterConfig()
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
+	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
 	envelope := promptfilter.BuildEnvelopeWithModels(rawBody, endpoint, requestedModel, effectiveModel, transport, cfg.MaxTextLength)
 	applyPromptGuardProviderOverride(&envelope, cfg, trustedProfile, providerOverride, providerOverrideSet)
 	extensionErrors := make([]string, 0, 3)
@@ -30,7 +32,7 @@ func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody
 	if err := h.enrichPromptGuardAttachments(promptGuardRequestContext(c), cfg, &envelope); err != nil {
 		extensionErrors = append(extensionErrors, "attachment_parser: "+err.Error())
 	}
-	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride)
+	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
 	if evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
@@ -44,6 +46,7 @@ func (h *Handler) evaluatePromptGuardText(c *gin.Context, text string, endpoint 
 	cfg := h.store.GetPromptFilterConfig()
 	signedBody := ingressRequestBody(c, nil)
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
+	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
 	envelope := promptfilter.RequestEnvelope{
 		Endpoint:       endpoint,
 		Protocol:       promptfilter.ProtocolForEndpoint(endpoint),
@@ -64,7 +67,7 @@ func (h *Handler) evaluatePromptGuardText(c *gin.Context, text string, endpoint 
 	if err != nil {
 		extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
 	}
-	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride)
+	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
 	if evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
@@ -98,6 +101,18 @@ func (h *Handler) resolvePromptGuardOverrides(c *gin.Context, cfg promptfilter.C
 	return requestedModel, effectiveModel, true, policyContext.Meta.Profile, policyContext.Meta.Mode, provider, provider != promptfilter.ModelFamilyUnknown
 }
 
+func (h *Handler) resolvePromptGuardRolloutIdentity(c *gin.Context, cfg promptfilter.Config, signedBody []byte) promptfilter.RolloutIdentity {
+	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody); verified {
+		if userID := strings.TrimSpace(policyContext.Identity.UserID); userID != "" {
+			return promptfilter.RolloutIdentity{Source: promptfilter.RolloutIdentityNewAPIUser, Value: userID}
+		}
+	}
+	if apiKeyID := requestAPIKeyID(c); apiKeyID > 0 {
+		return promptfilter.RolloutIdentity{Source: promptfilter.RolloutIdentityAPIKey, Value: strconv.FormatInt(apiKeyID, 10)}
+	}
+	return promptfilter.RolloutIdentity{}
+}
+
 func applyPromptGuardProviderOverride(envelope *promptfilter.RequestEnvelope, cfg promptfilter.Config, trusted bool, provider promptfilter.ModelFamily, providerSet bool) {
 	if envelope == nil || !trusted || !providerSet || !cfg.Advanced.Guard.AllowTrustedOverrides {
 		return
@@ -108,7 +123,7 @@ func applyPromptGuardProviderOverride(envelope *promptfilter.RequestEnvelope, cf
 	}
 }
 
-func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.Config, envelope promptfilter.RequestEnvelope, trustedProfile bool, profileOverride string, modeOverride string) promptGuardEvaluation {
+func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.Config, envelope promptfilter.RequestEnvelope, trustedProfile bool, profileOverride string, modeOverride string, rolloutIdentity promptfilter.RolloutIdentity) promptGuardEvaluation {
 	ctx := context.Background()
 	if c != nil && c.Request != nil {
 		ctx = c.Request.Context()
@@ -119,6 +134,7 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 		TrustedProfile:  trustedProfile,
 		ProfileOverride: profileOverride,
 		ModeOverride:    modeOverride,
+		RolloutIdentity: rolloutIdentity,
 	})
 	if cfg.Enabled && decision.Mode == promptfilter.GuardModeOff {
 		return h.evaluateLegacyPromptGuard(c, ctx, cfg, envelope, decision.Profile)
@@ -128,7 +144,7 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 	// The detector selected for audit can come from history, tool output, or
 	// session context. Semantic review, persisted request evidence, and the UI
 	// preview must nevertheless describe only the direct current-user prompt.
-	text := envelopeCurrentUserText(envelope)
+	text := promptGuardReviewText(decision, envelope)
 	verdict.FullText = text
 	verdict.TextPreview = promptfilter.RedactedPreview(text, 500)
 	verdict.ExtractedChars = len([]rune(text))
@@ -138,8 +154,7 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 	// reviewed against that different text: a benign current prompt could clear
 	// an administrator-enabled auxiliary-layer block. Clean-prompt sampling is
 	// still allowed when the pipeline itself made no enforcement decision.
-	inspectCurrentPrompt := promptGuardHasCurrentUserEnforcement(decision) ||
-		(decision.Action == promptfilter.ActionAllow && cfg.Advanced.Sidecar.ScanCleanEnabled && decision.ApplicationPromptKind == "")
+	inspectCurrentPrompt := promptGuardShouldInspect(decision, cfg)
 	if inspectCurrentPrompt {
 		advancedCfg := cfg
 		verdict = h.applyPromptSemanticProtection(c, text, verdict, advancedCfg)
@@ -214,8 +229,33 @@ func legacyModeForPromptGuard(mode string) string {
 	}
 }
 
-func promptGuardHasCurrentUserEnforcement(decision promptfilter.Decision) bool {
-	return decision.PrimaryOrigin == promptfilter.OriginCurrentUser && decision.Action != promptfilter.ActionAllow
+func promptGuardHasReviewableEnforcement(decision promptfilter.Decision) bool {
+	if decision.Action == promptfilter.ActionAllow {
+		return false
+	}
+	return decision.PrimaryOrigin == promptfilter.OriginCurrentUser || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate
+}
+
+func promptGuardShouldInspect(decision promptfilter.Decision, cfg promptfilter.Config) bool {
+	if promptGuardHasReviewableEnforcement(decision) {
+		return true
+	}
+	if decision.Action != promptfilter.ActionAllow || !cfg.Advanced.Sidecar.ScanCleanEnabled {
+		return false
+	}
+	// A verified ambient application prompt has already had its fixed policy
+	// boilerplate removed. Its dynamic candidate is therefore safe to send to a
+	// configured semantic scanner even when the local rules found no match.
+	return decision.ApplicationPromptKind == "" || strings.TrimSpace(decision.ReviewText) != ""
+}
+
+func promptGuardReviewText(decision promptfilter.Decision, envelope promptfilter.RequestEnvelope) string {
+	if decision.ApplicationPromptKind != "" || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate {
+		if candidate := strings.TrimSpace(decision.ReviewText); candidate != "" {
+			return candidate
+		}
+	}
+	return envelopeCurrentUserText(envelope)
 }
 
 func envelopeCurrentUserText(envelope promptfilter.RequestEnvelope) string {
@@ -253,6 +293,12 @@ func finalizePromptGuardDecision(decision promptfilter.Decision, verdict promptf
 		}
 	}
 	decision.Action = finalAction
+	if decision.ApplicationPromptKind != "" && finalAction != promptfilter.ActionAllow && decision.PrimaryOrigin == "" {
+		decision.PrimaryOrigin = promptfilter.OriginApplicationCandidate
+	}
+	if decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate {
+		decision.StrikeEligible = false
+	}
 	if verdict.Reviewed && !verdict.ReviewFlagged {
 		decision.Terminal = false
 		decision.StrikeEligible = false

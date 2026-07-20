@@ -113,3 +113,38 @@ func TestPromptFilterReviewFlaggedKeepsBlock(t *testing.T) {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 }
+
+func TestPromptFilterWarningMessageNeverEmpty(t *testing.T) {
+	tests := []struct {
+		name       string
+		evaluation promptGuardEvaluation
+		want       string
+	}{
+		{
+			name: "human readable reason",
+			evaluation: promptGuardEvaluation{
+				Verdict: promptfilter.Verdict{Reason: "matched strict policy"},
+			},
+			want: "matched strict policy",
+		},
+		{
+			name: "decision reason code fallback",
+			evaluation: promptGuardEvaluation{
+				Decision: promptfilter.Decision{ReasonCode: "prompt_policy_warning"},
+			},
+			want: "prompt_policy_warning",
+		},
+		{
+			name:       "stable final fallback",
+			evaluation: promptGuardEvaluation{},
+			want:       "prompt_policy_warning",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := promptFilterWarningMessage(tc.evaluation); got != tc.want {
+				t.Fatalf("warning = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

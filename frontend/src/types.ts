@@ -802,6 +802,18 @@ export type PromptGuardProfile = 'balanced' | 'strict' | 'research'
 
 export type PromptGuardProvider = 'openai' | 'anthropic' | 'xai' | 'unknown'
 
+export type PromptGuardRolloutFallbackMode = 'warn' | 'shadow'
+
+export interface PromptGuardRolloutConfig {
+  enabled: boolean
+  percent: number
+  fallback_mode: PromptGuardRolloutFallbackMode
+  newapi_user_allowlist: string[]
+  api_key_allowlist: string[]
+  protocols: string[]
+  providers: string[]
+}
+
 export type PromptGuardLayer =
   | 'current_user'
   | 'history'
@@ -820,6 +832,7 @@ export interface PromptGuardConfig {
   allow_trusted_overrides: boolean
   provider_profiles: Partial<Record<PromptGuardProvider, PromptGuardProfile>>
   layers: Record<PromptGuardLayer, { mode: PromptGuardMode }>
+  rollout: PromptGuardRolloutConfig
 }
 
 export interface PromptFilterRule {

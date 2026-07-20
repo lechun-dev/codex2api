@@ -12,7 +12,10 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
+import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
+import { createDefaultPromptGuardRollout, parsePromptGuardRollout } from '../lib/promptGuardRollout'
+import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptGuardRolloutFallbackMode, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
+import ChipInput from '../components/ChipInput'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -155,6 +158,8 @@ const promptGuardModes: PromptGuardMode[] = ['inherit', 'off', 'shadow', 'warn',
 const promptGuardProfiles: PromptGuardProfile[] = ['balanced', 'strict', 'research']
 const promptGuardProviders: PromptGuardProvider[] = ['openai', 'anthropic', 'xai', 'unknown']
 const promptGuardLayers: PromptGuardLayer[] = ['current_user', 'history', 'system', 'developer', 'instructions', 'tool_output', 'tool_arguments', 'attachment_refs', 'session_context', 'attachment_content']
+const promptGuardRolloutProtocols = ['responses', 'chat_completions', 'messages', 'images', 'unknown'] as const
+const promptGuardRolloutProviders = ['openai', 'anthropic', 'xai', 'unknown'] as const
 const sidecarModes: AdvancedProtectionConfig['sidecar']['mode'][] = ['shadow', 'warn', 'enforce']
 const inheritedPromptGuardProfile = '__default__'
 
@@ -163,6 +168,7 @@ const defaultPromptGuard: PromptGuardConfig = {
   default_profile: 'balanced',
   allow_trusted_overrides: false,
   provider_profiles: {},
+  rollout: createDefaultPromptGuardRollout(),
   layers: {
     current_user: { mode: 'enforce' },
     history: { mode: 'off' },
@@ -276,6 +282,7 @@ function parsePromptGuard(value: unknown): PromptGuardConfig {
     allow_trusted_overrides: raw.allow_trusted_overrides === true,
     provider_profiles: providerProfiles,
     layers,
+    rollout: parsePromptGuardRollout(raw.rollout),
   }
 }
 
@@ -728,6 +735,10 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
     { value: inheritedPromptGuardProfile, label: t('promptFilter.guard.inheritDefaultProfile') },
     ...guardProfileOptions,
   ]
+  const guardRolloutFallbackOptions = (['warn', 'shadow'] as PromptGuardRolloutFallbackMode[]).map((mode) => ({
+    value: mode,
+    label: t(`promptFilter.guard.rollout.fallbackModes.${mode}`),
+  }))
   const sidecarModeOptions = sidecarModes.map((mode) => ({
     value: mode,
     label: t(`promptFilter.extensions.sidecar.modes.${mode}`),
@@ -745,6 +756,19 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
     updateGuard({
       layers: { ...config.guard.layers, [layer]: { mode } },
     })
+  }
+  const updateGuardRollout = (patch: Partial<PromptGuardConfig['rollout']>) => {
+    updateGuard({
+      rollout: { ...config.guard.rollout, ...patch },
+    })
+  }
+  const toggleGuardRolloutFilter = (key: 'protocols' | 'providers', value: string) => {
+    const current = config.guard.rollout[key]
+    const next = current.includes(value)
+      ? current.filter((item) => item !== value)
+      : [...current, value]
+    if (key === 'protocols') updateGuardRollout({ protocols: next })
+    else updateGuardRollout({ providers: next })
   }
 
   return (
@@ -807,6 +831,99 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
                 <p className="mt-1 text-[11px] leading-[1.45] text-muted-foreground">{t(`promptFilter.guard.modes.${mode}.description`)}</p>
               </div>
             ))}
+          </div>
+
+          <div className="rounded-lg border border-amber-500/25 bg-amber-500/[0.035] p-3 dark:border-amber-400/20 dark:bg-amber-400/[0.04]">
+            <div className="mb-3 flex items-start gap-2.5">
+              <GitBranch className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300" />
+              <div className="min-w-0">
+                <h4 className="text-sm font-semibold">{t('promptFilter.guard.rollout.title')}</h4>
+                <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.rollout.description')}</p>
+              </div>
+            </div>
+
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-sky-500/20 bg-sky-500/[0.06] px-3 py-2.5 text-xs leading-5 dark:border-sky-400/20 dark:bg-sky-400/[0.07]">
+              <ShieldAlert className="mt-0.5 size-4 shrink-0 text-sky-600 dark:text-sky-300" />
+              <span>{t('promptFilter.guard.rollout.safetyNotice')}</span>
+            </div>
+
+            <div className="grid gap-3 lg:grid-cols-3">
+              <SwitchField
+                label={t('promptFilter.guard.rollout.enabled')}
+                hint={t('promptFilter.guard.rollout.enabledHint')}
+                checked={config.guard.rollout.enabled}
+                onCheckedChange={(next) => updateGuardRollout({ enabled: next })}
+              />
+              <CompactField
+                label={t('promptFilter.guard.rollout.percent')}
+                hint={t('promptFilter.guard.rollout.percentHint')}
+              >
+                <DraftNumberInput
+                  min={0}
+                  max={100}
+                  value={config.guard.rollout.percent}
+                  onValueChange={(next) => updateGuardRollout({ percent: next })}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.rollout.fallbackMode')}
+                hint={t('promptFilter.guard.rollout.fallbackModeHint')}
+              >
+                <Select
+                  value={config.guard.rollout.fallback_mode}
+                  onValueChange={(next) => updateGuardRollout({ fallback_mode: next as PromptGuardRolloutFallbackMode })}
+                  options={guardRolloutFallbackOptions}
+                />
+              </CompactField>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <CompactField
+                label={t('promptFilter.guard.rollout.newapiUserAllowlist')}
+                hint={t('promptFilter.guard.rollout.newapiUserAllowlistHint')}
+              >
+                <ChipInput
+                  value={config.guard.rollout.newapi_user_allowlist}
+                  onChange={(next) => updateGuardRollout({ newapi_user_allowlist: next })}
+                  placeholder={t('promptFilter.guard.rollout.newapiUserAllowlistPlaceholder')}
+                  maxVisible={6}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.rollout.apiKeyAllowlist')}
+                hint={t('promptFilter.guard.rollout.apiKeyAllowlistHint')}
+              >
+                <ChipInput
+                  value={config.guard.rollout.api_key_allowlist}
+                  onChange={(next) => updateGuardRollout({ api_key_allowlist: next })}
+                  placeholder={t('promptFilter.guard.rollout.apiKeyAllowlistPlaceholder')}
+                  maxVisible={6}
+                />
+              </CompactField>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <RolloutFilterField
+                label={t('promptFilter.guard.rollout.protocols')}
+                hint={t('promptFilter.guard.rollout.protocolsHint')}
+                options={promptGuardRolloutProtocols.map((protocol) => ({
+                  value: protocol,
+                  label: t(`promptFilter.guard.rollout.protocolOptions.${protocol}`),
+                }))}
+                selected={config.guard.rollout.protocols}
+                onToggle={(value) => toggleGuardRolloutFilter('protocols', value)}
+              />
+              <RolloutFilterField
+                label={t('promptFilter.guard.rollout.providers')}
+                hint={t('promptFilter.guard.rollout.providersHint')}
+                options={promptGuardRolloutProviders.map((provider) => ({
+                  value: provider,
+                  label: t(`promptFilter.guard.providers.${provider}.label`),
+                }))}
+                selected={config.guard.rollout.providers}
+                onToggle={(value) => toggleGuardRolloutFilter('providers', value)}
+              />
+            </div>
           </div>
 
           <div className="grid gap-3 xl:grid-cols-2">
@@ -1463,6 +1580,50 @@ function CompactField({ label, hint, children }: { label: string; hint?: string;
         {children}
       </div>
     </label>
+  )
+}
+
+function RolloutFilterField({
+  label,
+  hint,
+  options,
+  selected,
+  onToggle,
+}: {
+  label: string
+  hint?: string
+  options: Array<{ value: string; label: string }>
+  selected: string[]
+  onToggle: (value: string) => void
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <span className="flex h-4 items-center gap-1 truncate text-xs font-medium leading-none text-muted-foreground">
+        <span className="truncate">{label}</span>
+        <FieldHint label={label} hint={hint} />
+      </span>
+      <div className="flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border border-foreground/15 bg-transparent p-1.5 dark:border-foreground/20 dark:bg-input/30">
+        {options.map((option) => {
+          const active = selected.includes(option.value)
+          return (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={active}
+              className={cn(
+                'rounded px-2 py-1 text-xs transition-colors',
+                active
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground',
+              )}
+              onClick={() => onToggle(option.value)}
+            >
+              {option.label}
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 
@@ -3128,7 +3289,7 @@ function PromptFilterLogsTable({ logs, compact = false }: { logs: PromptFilterLo
             <TableHead className={compact ? 'w-[92px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
             <TableHead className={compact ? 'w-[82px]' : 'w-[96px]'}>{t('promptFilter.colAction')}</TableHead>
             <TableHead className={compact ? 'w-[150px]' : 'w-[180px]'}>{t('promptFilter.colEndpoint')}</TableHead>
-            <TableHead className={compact ? 'w-[72px]' : 'w-[88px]'}>{t('promptFilter.colScore')}</TableHead>
+            <TableHead className={compact ? 'w-[132px]' : 'w-[156px]'}>{t('promptFilter.colScore')}</TableHead>
             <TableHead className={compact ? 'w-[150px]' : 'w-[220px]'}>{t('promptFilter.colMatch')}</TableHead>
             <TableHead className={compact ? 'w-[118px]' : 'w-[160px]'}>{t('promptFilter.colApiKey')}</TableHead>
             <TableHead>{t('promptFilter.colPreview')}</TableHead>
@@ -3370,6 +3531,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
     : t('promptFilter.userPromptLabel')
   const legacyMissingMatchContext = !matchContext && !userPrompt && !fullText &&
     auxiliaryOrigin
+  const auditScore = typeof log.audit_score === 'number' ? log.audit_score : undefined
   return (
     <>
     <TableRow>
@@ -3406,13 +3568,23 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         ) : null}
       </TableCell>
       <TableCell>
-        <div>
-          <span className="font-semibold">{log.score}</span>
-          <span className="text-muted-foreground"> / {log.threshold}</span>
+        <div className="space-y-2">
+          <LogScoreMeter
+            label={t('promptFilter.executionScore')}
+            score={log.score}
+            suffix={` / ${log.threshold}`}
+            tone="execution"
+            description={t('promptFilter.executionScoreHint')}
+          />
+          {auditScore !== undefined ? (
+            <LogScoreMeter
+              label={t('promptFilter.shadowAuditScore')}
+              score={auditScore}
+              tone="audit"
+              description={t('promptFilter.shadowAuditScoreHint')}
+            />
+          ) : null}
         </div>
-        {(log.audit_score ?? 0) > log.score ? (
-          <div className="mt-0.5 text-[11px] text-muted-foreground">{t('promptFilter.auditScore')}: {log.audit_score}</div>
-        ) : null}
       </TableCell>
       <TableCell className={compact ? 'w-[150px] min-w-0' : 'w-[220px] min-w-0'}>
         {matches.length ? (
@@ -3492,6 +3664,60 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
       </TableRow>
     ) : null}
     </>
+  )
+}
+
+function LogScoreMeter({
+  label,
+  score,
+  suffix = '',
+  tone,
+  description,
+}: {
+  label: string
+  score: number
+  suffix?: string
+  tone: 'execution' | 'audit'
+  description: string
+}) {
+  const normalizedScore = normalizePromptFilterScore(score)
+  const scoreBand = getPromptFilterScoreBand(score)
+  const meterClass = tone === 'audit'
+    ? scoreBand === 'high'
+      ? 'bg-violet-500'
+      : scoreBand === 'medium'
+        ? 'bg-indigo-500'
+        : 'bg-sky-500'
+    : scoreBand === 'high'
+      ? 'bg-red-500'
+      : scoreBand === 'medium'
+        ? 'bg-amber-500'
+        : 'bg-emerald-500'
+
+  return (
+    <div className="min-w-0" title={description}>
+      <div className="flex items-baseline justify-between gap-1 text-[11px]">
+        <span className="truncate font-medium text-muted-foreground">{label}</span>
+        <span className="shrink-0 font-semibold text-foreground">
+          {score}
+          <span className="font-normal text-muted-foreground">{suffix}</span>
+        </span>
+      </div>
+      <div
+        className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={normalizedScore}
+        aria-valuetext={String(score)}
+      >
+        <div className={cn('h-full rounded-full transition-[width]', meterClass)} style={{ width: `${normalizedScore}%` }} />
+      </div>
+      {tone === 'audit' ? (
+        <div className="mt-1 text-[10px] leading-4 text-muted-foreground">{description}</div>
+      ) : null}
+    </div>
   )
 }
 

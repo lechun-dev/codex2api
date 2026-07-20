@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strings"
 )
@@ -27,24 +28,26 @@ type Signal struct {
 }
 
 type Decision struct {
-	Enabled               bool          `json:"enabled"`
-	Mode                  string        `json:"mode"`
-	Profile               string        `json:"profile"`
-	ApplicationPromptKind string        `json:"application_prompt_kind,omitempty"`
-	Action                string        `json:"action"`
-	WouldAction           string        `json:"would_action"`
-	Score                 int           `json:"score"`
-	RawScore              int           `json:"raw_score"`
-	AuditScore            int           `json:"audit_score,omitempty"`
-	AuditRawScore         int           `json:"audit_raw_score,omitempty"`
-	ReasonCode            string        `json:"reason_code,omitempty"`
-	Reason                string        `json:"reason,omitempty"`
-	Terminal              bool          `json:"terminal,omitempty"`
-	StrikeEligible        bool          `json:"strike_eligible,omitempty"`
-	PrimaryOrigin         SegmentOrigin `json:"primary_origin,omitempty"`
-	PrimaryDetector       string        `json:"primary_detector,omitempty"`
-	Signals               []Signal      `json:"signals,omitempty"`
-	Errors                []string      `json:"errors,omitempty"`
+	Enabled               bool             `json:"enabled"`
+	Mode                  string           `json:"mode"`
+	Profile               string           `json:"profile"`
+	ApplicationPromptKind string           `json:"application_prompt_kind,omitempty"`
+	Action                string           `json:"action"`
+	WouldAction           string           `json:"would_action"`
+	Score                 int              `json:"score"`
+	RawScore              int              `json:"raw_score"`
+	AuditScore            int              `json:"audit_score,omitempty"`
+	AuditRawScore         int              `json:"audit_raw_score,omitempty"`
+	ReasonCode            string           `json:"reason_code,omitempty"`
+	Reason                string           `json:"reason,omitempty"`
+	Terminal              bool             `json:"terminal,omitempty"`
+	StrikeEligible        bool             `json:"strike_eligible,omitempty"`
+	PrimaryOrigin         SegmentOrigin    `json:"primary_origin,omitempty"`
+	PrimaryDetector       string           `json:"primary_detector,omitempty"`
+	Rollout               *RolloutDecision `json:"rollout,omitempty"`
+	Signals               []Signal         `json:"signals,omitempty"`
+	Errors                []string         `json:"errors,omitempty"`
+	ReviewText            string           `json:"-"`
 	legacyVerdict         Verdict
 }
 
@@ -80,6 +83,7 @@ type GuardRequest struct {
 	TrustedProfile  bool
 	ProfileOverride string
 	ModeOverride    string
+	RolloutIdentity RolloutIdentity
 }
 
 type DetectionContext struct {
@@ -129,8 +133,9 @@ func (p *Pipeline) Evaluate(ctx context.Context, request GuardRequest) Decision 
 			globalMode = override
 		}
 	}
+	globalMode, rolloutDecision := resolveGuardRollout(globalMode, guard.Rollout, request.RolloutIdentity, request.Envelope)
 	var applicationPromptKind string
-	request.Envelope, applicationPromptKind = reclassifyKnownApplicationPromptsForShadow(request.Envelope, globalMode)
+	request.Envelope, applicationPromptKind = classifyKnownApplicationPrompt(request.Envelope, globalMode)
 	resolver := p.ProfileResolver
 	if resolver == nil {
 		resolver = BuiltinProfileResolver{}
@@ -143,7 +148,7 @@ func (p *Pipeline) Evaluate(ctx context.Context, request GuardRequest) Decision 
 	}
 	detectionContext := DetectionContext{Config: request.Config, Guard: guard, Profile: profile, GlobalMode: globalMode}
 	if globalMode == GuardModeOff {
-		return Decision{Enabled: false, Mode: globalMode, Profile: profile.Name, Action: ActionAllow, WouldAction: ActionAllow}
+		return Decision{Enabled: false, Mode: globalMode, Profile: profile.Name, Action: ActionAllow, WouldAction: ActionAllow, Rollout: rolloutDecision}
 	}
 
 	var signals []Signal
@@ -165,9 +170,26 @@ func (p *Pipeline) Evaluate(ctx context.Context, request GuardRequest) Decision 
 		policy = DefaultGuardPolicy{}
 	}
 	decision := policy.Decide(request, detectionContext, signals)
+	decision.Rollout = rolloutDecision
 	decision.ApplicationPromptKind = applicationPromptKind
+	if applicationPromptKind != "" {
+		decision.ReviewText = envelopeOriginText(request.Envelope, OriginApplicationCandidate)
+	}
 	decision.Errors = detectionErrors
 	return decision
+}
+
+func envelopeOriginText(envelope RequestEnvelope, origin SegmentOrigin) string {
+	parts := make([]string, 0, 1)
+	for _, segment := range envelope.Segments {
+		if segment.Origin != origin {
+			continue
+		}
+		if text := strings.TrimSpace(segment.Text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 const (
@@ -176,18 +198,33 @@ const (
 	ambientPromptPrefix    = "You are an expert at upholding safety and compliance standards for Codex ambient suggestions."
 	approvalPromptPrefix   = "The following is the Codex agent history added since your last approval assessment."
 	checkpointPrompt       = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work."
+	ambientCandidateStart  = "# Ambient suggestion candidates\nHere are the ambient suggestion candidates to evaluate:\n\n```\n"
+	ambientCandidateEnd    = "\n```\n\n# Output Format"
+	ambientPrefixSHA256    = "192428598601dc3985e332df5d1d5fd72ab222b00aa499b17cedca9a544ec58c"
+	ambientSuffixSHA256    = "4eabcc2441a931a4020db3057c99c9fc5330e6e45030c3f2c7df89b5ec87ed9e"
 )
 
-// Codex application tasks such as compaction, memory extraction, ambient
-// suggestion review, and approval reassessment are currently serialized as
-// ordinary role=user/input_text items. Their transport shape is therefore not
-// trustworthy enough to weaken enforcement. In shadow mode only, reclassify
-// exact, long-lived application templates as session context so operators can
-// choose whether to observe them through the existing session_context layer.
-// Warn/enforce requests deliberately keep them as current-user input, which
-// prevents copying one of these prefixes from becoming an enforcement bypass.
-func reclassifyKnownApplicationPromptsForShadow(envelope RequestEnvelope, globalMode string) (RequestEnvelope, string) {
-	if globalMode != GuardModeShadow || envelope.Protocol != ProtocolResponses || len(envelope.Segments) == 0 {
+type applicationTemplateSignature struct {
+	PrefixSHA256 string
+	SuffixSHA256 string
+}
+
+var ambientApplicationSignatures = []applicationTemplateSignature{{
+	PrefixSHA256: ambientPrefixSHA256,
+	SuffixSHA256: ambientSuffixSHA256,
+}}
+
+// Codex application tasks are serialized as ordinary Responses input_text
+// items, so a prefix alone is never trusted. Ambient safety classification is
+// the one application task whose fixed policy boilerplate contains terminal
+// rule phrases. Recognize it only when both complete static regions match a
+// known release signature and the dynamic candidate block has the exact
+// JSON-string field layout emitted by Codex Desktop. Only that dynamic block is
+// scanned. It remains fully enforceable, but can never create a user strike.
+// Any template mutation or text appended outside the signed static suffix
+// fails classification and the original current-user segment is scanned.
+func classifyKnownApplicationPrompt(envelope RequestEnvelope, globalMode string) (RequestEnvelope, string) {
+	if envelope.Protocol != ProtocolResponses || len(envelope.Segments) == 0 {
 		return envelope, ""
 	}
 	currentIndex := -1
@@ -207,7 +244,22 @@ func reclassifyKnownApplicationPromptsForShadow(envelope RequestEnvelope, global
 	if currentIndex < 0 {
 		return envelope, ""
 	}
-	kind := knownApplicationPromptKind(envelope.Segments[currentIndex].Text)
+	text := envelope.Segments[currentIndex].Text
+	if candidate, exact, ok := parseAmbientSafetyPrompt(text, ambientApplicationSignatures); ok {
+		segments := append([]Segment(nil), envelope.Segments...)
+		segments[currentIndex].Origin = OriginApplicationCandidate
+		segments[currentIndex].Role = "application"
+		segments[currentIndex].Text = candidate
+		envelope.Segments = segments
+		if exact {
+			return envelope, "ambient_safety"
+		}
+		return envelope, "ambient_safety_drift"
+	}
+	if globalMode != GuardModeShadow {
+		return envelope, ""
+	}
+	kind := knownApplicationPromptKind(text)
 	if kind == "" {
 		return envelope, ""
 	}
@@ -215,6 +267,132 @@ func reclassifyKnownApplicationPromptsForShadow(envelope RequestEnvelope, global
 	segments[currentIndex].Origin = OriginSessionContext
 	envelope.Segments = segments
 	return envelope, kind
+}
+
+func splitAmbientSafetyPrompt(text string, signatures []applicationTemplateSignature) (string, bool) {
+	candidate, exact, ok := parseAmbientSafetyPrompt(text, signatures)
+	return candidate, ok && exact
+}
+
+// parseAmbientSafetyPrompt recognizes both an exact known release and a
+// narrowly structured template drift. The Codex Desktop task is transported as
+// an ordinary user input_text item, while its fixed policy boilerplate itself
+// contains terminal safety phrases. Requiring an exact static hash forever
+// makes a harmless client wording update look like direct user intent and can
+// cause a fleet-wide block. For a drifted template we therefore require the
+// exact candidate delimiters, the five-field JSON-string record layout, strong
+// ambient-policy anchors, and an output-only JSON footer. Only the dynamic
+// candidate is returned for enforcement; it remains blockable but non-punitive.
+// Text appended after the footer fails the structural check and is scanned as
+// ordinary current-user input.
+func parseAmbientSafetyPrompt(text string, signatures []applicationTemplateSignature) (candidate string, exact bool, ok bool) {
+	if strings.Count(text, ambientCandidateStart) != 1 || strings.Count(text, ambientCandidateEnd) != 1 {
+		return "", false, false
+	}
+	start := strings.Index(text, ambientCandidateStart)
+	if start < 0 {
+		return "", false, false
+	}
+	candidateStart := start + len(ambientCandidateStart)
+	relativeEnd := strings.Index(text[candidateStart:], ambientCandidateEnd)
+	if relativeEnd < 0 {
+		return "", false, false
+	}
+	candidateEnd := candidateStart + relativeEnd
+	prefix := text[:candidateStart]
+	suffix := text[candidateEnd:]
+	candidate = text[candidateStart:candidateEnd]
+	if !validAmbientCandidateBlock(candidate) {
+		return "", false, false
+	}
+	if applicationTemplateSignatureMatches(prefix, suffix, signatures) {
+		return candidate, true, true
+	}
+	if !validAmbientTemplateDrift(prefix, suffix) {
+		return "", false, false
+	}
+	return candidate, false, true
+}
+
+func validAmbientTemplateDrift(prefix string, suffix string) bool {
+	if !strings.HasPrefix(strings.TrimSpace(prefix), ambientPromptPrefix) {
+		return false
+	}
+	if !containsAll(prefix,
+		"things to **ALWAYS** exclude",
+		"ambient suggestion candidates",
+		"determine if any suggestions should be excluded",
+	) {
+		return false
+	}
+	if !strings.HasPrefix(suffix, ambientCandidateEnd) || len([]rune(suffix)) > 8192 {
+		return false
+	}
+	footer := strings.TrimSpace(strings.TrimPrefix(suffix, ambientCandidateEnd))
+	if footer == "" {
+		return false
+	}
+	lowerFooter := strings.ToLower(footer)
+	if !strings.Contains(lowerFooter, "json") || !strings.Contains(lowerFooter, "exclude") {
+		return false
+	}
+	lines := strings.Split(footer, "\n")
+	closing := ""
+	for index := len(lines) - 1; index >= 0; index-- {
+		if value := strings.ToLower(strings.TrimSpace(lines[index])); value != "" {
+			closing = value
+			break
+		}
+	}
+	if !strings.Contains(closing, "json") {
+		return false
+	}
+	return strings.Contains(closing, "only") ||
+		strings.Contains(closing, "no other") ||
+		strings.Contains(closing, "nothing else") ||
+		strings.Contains(closing, "must not") ||
+		strings.Contains(closing, "do not")
+}
+
+func applicationTemplateSignatureMatches(prefix string, suffix string, signatures []applicationTemplateSignature) bool {
+	prefixHash := sha256.Sum256([]byte(prefix))
+	suffixHash := sha256.Sum256([]byte(suffix))
+	prefixHex := hex.EncodeToString(prefixHash[:])
+	suffixHex := hex.EncodeToString(suffixHash[:])
+	for _, signature := range signatures {
+		if prefixHex == signature.PrefixSHA256 && suffixHex == signature.SuffixSHA256 {
+			return true
+		}
+	}
+	return false
+}
+
+func validAmbientCandidateBlock(candidate string) bool {
+	lines := strings.Split(candidate, "\n")
+	if len(lines) == 0 || len(lines)%5 != 0 {
+		return false
+	}
+	prefixes := [...]string{
+		"- suggestion_id: ",
+		"  title: ",
+		"  description: ",
+		"  prompt: ",
+		"  app_id: ",
+	}
+	for index, line := range lines {
+		prefix := prefixes[index%len(prefixes)]
+		if !strings.HasPrefix(line, prefix) {
+			return false
+		}
+		var value string
+		if err := json.Unmarshal([]byte(line[len(prefix):]), &value); err != nil {
+			return false
+		}
+		if index%len(prefixes) == 0 && strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func knownApplicationPromptKind(text string) string {
@@ -318,38 +496,33 @@ func aggregateGuardSegments(envelope RequestEnvelope) []aggregatedGuardSegment {
 	sort.SliceStable(segments, func(i, j int) bool {
 		return segments[i].Sequence < segments[j].Sequence
 	})
-	partsByOrigin := make(map[SegmentOrigin][]string)
-	originOrder := make([]SegmentOrigin, 0, 8)
-	seenOrigin := map[SegmentOrigin]bool{}
-	linkedHistory := make([]string, 0, 1)
+	currentUserParts := make([]string, 0, 2)
+	auxiliary := make([]aggregatedGuardSegment, 0, len(segments))
 	for _, segment := range segments {
-		if strings.TrimSpace(segment.Text) == "" {
+		text := strings.TrimSpace(segment.Text)
+		if text == "" {
 			continue
 		}
 		if segment.Origin == OriginHistory && segment.Linked {
-			linkedHistory = append(linkedHistory, segment.Text)
+			currentUserParts = append(currentUserParts, text)
 			continue
 		}
-		if !seenOrigin[segment.Origin] {
-			seenOrigin[segment.Origin] = true
-			originOrder = append(originOrder, segment.Origin)
+		if segment.Origin == OriginCurrentUser {
+			currentUserParts = append(currentUserParts, text)
+			continue
 		}
-		partsByOrigin[segment.Origin] = append(partsByOrigin[segment.Origin], segment.Text)
+		// Auxiliary content must retain its segment boundary. Joining every tool
+		// result, attachment, or session fragment into one synthetic document lets
+		// unrelated rules accumulate across independent calls and inflates the
+		// shadow audit score. Each segment is therefore inspected independently;
+		// policy selection still retains the strongest single signal.
+		auxiliary = append(auxiliary, aggregatedGuardSegment{Origin: segment.Origin, Text: text})
 	}
-	if len(linkedHistory) > 0 {
-		if !seenOrigin[OriginCurrentUser] {
-			seenOrigin[OriginCurrentUser] = true
-			originOrder = append(originOrder, OriginCurrentUser)
-		}
-		partsByOrigin[OriginCurrentUser] = append(linkedHistory, partsByOrigin[OriginCurrentUser]...)
+	out := make([]aggregatedGuardSegment, 0, len(auxiliary)+1)
+	if text := strings.TrimSpace(strings.Join(currentUserParts, " ")); text != "" {
+		out = append(out, aggregatedGuardSegment{Origin: OriginCurrentUser, Text: text})
 	}
-	out := make([]aggregatedGuardSegment, 0, len(originOrder))
-	for _, origin := range originOrder {
-		text := strings.TrimSpace(strings.Join(partsByOrigin[origin], " "))
-		if text != "" {
-			out = append(out, aggregatedGuardSegment{Origin: origin, Text: text})
-		}
-	}
+	out = append(out, auxiliary...)
 	return out
 }
 

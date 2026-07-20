@@ -33,7 +33,7 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
+		c.Header("X-Prompt-Filter-Warning", promptFilterWarningMessage(evaluation))
 	}
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
@@ -58,7 +58,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
+		c.Header("X-Prompt-Filter-Warning", promptFilterWarningMessage(evaluation))
 	}
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
@@ -84,7 +84,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
+		c.Header("X-Prompt-Filter-Warning", promptFilterWarningMessage(evaluation))
 	}
 	if verdict.Action == promptfilter.ActionBlock {
 		if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
@@ -94,6 +94,16 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		return true
 	}
 	return false
+}
+
+func promptFilterWarningMessage(evaluation promptGuardEvaluation) string {
+	if reason := strings.TrimSpace(evaluation.Verdict.Reason); reason != "" {
+		return reason
+	}
+	if reasonCode := strings.TrimSpace(evaluation.Decision.ReasonCode); reasonCode != "" {
+		return reasonCode
+	}
+	return "prompt_policy_warning"
 }
 
 func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict) {

@@ -53,11 +53,25 @@ const (
 // New source layers default to profile-controlled behavior; the balanced
 // profile scans only the current user prompt, preserving legacy behavior.
 type GuardConfig struct {
-	Mode                  string            `json:"mode"`
-	DefaultProfile        string            `json:"default_profile"`
-	AllowTrustedOverrides bool              `json:"allow_trusted_overrides"`
-	ProviderProfiles      map[string]string `json:"provider_profiles,omitempty"`
-	Layers                GuardLayerConfig  `json:"layers"`
+	Mode                  string             `json:"mode"`
+	DefaultProfile        string             `json:"default_profile"`
+	AllowTrustedOverrides bool               `json:"allow_trusted_overrides"`
+	ProviderProfiles      map[string]string  `json:"provider_profiles,omitempty"`
+	Rollout               GuardRolloutConfig `json:"rollout"`
+	Layers                GuardLayerConfig   `json:"layers"`
+}
+
+// GuardRolloutConfig limits enforce mode to a stable subset of authenticated
+// users. Rollout is deliberately downgrade-only: requests outside the selected
+// cohort use FallbackMode, which is restricted to warn or shadow.
+type GuardRolloutConfig struct {
+	Enabled             bool     `json:"enabled"`
+	Percent             int      `json:"percent"`
+	FallbackMode        string   `json:"fallback_mode"`
+	NewAPIUserAllowlist []string `json:"newapi_user_allowlist"`
+	APIKeyAllowlist     []int64  `json:"api_key_allowlist"`
+	Protocols           []string `json:"protocols"`
+	Providers           []string `json:"providers"`
 }
 
 type GuardLayerConfig struct {
@@ -257,6 +271,10 @@ func DefaultGuardConfig() GuardConfig {
 		Mode:             GuardModeInherit,
 		DefaultProfile:   GuardProfileBalanced,
 		ProviderProfiles: map[string]string{},
+		Rollout: GuardRolloutConfig{
+			Percent:      0,
+			FallbackMode: GuardModeWarn,
+		},
 		Layers: GuardLayerConfig{
 			CurrentUser:       inherit,
 			History:           inherit,
@@ -538,6 +556,7 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	d := DefaultGuardConfig()
 	cfg.Mode = normalizeGuardMode(cfg.Mode, d.Mode)
 	cfg.DefaultProfile = normalizeGuardProfileName(cfg.DefaultProfile, d.DefaultProfile)
+	cfg.Rollout = normalizeGuardRolloutConfig(cfg.Rollout, d.Rollout)
 
 	profiles := make(map[string]string, len(d.ProviderProfiles)+len(cfg.ProviderProfiles))
 	for provider, profile := range d.ProviderProfiles {
@@ -563,6 +582,63 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	cfg.Layers.SessionContext.Mode = normalizeGuardMode(cfg.Layers.SessionContext.Mode, d.Layers.SessionContext.Mode)
 	cfg.Layers.AttachmentContent.Mode = normalizeGuardMode(cfg.Layers.AttachmentContent.Mode, d.Layers.AttachmentContent.Mode)
 	return cfg
+}
+
+func normalizeGuardRolloutConfig(cfg GuardRolloutConfig, defaults GuardRolloutConfig) GuardRolloutConfig {
+	if cfg.Percent < 0 {
+		cfg.Percent = 0
+	} else if cfg.Percent > 100 {
+		cfg.Percent = 100
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.FallbackMode)) {
+	case GuardModeShadow:
+		cfg.FallbackMode = GuardModeShadow
+	case GuardModeWarn:
+		cfg.FallbackMode = GuardModeWarn
+	default:
+		cfg.FallbackMode = defaults.FallbackMode
+	}
+	cfg.NewAPIUserAllowlist = normalizeGuardRolloutStrings(cfg.NewAPIUserAllowlist, false)
+	cfg.APIKeyAllowlist = normalizeGuardRolloutAPIKeyIDs(cfg.APIKeyAllowlist)
+	cfg.Protocols = normalizeGuardRolloutStrings(cfg.Protocols, true)
+	cfg.Providers = normalizeGuardRolloutStrings(cfg.Providers, true)
+	return cfg
+}
+
+func normalizeGuardRolloutStrings(values []string, lowercase bool) []string {
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if lowercase {
+			value = strings.ToLower(value)
+		}
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func normalizeGuardRolloutAPIKeyIDs(values []int64) []int64 {
+	seen := make(map[int64]struct{}, len(values))
+	normalized := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
 }
 
 func normalizeGuardMode(mode string, fallback string) string {

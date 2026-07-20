@@ -37,16 +37,17 @@ type SegmentOrigin string
 type SegmentTrust string
 
 const (
-	OriginCurrentUser       SegmentOrigin = "current_user"
-	OriginHistory           SegmentOrigin = "history"
-	OriginSystem            SegmentOrigin = "system"
-	OriginDeveloper         SegmentOrigin = "developer"
-	OriginInstructions      SegmentOrigin = "instructions"
-	OriginToolOutput        SegmentOrigin = "tool_output"
-	OriginToolArguments     SegmentOrigin = "tool_arguments"
-	OriginAttachmentRefs    SegmentOrigin = "attachment_refs"
-	OriginSessionContext    SegmentOrigin = "session_context"
-	OriginAttachmentContent SegmentOrigin = "attachment_content"
+	OriginCurrentUser          SegmentOrigin = "current_user"
+	OriginHistory              SegmentOrigin = "history"
+	OriginSystem               SegmentOrigin = "system"
+	OriginDeveloper            SegmentOrigin = "developer"
+	OriginInstructions         SegmentOrigin = "instructions"
+	OriginToolOutput           SegmentOrigin = "tool_output"
+	OriginToolArguments        SegmentOrigin = "tool_arguments"
+	OriginAttachmentRefs       SegmentOrigin = "attachment_refs"
+	OriginSessionContext       SegmentOrigin = "session_context"
+	OriginApplicationCandidate SegmentOrigin = "application_candidate"
+	OriginAttachmentContent    SegmentOrigin = "attachment_content"
 )
 
 const (

@@ -9,6 +9,15 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 			"default_profile": "research",
 			"allow_trusted_overrides": true,
 			"provider_profiles": {"openai":"balanced","anthropic":"strict","xai":"research"},
+			"rollout": {
+				"enabled": true,
+				"percent": 25,
+				"fallback_mode": "shadow",
+				"newapi_user_allowlist": ["42"],
+				"api_key_allowlist": [7],
+				"protocols": ["responses"],
+				"providers": ["openai"]
+			},
 			"layers": {
 				"current_user":{"mode":"enforce"},
 				"history":{"mode":"shadow"},
@@ -31,6 +40,9 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 	if !cfg.Guard.AllowTrustedOverrides {
 		t.Fatal("allow_trusted_overrides was not parsed")
 	}
+	if !cfg.Guard.Rollout.Enabled || cfg.Guard.Rollout.Percent != 25 || cfg.Guard.Rollout.FallbackMode != GuardModeShadow {
+		t.Fatalf("rollout config was not parsed: %+v", cfg.Guard.Rollout)
+	}
 	if cfg.Guard.ProviderProfiles[string(ModelFamilyAnthropic)] != GuardProfileStrict {
 		t.Fatalf("anthropic profile = %q, want strict", cfg.Guard.ProviderProfiles[string(ModelFamilyAnthropic)])
 	}
@@ -47,6 +59,9 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 	}
 	if !roundTripped.Guard.AllowTrustedOverrides {
 		t.Fatal("allow_trusted_overrides changed after round trip")
+	}
+	if len(roundTripped.Guard.Rollout.NewAPIUserAllowlist) != 1 || len(roundTripped.Guard.Rollout.APIKeyAllowlist) != 1 {
+		t.Fatalf("rollout allowlists changed after round trip: %+v", roundTripped.Guard.Rollout)
 	}
 	if roundTripped.Guard.Layers.ToolArguments.Mode != GuardModeWarn {
 		t.Fatalf("tool_arguments mode = %q, want warn", roundTripped.Guard.Layers.ToolArguments.Mode)
@@ -103,6 +118,13 @@ func TestNormalizeGuardConfigRejectsUnknownModesAndProfiles(t *testing.T) {
 			"XAI": "invalid",
 		},
 		Layers: GuardLayerConfig{CurrentUser: GuardLayerModeConfig{Mode: "invalid"}},
+		Rollout: GuardRolloutConfig{
+			Percent: 140, FallbackMode: GuardModeEnforce,
+			NewAPIUserAllowlist: []string{" 42 ", "42", ""},
+			APIKeyAllowlist:     []int64{7, 7, 0, -1},
+			Protocols:           []string{" Responses ", "responses"},
+			Providers:           []string{" OPENAI ", "openai"},
+		},
 	})
 	if cfg.Mode != GuardModeInherit || cfg.DefaultProfile != GuardProfileBalanced {
 		t.Fatalf("invalid guard values were not normalized: %+v", cfg)
@@ -112,5 +134,11 @@ func TestNormalizeGuardConfigRejectsUnknownModesAndProfiles(t *testing.T) {
 	}
 	if cfg.Layers.CurrentUser.Mode != GuardModeInherit {
 		t.Fatalf("current_user mode = %q, want inherit", cfg.Layers.CurrentUser.Mode)
+	}
+	if cfg.Rollout.Percent != 100 || cfg.Rollout.FallbackMode != GuardModeWarn {
+		t.Fatalf("invalid rollout limits were not normalized: %+v", cfg.Rollout)
+	}
+	if len(cfg.Rollout.NewAPIUserAllowlist) != 1 || len(cfg.Rollout.APIKeyAllowlist) != 1 || len(cfg.Rollout.Protocols) != 1 || len(cfg.Rollout.Providers) != 1 {
+		t.Fatalf("rollout lists were not normalized: %+v", cfg.Rollout)
 	}
 }

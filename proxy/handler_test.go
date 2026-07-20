@@ -2508,6 +2508,59 @@ func TestAppendMissingResponseImageOutputsAnnotatesExistingOutput(t *testing.T) 
 	}
 }
 
+func TestAccountFilterForModelRespectsAccountModelWhitelist(t *testing.T) {
+	filter := accountFilterForModel("gpt-5.6-sol")
+	if !filter(&auth.Account{PlanType: "plus"}) {
+		t.Fatal("空白名单账号应放行任意模型")
+	}
+	if !filter(&auth.Account{PlanType: "pro", Models: []string{"GPT-5.6-SOL", "gpt-5.3-codex"}}) {
+		t.Fatal("白名单命中（大小写不敏感）应放行")
+	}
+	restricted := &auth.Account{PlanType: "plus", Models: []string{"gpt-5.3-codex"}}
+	if filter(restricted) {
+		t.Fatal("白名单未包含请求模型时应拒绝")
+	}
+	if !accountFilterForModel("gpt-5.3-codex")(restricted) {
+		t.Fatal("白名单内模型应放行")
+	}
+	if !accountFilterForModel("")(restricted) {
+		t.Fatal("无模型信息的请求不应被白名单拦截")
+	}
+}
+
+func TestIsCodexModelUnsupportedError(t *testing.T) {
+	unsupported := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`)
+	if !isCodexModelUnsupportedError(unsupported) {
+		t.Fatal("应识别模型不支持错误")
+	}
+	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
+		t.Fatal("普通 invalid_request 不应命中")
+	}
+	if isCodexModelUnsupportedError(nil) {
+		t.Fatal("空 body 不应命中")
+	}
+
+	general, rate := 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unsupported, &general, &rate, 2, 1) {
+		t.Fatal("模型不支持的 400 应可换号重试")
+	}
+	general, rate = 0, 0
+	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
+		t.Fatal("普通 400 不应重试")
+	}
+}
+
+func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	if !responseFailedRetryable(payload) {
+		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
+	if responseFailedRetryable(plain) {
+		t.Fatal("普通 invalid_request 的 response.failed 不应重试")
+	}
+}
+
 func TestAccountFilterForSparkAllowsNonFreeOrUnknownPlans(t *testing.T) {
 	filter := accountFilterForModel("gpt-5.3-codex-spark")
 	if filter == nil {
@@ -2617,13 +2670,13 @@ func TestClassify429Header7dUsesAccountCooldown(t *testing.T) {
 func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("first 429 should consume rate-limit retry budget")
 	}
-	if shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("second 429 should be blocked by rate-limit retry budget")
 	}
-	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("503 should still use general retry budget")
 	}
 	if generalRetries != 1 || rateLimitRetries != 1 {
@@ -2868,13 +2921,13 @@ func TestShouldRetryHTTPStatus403(t *testing.T) {
 	}
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("首个 403（未达上限）应可重试")
 	}
-	if !shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("第二个 403（仍未达上限）应可重试")
 	}
-	if shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("达到 general 重试上限后 403 不应再重试")
 	}
 	if generalRetries != 2 {

@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== Anthropic 错误格式 ====================
@@ -71,6 +72,16 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 	}
 }
 
+// applyMessagesModelMapping 对翻译后的 codexBody 套用全局模型映射与思考强度别名。
+// 别名注入会同时写入顶层 reasoning_effort（Chat 形态字段）与 reasoning.effort；
+// 本路径的 codexBody 已是 Responses 形态且不再经过 PrepareResponsesBody 净化，
+// 顶层字段原样发到上游会触发 400 Unsupported parameter（issue #412），在此剥离。
+func (h *Handler) applyMessagesModelMapping(codexBody []byte, supportedModels []string) []byte {
+	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, supportedModels)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "reasoning_effort")
+	return codexBody
+}
+
 // ==================== /v1/messages Handler ====================
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
@@ -122,7 +133,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
-	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, h.supportedModelIDs(c.Request.Context()))
+	codexBody = h.applyMessagesModelMapping(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	if isImageOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
@@ -223,7 +234,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
@@ -237,7 +250,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
-			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
@@ -263,7 +276,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			if kind != "" && !(timedOut && shouldRetry) {
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -309,7 +322,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -431,6 +444,20 @@ func (h *Handler) Messages(c *gin.Context) {
 					gotTerminal = true
 				}
 
+				// 首 token 前的 response.failed 不翻译进下游流（issue #412）：
+				// 可重试（5xx/429 等）时吞掉事件，交由循环外静默换号重试；
+				// 不可重试或重试耗尽时中止转发，循环外按真实错误码返回 JSON。
+				// 否则 handleFailed 会把失败翻译成 stop_reason=end_turn 的"正常空结束"，
+				// 下游网关会把它当成功计一条 0 token 请求且无从重试。
+				if shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+					pendingFirstTokenEvents.Reset()
+					return false
+				}
+				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, writeErr != nil) {
+					pendingFirstTokenEvents.Reset()
+					return false
+				}
+
 				// 翻译并写入
 				events := translator.translateEvent(data)
 				if len(events) > 0 {
@@ -460,7 +487,9 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
-			if writeErr == nil {
+			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
+			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
+			if writeErr == nil && wroteAnyBody {
 				writeErr = streamWriter.Flush()
 			}
 
@@ -562,6 +591,17 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 
+		if isStream && !wroteAnyBody && writeErr == nil && c.Request.Context().Err() == nil && outcome.logStatusCode != http.StatusOK {
+			// 流式：首包前上游失败、未向下游写过任何字节（收尾 flush 有 wroteAnyBody 守卫，
+			// 200 header 尚未提交）——按真实错误码返回 Anthropic 错误 JSON，而不是空 200 流，
+			// 让下游网关/客户端能感知失败并自行重试（issue #412）。
+			statusCode := outcome.logStatusCode
+			if statusCode < 400 || statusCode > 599 || statusCode == logStatusUpstreamStreamBreak {
+				statusCode = http.StatusBadGateway
+			}
+			c.Header("Content-Type", "application/json; charset=utf-8")
+			sendAnthropicError(c, statusCode, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage)
+		}
 		if !isStream {
 			if anthropicResp != nil {
 				c.JSON(http.StatusOK, anthropicResp)

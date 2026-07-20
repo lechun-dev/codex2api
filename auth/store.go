@@ -129,6 +129,18 @@ type Account struct {
 	// -1 表示尚未探测过（未知）；>=0 为已知次数。
 	RateLimitResetCredits      int
 	RateLimitResetCreditsValid bool
+	// ApplicableResetCredits 是当下「可应用」的重置券张数，来自 wham/usage 的
+	// rate_limit_reset_credits.applicable_available_count。未触限时上游返回 0
+	// （券在有效期内但此刻不生效）。
+	ApplicableResetCredits      int
+	ApplicableResetCreditsValid bool
+	// Credits* 是 wham/usage 返回的 credits 积分余额快照（零额度成本）。
+	// Balance 原样保留上游字符串（单位未知，不做换算）；Valid 表示已探测过。
+	CreditsBalance             string
+	CreditsHasCredits          bool
+	CreditsUnlimited           bool
+	CreditsOverageLimitReached bool
+	CreditsValid               bool
 	// resetCreditsProbedAt 记录最近一次成功 wham 用量探针的时间。
 	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
 	// 因此用它独立判断重置次数是否过期，避免活跃账号因用量快照一直被流量刷新而长期不探针。
@@ -338,6 +350,39 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// SupportsCodexModel 判断 Codex OAuth 账号能否服务指定模型。
+// Models 为空表示未配置白名单，放行全部模型；非空时按大小写不敏感精确匹配。
+func (a *Account) SupportsCodexModel(model string) bool {
+	if a == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.Models) == 0 {
+		return true
+	}
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
+}
+
+// CodexModels 返回 Codex OAuth 账号配置的支持模型白名单（空表示放行全部）。
+func (a *Account) CodexModels() []string {
+	if a == nil {
+		return []string{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneStringSlice(a.Models)
 }
 
 func (a *Account) OpenAIResponsesModels() []string {
@@ -1703,6 +1748,42 @@ func (a *Account) GetRateLimitResetCredits() (int, bool) {
 	return a.RateLimitResetCredits, a.RateLimitResetCreditsValid
 }
 
+// SetApplicableResetCredits 记录当下「可应用」的重置券张数（未触限时为 0）。
+func (a *Account) SetApplicableResetCredits(count int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if count < 0 {
+		count = 0
+	}
+	a.ApplicableResetCredits = count
+	a.ApplicableResetCreditsValid = true
+}
+
+// GetApplicableResetCredits 返回当下可应用的重置券张数及其是否已探测过。
+func (a *Account) GetApplicableResetCredits() (int, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ApplicableResetCredits, a.ApplicableResetCreditsValid
+}
+
+// SetCreditBalance 记录 wham/usage 返回的 credits 积分余额快照。
+func (a *Account) SetCreditBalance(balance string, hasCredits, unlimited, overageReached bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.CreditsBalance = balance
+	a.CreditsHasCredits = hasCredits
+	a.CreditsUnlimited = unlimited
+	a.CreditsOverageLimitReached = overageReached
+	a.CreditsValid = true
+}
+
+// GetCreditBalance 返回 credits 积分余额快照及其是否已探测过。
+func (a *Account) GetCreditBalance() (balance string, hasCredits, unlimited, overageReached, ok bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.CreditsBalance, a.CreditsHasCredits, a.CreditsUnlimited, a.CreditsOverageLimitReached, a.CreditsValid
+}
+
 // MarkResetCreditsProbed 记录最近一次成功 wham 用量探针的时间。
 // 调用方应在 wham 探针成功（拿到 usage）后调用，无论本次响应是否带 reset_credits 字段，
 // 因为「能成功拉到 wham」本身就代表重置次数已是最新。
@@ -1831,6 +1912,14 @@ func (a *Account) GetPlanType() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.PlanType
+}
+
+// GroupIDSnapshot 返回账号当前所属组 ID 的副本。GroupIDs 写入受 a.mu 保护
+// （ApplyAccountGroups / ApplyAccountGroupMemberships），跨 goroutine 读取须走此快照。
+func (a *Account) GroupIDSnapshot() []int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneInt64Slice(a.GroupIDs)
 }
 
 // applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
@@ -2368,6 +2457,9 @@ type Store struct {
 	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
 	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
 	codexWSSizeRouterEnabled    atomic.Bool  // 1009 自学习体积路由，默认开启
+	codexWSBusyMaxWaitSec       atomic.Int64 // busy session 等待上限（秒），默认 30（issue #413）
+	codexWSBusyOverflowEnabled  atomic.Bool  // busy session 溢出到同账号兄弟连接，默认关闭
+	codexWSBusyPatienceSec      atomic.Int64 // 触发溢出前的短等待（秒），默认 2
 
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
 	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
@@ -2797,6 +2889,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
 			CodexWSSizeRouterEnabled:           true,
+			CodexWSBusyAcquireMaxWaitSec:       30,
+			CodexWSBusyPatienceSec:             2,
 			CodexContinueMaxRounds:             8,
 			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
 			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
@@ -2879,6 +2973,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
 	s.codexWSSizeRouterEnabled.Store(settings.CodexWSSizeRouterEnabled)
+	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)))
+	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
+	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(settings.CodexWSBusyPatienceSec)))
 	s.codexContinueThinkingEnabled.Store(settings.CodexContinueThinkingEnabled)
 	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(settings.CodexContinueMaxRounds)))
 	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
@@ -3130,6 +3227,54 @@ func (s *Store) CodexWSSilentMaxRetries() int {
 		return 2
 	}
 	return int(s.codexWSSilentMaxRetries.Load())
+}
+
+// SetCodexWSBusyAcquireMaxWaitSec 设置 busy session 等待上限（秒）。
+func (s *Store) SetCodexWSBusyAcquireMaxWaitSec(seconds int) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(seconds)))
+}
+
+// CodexWSBusyAcquireMaxWaitSec 返回 busy session 等待上限（秒）。
+func (s *Store) CodexWSBusyAcquireMaxWaitSec() int {
+	if s == nil {
+		return 30
+	}
+	return int(s.codexWSBusyMaxWaitSec.Load())
+}
+
+// SetCodexWSBusyOverflowEnabled 设置是否允许 busy session 溢出到同账号兄弟连接。
+func (s *Store) SetCodexWSBusyOverflowEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyOverflowEnabled.Store(enabled)
+}
+
+// CodexWSBusyOverflowEnabled 返回是否允许 busy session 溢出到同账号兄弟连接。
+func (s *Store) CodexWSBusyOverflowEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexWSBusyOverflowEnabled.Load()
+}
+
+// SetCodexWSBusyPatienceSec 设置触发溢出前的短等待（秒）。
+func (s *Store) SetCodexWSBusyPatienceSec(seconds int) {
+	if s == nil {
+		return
+	}
+	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(seconds)))
+}
+
+// CodexWSBusyPatienceSec 返回触发溢出前的短等待（秒）。
+func (s *Store) CodexWSBusyPatienceSec() int {
+	if s == nil {
+		return 2
+	}
+	return int(s.codexWSBusyPatienceSec.Load())
 }
 
 // SetCodexContinueThinkingEnabled 设置是否在上游截断思考时自动续想。
@@ -5595,6 +5740,23 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+// NormalizeAccountModels 归一化账号支持模型列表（去重、去空白、按字典序排序）。
+func NormalizeAccountModels(values []string) []string {
+	return normalizeModelList(values)
+}
+
+// ApplyAccountModels 更新运行时账号的支持模型白名单（空列表 = 清空白名单，放行全部模型）。
+func (s *Store) ApplyAccountModels(dbID int64, models []string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	acc.Models = normalizeModelList(models)
+	acc.mu.Unlock()
 	return true
 }
 

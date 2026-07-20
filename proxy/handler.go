@@ -905,6 +905,22 @@ func extractServiceTier(body []byte) string {
 
 const upstreamErrorKindMessageTooBig = "message_too_big"
 
+// upstreamErrorKindWsBusyAcquire 是 wsrelay busy session acquire 超时（issue #413）：
+// 同会话的前一个请求长时间占用 WS 连接导致的排队超时，属会话占用而非账号故障。
+const upstreamErrorKindWsBusyAcquire = "ws_busy_acquire"
+
+// isWsBusyAcquireTimeoutError 按错误文案识别 busy acquire 超时。wsrelay 依赖 proxy，
+// proxy 无法反向导入其哨兵类型，跨包只能靠稳定的错误消息片段匹配。
+func isWsBusyAcquireTimeoutError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "waiting for busy session")
+}
+
+// shouldPenalizeTransportKind 返回该传输失败是否应计入账号健康惩罚。
+// busy acquire 超时的账号本身没有故障，惩罚会让 fast scheduler 错误降权（issue #413）。
+func shouldPenalizeTransportKind(kind string) bool {
+	return kind != "" && kind != upstreamErrorKindWsBusyAcquire
+}
+
 func isWebsocketMessageTooBigError(err error) bool {
 	if err == nil {
 		return false
@@ -944,8 +960,11 @@ func classifyTransportFailure(err error) string {
 	if isWebsocketMessageTooBigError(err) {
 		return upstreamErrorKindMessageTooBig
 	}
+	if isWsBusyAcquireTimeoutError(err) {
+		return upstreamErrorKindWsBusyAcquire
+	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded") {
 		return "timeout"
 	}
 	return "transport"
@@ -1982,8 +2001,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
 				// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-				if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+				// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+				stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+				if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -2374,8 +2394,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3019,7 +3040,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
-				if kind := classifyTransportFailure(reqErr); kind != "" {
+				if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -3208,7 +3229,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3623,8 +3644,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

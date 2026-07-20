@@ -6238,6 +6238,9 @@ type settingsResponse struct {
 	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
 	CodexWSSizeRouterEnabled           bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec       int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled         bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec             int     `json:"codex_ws_busy_patience_sec"`
 	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
@@ -6351,6 +6354,9 @@ type updateSettingsReq struct {
 	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
 	CodexWSSizeRouterEnabled           *bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec       *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled         *bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec             *int     `json:"codex_ws_busy_patience_sec"`
 	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
@@ -6972,6 +6978,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -7420,6 +7429,26 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexWSSilentMaxRetries(v)
 		runtimeCfg.CodexWSSilentRetries = v
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
+	}
+
+	if req.CodexWSBusyAcquireMaxWaitSec != nil {
+		v := database.NormalizeCodexWSBusyAcquireMaxWaitSec(*req.CodexWSBusyAcquireMaxWaitSec)
+		h.store.SetCodexWSBusyAcquireMaxWaitSec(v)
+		runtimeCfg.CodexWSBusyMaxWaitSec = v
+		log.Printf("设置已更新: codex_ws_busy_acquire_max_wait_sec = %d", v)
+	}
+
+	if req.CodexWSBusyOverflowEnabled != nil {
+		h.store.SetCodexWSBusyOverflowEnabled(*req.CodexWSBusyOverflowEnabled)
+		runtimeCfg.CodexWSBusyOverflow = *req.CodexWSBusyOverflowEnabled
+		log.Printf("设置已更新: codex_ws_busy_overflow_enabled = %t", *req.CodexWSBusyOverflowEnabled)
+	}
+
+	if req.CodexWSBusyPatienceSec != nil {
+		v := database.NormalizeCodexWSBusyPatienceSec(*req.CodexWSBusyPatienceSec)
+		h.store.SetCodexWSBusyPatienceSec(v)
+		runtimeCfg.CodexWSBusyPatienceSec = v
+		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
 	}
 
 	if req.CodexContinueThinkingEnabled != nil {
@@ -7895,6 +7924,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -8036,6 +8068,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),

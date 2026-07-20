@@ -629,6 +629,9 @@ export interface SystemSettings {
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
   codex_ws_size_router_enabled: boolean
+  codex_ws_busy_acquire_max_wait_sec: number
+  codex_ws_busy_overflow_enabled: boolean
+  codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string

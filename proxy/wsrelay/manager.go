@@ -576,6 +576,7 @@ func (m *Manager) AcquireConnection(
 	wait := AcquireInitialBackoff
 	var waited time.Duration
 	var createLeaseFailures int
+	var busyOverflowAttempted bool
 
 	for {
 		lock.Lock()
@@ -617,8 +618,19 @@ func (m *Manager) AcquireConnection(
 				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
 				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
 				// 到龄连接也会走到这里等在途请求结束，结束后下一轮循环轮转重建。
-				if waited >= AcquireMaxWait {
-					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", AcquireMaxWait)
+				//
+				// 短等待(patience)后可溢出到同账号的兄弟槽位（issue #413，默认关闭）：
+				// 前一请求长时间流式输出时，同会话的并发请求不再等满整个上限。
+				// 只尝试一次；失败（容量满/拨号失败）回落到继续等待，最坏情况与关闭时一致。
+				if !busyOverflowAttempted && busyOverflowEnabled() && waited >= busyOverflowPatience() && !isBusyOverflowSessionKey(sessionKey) {
+					busyOverflowAttempted = true
+					if owc, opr, ok := m.tryAcquireBusyOverflow(ctx, account, wsURL, sessionKey, headers, proxyOverride); ok {
+						log.Printf("[WS] busy session 溢出到同账号兄弟连接 (account=%d, waited=%s)", account.ID(), waited.Round(time.Millisecond))
+						return owc, opr, nil
+					}
+				}
+				if maxWait := busyAcquireMaxWait(); waited >= maxWait {
+					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", maxWait)
 				}
 				select {
 				case <-ctx.Done():
@@ -640,8 +652,8 @@ func (m *Manager) AcquireConnection(
 		if !m.reserveAccountConnectionCapacity(account.ID(), accountConnectionLimit(account), key) {
 			accountLock.Unlock()
 			lock.Unlock()
-			if waited >= AcquireMaxWait {
-				return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", AcquireMaxWait)
+			if maxWait := busyAcquireMaxWait(); waited >= maxWait {
+				return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", maxWait)
 			}
 			select {
 			case <-ctx.Done():
@@ -706,6 +718,105 @@ func (m *Manager) AcquireConnection(
 
 		return wc, pr, nil
 	}
+}
+
+// tryAcquireBusyOverflow 在 busy session 等待超过 patience 后，尝试在同账号的有界
+// overflow 槽位（<sessionKey>#ovf-N）上复用空闲兄弟连接或新建一条（issue #413）。
+// 单遍、尽力而为：槽位也在忙则换下一个；账号容量满或拨号/租约失败即放弃，调用方
+// 回落到继续等待原连接——失败路径不会比不开启 overflow 更差。
+// 兄弟连接正常入池，由既有的 IdleTimeout/容量裁剪回收。
+func (m *Manager) tryAcquireBusyOverflow(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	baseSessionKey string,
+	headers http.Header,
+	proxyOverride string,
+) (*WsConnection, *PendingRequest, bool) {
+	proxyURL := effectiveProxyURL(account, proxyOverride)
+	accountLimit := accountConnectionLimit(account)
+	accountLock := m.accountLock(account.ID())
+	for i := 1; i <= BusyOverflowSlots; i++ {
+		slotSession := fmt.Sprintf("%s%s%d", baseSessionKey, busyOverflowKeyInfix, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if v, ok := m.connections.Load(key); ok {
+			wc := v.(*WsConnection)
+			if canReuseConnection(wc) {
+				if m.probe(wc) {
+					accountLock.Lock()
+					current, exists := m.connections.Load(key)
+					if exists && current == wc && canReuseConnection(wc) {
+						pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
+						if leaseErr == nil {
+							wc.account = account
+							wc.Touch()
+							m.trimIdleAccountConnections(account.ID(), accountLimit, wc)
+							accountLock.Unlock()
+							lock.Unlock()
+							return wc, pr, true
+						}
+						m.DiscardConnection(wc)
+					}
+					accountLock.Unlock()
+					lock.Unlock()
+					continue
+				}
+				m.DiscardConnection(wc)
+			} else if wc.IsConnected() && !wc.IsExpired() && wc.session != nil && wc.session.PendingCount() > 0 && !isRotatableOverAge(wc) {
+				// 兄弟槽位也在忙：换下一个槽位
+				lock.Unlock()
+				continue
+			} else {
+				// 死/到龄/过期连接：清掉腾出槽位，下方直接新建
+				m.DiscardConnection(wc)
+			}
+		}
+		accountLock.Lock()
+		if _, ok := m.connections.Load(key); ok {
+			accountLock.Unlock()
+			lock.Unlock()
+			continue
+		}
+		if !m.reserveAccountConnectionCapacity(account.ID(), accountLimit, key) {
+			// 账号连接容量已满：不为 overflow 挤占更多连接，放弃降级回到等待
+			accountLock.Unlock()
+			lock.Unlock()
+			return nil, nil, false
+		}
+		accountLock.Unlock()
+		wc, err := m.createConnection(ctx, account, wsURL, slotSession, headers, proxyOverride)
+		if err != nil {
+			m.releaseAccountConnectionCapacity(account.ID())
+			lock.Unlock()
+			log.Printf("[WS] busy overflow 新建连接失败，回落等待原连接 (account=%d): %v", account.ID(), err)
+			return nil, nil, false
+		}
+		m.connections.Store(key, wc)
+		if m.afterConnectionStored != nil {
+			m.afterConnectionStored(wc)
+		}
+		pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
+		if leaseErr == nil {
+			if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
+				wc.session.RemovePendingRequest(pr.RequestID)
+				leaseErr = earlyErr
+			}
+		}
+		m.releaseAccountConnectionCapacity(account.ID())
+		if leaseErr != nil {
+			m.DiscardConnection(wc)
+			lock.Unlock()
+			return nil, nil, false
+		}
+		lock.Unlock()
+		if fn := m.getOnConnected(); fn != nil {
+			fn(account.ID(), wc.session)
+		}
+		return wc, pr, true
+	}
+	return nil, nil, false
 }
 
 // StatelessConnectionSlots 无显式会话的请求在每个 (account, cacheKey) 维度下

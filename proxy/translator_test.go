@@ -1826,6 +1826,42 @@ func TestValidateResponsesFunctionNamesAllowsValidFunctionNames(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesFunctionNamesIgnoresInvalidJSON(t *testing.T) {
+	if err := ValidateResponsesFunctionNames([]byte(`{not json`)); err != nil {
+		t.Fatalf("invalid JSON must pass through (upstream validates), got %v", err)
+	}
+}
+
+// buildManyTurnResponsesBody 模拟 issue #417 的长会话形态：大量小文本轮次。
+func buildManyTurnResponsesBody(turns int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"model":"gpt-5.5","input":[`)
+	txt := strings.Repeat("analyze this module carefully ", 40)
+	for i := 0; i < turns; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+		b.WriteString(txt)
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`],"tools":[{"type":"function","name":"lookup","parameters":{}}]}`)
+	return []byte(b.String())
+}
+
+// BenchmarkValidateResponsesFunctionNamesManyTurns 守护 issue #417 的优化：校验器
+// 只做惰性 gjson 遍历，不再对大请求体做全量 map[string]any 反序列化。
+func BenchmarkValidateResponsesFunctionNamesManyTurns(b *testing.B) {
+	body := buildManyTurnResponsesBody(4000)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		if err := ValidateResponsesFunctionNames(body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestPrepareResponsesBody_InfersFunctionToolTypeWhenMissing(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

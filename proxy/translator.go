@@ -1621,55 +1621,47 @@ func validateChatCompletionFunctionNames(req openAIRequest) error {
 // ValidateResponsesFunctionNames rejects malformed tool-call names before they
 // reach the upstream Responses API. The upstream reports these as HTTP 400
 // empty_string errors; local validation makes the bad client field obvious.
+// ValidateResponsesFunctionNames 校验 input[] 中 function_call 与 tools[] 中
+// function 工具的 name 非空。采用 gjson 惰性遍历，只走 input/tools 两个数组，
+// 不把整份请求体反序列化成 map[string]any——大请求体(曾 16MB)上全量 Unmarshal
+// 会带来秒级开销且随后 prepare 阶段还会再解析一次(issue #417)。
 func ValidateResponsesFunctionNames(rawBody []byte) error {
-	var body map[string]any
-	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return nil
-	}
-	return validateResponsesFunctionNames(body)
-}
-
-func validateResponsesFunctionNames(body map[string]any) error {
-	inputItems, _ := body["input"].([]any)
-	for itemIdx, rawItem := range inputItems {
-		item, ok := rawItem.(map[string]any)
-		if !ok {
-			continue
+	// 无效 JSON 时 gjson 查询返回空结果、校验直接通过（与旧版 Unmarshal 失败即
+	// 放行一致），无需先做一次全量 ValidBytes 扫描。
+	var funcErr error
+	gjson.GetBytes(rawBody, "input").ForEach(func(idx, item gjson.Result) bool {
+		if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+			return true
 		}
-		if strings.TrimSpace(firstNonEmptyAnyString(item["type"])) != "function_call" {
-			continue
+		if strings.TrimSpace(item.Get("name").String()) == "" {
+			funcErr = invalidFunctionNameError(fmt.Sprintf("input[%d].name", idx.Int()))
+			return false
 		}
-		if strings.TrimSpace(firstNonEmptyAnyString(item["name"])) == "" {
-			return invalidFunctionNameError(fmt.Sprintf("input[%d].name", itemIdx))
-		}
+		return true
+	})
+	if funcErr != nil {
+		return funcErr
 	}
 
-	tools, _ := body["tools"].([]any)
-	for toolIdx, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
-			continue
+	gjson.GetBytes(rawBody, "tools").ForEach(func(idx, tool gjson.Result) bool {
+		if strings.TrimSpace(tool.Get("type").String()) != "function" {
+			return true
 		}
-		if responsesFunctionToolName(tool) == "" {
-			path := fmt.Sprintf("tools[%d].name", toolIdx)
-			if _, ok := tool["function"].(map[string]any); ok {
-				path = fmt.Sprintf("tools[%d].function.name", toolIdx)
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if name == "" {
+			path := fmt.Sprintf("tools[%d].name", idx.Int())
+			if tool.Get("function").IsObject() {
+				path = fmt.Sprintf("tools[%d].function.name", idx.Int())
 			}
-			return invalidFunctionNameError(path)
+			funcErr = invalidFunctionNameError(path)
+			return false
 		}
-	}
-	return nil
-}
-
-func responsesFunctionToolName(tool map[string]any) string {
-	if name := strings.TrimSpace(firstNonEmptyAnyString(tool["name"])); name != "" {
-		return name
-	}
-	function, _ := tool["function"].(map[string]any)
-	if function == nil {
-		return ""
-	}
-	return strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
+		return true
+	})
+	return funcErr
 }
 
 func normalizeResponsesFunctionTools(body map[string]any) bool {

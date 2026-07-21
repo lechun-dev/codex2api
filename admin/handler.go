@@ -414,6 +414,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
+	api.POST("/accounts/grok", h.AddGrokAccount)
+	api.POST("/accounts/grok/models", h.FetchGrokModels)
+	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -710,6 +713,8 @@ type accountResponse struct {
 	AccountType                string                     `json:"account_type,omitempty"`
 	AccessTokenType            string                     `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI         bool                       `json:"openai_responses_api,omitempty"`
+	GrokAPI                    bool                       `json:"grok_api,omitempty"`
+	GrokAuthKind               string                     `json:"grok_auth_kind,omitempty"`
 	BaseURL                    string                     `json:"base_url,omitempty"`
 	Models                     []string                   `json:"models,omitempty"`
 	ModelMapping               string                     `json:"model_mapping,omitempty"`
@@ -864,14 +869,24 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
-		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		grokAuthKind := ""
+		if isGrokAccount {
+			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+				grokAuthKind = auth.GrokAuthKindAPIKey
+			} else {
+				grokAuthKind = auth.GrokAuthKindOAuth
+			}
+		}
 		email := row.GetCredential("email")
 		baseURL := row.GetCredential("base_url")
 		if isOpenAIResponsesAccount && email == "" {
 			email = baseURL
 		}
 		planType := row.GetCredential("plan_type")
-		if isOpenAIResponsesAccount && planType == "" {
+		if (isOpenAIResponsesAccount || isGrokAccount) && planType == "" {
 			planType = "api"
 		}
 		codexClientMetadataMode := ""
@@ -893,13 +908,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
-			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			CreditEnabled:            row.CreditEnabled,
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
 			AccessTokenType:          accountAccessTokenType(row),
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+			GrokAPI:                  isGrokAccount,
+			GrokAuthKind:             grokAuthKind,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
 			ModelMapping:             row.GetCredential("model_mapping"),
@@ -2959,8 +2976,8 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
-	if account.IsOpenAIResponsesAPI() {
-		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号请在账号设置中编辑模型列表")
+	if account.IsRelayStyle() {
+		writeError(c, http.StatusBadRequest, "中转/Grok 账号请在账号设置中编辑模型列表")
 		return
 	}
 
@@ -2986,6 +3003,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	account := h.store.FindByID(id)
 	if account == nil {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsGrokAPI() {
+		// Grok 账号：用自身凭据拉取 Grok 上游模型目录
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		defer cancel()
+		models, err := proxy.FetchGrokModelIDs(ctx, account)
+		if err != nil {
+			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Grok 上游模型目录失败: %s", err.Error()))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"models": models})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -4927,7 +4956,7 @@ func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account
 }
 
 func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
-	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() || acc.GetAccessToken() == "" {
+	if h == nil || h.store == nil || acc == nil || acc.IsRelayStyle() || acc.GetAccessToken() == "" {
 		return nil
 	}
 	model, err := h.connectionTestModelForAccount(ctx, acc, "")

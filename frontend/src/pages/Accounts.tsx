@@ -23,6 +23,7 @@ import type {
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
+  AddGrokAccountRequest,
   CodexClientMetadataMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
@@ -98,6 +99,7 @@ import {
   ToggleLeft,
   ToggleRight,
   MoreHorizontal,
+  Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
@@ -505,7 +507,7 @@ function mergeModelLists(current: string[], incoming: string[]): string[] {
 }
 
 function formatAccountName(account: AccountRow): string {
-  if (account.openai_responses_api) {
+  if (account.openai_responses_api || account.grok_api) {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
@@ -867,7 +869,7 @@ export default function Accounts() {
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "grok" | "oauth"
   >("oauth");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
@@ -892,6 +894,16 @@ export default function Accounts() {
     ModelMappingEntry[]
   >(emptyModelMappingEntries);
   const [openAIModelsLoading, setOpenAIModelsLoading] = useState(false);
+  const [grokForm, setGrokForm] = useState<AddGrokAccountRequest>({
+    auth_kind: "oauth",
+    auth_json: "",
+    api_key: "",
+    base_url: "",
+    models: [],
+    proxy_url: "",
+  });
+  const [grokModelDraft, setGrokModelDraft] = useState("");
+  const [grokModelsLoading, setGrokModelsLoading] = useState(false);
   const [oauthStep, setOauthStep] = useState<"generate" | "exchange">(
     "generate",
   );
@@ -2094,6 +2106,79 @@ export default function Accounts() {
       setOpenAIModelMappingMode("form");
       setOpenAIModelMappingEntries(emptyModelMappingEntries());
       setAddCustomHeadersText("");
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const grokCredentialReady = () =>
+    grokForm.auth_kind === "api_key"
+      ? Boolean(grokForm.api_key?.trim())
+      : Boolean(grokForm.auth_json?.trim());
+
+  const addGrokModelValues = (raw: string) => {
+    const tokens = parseModelTokens(raw);
+    if (tokens.length === 0) return;
+    setGrokForm((form) => {
+      const existing = new Set((form.models ?? []).map((m) => m.toLowerCase()));
+      const merged = [...(form.models ?? [])];
+      for (const token of tokens) {
+        if (!existing.has(token.toLowerCase())) {
+          existing.add(token.toLowerCase());
+          merged.push(token);
+        }
+      }
+      return { ...form, models: merged };
+    });
+    setGrokModelDraft("");
+  };
+
+  const removeGrokModel = (model: string) =>
+    setGrokForm((form) => ({
+      ...form,
+      models: (form.models ?? []).filter((m) => m !== model),
+    }));
+
+  const handleFetchGrokModels = async () => {
+    if (!grokCredentialReady()) return;
+    setGrokModelsLoading(true);
+    try {
+      const result = await api.fetchGrokModels(grokForm);
+      const models = result.models ?? [];
+      setGrokForm((form) => ({ ...form, models }));
+      showToast(t("accounts.openaiModelsFetchSuccess", { count: models.length }));
+    } catch (error) {
+      showToast(
+        t("accounts.openaiModelsFetchFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setGrokModelsLoading(false);
+    }
+  };
+
+  const handleAddGrok = async () => {
+    if (!grokCredentialReady()) return;
+    setSubmitting(true);
+    try {
+      await api.addGrokAccount(grokForm);
+      showToast(t("accounts.addSuccess"));
+      setShowAdd(false);
+      setGrokForm({
+        auth_kind: "oauth",
+        auth_json: "",
+        api_key: "",
+        base_url: "",
+        models: [],
+        proxy_url: "",
+      });
+      setGrokModelDraft("");
       void reload();
     } catch (error) {
       showToast(
@@ -5224,7 +5309,7 @@ export default function Accounts() {
                                       openAccountDetail(account);
                                     }}
                                   >
-                                    {account.openai_responses_api
+                                    {account.openai_responses_api || account.grok_api
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
@@ -5245,6 +5330,7 @@ export default function Accounts() {
                                   )}
                                   {(account.at_only ||
                                     account.openai_responses_api ||
+                                    account.grok_api ||
                                     account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
@@ -5260,6 +5346,12 @@ export default function Accounts() {
                                       {account.openai_responses_api && (
                                         <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                                           Responses API
+                                        </span>
+                                      )}
+                                      {account.grok_api && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                                          <Sparkles className="size-2.5" />
+                                          Grok
                                         </span>
                                       )}
                                       {account.enabled === false && (
@@ -5700,6 +5792,13 @@ export default function Accounts() {
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
+                ) : addMethod === "grok" ? (
+                  <Button
+                    onClick={() => void handleAddGrok()}
+                    disabled={submitting || !grokCredentialReady()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
                 ) : oauthStep === "generate" ? (
                   <Button
                     onClick={() => void handleOAuthGenerate()}
@@ -5794,6 +5893,17 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
+              </button>
+              <button
+                onClick={() => setAddMethod("grok")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "grok"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Sparkles className="size-3.5" />
+                {t("accounts.addMethodGrok")}
               </button>
             </div>
 
@@ -6098,6 +6208,167 @@ export default function Accounts() {
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
+                })}
+              </div>
+            ) : addMethod === "grok" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                  <p className="font-semibold text-foreground mb-1">
+                    {t("accounts.grokTitle")}
+                  </p>
+                  <p>{t("accounts.grokDesc")}</p>
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.openaiNameLabel")}
+                  </label>
+                  <Input
+                    placeholder={t("accounts.grokNamePlaceholder")}
+                    value={grokForm.name ?? ""}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setGrokForm((form) => ({ ...form, name: event.target.value }))
+                    }
+                  />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.grokAuthKind")}
+                  </label>
+                  <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-muted/50 border border-border">
+                    {(["oauth", "api_key"] as const).map((kind) => (
+                      <button
+                        key={kind}
+                        type="button"
+                        onClick={() =>
+                          setGrokForm((form) => ({ ...form, auth_kind: kind }))
+                        }
+                        className={`flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition-all ${
+                          grokForm.auth_kind === kind
+                            ? "bg-background shadow-sm text-foreground"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        {kind === "oauth"
+                          ? t("accounts.grokAuthKindOAuth")
+                          : t("accounts.grokAuthKindApiKey")}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {grokForm.auth_kind === "oauth" ? (
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                      {t("accounts.grokAuthJson")} *
+                    </label>
+                    <textarea
+                      className="w-full min-h-[120px] rounded-lg border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/40"
+                      placeholder={t("accounts.grokAuthJsonPlaceholder")}
+                      value={grokForm.auth_json ?? ""}
+                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                        setGrokForm((form) => ({
+                          ...form,
+                          auth_json: event.target.value,
+                        }))
+                      }
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t("accounts.grokAuthJsonHint")}
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                      {t("accounts.grokApiKey")} *
+                    </label>
+                    <Input
+                      type="password"
+                      placeholder="xai-..."
+                      value={grokForm.api_key ?? ""}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setGrokForm((form) => ({
+                          ...form,
+                          api_key: event.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                )}
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.grokBaseUrl")}
+                  </label>
+                  <Input
+                    placeholder={t("accounts.grokBaseUrlPlaceholder")}
+                    value={grokForm.base_url ?? ""}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setGrokForm((form) => ({
+                        ...form,
+                        base_url: event.target.value,
+                      }))
+                    }
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.grokBaseUrlHint")}
+                  </p>
+                </div>
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <label className="text-sm font-semibold text-muted-foreground">
+                      {t("accounts.grokModels")}
+                    </label>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void handleFetchGrokModels()}
+                      disabled={grokModelsLoading || !grokCredentialReady()}
+                    >
+                      <RefreshCw
+                        className={`size-3.5 ${grokModelsLoading ? "animate-spin" : ""}`}
+                      />
+                      {grokModelsLoading
+                        ? t("accounts.openaiModelsFetching")
+                        : t("accounts.openaiModelsFetch")}
+                    </Button>
+                  </div>
+                  <div className="mb-3 flex gap-2">
+                    <Input
+                      placeholder={t("accounts.openaiModelsPlaceholder")}
+                      value={grokModelDraft}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setGrokModelDraft(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addGrokModelValues(grokModelDraft);
+                        }
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => addGrokModelValues(grokModelDraft)}
+                      disabled={!grokModelDraft.trim()}
+                    >
+                      <Plus className="size-3.5" />
+                      {t("accounts.openaiModelsAdd")}
+                    </Button>
+                  </div>
+                  <ModelChipGrid
+                    models={grokForm.models ?? []}
+                    onRemove={removeGrokModel}
+                    emptyLabel={t("accounts.grokModelsEmpty")}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.grokModelsHint")}
+                  </p>
+                </div>
+                {renderProxyInput({
+                  value: grokForm.proxy_url ?? "",
+                  testKey: "add-grok",
+                  onChange: (value) =>
+                    setGrokForm((form) => ({ ...form, proxy_url: value })),
                 })}
               </div>
             ) : (
@@ -9874,7 +10145,7 @@ function isRateLimitedAccount(account: AccountRow): boolean {
 
 function isUnsampledQuotaAccount(account: AccountRow): boolean {
   const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api) {
+  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
     return false;
   }
   // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
@@ -10686,7 +10957,10 @@ function AccountRowActionsMenu({
   const refreshDisabled =
     refreshing || account.at_only || account.openai_responses_api;
   const authJsonDisabled =
-    authJsonExporting || account.at_only || account.openai_responses_api;
+    authJsonExporting ||
+    account.at_only ||
+    account.openai_responses_api ||
+    account.grok_api;
   const resetCredits = account.rate_limit_reset_credits ?? 0;
 
   const items: HeaderActionMenuItem[] = [
@@ -10721,7 +10995,7 @@ function AccountRowActionsMenu({
       icon: <FileJson className="size-3.5" />,
       disabled: authJsonDisabled,
       title:
-        account.at_only || account.openai_responses_api
+        account.at_only || account.openai_responses_api || account.grok_api
           ? t("accounts.authJsonDisabled")
           : undefined,
       onSelect: onGenerateAuthJson,
@@ -10765,8 +11039,8 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
-    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay(openai_responses_api)账号不显示。
-    ...(onEditModels && !account.openai_responses_api
+    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay/Grok 账号不显示。
+    ...(onEditModels && !account.openai_responses_api && !account.grok_api
       ? [
           {
             key: "edit-models",
@@ -11078,6 +11352,7 @@ function AccountMobileCard({
   const hasStateBadges =
     account.at_only ||
     account.openai_responses_api ||
+    account.grok_api ||
     account.enabled === false ||
     account.locked;
   const modelCooldownCount = account.model_cooldowns?.length ?? 0;
@@ -11207,6 +11482,13 @@ function AccountMobileCard({
                 {account.openai_responses_api && (
                   <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                     Responses API
+                  </span>
+                )}
+                {account.grok_api && (
+                  <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                    <Sparkles className="size-2.5" />
+                    Grok
+                    {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
                   </span>
                 )}
                 {account.enabled === false && (
@@ -11475,6 +11757,13 @@ function AccountMobileCard({
             {account.openai_responses_api && (
               <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                 Responses API
+              </span>
+            )}
+            {account.grok_api && (
+              <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                <Sparkles className="size-2.5" />
+                Grok
+                {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
               </span>
             )}
             {account.enabled === false && (
@@ -11893,7 +12182,11 @@ function TestConnectionModal({
     onSettledRef.current();
   }, []);
 
-  const isOpenAIResponsesAccount = Boolean(account.openai_responses_api);
+  // Grok 与 openai_responses 同属"账号自带模型清单"的 relay 风格账号，
+  // 测试模型选择逻辑一致（用 account.models 而非上游 /v1/models 全量）。
+  const isOpenAIResponsesAccount = Boolean(
+    account.openai_responses_api || account.grok_api,
+  );
 
   const modelSelectOptions = useMemo(
     () =>

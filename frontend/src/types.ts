@@ -38,6 +38,8 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  grok_api?: boolean
+  grok_auth_kind?: string
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -249,6 +251,25 @@ export interface FetchOpenAIResponsesModelsRequest {
 
 export interface FetchOpenAIResponsesModelsResponse {
   base_url: string
+  models: string[]
+}
+
+export type GrokAuthKind = 'oauth' | 'api_key'
+
+export interface AddGrokAccountRequest {
+  name?: string
+  auth_kind: GrokAuthKind
+  auth_json?: string
+  api_key?: string
+  base_url?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+}
+
+export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface FetchGrokModelsResponse {
   models: string[]
 }
 

@@ -60,8 +60,8 @@ func (h *Handler) ProbeAccountModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
-	if account.IsOpenAIResponsesAPI() {
-		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号不支持模型探测")
+	if account.IsRelayStyle() {
+		writeError(c, http.StatusBadRequest, "中转/Grok 账号不支持模型探测")
 		return
 	}
 	if account.GetAccessToken() == "" {

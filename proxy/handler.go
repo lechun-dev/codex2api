@@ -223,7 +223,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			return false
 		}
 		if model != "" && account.IsModelRateLimited(model) {
@@ -249,9 +249,16 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	candidates := compactMappingCandidates(originalModel, effectiveModel)
-	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
+	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	})
+	return func(account *auth.Account) bool {
+		// Grok 上游没有 /responses/compact 端点，compact 请求不路由到 Grok 账号
+		if account.IsGrokAPI() {
+			return false
+		}
+		return inner(account)
+	}
 }
 
 func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
@@ -267,7 +274,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
@@ -300,7 +307,7 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account == nil || !account.IsOpenAIResponsesAPI() {
+		if account == nil || !account.IsRelayStyle() {
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
@@ -831,7 +838,7 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			continue
 		}
 		if account.IsAvailable() {
@@ -841,10 +848,10 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 	return false
 }
 
-// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转账号"约束。
+// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转/Grok 账号"约束。
 func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
-		if account == nil || account.IsOpenAIResponsesAPI() {
+		if account == nil || account.IsRelayStyle() {
 			return false
 		}
 		return inner == nil || inner(account)
@@ -1952,7 +1959,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			if lastUpstreamCancel != nil {
 				lastUpstreamCancel()
 			}
@@ -1970,8 +1977,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftTimedOut := func() bool {
 				return ttftGuard != nil && ttftGuard.TimedOut()
 			}
-			baseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			upstreamEndpoint := relayUpstreamEndpointForAccount(account)
 			upstreamBody := getOpenAIResponsesBody()
 			var mappedBody []byte
 			var mappedModel string
@@ -1986,7 +1992,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -2121,7 +2127,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 
-			c.Set("x-account-email", baseURL)
+			account.Mu().RLock()
+			relayAccountEmail := account.Email
+			account.Mu().RUnlock()
+			c.Set("x-account-email", relayAccountEmail)
 			c.Set("x-account-proxy", proxyURL)
 			c.Set("x-model", logModel)
 			c.Set("x-reasoning-effort", reasoningEffort)
@@ -3591,7 +3600,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
@@ -3609,8 +3618,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -3658,7 +3666,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -4510,6 +4518,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
+	if account.IsGrokAPI() {
+		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
+	}
 	if IsUsageLimitReachedError(body) {
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))

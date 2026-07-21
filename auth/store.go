@@ -105,6 +105,12 @@ type Account struct {
 	Models                  []string
 	ModelMapping            string
 	CodexClientMetadataMode string
+	// Grok OAuth 刷新元数据（upstream_type=grok 且 OAuth 凭据时有效）
+	GrokClientID      string
+	GrokTokenEndpoint string
+	GrokOIDCIssuer    string
+	GrokPrincipalType string
+	GrokPrincipalID   string
 	Status                  AccountStatus
 	CooldownUtil            time.Time
 	CooldownReason          string // rate_limited / rate_limited_5h / unauthorized / 空
@@ -319,6 +325,10 @@ func (a *Account) hasDispatchCredentialLocked() bool {
 	if a.isOpenAIResponsesAPILocked() {
 		return true
 	}
+	if a.isGrokAPILocked() {
+		// API Key 直接可调度；OAuth 需等 AT 刷出（RT-only 由后台/lazy 刷新补齐）
+		return strings.TrimSpace(a.APIKey) != "" || strings.TrimSpace(a.AccessToken) != ""
+	}
 	return strings.TrimSpace(a.AccessToken) != ""
 }
 
@@ -341,7 +351,7 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() || len(a.Models) == 0 {
+	if !a.isRelayStyleLocked() || len(a.Models) == 0 {
 		return false
 	}
 	for _, candidate := range a.Models {
@@ -391,7 +401,7 @@ func (a *Account) OpenAIResponsesModels() []string {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() {
+	if !a.isRelayStyleLocked() {
 		return []string{}
 	}
 	return cloneStringSlice(a.Models)
@@ -403,7 +413,7 @@ func (a *Account) OpenAIResponsesModelMapping() string {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() {
+	if !a.isRelayStyleLocked() {
 		return ""
 	}
 	return strings.TrimSpace(a.ModelMapping)
@@ -2205,6 +2215,9 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.usageProbeInFlight || a.AccessToken == "" || a.Status == StatusError {
 		return false
 	}
+	if a.isRelayStyleLocked() {
+		return false // wham 探针是 ChatGPT 专属；中转/Grok 账号没有该端点
+	}
 	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // token 失效，wham 也会 401，探针无意义
 	}
@@ -2340,6 +2353,9 @@ func (a *Account) NeedsRecoveryProbe(minInterval time.Duration) bool {
 
 	if a.recoveryProbeInFlight || a.healthTierLocked() != HealthTierBanned {
 		return false
+	}
+	if a.isRelayStyleLocked() {
+		return false // 恢复探测走 ChatGPT 探针；中转/Grok 账号不适用
 	}
 	if a.RefreshToken == "" {
 		return false
@@ -3732,7 +3748,8 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	modelMapping := strings.TrimSpace(row.GetCredential("model_mapping"))
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
-	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
+	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 		return nil
 	}
@@ -3754,6 +3771,23 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	if isOpenAIResponsesAccount {
 		account.HealthTier = HealthTierHealthy
+		if account.PlanType == "" {
+			account.PlanType = "api"
+		}
+	}
+	if isGrokAccount {
+		account.GrokClientID = row.GetCredential("grok_client_id")
+		account.GrokTokenEndpoint = row.GetCredential("grok_token_endpoint")
+		account.GrokOIDCIssuer = row.GetCredential("grok_oidc_issuer")
+		account.GrokPrincipalType = row.GetCredential("grok_principal_type")
+		account.GrokPrincipalID = row.GetCredential("grok_principal_id")
+		// API Key 凭据没有 AT，下方 at!="" 的恢复分支不会执行，这里补齐身份信息
+		account.AccountID = row.GetCredential("account_id")
+		account.Email = row.GetCredential("email")
+		account.PlanType = row.GetCredential("plan_type")
+		if strings.TrimSpace(apiKey) != "" || at != "" {
+			account.HealthTier = HealthTierHealthy
+		}
 		if account.PlanType == "" {
 			account.PlanType = "api"
 		}
@@ -4222,7 +4256,7 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 	if acc.quotaAutoPausedLocked(now) {
 		return false
 	}
-	if acc.isOpenAIResponsesAPILocked() {
+	if acc.isRelayStyleLocked() {
 		return true
 	}
 	return strings.TrimSpace(acc.AccessToken) != "" ||
@@ -7186,6 +7220,10 @@ func (s *Store) refreshAccountForced(ctx context.Context, acc *Account) error {
 
 // refreshAccountWithOptions 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, forceRefresh bool) error {
+	// Grok 账号走 auth.x.ai 的 OAuth 刷新流程，与 ChatGPT 的 RT 刷新完全不同。
+	if acc.IsGrokAPI() {
+		return s.refreshGrokAccount(ctx, acc, forceRefresh)
+	}
 	acc.mu.RLock()
 	rt := acc.RefreshToken
 	st := acc.SessionToken

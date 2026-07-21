@@ -5647,6 +5647,46 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 	)
 }
 
+// InsertAccountWithUpstream 插入一个指定 platform / type 的账号（用于 Grok 等
+// 非 Codex 上游），credentials 全量入库。
+func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, accountType string, credentials map[string]interface{}, proxyURL string) (int64, error) {
+	if credentials == nil {
+		credentials = map[string]interface{}{}
+	}
+	if strings.TrimSpace(platform) == "" {
+		platform = "xai"
+	}
+	if strings.TrimSpace(accountType) == "" {
+		accountType = "api"
+	}
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5)`,
+		name, platform, accountType, credJSON, proxyURL,
+	)
+}
+
+// UpdateAccountName 仅更新账号名称。
+func (db *DB) UpdateAccountName(ctx context.Context, id int64, name string) error {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE accounts SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, name, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重，排除已删除账号）
 func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)

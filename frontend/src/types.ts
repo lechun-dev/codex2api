@@ -88,6 +88,11 @@ export interface AccountRow {
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
+  applicable_reset_credits?: number | null
+  credits_balance?: string | null
+  credits_has_credits?: boolean | null
+  credits_unlimited?: boolean | null
+  credits_overage_limit_reached?: boolean | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -624,7 +629,11 @@ export interface SystemSettings {
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
   codex_ws_size_router_enabled: boolean
+  codex_ws_busy_acquire_max_wait_sec: number
+  codex_ws_busy_overflow_enabled: boolean
+  codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
+  overflow_auto_compact_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
@@ -979,6 +988,7 @@ export interface UsageLog {
   output_tokens: number
   reasoning_tokens: number
   first_token_ms: number
+  ws_acquire_ms?: number
   reasoning_effort: string
   inbound_endpoint: string
   upstream_endpoint: string

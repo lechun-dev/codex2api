@@ -33,6 +33,10 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "auto_reset_credits_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "auto_reset_credits_before_expiry_min", def: "INT DEFAULT 60"},
 	{table: "system_settings", name: "codex_ws_size_router_enabled", def: "TINYINT(1) DEFAULT 1"},
+	{table: "system_settings", name: "codex_ws_busy_acquire_max_wait_sec", def: "INT DEFAULT 30"},
+	{table: "system_settings", name: "codex_ws_busy_overflow_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_ws_busy_patience_sec", def: "INT DEFAULT 2"},
+	{table: "system_settings", name: "overflow_auto_compact_enabled", def: "TINYINT(1) DEFAULT 0"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -88,6 +92,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			output_tokens INT DEFAULT 0,
 			reasoning_tokens INT DEFAULT 0,
 			first_token_ms INT DEFAULT 0,
+			ws_acquire_ms INT DEFAULT 0,
 			reasoning_effort VARCHAR(20) DEFAULT '',
 			effective_model VARCHAR(100) DEFAULT '',
 			inbound_endpoint VARCHAR(100) DEFAULT '',
@@ -279,6 +284,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "output_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "reasoning_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "first_token_ms", "INT DEFAULT 0"},
+		{"usage_logs", "ws_acquire_ms", "INT DEFAULT 0"},
 		{"usage_logs", "reasoning_effort", "VARCHAR(20) DEFAULT ''"},
 		{"usage_logs", "effective_model", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "inbound_endpoint", "VARCHAR(100) DEFAULT ''"},
@@ -577,6 +583,10 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_silent_retry_enabled TINYINT(1) DEFAULT 1,
 		codex_ws_silent_max_retries INT DEFAULT 2,
 		codex_ws_size_router_enabled TINYINT(1) DEFAULT 1,
+		codex_ws_busy_acquire_max_wait_sec INT DEFAULT 30,
+		codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0,
+		codex_ws_busy_patience_sec INT DEFAULT 2,
+		overflow_auto_compact_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_thinking_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_max_rounds INT DEFAULT 8,
 		retry_interval_ms INT DEFAULT 0,

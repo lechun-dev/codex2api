@@ -652,6 +652,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
 	populateUserAgentMetaFromRequest(c, input)
+	populateWsAcquireFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	if h != nil && h.cfg != nil && h.cfg.UsageLogCaptureContent {
 		populateRequestContentUsageMeta(c, input)
@@ -920,6 +921,22 @@ func extractServiceTier(body []byte) string {
 
 const upstreamErrorKindMessageTooBig = "message_too_big"
 
+// upstreamErrorKindWsBusyAcquire 是 wsrelay busy session acquire 超时（issue #413）：
+// 同会话的前一个请求长时间占用 WS 连接导致的排队超时，属会话占用而非账号故障。
+const upstreamErrorKindWsBusyAcquire = "ws_busy_acquire"
+
+// isWsBusyAcquireTimeoutError 按错误文案识别 busy acquire 超时。wsrelay 依赖 proxy，
+// proxy 无法反向导入其哨兵类型，跨包只能靠稳定的错误消息片段匹配。
+func isWsBusyAcquireTimeoutError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "waiting for busy session")
+}
+
+// shouldPenalizeTransportKind 返回该传输失败是否应计入账号健康惩罚。
+// busy acquire 超时的账号本身没有故障，惩罚会让 fast scheduler 错误降权（issue #413）。
+func shouldPenalizeTransportKind(kind string) bool {
+	return kind != "" && kind != upstreamErrorKindWsBusyAcquire
+}
+
 func isWebsocketMessageTooBigError(err error) bool {
 	if err == nil {
 		return false
@@ -959,8 +976,11 @@ func classifyTransportFailure(err error) string {
 	if isWebsocketMessageTooBigError(err) {
 		return upstreamErrorKindMessageTooBig
 	}
+	if isWsBusyAcquireTimeoutError(err) {
+		return upstreamErrorKindWsBusyAcquire
+	}
 	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded") {
 		return "timeout"
 	}
 	return "transport"
@@ -1443,6 +1463,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
 		attachUserAgentAudit(c)
+		attachWsAcquireAudit(c)
 		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
 			if allowAnonymous {
@@ -1880,6 +1901,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	overflowCompactRetried := false
+	overflowCompactEnabled := autoCompactOverflowEnabled(c)
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1999,8 +2022,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
 				// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-				if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+				// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+				stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+				if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -2394,8 +2418,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -2455,6 +2480,19 @@ func (h *Handler) Responses(c *gin.Context) {
 					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
+			// 上下文超窗 + Key 开启自动压缩：摘要旧轮次后同参重试一次 (issue #415)
+			if overflowCompactEnabled && !overflowCompactRetried &&
+				resp.StatusCode == http.StatusBadRequest && isContextLengthExceededBody(errBody) {
+				if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+					overflowCompactRetried = true
+					codexBody = compacted
+					expandedInputRaw = responsesInputRaw(codexBody)
+					log.Printf("上游报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
 					continue
 				}
 			}
@@ -2529,6 +2567,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
+		// contentTokenSeen: 是否已出现真正的内容事件（严格判定，与 first_token_mode 无关）。
+		// loose 模式下 codex.rate_limits 等前置事件会置位 ttftRecorded，"首 token 前"
+		// 的失败抑制/真实错误码/事件缓冲决策改用本标志，避免在 loose 部署上失效。
+		contentTokenSeen := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
@@ -2568,6 +2610,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				// contentTokenSeen 用严格判定（与 first_token_mode 无关）：loose 模式下
+				// codex.rate_limits 等前置事件也会置位 ttftRecorded，若用它做"首 token 前"
+				// 判断，失败抑制/真实错误码/超窗压缩重试在 loose 部署上全部失效。
+				if !contentTokenSeen && isFirstTokenResult(parsed) {
+					contentTokenSeen = true
+				}
 
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
@@ -2592,21 +2640,26 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
 
 				// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 				// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 + [DONE] 让中转层误计费。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) {
 					pendingFirstTokenEvents.Reset()
 					abortedForHTTPError = true
 					return false
 				}
 
 				if !clientGone {
-					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+					// codex.* 前置元数据事件（rate_limits / response.metadata）与生命周期
+					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
+					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
+					// 既无法按真实错误码返回，也无法走超窗压缩重试。
+					shouldDefer := !contentTokenSeen && !gotTerminal &&
+						(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
 					if err != nil {
 						writeErr = err
@@ -2809,6 +2862,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
+		// 流内报上下文超窗（HTTP SSE 与 WS 上游同路径）+ Key 开启自动压缩：
+		// 未向下游写过任何字节时，摘要旧轮次后同参重试一次 (issue #415)。
+		if overflowCompactEnabled && !overflowCompactRetried && !wroteAnyBody &&
+			(!isStream || abortedForHTTPError) &&
+			isContextLengthExceededFailedPayload(terminalFailurePayload) {
+			if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+				overflowCompactRetried = true
+				codexBody = compacted
+				expandedInputRaw = responsesInputRaw(codexBody)
+				log.Printf("上游流内报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+				resp.Body.Close()
+				h.store.Release(account)
+				continue
+			}
+		}
+
 		if isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -3042,7 +3111,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
-				if kind := classifyTransportFailure(reqErr); kind != "" {
+				if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -3231,7 +3300,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3648,8 +3717,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
+			stickyRetry := shouldRetry && !timedOut && kind != "" && kind != upstreamErrorKindWsBusyAcquire && h.stickyTransportRetryEnabled()
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

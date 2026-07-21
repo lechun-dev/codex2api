@@ -293,6 +293,14 @@ function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
 
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+function getCreditBalanceDisplay(account: AccountRow): string | null {
+  if (!account.credits_has_credits) return null;
+  if (account.credits_unlimited) return "∞";
+  const balance = (account.credits_balance ?? "").trim();
+  return balance ? balance : null;
+}
+
 function getInitialAnalysisVisibility(): boolean {
   try {
     return (
@@ -5344,7 +5352,9 @@ export default function Accounts() {
                                     account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
-                                      0) && (
+                                      0 ||
+                                    getCreditBalanceDisplay(account) !==
+                                      null) && (
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
@@ -5385,6 +5395,35 @@ export default function Accounts() {
                                         >
                                           <RotateCcw className="mr-0.5 size-2.5" />
                                           {account.rate_limit_reset_credits ?? 0}
+                                        </button>
+                                      )}
+                                      {getCreditBalanceDisplay(account) !==
+                                        null && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setUsageAccount(account);
+                                          }}
+                                          className="inline-flex items-center rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-400 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                                          title={
+                                            account.credits_unlimited
+                                              ? t(
+                                                  "accounts.creditsBalanceUnlimited",
+                                                )
+                                              : t(
+                                                  "accounts.creditsBalanceBadge",
+                                                  {
+                                                    balance:
+                                                      getCreditBalanceDisplay(
+                                                        account,
+                                                      ),
+                                                  },
+                                                )
+                                          }
+                                        >
+                                          <Coins className="mr-0.5 size-2.5" />
+                                          {getCreditBalanceDisplay(account)}
                                         </button>
                                       )}
                                     </div>
@@ -11171,6 +11210,26 @@ function AccountMobileCard({
               >
                 <RotateCcw className="size-2.5" />
                 {resetCredits}
+              </button>
+            )}
+            {getCreditBalanceDisplay(account) !== null && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUsage();
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                title={
+                  account.credits_unlimited
+                    ? t("accounts.creditsBalanceUnlimited")
+                    : t("accounts.creditsBalanceBadge", {
+                        balance: getCreditBalanceDisplay(account),
+                      })
+                }
+              >
+                <Coins className="size-2.5" />
+                {getCreditBalanceDisplay(account)}
               </button>
             )}
           </div>

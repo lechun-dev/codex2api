@@ -1007,6 +1007,12 @@
     "resetCreditsConfirmMessage": "This will consume one manual reset credit to reset this account's quota immediately. Continue?",
     "resetCreditsSuccess": "Quota has been reset",
     "resetCreditsBadge": "Manual resets left: {{count}}",
+    "creditsBalanceBadge": "Credit balance: {{balance}}",
+    "creditsBalanceUnlimited": "Credit balance: unlimited",
+    "creditsBalanceLabel": "Credit balance",
+    "creditsBalanceUnlimitedShort": "Unlimited",
+    "creditsOverageReached": "Overage limit reached",
+    "resetCreditsNotApplicable": "Not applicable now (account not rate-limited)",
     "resetCreditsExpiryTitle": "Reset credit expiry",
     "resetCreditsExpiryItem": "Credit {{index}}",
     "resetCreditsExpiresAt": "Expires {{time}}",
@@ -1450,6 +1456,7 @@
     "imageTooltipNoDetails": "No image details recorded",
     "unknownApiKey": "Not Recorded",
     "costDetails": "Cost Details",
+    "wsAcquireTooltip": "Time spent acquiring the upstream WebSocket connection for this request (busy queueing + probe + handshake); included in first-token time. Consistently high values indicate same-session queueing or account connection capacity pressure.",
     "inputCost": "Input Cost",
     "outputCost": "Output Cost",
     "cacheReadCost": "Cache Read Cost",
@@ -1503,7 +1510,8 @@
     "noApiKeyStats": "No API key statistics yet",
     "apiKeyUsageModalTitle": "All API Key Usage",
     "apiKeyUsageModalDesc": "All API keys for the current time range, sorted by total tokens from high to low by default.",
-    "apiKeyUsageLoadFailed": "Failed to load API key usage"
+    "apiKeyUsageLoadFailed": "Failed to load API key usage",
+    "tableWsAcquire": "Conn Acquire"
   },
   "promptFilter": {
     "title": "Prompt Filter",
@@ -2056,6 +2064,12 @@
     "codexWSSilentRetryEnabledDesc": "When enabled, rate limits, usage exhaustion, 5xx, read errors, and timeouts before the first token switch accounts and rebuild the upstream WS while the client connection keeps waiting. Enabled by default.",
     "codexWSSizeRouterEnabled": "Route Oversized Requests to HTTP",
     "codexWSSizeRouterEnabledDesc": "Learns the trigger size from actual WS close 1009 (message too big) events and sends later requests of similar size straight to the HTTP upstream, avoiding the first-token delay of waiting for a doomed WS attempt before the serial fallback. Learned threshold expires after 6 hours and recalibrates. Enabled by default.",
+    "codexWSBusyAcquireMaxWait": "Busy Session Max Wait",
+    "codexWSBusyAcquireMaxWaitDesc": "Concurrent requests of the same session queue for the in-use WS connection; once the cumulative wait exceeds this cap the attempt fails and retries on another account. Default 30s.",
+    "codexWSBusyOverflowEnabled": "Busy Session Overflow",
+    "codexWSBusyOverflowEnabledDesc": "When queueing outlasts the patience below, reuse or create a bounded sibling connection on the same account and send immediately, removing the fixed ~30s first-token tail. The request's prompt_cache_key is unchanged, so upstream caching is unaffected. Disabled by default.",
+    "codexWSBusyPatience": "Overflow Patience",
+    "codexWSBusyPatienceDesc": "Seconds to wait for the original connection to go idle before overflowing: requests finishing within a short gap still reuse it and keep connection locality. Default 2s.",
     "codexWSSilentMaxRetries": "Max WS Silent Retries",
     "codexWSSilentMaxRetriesDesc": "Maximum account-switch retries for upstream WS errors before the first token, range 0-10, default 2.",
     "schedulerMode": "Scheduler Mode",
@@ -2363,7 +2377,11 @@
     "codexContinueThinking": "Auto-Continue Truncated Reasoning",
     "codexContinueThinkingDesc": "When upstream truncates reasoning at the known fingerprint, silently resend with prior reasoning and fold rounds into one response. Each round is a real upstream request that multiplies quota usage, and this explicitly bypasses upstream truncation — use at your own risk. Disabled by default.",
     "codexContinueMaxRounds": "Max Continue Rounds",
-    "codexContinueMaxRoundsDesc": "Total upstream rounds allowed per request (including the first). Returns current result once reached. Range 1-32, default 8."
+    "codexContinueMaxRoundsDesc": "Total upstream rounds allowed per request (including the first). Returns current result once reached. Range 1-32, default 8.",
+    "overflowAutoCompact": "Overflow Auto-Compact (Experimental)",
+    "overflowAutoCompactDesc": "When the upstream rejects a request with context_length_exceeded, the gateway summarizes older turns into a single context note and retries once instead of returning 400 to the client.",
+    "overflowAutoCompactEnabled": "Enable overflow auto-compact",
+    "overflowAutoCompactEnabledDesc": "Experimental, off by default. Summarization runs an internal model call, consuming account quota and adding roughly 10s latency; the summary is lossy while recent turns are kept verbatim. Can also be enabled per key via limits.auto_compact_overflow."
   },
   "proxies": {
     "description": "Manage proxy pool with round-robin distribution to accounts",

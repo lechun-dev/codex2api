@@ -849,9 +849,13 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	// filter 关闭时跳过昂贵的正文提取 (issue #417)；WS 路径不含 sidecar。
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)

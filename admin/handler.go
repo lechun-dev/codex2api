@@ -708,83 +708,88 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	ID                       int64                      `json:"id"`
-	Name                     string                     `json:"name"`
-	Email                    string                     `json:"email"`
-	EmailDomain              string                     `json:"email_domain,omitempty"`
-	ChatGPTAccountID         string                     `json:"chatgpt_account_id,omitempty"`
-	PlanType                 string                     `json:"plan_type"`
-	SubscriptionExpiresAt    string                     `json:"subscription_expires_at,omitempty"`
-	Status                   string                     `json:"status"`
-	ErrorMessage             string                     `json:"error_message,omitempty"`
-	ATOnly                   bool                       `json:"at_only"`
-	CreditEnabled            bool                       `json:"credit_enabled"`
-	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
-	SkipWarmTier             bool                       `json:"skip_warm_tier"`
-	AccountType              string                     `json:"account_type,omitempty"`
-	AccessTokenType          string                     `json:"access_token_type,omitempty"`
-	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
-	BaseURL                  string                     `json:"base_url,omitempty"`
-	Models                   []string                   `json:"models,omitempty"`
-	ModelMapping             string                     `json:"model_mapping,omitempty"`
-	CodexClientMetadataMode  string                     `json:"codex_client_metadata_mode,omitempty"`
-	CustomHeaders            map[string]string          `json:"custom_headers,omitempty"`
-	HealthTier               string                     `json:"health_tier"`
-	SchedulerScore           float64                    `json:"scheduler_score"`
-	DispatchScore            float64                    `json:"dispatch_score"`
-	ScoreBiasOverride        *int64                     `json:"score_bias_override"`
-	ScoreBiasEffective       int64                      `json:"score_bias_effective"`
-	BaseConcurrencyOverride  *int64                     `json:"base_concurrency_override"`
-	BaseConcurrencyEffective int64                      `json:"base_concurrency_effective"`
-	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
-	ProxyURL                 string                     `json:"proxy_url"`
-	CreatedAt                string                     `json:"created_at"`
-	UpdatedAt                string                     `json:"updated_at"`
-	CodexUsageUpdatedAt      string                     `json:"codex_usage_updated_at,omitempty"`
-	Codex5HUsageUpdatedAt    string                     `json:"codex_5h_usage_updated_at,omitempty"`
-	ActiveRequests           int64                      `json:"active_requests"`
-	TotalRequests            int64                      `json:"total_requests"`
-	LastUsedAt               string                     `json:"last_used_at"`
-	SuccessRequests          int64                      `json:"success_requests"`
-	ErrorRequests            int64                      `json:"error_requests"`
-	RetryErrorRequests       int64                      `json:"retry_error_requests"`
-	RateLimitAttempts        int64                      `json:"rate_limit_attempts"`
-	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
-	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
-	RateLimitResetCredits    *int                       `json:"rate_limit_reset_credits"`
-	AutoPause5hThreshold     *float64                   `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold     *float64                   `json:"auto_pause_7d_threshold"`
-	AutoPause5hDisabled      bool                       `json:"auto_pause_5h_disabled"`
-	AutoPause7dDisabled      bool                       `json:"auto_pause_7d_disabled"`
-	UsageLimitOverride       *bool                      `json:"ignore_usage_limit_status_override"`
-	UsageLimitEffective      bool                       `json:"ignore_usage_limit_status_effective"`
-	DispatchCountLimit       *int64                     `json:"dispatch_count_limit"`
-	DispatchCountUsed        int64                      `json:"dispatch_count_used,omitempty"`
-	DispatchCountResetAt     string                     `json:"dispatch_count_reset_at,omitempty"`
-	DispatchCountLimited     bool                       `json:"dispatch_count_limited,omitempty"`
-	SchedulerPriority        *int64                     `json:"scheduler_priority"`
-	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
-	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
-	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
-	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
-	Window7dKind             string                     `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
-	Window7dSeconds          *int64                     `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
-	Billed5h                 *float64                   `json:"billed_5h"`
-	Billed7d                 *float64                   `json:"billed_7d"`
-	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
-	LastUnauthorizedAt       string                     `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
-	CooldownReason           string                     `json:"cooldown_reason,omitempty"`
-	CooldownUntil            string                     `json:"cooldown_until,omitempty"`
-	ModelCooldowns           []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
-	Enabled                  bool                       `json:"enabled"`
-	Locked                   bool                       `json:"locked"`
-	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
-	Tags                     []string                   `json:"tags"`
-	GroupIDs                 []int64                    `json:"group_ids"`
-	Note                     string                     `json:"note"`
+	ID                         int64                      `json:"id"`
+	Name                       string                     `json:"name"`
+	Email                      string                     `json:"email"`
+	EmailDomain                string                     `json:"email_domain,omitempty"`
+	ChatGPTAccountID           string                     `json:"chatgpt_account_id,omitempty"`
+	PlanType                   string                     `json:"plan_type"`
+	SubscriptionExpiresAt      string                     `json:"subscription_expires_at,omitempty"`
+	Status                     string                     `json:"status"`
+	ErrorMessage               string                     `json:"error_message,omitempty"`
+	ATOnly                     bool                       `json:"at_only"`
+	CreditEnabled              bool                       `json:"credit_enabled"`
+	CreditSkipUsageWindow      bool                       `json:"credit_skip_usage_window"`
+	SkipWarmTier               bool                       `json:"skip_warm_tier"`
+	AccountType                string                     `json:"account_type,omitempty"`
+	AccessTokenType            string                     `json:"access_token_type,omitempty"`
+	OpenAIResponsesAPI         bool                       `json:"openai_responses_api,omitempty"`
+	BaseURL                    string                     `json:"base_url,omitempty"`
+	Models                     []string                   `json:"models,omitempty"`
+	ModelMapping               string                     `json:"model_mapping,omitempty"`
+	CodexClientMetadataMode    string                     `json:"codex_client_metadata_mode,omitempty"`
+	CustomHeaders              map[string]string          `json:"custom_headers,omitempty"`
+	HealthTier                 string                     `json:"health_tier"`
+	SchedulerScore             float64                    `json:"scheduler_score"`
+	DispatchScore              float64                    `json:"dispatch_score"`
+	ScoreBiasOverride          *int64                     `json:"score_bias_override"`
+	ScoreBiasEffective         int64                      `json:"score_bias_effective"`
+	BaseConcurrencyOverride    *int64                     `json:"base_concurrency_override"`
+	BaseConcurrencyEffective   int64                      `json:"base_concurrency_effective"`
+	ConcurrencyCap             int64                      `json:"dynamic_concurrency_limit"`
+	ProxyURL                   string                     `json:"proxy_url"`
+	CreatedAt                  string                     `json:"created_at"`
+	UpdatedAt                  string                     `json:"updated_at"`
+	CodexUsageUpdatedAt        string                     `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt      string                     `json:"codex_5h_usage_updated_at,omitempty"`
+	ActiveRequests             int64                      `json:"active_requests"`
+	TotalRequests              int64                      `json:"total_requests"`
+	LastUsedAt                 string                     `json:"last_used_at"`
+	SuccessRequests            int64                      `json:"success_requests"`
+	ErrorRequests              int64                      `json:"error_requests"`
+	RetryErrorRequests         int64                      `json:"retry_error_requests"`
+	RateLimitAttempts          int64                      `json:"rate_limit_attempts"`
+	UsagePercent7d             *float64                   `json:"usage_percent_7d"`
+	UsagePercent5h             *float64                   `json:"usage_percent_5h"`
+	RateLimitResetCredits      *int                       `json:"rate_limit_reset_credits"`
+	ApplicableResetCredits     *int                       `json:"applicable_reset_credits"`
+	CreditsBalance             *string                    `json:"credits_balance"`
+	CreditsHasCredits          *bool                      `json:"credits_has_credits"`
+	CreditsUnlimited           *bool                      `json:"credits_unlimited"`
+	CreditsOverageLimitReached *bool                      `json:"credits_overage_limit_reached"`
+	AutoPause5hThreshold       *float64                   `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold       *float64                   `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled        bool                       `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled        bool                       `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride         *bool                      `json:"ignore_usage_limit_status_override"`
+	UsageLimitEffective        bool                       `json:"ignore_usage_limit_status_effective"`
+	DispatchCountLimit         *int64                     `json:"dispatch_count_limit"`
+	DispatchCountUsed          int64                      `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt       string                     `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited       bool                       `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority          *int64                     `json:"scheduler_priority"`
+	Usage5hDetail              *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail              *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
+	Reset5hAt                  string                     `json:"reset_5h_at,omitempty"`
+	Reset7dAt                  string                     `json:"reset_7d_at,omitempty"`
+	Window7dKind               string                     `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
+	Window7dSeconds            *int64                     `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
+	Billed5h                   *float64                   `json:"billed_5h"`
+	Billed7d                   *float64                   `json:"billed_7d"`
+	ScoreBreakdown             schedulerBreakdownResponse `json:"scheduler_breakdown"`
+	LastUnauthorizedAt         string                     `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt          string                     `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt              string                     `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt          string                     `json:"last_server_error_at,omitempty"`
+	CooldownReason             string                     `json:"cooldown_reason,omitempty"`
+	CooldownUntil              string                     `json:"cooldown_until,omitempty"`
+	ModelCooldowns             []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
+	Enabled                    bool                       `json:"enabled"`
+	Locked                     bool                       `json:"locked"`
+	AllowedAPIKeyIDs           []int64                    `json:"allowed_api_key_ids"`
+	Tags                       []string                   `json:"tags"`
+	GroupIDs                   []int64                    `json:"group_ids"`
+	Note                       string                     `json:"note"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -980,6 +985,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if credits, ok := acc.GetRateLimitResetCredits(); ok {
 				resp.RateLimitResetCredits = &credits
+			}
+			if applicable, ok := acc.GetApplicableResetCredits(); ok {
+				resp.ApplicableResetCredits = &applicable
+			}
+			if balance, hasCredits, unlimited, overage, ok := acc.GetCreditBalance(); ok {
+				resp.CreditsBalance = &balance
+				resp.CreditsHasCredits = &hasCredits
+				resp.CreditsUnlimited = &unlimited
+				resp.CreditsOverageLimitReached = &overage
 			}
 			if snapshot := acc.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
 				limit := snapshot.Limit
@@ -6253,6 +6267,10 @@ type settingsResponse struct {
 	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
 	CodexWSSizeRouterEnabled           bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec       int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled         bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec             int     `json:"codex_ws_busy_patience_sec"`
+	OverflowAutoCompactEnabled         bool    `json:"overflow_auto_compact_enabled"`
 	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
@@ -6366,6 +6384,10 @@ type updateSettingsReq struct {
 	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
 	CodexWSSizeRouterEnabled           *bool    `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec       *int     `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled         *bool    `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec             *int     `json:"codex_ws_busy_patience_sec"`
+	OverflowAutoCompactEnabled         *bool    `json:"overflow_auto_compact_enabled"`
 	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
@@ -7000,6 +7022,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -7448,6 +7474,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexWSSilentMaxRetries(v)
 		runtimeCfg.CodexWSSilentRetries = v
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
+	}
+
+	if req.CodexWSBusyAcquireMaxWaitSec != nil {
+		v := database.NormalizeCodexWSBusyAcquireMaxWaitSec(*req.CodexWSBusyAcquireMaxWaitSec)
+		h.store.SetCodexWSBusyAcquireMaxWaitSec(v)
+		runtimeCfg.CodexWSBusyMaxWaitSec = v
+		log.Printf("设置已更新: codex_ws_busy_acquire_max_wait_sec = %d", v)
+	}
+
+	if req.CodexWSBusyOverflowEnabled != nil {
+		h.store.SetCodexWSBusyOverflowEnabled(*req.CodexWSBusyOverflowEnabled)
+		runtimeCfg.CodexWSBusyOverflow = *req.CodexWSBusyOverflowEnabled
+		log.Printf("设置已更新: codex_ws_busy_overflow_enabled = %t", *req.CodexWSBusyOverflowEnabled)
+	}
+
+	if req.CodexWSBusyPatienceSec != nil {
+		v := database.NormalizeCodexWSBusyPatienceSec(*req.CodexWSBusyPatienceSec)
+		h.store.SetCodexWSBusyPatienceSec(v)
+		runtimeCfg.CodexWSBusyPatienceSec = v
+		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
+	}
+
+	if req.OverflowAutoCompactEnabled != nil {
+		h.store.SetOverflowAutoCompactEnabled(*req.OverflowAutoCompactEnabled)
+		runtimeCfg.OverflowAutoCompact = *req.OverflowAutoCompactEnabled
+		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
 	}
 
 	if req.CodexContinueThinkingEnabled != nil {
@@ -7925,6 +7977,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -8067,6 +8123,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
 		CodexWSSizeRouterEnabled:           h.store.CodexWSSizeRouterEnabled(),
+		CodexWSBusyAcquireMaxWaitSec:       h.store.CodexWSBusyAcquireMaxWaitSec(),
+		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
+		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
+		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),

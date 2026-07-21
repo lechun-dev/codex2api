@@ -141,6 +141,10 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		AutoResetCreditsEnabled:           true,
 		AutoResetCreditsBeforeExpiryMin:   75,
 		CodexWSSizeRouterEnabled:          true,
+		CodexWSBusyAcquireMaxWaitSec:      45,
+		CodexWSBusyOverflowEnabled:        true,
+		CodexWSBusyPatienceSec:            3,
+		OverflowAutoCompactEnabled:        true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -160,16 +164,20 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"auto_reset_credits_enabled = VALUES(auto_reset_credits_enabled)",
 		"auto_reset_credits_before_expiry_min = VALUES(auto_reset_credits_before_expiry_min)",
 		"codex_ws_size_router_enabled = VALUES(codex_ws_size_router_enabled)",
+		"codex_ws_busy_acquire_max_wait_sec = VALUES(codex_ws_busy_acquire_max_wait_sec)",
+		"codex_ws_busy_overflow_enabled = VALUES(codex_ws_busy_overflow_enabled)",
+		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
+		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 95 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 95", got)
+	if got := strings.Count(capture.query, "?"); got != 99 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 99", got)
 	}
-	if len(capture.args) != 95 {
-		t.Fatalf("rewritten settings argument count = %d, want 95", len(capture.args))
+	if len(capture.args) != 99 {
+		t.Fatalf("rewritten settings argument count = %d, want 99", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -182,6 +190,10 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.PayloadRules,
 		settings.PublicAccountPortalPageEnabled,
 		settings.CodexWSSizeRouterEnabled,
+		int64(settings.CodexWSBusyAcquireMaxWaitSec),
+		settings.CodexWSBusyOverflowEnabled,
+		int64(settings.CodexWSBusyPatienceSec),
+		settings.OverflowAutoCompactEnabled,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
@@ -244,6 +256,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		ConversationID:      "conversation-1",
 		PreviousResponseID:  "response-1",
 		RequestText:         "hello",
+		WsAcquireMs:         1234,
 		ClientUserAgent:     "Codex Desktop/0.144.2",
 		UpstreamUserAgent:   "codex_cli_rs/0.144.2",
 		UserAgentOverridden: true,
@@ -255,6 +268,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 	for _, fragment := range []string{
 		"session_id",
 		"request_text",
+		"ws_acquire_ms",
 		"client_user_agent",
 		"upstream_user_agent",
 		"user_agent_overridden",

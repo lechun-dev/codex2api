@@ -1007,6 +1007,12 @@
     "resetCreditsConfirmMessage": "将消耗 1 次主动重置次数立即重置该账号额度，是否继续？",
     "resetCreditsSuccess": "已重置额度",
     "resetCreditsBadge": "剩余主动重置次数：{{count}}",
+    "creditsBalanceBadge": "积分余额：{{balance}}",
+    "creditsBalanceUnlimited": "积分余额：无限",
+    "creditsBalanceLabel": "积分余额",
+    "creditsBalanceUnlimitedShort": "无限",
+    "creditsOverageReached": "已达超额上限",
+    "resetCreditsNotApplicable": "当前不可应用（账号未触限）",
     "resetCreditsExpiryTitle": "重置次数有效期",
     "resetCreditsExpiryItem": "第 {{index}} 次",
     "resetCreditsExpiresAt": "{{time}} 过期",
@@ -1450,6 +1456,7 @@
     "imageTooltipNoDetails": "暂无详细图像信息",
     "unknownApiKey": "未记录",
     "costDetails": "成本明细",
+    "wsAcquireTooltip": "本次请求获取上游 WebSocket 连接的耗时（busy 排队 + 探活 + 握手），已包含在首字耗时内。持续偏高说明同会话并发排队或账号连接容量吃紧。",
     "inputCost": "输入成本",
     "outputCost": "输出成本",
     "cacheReadCost": "缓存读取成本",
@@ -1503,7 +1510,8 @@
     "noApiKeyStats": "暂无密钥统计",
     "apiKeyUsageModalTitle": "全部密钥用量",
     "apiKeyUsageModalDesc": "按当前时间范围统计所有 API 密钥用量，默认按总 Token 从高到低排序。",
-    "apiKeyUsageLoadFailed": "密钥用量加载失败"
+    "apiKeyUsageLoadFailed": "密钥用量加载失败",
+    "tableWsAcquire": "取得连接"
   },
   "promptFilter": {
     "title": "Prompt 检查",
@@ -2056,6 +2064,12 @@
     "codexWSSilentRetryEnabledDesc": "启用后，首个 token 前遇到限流、额度耗尽、5xx、读取错误或超时时，会先换账号重建上游 WS，客户端连接保持等待。默认开启。",
     "codexWSSizeRouterEnabled": "超大请求直发 HTTP",
     "codexWSSizeRouterEnabledDesc": "从实际发生的 WS 1009（帧过大）中学习触发体积，后续同量级请求直接首发 HTTP 上游，避免先等 WS 必败再串行降级的首字延迟。学习结果 6 小时过期后自动重新校准。默认开启。",
+    "codexWSBusyAcquireMaxWait": "busy 会话等待上限",
+    "codexWSBusyAcquireMaxWaitDesc": "同一会话的并发请求会排队等待占用中的 WS 连接空闲，累计等待超过该上限后报错并换号重试。默认 30 秒。",
+    "codexWSBusyOverflowEnabled": "busy 会话溢出兄弟连接",
+    "codexWSBusyOverflowEnabledDesc": "排队超过下方短等待仍未空闲时，在同账号上复用或新建有界的兄弟连接立即发出请求，消除固定约 30 秒的首字长尾。请求的 prompt_cache_key 不变，上游缓存不受影响。默认关闭。",
+    "codexWSBusyPatience": "溢出前短等待",
+    "codexWSBusyPatienceDesc": "触发溢出前先等待原连接空闲的秒数：前一请求在短间隙内结束时直接复用原连接，保住连接局部性。默认 2 秒。",
     "codexWSSilentMaxRetries": "WS 静默最大重试次数",
     "codexWSSilentMaxRetriesDesc": "首包前上游错误最多静默换号重试的次数，范围 0–10，默认 2。",
     "schedulerMode": "调度模式",
@@ -2363,7 +2377,11 @@
     "codexContinueThinking": "思考截断自动续想",
     "codexContinueThinkingDesc": "检测到上游按特征指纹截断思考（“516 降智”）时，自动携带已有思考续发请求并折叠成单次响应。每次续想都是一次真实上游请求，会成倍放大额度消耗，且属于显式绕过上游截断行为，风险自负。默认关闭。",
     "codexContinueMaxRounds": "最大续想轮数",
-    "codexContinueMaxRoundsDesc": "单次请求允许的上游请求总轮数（含首轮），到达上限后按当前结果返回。范围 1-32，默认 8。"
+    "codexContinueMaxRoundsDesc": "单次请求允许的上游请求总轮数（含首轮），到达上限后按当前结果返回。范围 1-32，默认 8。",
+    "overflowAutoCompact": "超窗自动压缩（实验性）",
+    "overflowAutoCompactDesc": "上游报上下文超窗（context_length_exceeded）时，网关自动把旧轮次摘要成一条上下文说明并重试一次，代替直接向客户端返回 400。",
+    "overflowAutoCompactEnabled": "启用超窗自动压缩",
+    "overflowAutoCompactEnabledDesc": "实验性功能，默认关闭。摘要通过内部模型调用完成，会消耗账号额度并增加约 10 秒延迟；摘要有损，最近轮次保留原文。也可在 API 密钥的 limits.auto_compact_overflow 按 Key 单独开启。"
   },
   "proxies": {
     "description": "管理代理池，支持轮询分配给账号使用",

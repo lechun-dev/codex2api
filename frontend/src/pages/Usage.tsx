@@ -1346,7 +1346,7 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'tokensPerSec' | 'duration' | 'time'
+type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'wsAcquire' | 'tokensPerSec' | 'duration' | 'time'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
@@ -1361,6 +1361,7 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'cached', labelKey: 'usage.tableCached' },
   { key: 'firstToken', labelKey: 'usage.tableFirstToken' },
+  { key: 'wsAcquire', labelKey: 'usage.tableWsAcquire' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
   { key: 'duration', labelKey: 'usage.tableDuration' },
   { key: 'time', labelKey: 'usage.tableTime' },
@@ -1380,6 +1381,8 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   cost: true,
   cached: true,
   firstToken: true,
+  // 取得连接耗时属于深挖排障信息，默认隐藏，需在列设置中手动开启
+  wsAcquire: false,
   tokensPerSec: true,
   duration: true,
   time: true,
@@ -2255,6 +2258,7 @@ export default function Usage() {
                       {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
                       {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}><span title={t('usage.tableFirstTokenHint')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableFirstToken')}</span></TableHead>}
+                      {visibleColumns.wsAcquire && <TableHead className={usageTableHeadClass}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
                       {visibleColumns.tokensPerSec && (
                         <TableHead className={usageTableHeadClass}>
                           <span
@@ -2403,6 +2407,16 @@ export default function Usage() {
                           {log.first_token_ms > 0 ? (
                             <span className={`${usageTableMonoClass} ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`}>
                               {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
+                            </span>
+                          ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
+                        </TableCell>}
+                        {visibleColumns.wsAcquire && <TableCell>
+                          {(log.ws_acquire_ms ?? 0) > 0 ? (
+                            <span
+                              className={`${usageTableMonoClass} ${(log.ws_acquire_ms as number) > 5000 ? 'text-red-500' : (log.ws_acquire_ms as number) > 1000 ? 'text-amber-500' : 'text-muted-foreground'}`}
+                              title={t('usage.wsAcquireTooltip')}
+                            >
+                              {(log.ws_acquire_ms as number) > 1000 ? `${((log.ws_acquire_ms as number) / 1000).toFixed(1)}s` : `${log.ws_acquire_ms}ms`}
                             </span>
                           ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}

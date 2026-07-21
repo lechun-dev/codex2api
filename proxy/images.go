@@ -1406,7 +1406,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

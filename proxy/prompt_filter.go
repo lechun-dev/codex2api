@@ -24,12 +24,17 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	// 本地 filter 与需要正文的 advanced 能力全部关闭时，在提取正文前直接放行，
+	// 避免对大请求体做无效的 JSON 遍历/UTF-8 解码 (issue #417)。
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
-	verdict = h.applyAdvancedPromptProtection(c, promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength), verdict, cfg)
+	verdict = h.applyAdvancedPromptProtection(c, text, verdict, cfg)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
@@ -53,6 +58,9 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
 	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
@@ -81,12 +89,15 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
 	}
-	verdict = h.applyAdvancedPromptProtection(c, promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength), verdict, cfg)
+	verdict = h.applyAdvancedPromptProtection(c, text, verdict, cfg)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)

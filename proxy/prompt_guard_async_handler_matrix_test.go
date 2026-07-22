@@ -92,6 +92,7 @@ func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
 	cfg.Advanced.Guard.Layers.History.Mode = promptfilter.GuardModeShadow
 	cfg.Advanced.Guard.Layers.ToolOutput.Mode = promptfilter.GuardModeShadow
 	cfg.Advanced.Guard.Layers.Instructions.Mode = promptfilter.GuardModeShadow
+	cfg.Advanced.Guard.Layers.AttachmentRefs.Mode = promptfilter.GuardModeShadow
 	cfg.Advanced.Guard.Performance.AsyncShadowAuxiliaryEnabled = true
 	cfg.Advanced.Guard.Performance.ExactSegmentCacheEnabled = true
 	cfg.Advanced.Guard.Performance.ShadowWorkers = 2
@@ -186,18 +187,18 @@ func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
 			name:                "images_generations",
 			endpoint:            "/v1/images/generations",
 			normalBody:          `{"model":"gpt-image-2","prompt":"画一只蓝色小鸟。"}`,
-			harmfulCurrentBody:  `{"model":"gpt-image-2","prompt":"` + malicious + `"}`,
-			shadowAuxiliaryBody: `{"model":"gpt-image-2","prompt":"画一只蓝色小鸟。","style":"` + malicious + `"}`,
-			shadowOrigin:        promptfilter.OriginInstructions,
+			harmfulCurrentBody:  `{"model":"gpt-image-2","prompt":"画一只蓝色小鸟。","style":"` + malicious + `"}`,
+			shadowAuxiliaryBody: `{"model":"gpt-image-2","prompt":"画一只蓝色小鸟。","image_url":"` + malicious + `"}`,
+			shadowOrigin:        promptfilter.OriginAttachmentRefs,
 			invoke:              (*Handler).ImagesGenerations,
 		},
 		{
 			name:                "images_edits_json",
 			endpoint:            "/v1/images/edits",
 			normalBody:          imageEditJSONBody("修复图片亮度。", ""),
-			harmfulCurrentBody:  imageEditJSONBody(malicious, ""),
-			shadowAuxiliaryBody: imageEditJSONBody("修复图片亮度。", malicious),
-			shadowOrigin:        promptfilter.OriginInstructions,
+			harmfulCurrentBody:  imageEditJSONBody("修复图片亮度。", malicious),
+			shadowAuxiliaryBody: `{"model":"gpt-image-2","prompt":"修复图片亮度。","image_url":"` + malicious + ` image-edit-reference","images":[{"image_url":"data:image/png;base64,` + tinyPNGBase64 + `"}]}`,
+			shadowOrigin:        promptfilter.OriginAttachmentRefs,
 			invoke:              (*Handler).ImagesEdits,
 		},
 	}
@@ -210,6 +211,7 @@ func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
 			beforeAsyncLogs := countAsyncShadowHandlerLogs(t, db, tc.endpoint)
 			invokePromptGuardHandlerMatrixRequest(t, handler, tc.invoke, tc.endpoint, "application/json", []byte(tc.shadowAuxiliaryBody), http.StatusOK, &upstreamCalls, 1)
 			waitPromptGuardShadowDispatcherIdle(t, dispatcher)
+			waitPromptFilterAuditIdle(t, db)
 			logs, err := db.ListPromptFilterLogs(context.Background(), 200)
 			if err != nil {
 				t.Fatalf("ListPromptFilterLogs: %v", err)
@@ -384,6 +386,8 @@ func invokePromptGuardHandlerMatrixRequest(t *testing.T, handler *Handler, invok
 
 func countAsyncShadowHandlerLogs(t *testing.T, db *database.DB, endpoint string) int {
 	t.Helper()
+	waitPromptFilterAuditIdle(t, db)
+	waitPromptFilterAuditIdle(t, db)
 	logs, err := db.ListPromptFilterLogs(context.Background(), 200)
 	if err != nil {
 		t.Fatalf("ListPromptFilterLogs: %v", err)

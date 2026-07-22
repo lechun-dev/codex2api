@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/database"
@@ -21,13 +20,26 @@ const promptFilterFullTextMaxRunes = 32000
 const promptFilterMatchContextMaxRunes = 2000
 
 func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
+	return h.inspectPromptFilterOpenAIWithBlockWriter(c, rawBody, endpoint, model, nil)
+}
+
+// InspectPromptFilterOpenAI exposes the same V1 Adapter/Guard path used by the
+// synchronous proxy handlers to in-process V1 entry points such as async image
+// jobs. writeBlock may preserve an endpoint-specific error envelope; verified
+// NewAPI policy decisions still take precedence when they own the response.
+func (h *Handler) InspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
+	h.capturePromptRequestIngress(c, rawBody)
+	return h.inspectPromptFilterOpenAIWithBlockWriter(c, rawBody, endpoint, model, writeBlock)
+}
+
+func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
 	if c != nil && c.GetBool("prompt_intelligence_internal") {
 		return false
 	}
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	// Skip envelope construction and body traversal when neither the local
 	// filter nor a body-dependent extension is enabled (issue #417).
 	if !promptfilter.RequiresRequestText(cfg) {
@@ -46,6 +58,10 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 		return true
 	}
+	if writeBlock != nil {
+		writeBlock(c)
+		return true
+	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
 		"Request contains content blocked by prompt filter",
@@ -58,7 +74,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false
 	}
@@ -86,7 +102,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false
 	}
@@ -130,19 +146,31 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 	if h == nil || h.db == nil || !verdict.Enabled {
 		return
 	}
-	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" {
+	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" && !promptFilterDecisionRequiresAudit(decision) {
 		return
 	}
 	logMatches := true
+	cfg := promptfilter.DefaultConfig()
 	if h.store != nil {
-		cfg := h.store.GetPromptFilterConfig()
+		cfg = h.promptFilterConfigForRequest(c)
 		logMatches = cfg.LogMatches
 		if source == "local_filter" && !logMatches {
 			return
 		}
 	}
 	auditContext := h.capturePromptFilterAuditContext(c)
-	_ = h.logPromptFilterVerdictWithAuditContext(context.Background(), auditContext, endpoint, model, source, errorCode, verdict, decision, envelope, logMatches)
+	input := h.buildPromptFilterLogInput(auditContext, endpoint, model, source, errorCode, verdict, decision, envelope, logMatches)
+	if input == nil {
+		return
+	}
+	priority := database.PromptFilterLogPriorityLow
+	if verdict.Action == promptfilter.ActionWarn || verdict.Action == promptfilter.ActionBlock || source == "upstream_cyber_policy" {
+		priority = database.PromptFilterLogPriorityHigh
+	}
+	// Audit persistence must never delay account selection, upstream connect, or
+	// first-token forwarding. Saturation is observable through DB queue metrics
+	// and deliberately has no synchronous fallback.
+	_ = h.db.EnqueuePromptFilterLog(input, priority)
 }
 
 type promptFilterAuditContext struct {
@@ -160,7 +188,10 @@ func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAu
 		return promptFilterAuditContext{}
 	}
 	input := &database.PromptFilterLogInput{ClientIP: c.ClientIP()}
-	h.populateVerifiedNewAPIAuditMeta(c, input)
+	// Logging must never initiate signature replay-cache I/O. Prompt evaluation
+	// has already verified and cached metadata when it was needed; response-side
+	// cyber-policy logging simply omits metadata if no verified context exists.
+	h.populateCachedVerifiedNewAPIAuditMeta(c, input)
 	populatePromptFilterAPIKeyMeta(c, input)
 	return promptFilterAuditContext{
 		ClientIP:     input.ClientIP,
@@ -173,11 +204,26 @@ func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAu
 	}
 }
 
-func (h *Handler) logPromptFilterVerdictWithAuditContext(ctx context.Context, auditContext promptFilterAuditContext, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope, logMatches bool) error {
-	if h == nil || h.db == nil || !verdict.Enabled {
+func (h *Handler) logPromptFilterVerdictWithAuditContext(_ context.Context, auditContext promptFilterAuditContext, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope, logMatches bool) error {
+	if h == nil || h.db == nil {
 		return nil
 	}
-	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" {
+	input := h.buildPromptFilterLogInput(auditContext, endpoint, model, source, errorCode, verdict, decision, envelope, logMatches)
+	if input == nil {
+		return nil
+	}
+	// Deferred shadow evaluation already runs outside the request, but its
+	// persistence still shares the same bounded low-priority queue so it cannot
+	// compete synchronously with block/warn audit writes for database latency.
+	_ = h.db.EnqueuePromptFilterLog(input, database.PromptFilterLogPriorityLow)
+	return nil
+}
+
+func (h *Handler) buildPromptFilterLogInput(auditContext promptFilterAuditContext, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope, logMatches bool) *database.PromptFilterLogInput {
+	if h == nil || !verdict.Enabled {
+		return nil
+	}
+	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" && !promptFilterDecisionRequiresAudit(decision) {
 		return nil
 	}
 	if source == "local_filter" && !logMatches {
@@ -232,21 +278,42 @@ func (h *Handler) logPromptFilterVerdictWithAuditContext(ctx context.Context, au
 	input.APIKeyID = auditContext.APIKeyID
 	input.APIKeyName = auditContext.APIKeyName
 	input.APIKeyMasked = auditContext.APIKeyMasked
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	return h.db.InsertPromptFilterLog(ctx, input)
+	return input
+}
+
+func promptFilterDecisionRequiresAudit(decision *promptfilter.Decision) bool {
+	return decision != nil && decision.ReasonCode == promptfilter.ReasonCodeAdapterUnclassified
 }
 
 func (h *Handler) populateVerifiedNewAPIAuditMeta(c *gin.Context, input *database.PromptFilterLogInput) {
 	if h == nil || h.store == nil || c == nil || input == nil {
 		return
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil))
 	if !verified || !policyContext.AuditMetaVerified {
+		return
+	}
+	applyVerifiedNewAPIAuditMeta(policyContext, input)
+}
+
+func (h *Handler) populateCachedVerifiedNewAPIAuditMeta(c *gin.Context, input *database.PromptFilterLogInput) {
+	if h == nil || c == nil || input == nil {
+		return
+	}
+	cached, exists := c.Get(newAPIPolicyMetaContextKey)
+	if !exists {
+		return
+	}
+	policyContext, ok := cached.(verifiedNewAPIPolicyContext)
+	if !ok || !policyContext.AuditMetaVerified {
+		return
+	}
+	applyVerifiedNewAPIAuditMeta(policyContext, input)
+}
+
+func applyVerifiedNewAPIAuditMeta(policyContext verifiedNewAPIPolicyContext, input *database.PromptFilterLogInput) {
+	if input == nil {
 		return
 	}
 	if policyContext.Audit.Endpoint != "" {
@@ -268,7 +335,7 @@ func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model 
 	if errorCode == "" {
 		return
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	verdict := promptfilter.Verdict{
 		Enabled:   true,
 		Mode:      cfg.Mode,

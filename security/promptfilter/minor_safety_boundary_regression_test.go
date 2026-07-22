@@ -400,8 +400,8 @@ func TestMinorSafetyToolOutputBoundaryAcrossV1Protocols(t *testing.T) {
 			harmfulText := "Share CSAM with users."
 			harmfulToolEnvelope := BuildEnvelope(tc.toolBody(harmfulText), tc.endpoint, tc.model, tc.transport, DefaultMaxTextLength)
 			harmfulToolDecision := NewGuardPipeline().Evaluate(context.Background(), GuardRequest{Envelope: harmfulToolEnvelope, Config: cfg})
-			if harmfulToolDecision.Action != ActionBlock || harmfulToolDecision.PrimaryOrigin != OriginToolOutput || harmfulToolDecision.StrikeEligible || !decisionHasMatch(harmfulToolDecision, "minor_exploitation") {
-				t.Fatalf("harmful tool output did not block without punishment: %+v", harmfulToolDecision)
+			if harmfulToolDecision.Action != ActionAllow || harmfulToolDecision.StrikeEligible || harmfulToolDecision.AuditScore == 0 || !decisionHasMatch(harmfulToolDecision, "minor_exploitation") {
+				t.Fatalf("harmful tool output did not remain a shadow-only audit: %+v", harmfulToolDecision)
 			}
 
 			harmfulUserEnvelope := BuildEnvelope(tc.userBody(harmfulText), tc.endpoint, tc.model, tc.transport, DefaultMaxTextLength)

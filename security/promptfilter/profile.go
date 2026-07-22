@@ -103,7 +103,15 @@ func resolveGuardLayerMode(cfg GuardConfig, profile GuardProfile, origin Segment
 	if configured == GuardModeInherit {
 		configured = globalMode
 	}
-	return capGuardMode(configured, globalMode)
+	resolved := capGuardMode(configured, globalMode)
+	if !guardOriginCanEnforce(origin) && resolved == GuardModeEnforce {
+		return GuardModeShadow
+	}
+	return resolved
+}
+
+func guardOriginCanEnforce(origin SegmentOrigin) bool {
+	return origin == OriginCurrentUser || origin == OriginApplicationCandidate
 }
 
 func guardLayerMode(layers GuardLayerConfig, origin SegmentOrigin) string {

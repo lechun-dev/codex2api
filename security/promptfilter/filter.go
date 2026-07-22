@@ -108,16 +108,19 @@ type Engine struct {
 	patterns               []compiledPattern
 	sensitiveWords         []string
 	literalIndex           *literalIndex
+	viewMatchHintAutomaton *decodedSafetyHintAutomaton
 	decodedPriorityScanner decodedSafetyPriorityScanner
+	exactPrecheckScanner   decodedSafetyPriorityScanner
 }
 
 type compiledPattern struct {
-	cfg      PatternConfig
-	re       *regexp.Regexp
-	requires []string
-	all      []*regexp.Regexp
-	any      []*regexp.Regexp
-	exclude  []*regexp.Regexp
+	cfg                   PatternConfig
+	re                    *regexp.Regexp
+	requires              []string
+	guaranteedHintClauses [][]string
+	all                   []*regexp.Regexp
+	any                   []*regexp.Regexp
+	exclude               []*regexp.Regexp
 }
 
 type literalIndex struct {
@@ -362,25 +365,35 @@ func NewEngine(cfg Config) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("compile exclude pattern %q: %w", pattern.Name, err)
 		}
-		patterns = append(patterns, compiledPattern{
+		compiled := compiledPattern{
 			cfg:      pattern,
 			re:       re,
 			requires: patternRequires(pattern.Pattern),
 			all:      all, any: any, exclude: exclude,
-		})
+		}
+		compiled.guaranteedHintClauses = decodedSafetyGuaranteedHintClauses(compiled)
+		patterns = append(patterns, compiled)
 	}
 	sensitiveWords := parseSensitiveWords(cfg.SensitiveWords)
 
 	engine := &Engine{
-		cfg:            cfg,
-		patterns:       patterns,
-		sensitiveWords: sensitiveWords,
-		literalIndex:   buildLiteralIndex(patterns, sensitiveWords),
+		cfg:                    cfg,
+		patterns:               patterns,
+		sensitiveWords:         sensitiveWords,
+		literalIndex:           buildLiteralIndex(patterns, sensitiveWords),
+		viewMatchHintAutomaton: buildGuaranteedPatternHintAutomaton(patterns),
 	}
 	// Keep decoded-rule prioritization bound to this exact immutable Engine.
 	// A process-global scan over cached engines can leak another tenant/config's
 	// custom rules into this request's encoded-candidate budget.
-	engine.decodedPriorityScanner = buildDecodedSafetyPriorityScanner(patterns)
+	priorityScanner := buildDecodedSafetyPriorityScanner(patterns)
+	priorityScanner.sensitiveWords = sensitiveWords
+	priorityScanner.hintIndex = buildDecodedSafetyHintIndex(priorityScanner)
+	engine.decodedPriorityScanner = priorityScanner
+	exactPrecheckScanner := buildDecodedSafetyExactPrecheckScanner(patterns, cfg.Threshold)
+	exactPrecheckScanner.sensitiveWords = sensitiveWords
+	exactPrecheckScanner.hintIndex = buildDecodedSafetyHintIndex(exactPrecheckScanner)
+	engine.exactPrecheckScanner = exactPrecheckScanner
 	return engine, nil
 }
 
@@ -474,8 +487,31 @@ func patternRequires(pattern string) []string {
 }
 
 func regexpRequiredLiterals(re *syntax.Regexp) []string {
+	// normalizeForScan lowercases text but does not collapse every Unicode
+	// SimpleFold equivalent (for example long-s). A plain lowercase literal is
+	// therefore not a correctness-safe hard gate for case-insensitive regexps.
+	// The separate syntax-proven Aho gate handles fold-stable substrings; keep
+	// this legacy fast path only for case-sensitive expressions.
+	if regexpHasFoldCaseLiteral(re) {
+		return nil
+	}
 	literals := requiredLiteralSet(re)
 	return sortedLiteralSet(literals, 4)
+}
+
+func regexpHasFoldCaseLiteral(re *syntax.Regexp) bool {
+	if re == nil {
+		return false
+	}
+	if re.Op == syntax.OpLiteral && re.Flags&syntax.FoldCase != 0 {
+		return true
+	}
+	for _, child := range re.Sub {
+		if regexpHasFoldCaseLiteral(child) {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredLiteralSet(re *syntax.Regexp) map[string]struct{} {
@@ -556,13 +592,13 @@ func Inspect(body []byte, endpoint string, cfg Config) Verdict {
 // RequiresRequestText 判断当前配置下是否真的需要从请求正文提取文本。
 // 本地 filter 关闭时 InspectText 直接判定为放行；review 仅在本地 filter 产出
 // warn/block 后才触发，risk 只读取聚合分数与身份、不消费正文，newapi 只塑形
-// 已拦截响应——因此这些能力都无法在本地 filter 关闭时独立需要正文。唯一的例外
-// 是 sidecar：当 MinScore<=0 时它可能在零分下仍被调用，故一并纳入判定。
+// 已拦截响应。Sidecar 也受同一个主开关控制；主开关关闭时语义审核入口会
+// 直接放行，因此不能仅因遗留的 Sidecar 子开关仍为 true 就遍历整个正文。
 //
 // 全部相关能力关闭时返回 false，调用方应在提取正文前直接放行，避免对大请求体
 // (曾达 16MB) 做无效的 JSON 遍历/UTF-8 解码 (issue #417)。
 func RequiresRequestText(cfg Config) bool {
-	return cfg.Enabled || cfg.Advanced.Sidecar.Enabled
+	return cfg.Enabled
 }
 
 func InspectText(text string, cfg Config) Verdict {
@@ -592,27 +628,51 @@ func InspectText(text string, cfg Config) Verdict {
 		verdict.Reason = err.Error()
 		return verdict
 	}
-	return engine.InspectText(text)
+	return engine.InspectTextWithPerformanceBudget(text, cfg.MaxTextLength, cfg.Advanced.Guard.Performance)
 }
 
 func (e *Engine) InspectText(text string) Verdict {
+	return e.inspectText(text, false)
+}
+
+func (e *Engine) inspectText(text string, omitFullEvidence bool) Verdict {
 	cfg := e.cfg
-	preview := RedactedPreview(text, 500)
-	verdict := Verdict{
-		Enabled:        cfg.Enabled,
-		Mode:           cfg.Mode,
-		Action:         ActionAllow,
-		Threshold:      cfg.Threshold,
-		TextPreview:    preview,
-		FullText:       text,
-		ExtractedChars: utf8.RuneCountInString(text),
-	}
 	if !cfg.Enabled || strings.TrimSpace(text) == "" {
-		return verdict
+		return e.newPreparedScanVerdict(text, omitFullEvidence)
 	}
 
 	limitedText := limitScanText(text, cfg.MaxTextLength)
-	scanViewList := scanViews(limitedText, cfg.Advanced.Normalization, e)
+	scanViewList := boundedEnforcementScanViews(scanViewsWithRuntimeBudget(limitedText, cfg.Advanced.Normalization, cfg.MaxTextLength, cfg.Advanced.Guard.Performance, e), cfg.MaxTextLength)
+	return e.inspectPreparedScanViews(text, limitedText, scanViewList, omitFullEvidence)
+}
+
+func (e *Engine) newPreparedScanVerdict(text string, omitFullEvidence bool) Verdict {
+	cfg := e.cfg
+	verdict := Verdict{
+		Enabled:   cfg.Enabled,
+		Mode:      cfg.Mode,
+		Action:    ActionAllow,
+		Threshold: cfg.Threshold,
+	}
+	if !omitFullEvidence {
+		verdict.TextPreview = RedactedPreview(text, 500)
+		verdict.FullText = text
+		verdict.ExtractedChars = utf8.RuneCountInString(text)
+	}
+	return verdict
+}
+
+// inspectPreparedScanViews is the single scoring/suppression core for both the
+// ordinary detector and the over-budget exact CurrentUser precheck. Callers may
+// spend different bounded effort discovering normalization views, but every
+// match still flows through the same exclusion, defensive-context, scoring,
+// strict, terminal, and incomplete-normalization semantics.
+func (e *Engine) inspectPreparedScanViews(evidenceText string, policyText string, scanViewList []scanView, omitFullEvidence bool) Verdict {
+	cfg := e.cfg
+	verdict := e.newPreparedScanVerdict(evidenceText, omitFullEvidence)
+	if !cfg.Enabled || strings.TrimSpace(policyText) == "" {
+		return verdict
+	}
 	if len(scanViewList) == 0 {
 		return verdict
 	}
@@ -663,6 +723,10 @@ func (e *Engine) InspectText(text string) Verdict {
 			continue
 		}
 		literalHits := e.literalIndex.match(scanText)
+		var guaranteedHintMatches map[string]struct{}
+		if !view.Compacted && e.viewMatchHintAutomaton != nil {
+			guaranteedHintMatches = e.viewMatchHintAutomaton.match(scanText)
+		}
 		if !view.Compacted {
 			for _, word := range e.sensitiveWords {
 				if word == "" {
@@ -690,12 +754,22 @@ func (e *Engine) InspectText(text string) Verdict {
 			if view.Compacted && !isBuiltinMinorSafetyPattern(pattern) {
 				continue
 			}
+			// Only syntax-proven mandatory literals participate in this gate. A
+			// regex match cannot exist when none of its proven clauses exists in
+			// the same normalized view, so skip the substantially more expensive
+			// suppression and regexp work. Heuristic decoded-candidate hints are
+			// intentionally excluded because they are useful for prioritization,
+			// but are not a correctness proof.
+			if !view.Compacted && len(pattern.guaranteedHintClauses) > 0 &&
+				!containsDecodedSafetyHintClauseWithMatches("", pattern.guaranteedHintClauses, guaranteedHintMatches) {
+				continue
+			}
 			if !patternShouldRun(scanText, pattern, literalHits) {
 				continue
 			}
-			if patternSuppressedForQuotedPolicyReview(limitedText, pattern) ||
-				patternSuppressedForDefensiveRuleArtifact(limitedText, pattern) ||
-				patternSuppressedForDefensiveDocumentation(limitedText, pattern) {
+			if patternSuppressedForQuotedPolicyReview(policyText, pattern) ||
+				patternSuppressedForDefensiveRuleArtifact(policyText, pattern) ||
+				patternSuppressedForDefensiveDocumentation(policyText, pattern) {
 				continue
 			}
 			var loc []int
@@ -801,7 +875,7 @@ func (e *Engine) InspectText(text string) Verdict {
 		}
 	}
 	if score > 0 {
-		contextDiscount = defensiveContextDiscount(limitedText, scanTexts, cfg.Advanced.ContextDiscount, highConfidenceContextEvidence)
+		contextDiscount = defensiveContextDiscount(policyText, scanTexts, cfg.Advanced.ContextDiscount, highConfidenceContextEvidence)
 		score -= contextDiscount
 		if score < 0 {
 			score = 0
@@ -852,9 +926,9 @@ func (e *Engine) InspectText(text string) Verdict {
 		}
 	}
 	if action == ActionAllow && normalizationIncomplete && cfg.Mode != ModeMonitor {
-		// Balanced enforcement forwards the request with an explicit warning so
-		// ordinary large archives are not falsely punished. Strict guard profiles
-		// may fail closed later, still without terminal/strike semantics.
+		// Every enforcement profile forwards the request with an explicit warning
+		// so ordinary large archives are not falsely punished. Reaching a bounded
+		// normalization limit never becomes terminal or strike-eligible by itself.
 		action = ActionWarn
 	}
 
@@ -876,6 +950,199 @@ func (e *Engine) InspectText(text string) Verdict {
 		verdict.MatchContext = strings.Join(matchContexts, "\n---\n")
 	}
 	return verdict
+}
+
+// InspectTextWithBudget reuses the immutable compiled detector while applying
+// a request-source-specific text and normalization budget. The shallow Engine
+// copy shares only read-only matcher state and does not enter the process-wide
+// engine cache under a second configuration identity.
+func (e *Engine) InspectTextWithBudget(text string, maxBytes int) Verdict {
+	if e == nil {
+		return Verdict{}
+	}
+	return e.InspectTextWithPerformanceBudget(text, maxBytes, e.cfg.Advanced.Guard.Performance)
+}
+
+// InspectTextWithPerformanceBudget applies the current operational scan
+// window explicitly. Guard performance is deliberately excluded from the
+// compiled Engine cache key, so hot configuration updates must not read these
+// values back from a previously cached Engine instance.
+func (e *Engine) InspectTextWithPerformanceBudget(text string, maxBytes int, performance GuardPerformanceConfig) Verdict {
+	return e.inspectTextWithPerformanceBudget(text, maxBytes, performance, false)
+}
+
+func (e *Engine) inspectTextWithPerformanceBudget(text string, maxBytes int, performance GuardPerformanceConfig, omitFullEvidence bool) Verdict {
+	if e == nil {
+		return Verdict{}
+	}
+	if maxBytes <= 0 {
+		maxBytes = e.cfg.MaxTextLength
+	}
+	if maxBytes > MaxGuardCurrentUserBytes {
+		maxBytes = MaxGuardCurrentUserBytes
+	}
+	text = limitScanTextExact(text, maxBytes)
+	bounded := *e
+	bounded.cfg = e.cfg
+	bounded.cfg.MaxTextLength = maxBytes
+	bounded.cfg.Advanced.Guard.Performance = performance
+	if bounded.cfg.Advanced.Normalization.MaxDecodedBytes > maxBytes {
+		bounded.cfg.Advanced.Normalization.MaxDecodedBytes = maxBytes
+	}
+	return bounded.inspectText(text, omitFullEvidence)
+}
+
+// inspectExactCurrentUserPrecheck evaluates the complete CurrentUser view
+// without running every regex over the entire source. Normalization views are
+// generated at most once under the ordinary byte/block/compression budgets,
+// then reused by both hint selection and the shared scoring core. Rules without
+// a provable literal remain eligible. Exact candidate retention keeps decoded
+// sub-threshold rules available for cumulative scoring without changing their
+// configured weights, strictness, suppression, or final enforcement semantics.
+func (e *Engine) inspectExactCurrentUserPrecheck(text string, performance GuardPerformanceConfig) Verdict {
+	if e == nil || strings.TrimSpace(text) == "" {
+		return Verdict{}
+	}
+	maxBytes := len(text)
+	if maxBytes > MaxGuardCurrentUserBytes {
+		maxBytes = MaxGuardCurrentUserBytes
+	}
+	text = limitScanTextExact(text, maxBytes)
+
+	scanner := e.exactPrecheckScanner
+	needsDerivedViews := exactPrecheckNeedsDerivedViews(text, e.cfg.Advanced.Normalization, scanner)
+	var scanViewList []scanView
+	if needsDerivedViews {
+		selector := *e
+		selector.decodedPriorityScanner = scanner
+		selector.cfg = e.cfg
+		selector.cfg.MaxTextLength = maxBytes
+		selector.cfg.Advanced.Guard.Performance = performance
+		if selector.cfg.Advanced.Normalization.MaxDecodedBytes > maxBytes {
+			selector.cfg.Advanced.Normalization.MaxDecodedBytes = maxBytes
+		}
+		scanViewList = boundedEnforcementScanViews(
+			scanViewsWithRuntimeBudget(text, selector.cfg.Advanced.Normalization, maxBytes, performance, &selector),
+			maxBytes,
+		)
+	} else {
+		scanViewList = []scanView{{Text: normalizeForScan(text)}}
+	}
+
+	matchedHints := make(map[string]struct{})
+	for _, view := range scanViewList {
+		if view.ReviewOnly {
+			continue
+		}
+		viewHints, _ := decodedSafetyPriorityMatchedHints(view.Text, scanner)
+		for hint := range viewHints {
+			matchedHints[hint] = struct{}{}
+		}
+	}
+	selectedPatterns := make([]compiledPattern, 0, len(scanner.patterns))
+	for _, candidate := range scanner.patterns {
+		if len(candidate.hintClauses) > 0 && !containsDecodedSafetyHintClauseWithMatches("", candidate.hintClauses, matchedHints) {
+			continue
+		}
+		selectedPatterns = append(selectedPatterns, candidate.pattern)
+	}
+	selectedWords := make([]string, 0, len(scanner.sensitiveWords))
+	for _, word := range scanner.sensitiveWords {
+		if _, exists := matchedHints[word]; exists {
+			selectedWords = append(selectedWords, word)
+		}
+	}
+	filtered := *e
+	filtered.patterns = selectedPatterns
+	filtered.sensitiveWords = selectedWords
+	filtered.literalIndex = buildLiteralIndex(selectedPatterns, selectedWords)
+	filtered.cfg = e.cfg
+	filtered.cfg.MaxTextLength = maxBytes
+	filtered.cfg.Advanced.Guard.Performance = performance
+	return filtered.inspectPreparedScanViews(text, text, scanViewList, true)
+}
+
+func exactPrecheckNeedsDerivedViews(text string, cfg NormalizationConfig, scanner decodedSafetyPriorityScanner) bool {
+	if !cfg.Enabled || text == "" {
+		return false
+	}
+	for index := 0; index < len(text); index++ {
+		if text[index] >= utf8.RuneSelf {
+			// NFKC and invisible-character removal can change any non-ASCII source.
+			return true
+		}
+	}
+	if cfg.DecodeURL && strings.ContainsAny(text, "%+") {
+		return true
+	}
+	if cfg.DecodeHTML && strings.Contains(text, "&") {
+		return true
+	}
+	if cfg.DecodeEscapes && strings.Contains(text, "\\") {
+		return true
+	}
+	if (cfg.DecodeBase64 || cfg.DecodeHex) && len(encodedCandidates(text, cfg, min(len(text), MaxGuardCurrentUserBytes))) > 0 {
+		return true
+	}
+	if !cfg.DecodeROT13 {
+		return false
+	}
+	index := scanner.hintIndex
+	if index == nil {
+		index = buildDecodedSafetyHintIndex(scanner)
+	}
+	if index.unhinted {
+		return true
+	}
+	matched := index.automaton.matchNormalizedROT13Source(text)
+	return decodedSafetyPriorityMatchedHintSetCanMatch(scanner, matched)
+}
+
+func limitScanTextExact(text string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxTextLength
+	}
+	if len(text) <= maxBytes {
+		return text
+	}
+	if maxBytes == 1 {
+		return safeUTF8Prefix(text, 1)
+	}
+	payloadBytes := maxBytes - 1
+	headBytes := payloadBytes * 4 / 5
+	tailBytes := payloadBytes - headBytes
+	return safeUTF8Prefix(text, headBytes) + "\n" + safeUTF8Suffix(text, tailBytes)
+}
+
+// boundedEnforcementScanViews keeps the original, already-bounded request view
+// and gives all normalization-derived views one shared synchronous byte
+// budget. Decoding may discover more material for audit purposes, but content
+// beyond this prefix budget cannot become a blocking signal on the request
+// path. This is intentionally prefix-based: head/tail sampling is useful for
+// raw request coverage, while applying it after decompression would promote an
+// arbitrarily distant decoded tail into synchronous enforcement.
+func boundedEnforcementScanViews(views []scanView, maxBytes int) []scanView {
+	if len(views) <= 1 {
+		return views
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxTextLength
+	}
+	out := make([]scanView, 0, len(views))
+	out = append(out, views[0])
+	remaining := maxBytes
+	for _, view := range views[1:] {
+		if remaining <= 0 {
+			break
+		}
+		view.Text = safeUTF8Prefix(view.Text, remaining)
+		if view.Text == "" {
+			continue
+		}
+		remaining -= len(view.Text)
+		out = append(out, view)
+	}
+	return out
 }
 
 var (

@@ -7117,6 +7117,12 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterAdvancedRaw := h.store.GetPromptFilterAdvancedConfig()
+	if dbSettings != nil {
+		if document, err := promptfilter.ParseAdvancedConfigDocument(dbSettings.PromptFilterAdvancedConfig); err == nil {
+			promptFilterAdvancedRaw = document.Raw
+		}
+	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
@@ -7201,7 +7207,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
 		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
+		PromptFilterAdvancedConfig:         promptFilterAdvancedRaw,
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -7906,6 +7912,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	promptFilterAdvancedRaw := h.store.GetPromptFilterAdvancedConfig()
+	promptFilterNewAPISecret := promptFilterCfg.Advanced.NewAPI.Secret
+	// The database is authoritative for the persisted JSON in multi-instance
+	// deployments. Invalid persisted JSON must not replace the Store's last
+	// valid raw/effective pair.
+	if existingSettings != nil {
+		if document, err := promptfilter.ParseAdvancedConfigDocument(existingSettings.PromptFilterAdvancedConfig); err == nil {
+			promptFilterAdvancedRaw = document.Raw
+			promptFilterCfg.Advanced = document.Effective
+			promptFilterCfg.Advanced.NewAPI.Secret = promptFilterNewAPISecret
+		}
+	}
 	promptFilterChanged := false
 	if req.PromptFilterEnabled != nil {
 		promptFilterCfg.Enabled = *req.PromptFilterEnabled
@@ -7928,12 +7946,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		promptFilterChanged = true
 	}
 	if req.PromptFilterAdvancedConfig != nil {
-		advanced, err := promptfilter.ParseAdvancedConfig(*req.PromptFilterAdvancedConfig)
+		document, err := promptfilter.MergeAdvancedConfigDocument(promptFilterAdvancedRaw, *req.PromptFilterAdvancedConfig)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "prompt_filter_advanced_config JSON 无效: " + err.Error()})
 			return
 		}
-		promptFilterCfg.Advanced = advanced
+		promptFilterAdvancedRaw = document.Raw
+		promptFilterCfg.Advanced = document.Effective
+		promptFilterCfg.Advanced.NewAPI.Secret = promptFilterNewAPISecret
 		promptFilterChanged = true
 	}
 	if req.PromptFilterLogMatches != nil {
@@ -8150,7 +8170,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
 		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
+		PromptFilterAdvancedConfig:         promptFilterAdvancedRaw,
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -8203,7 +8223,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	} else {
 		if promptFilterChanged {
-			h.store.SetPromptFilterConfig(promptFilterCfg)
+			if err := h.store.SetPromptFilterConfigWithAdvancedRaw(promptFilterCfg, promptFilterAdvancedRaw); err != nil {
+				// The document was validated before persistence, so reaching this
+				// branch indicates an internal invariant violation. Keep the last
+				// valid runtime state rather than publishing a partial update.
+				log.Printf("无法发布 Prompt 检查运行时配置: %v", err)
+				writeError(c, http.StatusInternalServerError, "Prompt 检查设置已保存，但运行时配置更新失败")
+				return
+			}
 			log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
 		}
 		if autoResetCreditsChanged {
@@ -8300,7 +8327,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
 		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
-		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
+		PromptFilterAdvancedConfig:         promptFilterAdvancedRaw,
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,

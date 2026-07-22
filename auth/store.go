@@ -119,11 +119,11 @@ type Account struct {
 	GrokPrincipalType string
 	GrokPrincipalID   string
 	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
-	grokRateLimit *GrokRateLimitSnapshot
-	Status                  AccountStatus
-	CooldownUtil            time.Time
-	CooldownReason          string // rate_limited / rate_limited_5h / unauthorized / 空
-	ErrorMsg                string
+	grokRateLimit  *GrokRateLimitSnapshot
+	Status         AccountStatus
+	CooldownUtil   time.Time
+	CooldownReason string // rate_limited / rate_limited_5h / unauthorized / 空
+	ErrorMsg       string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -2513,7 +2513,7 @@ type Store struct {
 	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
-	promptFilterConfig    atomic.Value // promptfilter.Config
+	promptFilterConfig    atomic.Value // promptFilterConfigState
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
@@ -2979,13 +2979,18 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.ReasoningEffortModels != "" {
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
-	promptFilterCfg := promptFilterConfigFromSettings(settings)
+	promptFilterCfg, promptFilterAdvancedRaw := promptFilterConfigFromSettings(settings)
 	if s.db != nil {
 		if secret, err := s.db.GetPromptFilterNewAPISecret(context.Background()); err == nil {
 			promptFilterCfg.Advanced.NewAPI.Secret = secret
 		}
 	}
-	s.SetPromptFilterConfig(promptFilterCfg)
+	if err := s.SetPromptFilterConfigWithAdvancedRaw(promptFilterCfg, promptFilterAdvancedRaw); err != nil {
+		// promptFilterAdvancedRaw is already validated by
+		// promptFilterConfigFromSettings. Keep a defensive fallback so a corrupt
+		// persisted value can never prevent Store initialization.
+		s.SetPromptFilterConfig(promptFilterCfg)
+	}
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -5073,18 +5078,25 @@ func (s *Store) SetAffinityMode(mode string) {
 	s.affinityMode.Store(mode)
 }
 
-func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {
+type promptFilterConfigState struct {
+	Config      promptfilter.Config
+	AdvancedRaw string
+}
+
+func promptFilterConfigFromSettings(settings *database.SystemSettings) (promptfilter.Config, string) {
 	cfg := promptfilter.DefaultConfig()
+	advancedRaw := promptfilter.MarshalAdvancedConfig(cfg.Advanced)
 	if settings == nil {
-		return cfg
+		return cfg, advancedRaw
 	}
 	cfg.Enabled = settings.PromptFilterEnabled
 	cfg.Mode = settings.PromptFilterMode
 	cfg.Threshold = settings.PromptFilterThreshold
 	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
 	cfg.StrictTerminalEnabled = settings.PromptFilterStrictTerminalEnabled
-	if advanced, err := promptfilter.ParseAdvancedConfig(settings.PromptFilterAdvancedConfig); err == nil {
-		cfg.Advanced = advanced
+	if document, err := promptfilter.ParseAdvancedConfigDocument(settings.PromptFilterAdvancedConfig); err == nil {
+		cfg.Advanced = document.Effective
+		advancedRaw = document.Raw
 	}
 	cfg.LogMatches = settings.PromptFilterLogMatches
 	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
@@ -5103,18 +5115,60 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfil
 		TimeoutSeconds: settings.PromptFilterReviewTimeoutSeconds,
 		FailClosed:     settings.PromptFilterReviewFailClosed,
 	}
-	return promptfilter.NormalizeConfig(cfg)
+	return promptfilter.NormalizeConfig(cfg), advancedRaw
 }
 
 func (s *Store) SetPromptFilterConfig(cfg promptfilter.Config) {
-	s.promptFilterConfig.Store(promptfilter.NormalizeConfig(cfg))
+	normalized := promptfilter.NormalizeConfig(cfg)
+	advancedRaw := promptfilter.MarshalAdvancedConfig(normalized.Advanced)
+	if current, ok := s.promptFilterConfig.Load().(promptFilterConfigState); ok {
+		if merged, err := promptfilter.MarshalAdvancedConfigDocument(current.AdvancedRaw, normalized.Advanced); err == nil {
+			advancedRaw = merged
+		}
+	}
+	s.promptFilterConfig.Store(promptFilterConfigState{Config: normalized, AdvancedRaw: advancedRaw})
+}
+
+// SetPromptFilterConfigWithAdvancedRaw atomically publishes the normalized
+// runtime configuration together with its forward-compatible persisted JSON.
+// The caller must persist successfully before invoking this method.
+func (s *Store) SetPromptFilterConfigWithAdvancedRaw(cfg promptfilter.Config, raw string) error {
+	normalized := promptfilter.NormalizeConfig(cfg)
+	advancedRaw, err := promptfilter.MarshalAdvancedConfigDocument(raw, normalized.Advanced)
+	if err != nil {
+		return err
+	}
+	s.promptFilterConfig.Store(promptFilterConfigState{Config: normalized, AdvancedRaw: advancedRaw})
+	return nil
 }
 
 func (s *Store) GetPromptFilterConfig() promptfilter.Config {
-	if v, ok := s.promptFilterConfig.Load().(promptfilter.Config); ok {
-		return promptfilter.NormalizeConfig(v)
+	if state, ok := s.promptFilterConfig.Load().(promptFilterConfigState); ok {
+		return promptfilter.NormalizeConfig(state.Config)
 	}
 	return promptfilter.DefaultConfig()
+}
+
+// GetPromptFilterConfigSnapshot returns the immutable, already-normalized
+// runtime snapshot published by SetPromptFilterConfig. Request hot paths may
+// read it without rebuilding maps and slices, but callers must never mutate
+// nested maps or slices on the returned value. Administrative edit paths must
+// continue to use GetPromptFilterConfig, which returns an independent copy.
+func (s *Store) GetPromptFilterConfigSnapshot() promptfilter.Config {
+	if state, ok := s.promptFilterConfig.Load().(promptFilterConfigState); ok {
+		return state.Config
+	}
+	return promptfilter.DefaultConfig()
+}
+
+// GetPromptFilterAdvancedConfig returns the JSON document exposed through the
+// settings API. It contains normalized known fields and retains unknown fields
+// loaded from or accepted into persistent settings.
+func (s *Store) GetPromptFilterAdvancedConfig() string {
+	if state, ok := s.promptFilterConfig.Load().(promptFilterConfigState); ok && strings.TrimSpace(state.AdvancedRaw) != "" {
+		return state.AdvancedRaw
+	}
+	return promptfilter.MarshalAdvancedConfig(s.GetPromptFilterConfig().Advanced)
 }
 
 // SetIgnoreUsageLimitStatus updates the global default and immediately

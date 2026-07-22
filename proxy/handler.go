@@ -847,14 +847,12 @@ func rawRequestBodyFromContext(c *gin.Context) ([]byte, bool) {
 
 func readRawRequestBody(c *gin.Context) ([]byte, error) {
 	if body, ok := rawRequestBodyFromContext(c); ok {
-		setIngressRequestBodyIfAbsent(c, body)
 		return body, nil
 	}
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		return nil, err
 	}
-	setIngressRequestBodyIfAbsent(c, body)
 	setRawRequestBody(c, body)
 	return body, nil
 }
@@ -868,7 +866,9 @@ func setIngressRequestBodyIfAbsent(c *gin.Context, body []byte) {
 	if _, exists := c.Get(ingressRequestBodyContextKey); exists {
 		return
 	}
-	c.Set(ingressRequestBodyContextKey, append([]byte(nil), body...))
+	// The request-size middleware already owns this immutable buffer for the
+	// request lifetime. Retain the same slice instead of copying the full body.
+	c.Set(ingressRequestBodyContextKey, body)
 }
 
 func ingressRequestBody(c *gin.Context, fallback []byte) []byte {
@@ -1851,6 +1851,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	bodyReadDone := time.Now()
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
@@ -2277,7 +2278,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.Release(account)
 					return
 				}
-				streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+				streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -2692,7 +2693,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -3058,6 +3059,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3586,6 +3588,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -3956,7 +3959,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -4241,7 +4244,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		return
 	}
 
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {

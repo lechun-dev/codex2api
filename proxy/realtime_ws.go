@@ -99,6 +99,7 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 		completed := false
 		var completedOutput []json.RawMessage
 		options := &responsesWSForwardOptions{
+			auditEndpoint:        "/v1/realtime",
 			transformClientEvent: realtimeResponsesClientEvent,
 			onResponseCompleted: func(data []byte) {
 				completed = true
@@ -180,6 +181,10 @@ func normalizeRealtimeTextClientEvent(state *realtimeTextSession, raw []byte) (a
 	case "response.create":
 		body, err := buildResponsesTurnFromRealtime(state, trimmed)
 		if err != nil {
+			// A failed logical turn must not leak pending user items into the
+			// next response.create. The client can resend the intended input as a
+			// fresh conversation item after correcting the request.
+			state.Items = nil
 			return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, err.Error(), api.ErrorTypeInvalidRequest)
 		}
 		return nil, body, nil
@@ -190,7 +195,13 @@ func normalizeRealtimeTextClientEvent(state *realtimeTextSession, raw []byte) (a
 	case "input_audio_buffer.append", "input_audio_buffer.commit", "input_audio_buffer.clear":
 		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, "Codex2API /v1/realtime currently supports text events only", api.ErrorTypeInvalidRequest)
 
-	case "response.cancel", "conversation.item.delete", "conversation.item.truncate":
+	case "response.cancel":
+		// Cancellation is a logical turn boundary even though the Responses
+		// compatibility transport does not forward this event upstream.
+		state.Items = nil
+		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, fmt.Sprintf("realtime event %s is not supported by the Responses compatibility transport", eventType), api.ErrorTypeInvalidRequest)
+
+	case "conversation.item.delete", "conversation.item.truncate":
 		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, fmt.Sprintf("realtime event %s is not supported by the Responses compatibility transport", eventType), api.ErrorTypeInvalidRequest)
 
 	default:

@@ -22,13 +22,15 @@ import (
 )
 
 const (
-	promptSessionCorrelationNamespace = "prompt-filter-session-correlation"
-	promptAttachmentCacheNamespace    = "prompt-filter-attachment-cache"
-	promptExtensionBreakerNamespace   = "prompt-filter-extension-breaker"
-	promptAttachmentResponseMaxBytes  = 64 * 1024
+	promptSessionCorrelationNamespace  = "prompt-filter-session-correlation"
+	promptAttachmentCacheNamespace     = "prompt-filter-attachment-cache"
+	promptExtensionBreakerNamespace    = "prompt-filter-extension-breaker"
+	promptAttachmentResponseMaxBytes   = 64 * 1024
+	promptGuardSessionReadTimeout      = 50 * time.Millisecond
+	promptGuardPolicyEventIDContextKey = "prompt_filter_policy_event_id"
 )
 
-var promptSessionContinuationPattern = regexp.MustCompile(`(?i)^(?:继续(?:吧|做|处理|执行|完成|生成|写)?(?:它|这个|上面(?:的)?内容|之前(?:的)?内容)?|接着(?:做|处理|执行)?|照做|按(?:上面|之前|刚才)(?:的)?(?:要求|内容|方案)?(?:继续)?(?:做|执行|处理)?|就这样做|continue(?:\s+(?:please|with\s+(?:that|it)))?|go\s+ahead|do\s+it|proceed(?:\s+with\s+it)?|carry\s+on|same\s+as\s+above)[。.!！\s]*$`)
+var promptSessionContinuationPattern = regexp.MustCompile(`(?i)^(?:(?:(?:请|麻烦)\s*)?继续(?:一下|吧|做|处理|执行|完成|生成|写)?(?:它|这个|上面(?:的)?内容|之前(?:的)?内容)?|接着(?:做|处理|执行)?|照做|按(?:上面|之前|刚才)(?:的)?(?:要求|内容|方案)?(?:继续)?(?:做|执行|处理)?|就这样做|continue(?:\s+(?:please|with\s+(?:that|it)))?|go\s+ahead|do\s+it|proceed(?:\s+with\s+it)?|carry\s+on|same\s+as\s+above)[。.!！\s]*$`)
 
 type promptSessionCorrelationRecord struct {
 	Fragments     []string  `json:"fragments"`
@@ -121,18 +123,29 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 	}
 	currentText = truncatePromptRunes(currentText, sessionCfg.MaxTextLength)
 	key := hashRiskIdentity(identityKey + "\x00" + sessionFingerprint)
-	ctx := promptGuardRequestContext(c)
+	if eventID := promptGuardPolicyEventID(c); requestID != "" && eventID != "" {
+		requestID += "\x00" + eventID
+	}
+	pending := &promptSessionCorrelationPending{Key: key, CurrentText: currentText, RequestID: requestID}
+	linkPrevious := promptSessionContinuationPattern.MatchString(strings.Join(strings.Fields(currentText), " "))
+	readForShortFragment := sessionCfg.CombineShortFragments && utf8.RuneCountInString(currentText) <= sessionCfg.ShortFragmentMaxChars
+	if !linkPrevious && !readForShortFragment {
+		// Ordinary requests only schedule the bounded post-decision write. They do
+		// not pay a cache read RTT on the first-token path.
+		return pending, nil
+	}
+	ctx, cancel := context.WithTimeout(promptGuardRequestContext(c), promptGuardSessionReadTimeout)
+	defer cancel()
 	var record promptSessionCorrelationRecord
 	if raw, ok, err := h.cache.GetRuntime(ctx, promptSessionCorrelationNamespace, key); err == nil && ok {
 		_ = json.Unmarshal(raw, &record)
 	} else if err != nil {
-		return nil, err
+		return pending, err
 	}
 	if requestID != "" && record.LastRequestID == requestID {
 		return nil, nil
 	}
-	linkPrevious := promptSessionContinuationPattern.MatchString(strings.Join(strings.Fields(currentText), " "))
-	if !linkPrevious && sessionCfg.CombineShortFragments && utf8.RuneCountInString(currentText) <= sessionCfg.ShortFragmentMaxChars {
+	if !linkPrevious && readForShortFragment {
 		linkPrevious = len(record.Fragments) > 0
 	}
 	if linkPrevious && len(record.Fragments) > 0 {
@@ -153,7 +166,16 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 			})
 		}
 	}
-	return &promptSessionCorrelationPending{Key: key, CurrentText: currentText, RequestID: requestID}, nil
+	return pending, nil
+}
+
+func promptGuardPolicyEventID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	value, _ := c.Get(promptGuardPolicyEventIDContextKey)
+	eventID, _ := value.(string)
+	return normalizeNewAPIPolicyWebSocketEventID(eventID)
 }
 
 func envelopeDirectCurrentUserText(envelope promptfilter.RequestEnvelope) string {

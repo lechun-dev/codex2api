@@ -58,6 +58,7 @@ type responsesWSCloseError struct {
 }
 
 type responsesWSForwardOptions struct {
+	auditEndpoint        string
 	transformClientEvent func([]byte) []byte
 	onResponseCompleted  func([]byte)
 }
@@ -164,6 +165,10 @@ func stripNewAPIPolicyWebSocketEventID(payload []byte) ([]byte, string) {
 }
 
 func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte, policyEventID string, options *responsesWSForwardOptions) error {
+	// Each response.create is a separate logical request. Keep the verified
+	// connection identity, but never reuse a prior frame's config or body digest.
+	resetPromptRequestSecurityFrame(c)
+	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
@@ -200,7 +205,13 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
-	if blocked, delegated := h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, "/v1/responses", model, policyEventID); blocked {
+	auditEndpoint := "/v1/responses"
+	if options != nil {
+		if configured := strings.TrimSpace(options.auditEndpoint); configured != "" {
+			auditEndpoint = configured
+		}
+	}
+	if blocked, delegated := h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, auditEndpoint, model, policyEventID); blocked {
 		// A verified NewAPI connection owns warning/ban state. Keep the upstream
 		// WebSocket alive after returning the signed decision so NewAPI can show
 		// the first warning and accept another frame; it closes both peers only
@@ -572,7 +583,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	c.Set("x-reasoning-effort", reasoningEffort)
 
 	var firstTokenMs int
-	outputBuffer := newWSPromptOutputBuffer(h.store.GetPromptFilterConfig())
+	outputBuffer := newWSPromptOutputBuffer(h.promptFilterConfigForRequest(c))
 	var usage *UsageInfo
 	var actualServiceTier string
 	ttftRecorded := false
@@ -890,7 +901,7 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	if h == nil || h.store == nil {
 		return false, false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	// Keep disabled filters off the WebSocket request-body hot path too.
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false, false

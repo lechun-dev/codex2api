@@ -510,7 +510,7 @@ func TestRequiresRequestText(t *testing.T) {
 	}{
 		{"all disabled", func(c *Config) { c.Enabled = false }, false},
 		{"filter enabled", func(c *Config) { c.Enabled = true }, true},
-		{"sidecar enabled only", func(c *Config) { c.Enabled = false; c.Advanced.Sidecar.Enabled = true }, true},
+		{"sidecar enabled only", func(c *Config) { c.Enabled = false; c.Advanced.Sidecar.Enabled = true }, false},
 		{"risk enabled only", func(c *Config) { c.Enabled = false; c.Advanced.Risk.Enabled = true }, false},
 		{"review enabled only", func(c *Config) { c.Enabled = false; c.Review.Enabled = true }, false},
 		{"output enabled only", func(c *Config) { c.Enabled = false; c.Advanced.Output.Enabled = true }, false},
@@ -575,6 +575,7 @@ func BenchmarkInspectDisabledLargeBody(b *testing.B) {
 	cfg := DefaultConfig()                    // Enabled=false
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// 复刻优化后调用方的早退判定：关闭态不应触碰正文。
 		if RequiresRequestText(cfg) {
@@ -590,6 +591,7 @@ func BenchmarkInspectDisabledLargeBodyOldPath(b *testing.B) {
 	cfg := DefaultConfig()                    // Enabled=false
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = Inspect(body, "/v1/responses", cfg)
 	}
@@ -600,6 +602,7 @@ func BenchmarkInspectEnabledLargeBody(b *testing.B) {
 	cfg := testConfig(ModeBlock)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if RequiresRequestText(cfg) {
 			_ = Inspect(body, "/v1/responses", cfg)

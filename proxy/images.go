@@ -1007,6 +1007,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1101,6 +1102,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if prompt == "" {
@@ -1121,26 +1123,6 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if len(imageFiles) > MaxImageEditInputCount {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(imageFiles), MaxImageEditInputCount), "type": "invalid_request_error"}})
 		return
-	}
-
-	images := make([]string, 0, len(imageFiles))
-	for _, fileHeader := range imageFiles {
-		dataURL, err := multipartFileToDataURL(fileHeader)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		images = append(images, dataURL)
-	}
-
-	var maskDataURL string
-	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
-		dataURL, err := multipartFileToDataURL(maskFiles[0])
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		maskDataURL = dataURL
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
@@ -1174,6 +1156,29 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+
+	// Multipart parsing may have used bounded temporary storage before the
+	// prompt field was known, but image bytes must not be decoded or expanded to
+	// Base64 until the current-user prompt has passed the guard.
+	images := make([]string, 0, len(imageFiles))
+	for _, fileHeader := range imageFiles {
+		dataURL, err := multipartFileToDataURL(fileHeader)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, dataURL)
+	}
+
+	var maskDataURL string
+	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		dataURL, err := multipartFileToDataURL(maskFiles[0])
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		maskDataURL = dataURL
+	}
 	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
 	if !ok {
 		return
@@ -1194,7 +1199,7 @@ func (h *Handler) captureSignedMultipartIngress(c *gin.Context) error {
 	if h == nil || h.store == nil || c == nil || c.Request == nil {
 		return nil
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	if !cfg.Advanced.NewAPI.Enabled || strings.TrimSpace(c.GetHeader("X-NewAPI-Signature")) == "" {
 		return nil
 	}
@@ -1202,6 +1207,7 @@ func (h *Handler) captureSignedMultipartIngress(c *gin.Context) error {
 	if err != nil {
 		return err
 	}
+	setIngressRequestBodyIfAbsent(c, body)
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	c.Request.ContentLength = int64(len(body))
 	return nil
@@ -1234,6 +1240,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1751,7 +1758,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once

@@ -70,8 +70,7 @@ func (h *Handler) verifyNewAPIIdentity(c *gin.Context, cfg promptfilter.NewAPICo
 	if c == nil || !cfg.Enabled {
 		return newAPIIdentity{}, false
 	}
-	digest := sha256.Sum256(body)
-	actualBodyDigest := hex.EncodeToString(digest[:])
+	_, actualBodyDigest := promptRequestBodyDigest(c, body)
 	if cached, exists := c.Get(newAPIIdentityContextKey); exists {
 		if identityContext, ok := cached.(verifiedNewAPIIdentityContext); ok && identityContext.BodySHA256 == actualBodyDigest {
 			return identityContext.Identity, true
@@ -104,7 +103,7 @@ func (h *Handler) verifyNewAPIIdentity(c *gin.Context, cfg promptfilter.NewAPICo
 	if requestPath == "" {
 		requestPath = c.Request.URL.Path
 	}
-	if method != strings.ToUpper(c.Request.Method) || path != requestPath || bodyDigest != hex.EncodeToString(digest[:]) {
+	if method != strings.ToUpper(c.Request.Method) || path != requestPath || bodyDigest != actualBodyDigest {
 		return newAPIIdentity{}, false
 	}
 	switch strings.TrimSpace(c.GetHeader("X-NewAPI-Signature-Version")) {
@@ -142,11 +141,10 @@ func (h *Handler) verifyNewAPIIdentity(c *gin.Context, cfg promptfilter.NewAPICo
 }
 
 func (h *Handler) verifyNewAPIPolicyContext(c *gin.Context, cfg promptfilter.NewAPIConfig, body []byte) (verifiedNewAPIPolicyContext, bool) {
-	if c == nil {
+	if c == nil || !cfg.Enabled {
 		return verifiedNewAPIPolicyContext{}, false
 	}
-	digest := sha256.Sum256(body)
-	actualBodyDigest := hex.EncodeToString(digest[:])
+	_, actualBodyDigest := promptRequestBodyDigest(c, body)
 	if cached, exists := c.Get(newAPIPolicyMetaContextKey); exists {
 		if policyContext, ok := cached.(verifiedNewAPIPolicyContext); ok && policyContext.BodySHA256 == actualBodyDigest {
 			return policyContext, true

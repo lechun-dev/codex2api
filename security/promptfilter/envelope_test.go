@@ -127,7 +127,14 @@ func TestResponsesEnvelopeClassifiesReplayItemFamilies(t *testing.T) {
 	assertEnvelopeContains(t, envelope, OriginSessionContext, "reasoning payload")
 	assertEnvelopeContains(t, envelope, OriginSessionContext, "compaction payload")
 	assertEnvelopeContains(t, envelope, OriginSessionContext, "context payload")
-	assertEnvelopeContains(t, envelope, OriginSessionContext, "unknown payload")
+	if !envelope.AdapterUnclassified {
+		t.Fatal("unknown typed replay item did not set adapter audit marker")
+	}
+	for _, segment := range envelope.Segments {
+		if strings.Contains(segment.Text, "unknown payload") {
+			t.Fatalf("unknown typed payload leaked into detector input: %+v", envelope.Segments)
+		}
+	}
 	assertEnvelopeContains(t, envelope, OriginToolArguments, `"command":"payload"`)
 	assertEnvelopeContains(t, envelope, OriginToolOutput, "tool payload")
 }
@@ -309,8 +316,40 @@ func TestBuildImageEnvelopePreservesPromptStyleAndReference(t *testing.T) {
 		t.Fatalf("protocol = %q, want images", envelope.Protocol)
 	}
 	assertEnvelopeContains(t, envelope, OriginCurrentUser, "Draw a blue bird")
-	assertEnvelopeContains(t, envelope, OriginInstructions, "watercolor")
+	assertEnvelopeContains(t, envelope, OriginCurrentUser, "watercolor")
 	assertEnvelopeContains(t, envelope, OriginAttachmentRefs, "reference.png")
+}
+
+func TestProtocolForEndpointMapsExplicitV1GuardAdapters(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     Protocol
+	}{
+		{endpoint: "/v1/realtime", want: ProtocolResponses},
+		{endpoint: "/v1/images/jobs", want: ProtocolImages},
+		{endpoint: "/v1/images/jobs:edit", want: ProtocolImages},
+	}
+	for _, tc := range tests {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			if got := ProtocolForEndpoint(tc.endpoint); got != tc.want {
+				t.Fatalf("ProtocolForEndpoint(%q) = %q, want %q", tc.endpoint, got, tc.want)
+			}
+		})
+	}
+
+	realtime := BuildEnvelope([]byte(`{"input":[{"role":"user","content":"latest realtime prompt"}]}`), "/v1/realtime", "gpt-5.5", TransportWebSocket, DefaultMaxTextLength)
+	if realtime.Protocol != ProtocolResponses {
+		t.Fatalf("realtime protocol = %q, want responses", realtime.Protocol)
+	}
+	assertEnvelopeContains(t, realtime, OriginCurrentUser, "latest realtime prompt")
+
+	imageJob := BuildEnvelope([]byte(`{"prompt":"draw a bird","style":"watercolor","input_images":["https://example.test/reference.png"]}`), "/v1/images/jobs", "gpt-image-2", TransportHTTP, DefaultMaxTextLength)
+	if imageJob.Protocol != ProtocolImages {
+		t.Fatalf("image jobs protocol = %q, want images", imageJob.Protocol)
+	}
+	assertEnvelopeContains(t, imageJob, OriginCurrentUser, "draw a bird")
+	assertEnvelopeContains(t, imageJob, OriginCurrentUser, "watercolor")
+	assertEnvelopeContains(t, imageJob, OriginAttachmentRefs, "reference.png")
 }
 
 func TestResolveModelFamilyKeepsProtocolAndProviderSeparate(t *testing.T) {

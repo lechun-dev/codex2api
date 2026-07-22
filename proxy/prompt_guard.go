@@ -189,25 +189,37 @@ type promptGuardEvaluation struct {
 }
 
 func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	return h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, transport)
 }
 
 func (h *Handler) evaluatePromptGuardWithConfig(c *gin.Context, cfg promptfilter.Config, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
 	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
-	envelope := promptfilter.BuildEnvelopeWithModels(rawBody, endpoint, requestedModel, effectiveModel, transport, cfg.MaxTextLength)
+	envelope := promptfilter.BuildEnvelopeWithModelsAndConfig(
+		rawBody,
+		endpoint,
+		requestedModel,
+		effectiveModel,
+		transport,
+		cfg,
+	)
 	applyPromptGuardProviderOverride(&envelope, cfg, trustedProfile, providerOverride, providerOverrideSet)
 	extensionErrors := make([]string, 0, 3)
-	sessionPending, err := h.enrichPromptGuardSession(c, cfg, signedBody, &envelope)
-	if err != nil {
-		extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
-	}
-	if err := h.enrichPromptGuardAttachments(promptGuardRequestContext(c), cfg, &envelope); err != nil {
-		extensionErrors = append(extensionErrors, "attachment_parser: "+err.Error())
+	var sessionPending *promptSessionCorrelationPending
+	adapterOnly := envelope.AdapterUnclassified && len(envelope.Segments) == 0
+	if !adapterOnly {
+		var err error
+		sessionPending, err = h.enrichPromptGuardSession(c, cfg, signedBody, &envelope)
+		if err != nil {
+			extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
+		}
+		if err := h.enrichPromptGuardAttachments(promptGuardRequestContext(c), cfg, &envelope); err != nil {
+			extensionErrors = append(extensionErrors, "attachment_parser: "+err.Error())
+		}
 	}
 	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
-	if evaluation.Decision.ApplicationPromptKind == "" {
+	if !adapterOnly && evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
 		}
@@ -217,7 +229,7 @@ func (h *Handler) evaluatePromptGuardWithConfig(c *gin.Context, cfg promptfilter
 }
 
 func (h *Handler) evaluatePromptGuardText(c *gin.Context, text string, endpoint string, model string) promptGuardEvaluation {
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := h.promptFilterConfigForRequest(c)
 	return h.evaluatePromptGuardTextWithConfig(c, cfg, text, endpoint, model)
 }
 
@@ -225,28 +237,27 @@ func (h *Handler) evaluatePromptGuardTextWithConfig(c *gin.Context, cfg promptfi
 	signedBody := ingressRequestBody(c, nil)
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
 	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
-	envelope := promptfilter.RequestEnvelope{
-		Endpoint:       endpoint,
-		Protocol:       promptfilter.ProtocolForEndpoint(endpoint),
-		Transport:      promptfilter.TransportHTTP,
-		RequestedModel: requestedModel,
-		EffectiveModel: effectiveModel,
-		ModelFamily:    promptfilter.ResolveModelFamily(requestedModel, effectiveModel),
-		Segments: []promptfilter.Segment{{
-			Origin: promptfilter.OriginCurrentUser,
-			Role:   "user",
-			Text:   text,
-			Trust:  promptfilter.SegmentTrustClientSupplied,
-		}},
-	}
+	envelope := promptfilter.BuildTextEnvelopeWithModelsAndConfig(
+		text,
+		endpoint,
+		requestedModel,
+		effectiveModel,
+		promptfilter.TransportHTTP,
+		cfg,
+	)
 	applyPromptGuardProviderOverride(&envelope, cfg, trustedProfile, providerOverride, providerOverrideSet)
 	extensionErrors := make([]string, 0, 2)
-	sessionPending, err := h.enrichPromptGuardSession(c, cfg, signedBody, &envelope)
-	if err != nil {
-		extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
+	var sessionPending *promptSessionCorrelationPending
+	adapterOnly := envelope.AdapterUnclassified && len(envelope.Segments) == 0
+	if !adapterOnly {
+		var err error
+		sessionPending, err = h.enrichPromptGuardSession(c, cfg, signedBody, &envelope)
+		if err != nil {
+			extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
+		}
 	}
 	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
-	if evaluation.Decision.ApplicationPromptKind == "" {
+	if !adapterOnly && evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
 		}
@@ -314,7 +325,7 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 		ModeOverride:    modeOverride,
 		RolloutIdentity: rolloutIdentity,
 	})
-	if cfg.Enabled && decision.Mode == promptfilter.GuardModeOff {
+	if cfg.Enabled && decision.Mode == promptfilter.GuardModeOff && decision.ReasonCode != promptfilter.ReasonCodeAdapterUnclassified {
 		return h.evaluateLegacyPromptGuard(c, ctx, cfg, envelope, decision.Profile)
 	}
 	verdict := decision.LegacyVerdict()
@@ -381,17 +392,6 @@ func (h *Handler) scheduleDeferredPromptGuardAudit(c *gin.Context, endpoint stri
 	performance := evaluation.Config.Advanced.Guard.Performance
 	status, reason := defaultPromptGuardShadowDispatcher.enqueue(job, performance.ShadowWorkers, performance.ShadowQueueSize)
 	if status == promptGuardShadowEnqueueAccepted {
-		return
-	}
-	if status == promptGuardShadowEnqueueOverflow && performance.ShadowOverflowMode == promptfilter.GuardShadowOverflowSync {
-		promptGuardShadowFallbackSync.Add(1)
-		ctx, cancel := context.WithTimeout(context.Background(), promptGuardShadowTaskTimeout)
-		err := runDeferredPromptGuardAudit(ctx, job)
-		cancel()
-		if err != nil {
-			promptGuardShadowFailures.Add(1)
-			log.Printf("prompt guard shadow synchronous overflow audit failed: %v", err)
-		}
 		return
 	}
 	promptGuardShadowDropped.Add(1)
@@ -550,6 +550,9 @@ func promptGuardHasReviewableEnforcement(decision promptfilter.Decision) bool {
 }
 
 func promptGuardShouldInspect(decision promptfilter.Decision, cfg promptfilter.Config) bool {
+	if decision.ReasonCode == promptfilter.ReasonCodeAdapterUnclassified {
+		return false
+	}
 	if promptGuardHasReviewableEnforcement(decision) {
 		return true
 	}
@@ -563,7 +566,7 @@ func promptGuardShouldInspect(decision promptfilter.Decision, cfg promptfilter.C
 }
 
 func promptGuardReviewText(decision promptfilter.Decision, envelope promptfilter.RequestEnvelope) string {
-	if decision.ApplicationPromptKind != "" || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate {
+	if decision.ApplicationPromptKind != "" || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate || decision.PrimaryOrigin == promptfilter.OriginCurrentUser {
 		if candidate := strings.TrimSpace(decision.ReviewText); candidate != "" {
 			return candidate
 		}

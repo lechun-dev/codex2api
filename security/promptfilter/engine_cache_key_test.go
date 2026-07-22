@@ -15,6 +15,11 @@ func TestEngineCacheIgnoresOperationalGuardPerformanceChanges(t *testing.T) {
 	operational.Advanced.Guard.Performance.ShadowWorkers = 16
 	operational.Advanced.Guard.Performance.ShadowQueueSize = 4096
 	operational.Advanced.Guard.Performance.ShadowOverflowMode = GuardShadowOverflowSync
+	operational.Advanced.Guard.Performance.MaxSegments = 32
+	operational.Advanced.Guard.Performance.MaxCurrentUserBytes = 262144
+	operational.Advanced.Guard.Performance.MaxAuxiliaryBytes = 16384
+	operational.Advanced.Guard.Performance.ScanChunkBytes = 4096
+	operational.Advanced.Guard.Performance.ScanOverlapBytes = 256
 	operational.Advanced.Guard.Rollout.Enabled = true
 	operational.Advanced.Guard.Rollout.Percent = 25
 	second, err := engineForConfig(operational)

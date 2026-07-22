@@ -1,5 +1,10 @@
 {
   "promptFilter": {
+    "saveRefreshFailed": "設定已儲存，但規則或日誌重新整理失敗；可稍後單獨重新整理頁面",
+    "advancedConfigInvalidTitle": "進階防護設定無法解析",
+    "advancedConfigInvalidDescription": "原始設定已完整保留，目前不會以預設值覆蓋。請修正設定 JSON，或重新整理頁面取得伺服器內容後再儲存。",
+    "advancedConfigInvalidSave": "進階防護設定無效，已阻止儲存以避免覆蓋原始內容",
+    "unknownMode": "未知模式（已保留）",
     "testResultMode": "處理模式",
     "testResultScore": "風險分數",
     "testResultMatches": "命中規則",
@@ -21,7 +26,7 @@
     "sensitiveWordsHint": "敏感詞只進入稽核分，不會提高執行分；如需攔截特定組合，請設定帶意圖條件的自訂規則或 strict 終局規則。",
     "guard": {
       "title": "統一 GuardPipeline",
-      "description": "為 Responses、Chat Completions、Messages 與 WebSocket 提供同一套來源感知審核入口。所有設定皆可獨立選擇，並儲存在進階防護設定中。",
+      "description": "為 Responses、Chat Completions、Messages 與 WebSocket 提供統一的來源感知審核。頁面只保留會改變審核範圍或處理結果的策略設定，執行預算、快取與佇列由系統管理。",
       "globalMode": "全域執行模式",
       "globalModeHint": "控制新 GuardPipeline 的整體行為。選擇繼承舊設定時，不會改變現有 Prompt 過濾、門檻與終局規則的處理方式。",
       "defaultProfile": "預設審核檔案",
@@ -66,14 +71,36 @@
       "providerTitle": "模型家族審核檔案",
       "providerDescription": "預設繼承上方審核檔案；只有需要差異化審核時，才為 GPT、Claude Code、Grok 或其他模型家族設定獨立檔案。",
       "inheritDefaultProfile": "繼承預設審核檔案",
+      "unknownEnumPreserved": "未知設定值（已保留）",
+      "unknownProfile": "未知審核檔案（已保留）",
       "profileTitle": "審核檔案說明",
       "profileDescription": "檔案會調整檢測深度，不會把單一安全技術名詞直接判定為終局違規。",
       "layersTitle": "請求來源層",
-      "layersDescription": "每種來源可選擇獨立模式。建議對目前使用者 Prompt 執行審核，應用程式上下文先使用繼承或影子模式觀察誤報。",
+      "layersDescription": "目前使用者 Prompt 是同步攔截與處罰證據；其他來源只允許關閉或影子稽核，不會直接觸發同步攔截。",
       "performance": {
         "title": "審核效能與首字延遲",
         "description": "重用完全相同的片段檢測結果，並可把純影子輔助層移出使用者等待路徑，在不降低執行層審核強度的前提下減少重複掃描。",
-        "syncSafetyNotice": "無論如何設定，current_user、application_candidate 以及 Warn / Enforce 層一律同步完成審核；這些效能選項無法略過目前使用者 Prompt 的攔截。",
+        "syncSafetyNotice": "無論如何設定，目前使用者輸入、應用候選內容以及警告／攔截層一律同步完成審核；這些效能選項無法略過目前使用者 Prompt 的攔截。",
+        "budgetTitle": "掃描預算與分段邊界",
+        "budgetDescription": "目前使用者輸入與歷史、工具、附件等輔助來源分別使用獨立總預算；建議值兼顧深度審核、首字速度與記憶體穩定性。",
+        "maxCurrentUserBytes": "目前使用者同步掃描上限",
+        "maxCurrentUserBytesHint": "本次請求中目前使用者可控文字共享的 UTF-8 位元組總預算，範圍 8192–1048576，建議 131072。",
+        "maxAuxiliaryBytes": "輔助上下文掃描上限",
+        "maxAuxiliaryBytesHint": "歷史、系統、工具輸出、附件與工作階段上下文共享的 UTF-8 位元組總預算，範圍 0–262144，建議 32768；設為 0 表示不掃描輔助來源。",
+        "scanChunkBytes": "單次掃描分塊大小",
+        "scanChunkBytesHint": "有界掃描工作使用的目標分塊大小，範圍 1024–65536，建議 8192；不得大於目前使用者預算。",
+        "scanOverlapBytes": "相鄰分塊重疊大小",
+        "scanOverlapBytesHint": "相鄰掃描塊保留的 UTF-8 安全重疊位元組，範圍 64–8192，建議 512；必須小於分塊大小。",
+        "maxSegments": "最大文字段數量",
+        "maxSegmentsHint": "一次邏輯請求最多保留的文字段數量，範圍 1–256，建議 64；目前使用者段優先於輔助段。",
+        "overBudgetNotice": "超過預算只會標記為已截斷並進入有界稽核，不會只因內容過長而攔截、處罰或封鎖。",
+        "maxSegmentsError": "請輸入 1–256 的整數。",
+        "maxCurrentUserBytesError": "請輸入 8192–1048576 的整數。",
+        "maxAuxiliaryBytesError": "請輸入 0–262144 的整數。",
+        "scanChunkBytesError": "請輸入 1024–65536 的整數。",
+        "scanChunkBudgetError": "分塊大小不得超過目前使用者同步掃描上限。",
+        "scanOverlapBytesError": "請輸入 64–8192 的整數。",
+        "scanOverlapChunkError": "重疊大小必須小於分塊大小。",
         "asyncShadowAuxiliary": "非同步處理影子輔助層",
         "asyncShadowAuxiliaryHint": "只把最終模式為 Shadow 的工具輸出、歷史、系統/開發者上下文、工作階段與附件等輔助內容放入背景佇列；關閉時這些影子層仍同步掃描。舊設定預設關閉。",
         "exactSegmentCache": "精確片段快取",
@@ -87,10 +114,9 @@
         "shadowQueue": "影子佇列容量",
         "shadowQueueHint": "等待背景審核的純 Shadow 輔助工作上限，範圍 1–4096。預設溢出策略不會把掃描壓回請求執行緒。",
         "shadowOverflowMode": "佇列溢出策略",
-        "shadowOverflowModeHint": "優先低延遲會略過本次純 Shadow 輔助稽核並記錄丟棄計數；完整稽核會同步回退，可能增加首字延遲。目前使用者 Prompt 與 Warn / Enforce 層不受影響。",
+        "shadowOverflowModeHint": "佇列滿時略過本次純影子輔助稽核並記錄丟棄計數，不會把掃描壓回請求執行緒；目前使用者提示詞與警告、攔截層不受影響。",
         "overflowModes": {
-          "drop": "優先低延遲（建議）",
-          "sync": "完整稽核（同步回退）"
+          "drop": "佇列滿時丟棄並記錄"
         }
       },
       "modes": {
@@ -257,7 +283,7 @@
         "title": "會話分段關聯",
         "description": "把同一可信會話內明確要求「繼續」的短請求與最近片段聯合檢查，減少將高風險指令拆成多輪逃避檢測的缺口。",
         "enabled": "啟用會話關聯",
-        "enabledHint": "只增加關聯檢查，不會僅憑歷史累計分直接封禁；建議開啟。",
+        "enabledHint": "目前會話寫入仍需同步存取快取，開啟後可能增加請求延遲；建議暫時保持關閉。",
         "requireSignedIdentity": "僅接受簽名身分",
         "requireSignedIdentityHint": "只使用通過 NewAPI HMAC 驗證的使用者與會話識別，避免客戶端偽造會話串聯他人內容。",
         "combineShortFragments": "自動合併一般短句",
@@ -270,7 +296,7 @@
         "maxTextLengthHint": "聯合後的歷史與目前文字最大長度，超出部分會被有界截斷。",
         "shortFragmentMaxChars": "短片段字元上限",
         "shortFragmentMaxCharsHint": "只在開啟自動合併一般短句時使用；超過此長度的訊息不會作為一般短片段自動串聯。",
-        "recommendedHint": "建議預設：開啟會話關聯、要求簽名身分、關閉一般短句自動合併。這樣只關聯明確的繼續請求，不影響獨立的新任務。"
+        "recommendedHint": "建議預設：關閉會話關聯、保留簽名身分要求並關閉一般短句自動合併。待支援有序非同步寫入後再開啟，可避免快取延遲進入首字路徑。"
       },
       "attachment": {
         "title": "附件內容解析",

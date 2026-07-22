@@ -54,6 +54,67 @@ func TestApplicationCandidateUsesTriggerTextForReviewWithoutStrike(t *testing.T)
 	}
 }
 
+func TestOverflowCurrentUserUsesPrecheckEvidenceForReview(t *testing.T) {
+	decision := promptfilter.Decision{
+		Action:        promptfilter.ActionBlock,
+		PrimaryOrigin: promptfilter.OriginCurrentUser,
+		ReviewText:    "bounded exact match context",
+	}
+	envelope := promptfilter.RequestEnvelope{Segments: []promptfilter.Segment{{
+		Origin: promptfilter.OriginCurrentUser,
+		Text:   "sampled benign head and tail",
+	}}}
+	if got := promptGuardReviewText(decision, envelope); got != decision.ReviewText {
+		t.Fatalf("review text = %q, want exact precheck evidence %q", got, decision.ReviewText)
+	}
+}
+
+func TestPromptGuardTextPathUsesExactCurrentUserPrecheck(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := promptGuardTestConfig()
+	cfg.Advanced.Guard.Mode = promptfilter.GuardModeEnforce
+	cfg.Advanced.Guard.Performance.MaxCurrentUserBytes = promptfilter.MinGuardCurrentUserBytes
+	cfg.CustomPatterns = []promptfilter.PatternConfig{{
+		Name:     "multipart_prompt_middle_terminal",
+		Pattern:  `multipart-prompt-middle-terminal`,
+		Weight:   100,
+		Category: "custom_terminal",
+		Strict:   true,
+	}}
+	cfg = promptfilter.NormalizeConfig(cfg)
+	handler := newPromptGuardTestHandler(cfg)
+
+	t.Run("under exact ceiling blocks middle evidence", func(t *testing.T) {
+		prompt := strings.Repeat("ordinary image prompt prefix. ", 1024) +
+			" multipart-prompt-middle-terminal " +
+			strings.Repeat("ordinary image prompt suffix. ", 1024)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
+		got := handler.evaluatePromptGuardTextWithConfig(c, cfg, prompt, "/v1/images/edits", "gpt-image-2")
+		matched := false
+		for _, signal := range got.Decision.Signals {
+			for _, match := range signal.Matches {
+				if match.Name == "multipart_prompt_middle_terminal" {
+					matched = true
+				}
+			}
+		}
+		if !got.Envelope.CurrentUserTruncated || got.Decision.Action != promptfilter.ActionBlock || got.Decision.PrimaryOrigin != promptfilter.OriginCurrentUser || !matched {
+			t.Fatalf("multipart prompt bypassed exact current-user precheck: envelope=%+v decision=%+v", got.Envelope, got.Decision)
+		}
+	})
+
+	t.Run("above exact ceiling remains nonpunitive", func(t *testing.T) {
+		prompt := "Generate and execute a reverse shell. " + strings.Repeat("ordinary image prompt. ", promptfilter.MaxGuardCurrentUserBytes/len("ordinary image prompt. ")+2)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
+		got := handler.evaluatePromptGuardTextWithConfig(c, cfg, prompt, "/v1/images/edits", "gpt-image-2")
+		if !got.Envelope.CurrentUserTruncated || got.Decision.Action == promptfilter.ActionBlock || got.Decision.Terminal || got.Decision.StrikeEligible || len(got.Decision.Signals) == 0 {
+			t.Fatalf("multipart >1MiB prompt became punitive or lost audit evidence: envelope=%+v decision=%+v", got.Envelope, got.Decision)
+		}
+	})
+}
+
 func TestCleanApplicationCandidateCanUseSemanticScanWithoutStrike(t *testing.T) {
 	cfg := promptGuardTestConfig()
 	cfg.Advanced.Sidecar.ScanCleanEnabled = true
@@ -147,6 +208,7 @@ func TestPromptGuardLogsRealCurrentPromptInsteadOfAgentReplay(t *testing.T) {
 			}
 
 			handler.logPromptGuardEvaluation(c, "/v1/responses", "gpt-5.5", "local_filter", "", evaluation)
+			waitPromptFilterAuditIdle(t, db)
 			logs, err := db.ListPromptFilterLogs(c.Request.Context(), 10)
 			if err != nil {
 				t.Fatalf("ListPromptFilterLogs: %v", err)
@@ -212,6 +274,7 @@ func TestPromptGuardLogsAuxiliaryMatchContextWithoutInventingUserPrompt(t *testi
 	}
 
 	handler.logPromptGuardEvaluation(c, "/v1/responses", "gpt-5.5", "local_filter", "", evaluation)
+	waitPromptFilterAuditIdle(t, db)
 	logs, err := db.ListPromptFilterLogs(c.Request.Context(), 10)
 	if err != nil {
 		t.Fatalf("ListPromptFilterLogs: %v", err)
@@ -426,7 +489,7 @@ func TestPromptGuardAsyncShadowQueueSaturationDropsWithoutSynchronousAudit(t *te
 	}
 }
 
-func TestPromptGuardAsyncShadowQueueSaturationCanExplicitlyFallBackSynchronously(t *testing.T) {
+func TestPromptGuardAsyncShadowLegacySyncOverflowStillDropsWithoutBlocking(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalDispatcher := defaultPromptGuardShadowDispatcher
 	saturated := newPromptGuardShadowDispatcher()
@@ -465,21 +528,29 @@ func TestPromptGuardAsyncShadowQueueSaturationCanExplicitlyFallBackSynchronously
 	if _, ok := evaluation.Decision.DeferredAudit(); !ok {
 		t.Fatalf("expected deferred shadow audit: %+v", evaluation.Decision)
 	}
-	before := promptGuardShadowFallbackSync.Load()
+	beforeDropped := promptGuardShadowDropped.Load()
+	beforeFallback := promptGuardShadowFallbackSync.Load()
+	started := time.Now()
 	handler.logPromptGuardEvaluation(c, "/v1/responses", "gpt-5.5", "local_filter", "", evaluation)
-	if got := promptGuardShadowFallbackSync.Load(); got != before+1 {
-		t.Fatalf("fallback counter = %d, want %d", got, before+1)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("legacy sync overflow blocked request goroutine for %s", elapsed)
+	}
+	if got := promptGuardShadowDropped.Load(); got != beforeDropped+1 {
+		t.Fatalf("dropped counter = %d, want %d", got, beforeDropped+1)
+	}
+	if got := promptGuardShadowFallbackSync.Load(); got != beforeFallback {
+		t.Fatalf("fallback counter = %d, want unchanged %d", got, beforeFallback)
 	}
 	logs, err := db.ListPromptFilterLogs(c.Request.Context(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 1 || logs[0].ReasonCode != "prompt_policy_shadow_async" || logs[0].AuditScore < 100 {
-		t.Fatalf("explicit synchronous fallback did not persist shadow evidence: %+v", logs)
+	if len(logs) != 0 {
+		t.Fatalf("legacy sync overflow unexpectedly persisted synchronous shadow evidence: %+v", logs)
 	}
 }
 
-func TestPromptGuardAsyncShadowDatabaseFailureIsNotCompleted(t *testing.T) {
+func TestPromptGuardAsyncShadowClosedAuditQueueDropsWithoutBlocking(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	waitPromptGuardShadowDispatcherIdle(t, defaultPromptGuardShadowDispatcher)
 	originalDispatcher := defaultPromptGuardShadowDispatcher
@@ -519,13 +590,17 @@ func TestPromptGuardAsyncShadowDatabaseFailureIsNotCompleted(t *testing.T) {
 
 	beforeFailures := promptGuardShadowFailures.Load()
 	beforeCompleted := promptGuardShadowCompleted.Load()
+	beforeDropped := db.PromptFilterAuditStats().DroppedLow
 	handler.logPromptGuardEvaluation(c, "/v1/responses", "gpt-5.5", "local_filter", "", evaluation)
 	waitPromptGuardShadowDispatcherIdle(t, dispatcher)
-	if got := promptGuardShadowFailures.Load(); got != beforeFailures+1 {
-		t.Fatalf("failure counter = %d, want %d", got, beforeFailures+1)
+	if got := promptGuardShadowFailures.Load(); got != beforeFailures {
+		t.Fatalf("shadow dispatcher failure counter = %d, want unchanged %d", got, beforeFailures)
 	}
-	if got := promptGuardShadowCompleted.Load(); got != beforeCompleted {
-		t.Fatalf("completed counter = %d, want unchanged %d after database failure", got, beforeCompleted)
+	if got := promptGuardShadowCompleted.Load(); got != beforeCompleted+1 {
+		t.Fatalf("shadow dispatcher completed counter = %d, want %d", got, beforeCompleted+1)
+	}
+	if got := db.PromptFilterAuditStats().DroppedLow; got <= beforeDropped {
+		t.Fatalf("closed audit queue drop counter = %d, want greater than %d", got, beforeDropped)
 	}
 }
 
@@ -737,7 +812,7 @@ func TestPromptGuardToolContinuationDoesNotReblockHistoricalPrompt(t *testing.T)
 	}
 }
 
-func TestAuxiliaryLayerEnforcementIsNotReviewedAgainstCurrentPrompt(t *testing.T) {
+func TestAuxiliaryLayerRequestedEnforceIsShadowOnlyAndNotReviewed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	reviewCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -764,8 +839,13 @@ func TestAuxiliaryLayerEnforcementIsNotReviewedAgainstCurrentPrompt(t *testing.T
 	if reviewCalls != 0 {
 		t.Fatalf("auxiliary-layer match was reviewed against different current text; calls=%d", reviewCalls)
 	}
-	if got.Decision.Action != promptfilter.ActionBlock || got.Decision.PrimaryOrigin != promptfilter.OriginHistory || got.Decision.StrikeEligible {
-		t.Fatalf("auxiliary-layer decision was changed by current-prompt review: %+v", got.Decision)
+	if got.Decision.Action != promptfilter.ActionAllow || got.Decision.WouldAction != promptfilter.ActionBlock || got.Decision.PrimaryOrigin != promptfilter.OriginHistory || got.Decision.StrikeEligible {
+		t.Fatalf("auxiliary-layer decision was not normalized to shadow-only evidence: %+v", got.Decision)
+	}
+	for _, signal := range got.Decision.Signals {
+		if signal.Origin == promptfilter.OriginHistory && signal.LayerMode != promptfilter.GuardModeShadow {
+			t.Fatalf("history signal escaped shadow normalization: %+v", signal)
+		}
 	}
 }
 

@@ -3,9 +3,374 @@ package database
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
+
+const (
+	promptFilterAuditHighCapacity = 512
+	promptFilterAuditLowCapacity  = 3584
+	promptFilterAuditWorkers      = 4
+	promptFilterAuditTaskTimeout  = 3 * time.Second
+	promptFilterAuditMaxJobBytes  = 256 * 1024
+	promptFilterAuditMaxHighBytes = 8 * 1024 * 1024
+	promptFilterAuditMaxLowBytes  = 24 * 1024 * 1024
+)
+
+type PromptFilterLogPriority uint8
+
+const (
+	PromptFilterLogPriorityLow PromptFilterLogPriority = iota
+	PromptFilterLogPriorityHigh
+)
+
+type PromptFilterAuditStats struct {
+	Enqueued           uint64
+	Completed          uint64
+	DroppedHigh        uint64
+	DroppedLow         uint64
+	Failed             uint64
+	ProcessingNanos    uint64
+	MaxProcessingNanos uint64
+	PendingHigh        int
+	PendingLow         int
+	RetainedBytes      int64
+}
+
+type promptFilterAuditJob struct {
+	input PromptFilterLogInput
+	bytes int64
+}
+
+type promptFilterAuditQueue struct {
+	db        *DB
+	high      chan promptFilterAuditJob
+	low       chan promptFilterAuditJob
+	ctx       context.Context
+	stop      chan struct{}
+	done      chan struct{}
+	cancel    context.CancelFunc
+	closed    atomic.Bool
+	enqueueMu sync.RWMutex
+	wg        sync.WaitGroup
+
+	enqueued           atomic.Uint64
+	completed          atomic.Uint64
+	droppedHigh        atomic.Uint64
+	droppedLow         atomic.Uint64
+	failed             atomic.Uint64
+	processingNanos    atomic.Uint64
+	maxProcessingNanos atomic.Uint64
+	pending            atomic.Int64
+	retainedHigh       atomic.Int64
+	retainedLow        atomic.Int64
+	lastDropLog        atomic.Int64
+}
+
+func newPromptFilterAuditQueue(db *DB) *promptFilterAuditQueue {
+	ctx, cancel := context.WithCancel(context.Background())
+	queue := &promptFilterAuditQueue{
+		db: db, high: make(chan promptFilterAuditJob, promptFilterAuditHighCapacity), low: make(chan promptFilterAuditJob, promptFilterAuditLowCapacity),
+		ctx: ctx, stop: make(chan struct{}), done: make(chan struct{}), cancel: cancel,
+	}
+	return queue
+}
+
+func (q *promptFilterAuditQueue) start() {
+	if q == nil || q.db == nil {
+		return
+	}
+	q.wg.Add(promptFilterAuditWorkers)
+	for range promptFilterAuditWorkers {
+		go q.worker()
+	}
+	go func() {
+		q.wg.Wait()
+		close(q.done)
+	}()
+}
+
+func (q *promptFilterAuditQueue) close(timeout time.Duration) {
+	if q == nil {
+		return
+	}
+	q.enqueueMu.Lock()
+	if !q.closed.CompareAndSwap(false, true) {
+		q.enqueueMu.Unlock()
+		return
+	}
+	close(q.stop)
+	q.enqueueMu.Unlock()
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-q.done:
+		q.cancel()
+		return
+	case <-timer.C:
+		q.cancel()
+	}
+	// Give canceled database calls a short, fixed window to unwind. Close may
+	// continue afterwards; workers hold no request-scoped data or raw bodies.
+	select {
+	case <-q.done:
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+func (q *promptFilterAuditQueue) enqueue(input PromptFilterLogInput, priority PromptFilterLogPriority) bool {
+	if q == nil || q.db == nil {
+		return false
+	}
+	q.enqueueMu.RLock()
+	defer q.enqueueMu.RUnlock()
+	if q.closed.Load() {
+		q.drop(priority, "closed")
+		return false
+	}
+	jobBytes := int64(promptFilterLogInputBytes(input))
+	if jobBytes > promptFilterAuditMaxJobBytes {
+		q.drop(priority, "job_too_large")
+		return false
+	}
+	input = clonePromptFilterLogInput(input)
+	if !q.reserveBytes(priority, jobBytes) {
+		q.drop(priority, "queue_bytes_full")
+		return false
+	}
+	job := promptFilterAuditJob{input: input, bytes: jobBytes}
+	queue := q.low
+	if priority == PromptFilterLogPriorityHigh {
+		queue = q.high
+	}
+	q.pending.Add(1)
+	select {
+	case <-q.stop:
+		q.pending.Add(-1)
+		q.releaseBytes(priority, jobBytes)
+		q.drop(priority, "closed")
+		return false
+	case queue <- job:
+		q.enqueued.Add(1)
+		return true
+	default:
+		q.pending.Add(-1)
+		q.releaseBytes(priority, jobBytes)
+		q.drop(priority, "queue_full")
+		return false
+	}
+}
+
+func (q *promptFilterAuditQueue) reserveBytes(priority PromptFilterLogPriority, size int64) bool {
+	limit := int64(promptFilterAuditMaxLowBytes)
+	counter := &q.retainedLow
+	if priority == PromptFilterLogPriorityHigh {
+		limit = promptFilterAuditMaxHighBytes
+		counter = &q.retainedHigh
+	}
+	if size < 0 || size > limit {
+		return false
+	}
+	for {
+		current := counter.Load()
+		if current+size > limit {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+size) {
+			return true
+		}
+	}
+}
+
+func (q *promptFilterAuditQueue) releaseBytes(priority PromptFilterLogPriority, size int64) {
+	if priority == PromptFilterLogPriorityHigh {
+		q.retainedHigh.Add(-size)
+		return
+	}
+	q.retainedLow.Add(-size)
+}
+
+func (q *promptFilterAuditQueue) worker() {
+	defer q.wg.Done()
+	for {
+		job, priority, ok := q.next()
+		if !ok {
+			return
+		}
+		func() {
+			started := time.Now()
+			defer q.pending.Add(-1)
+			defer q.releaseBytes(priority, job.bytes)
+			defer func() {
+				elapsed := uint64(time.Since(started))
+				q.processingNanos.Add(elapsed)
+				for {
+					current := q.maxProcessingNanos.Load()
+					if elapsed <= current || q.maxProcessingNanos.CompareAndSwap(current, elapsed) {
+						break
+					}
+				}
+			}()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					q.failed.Add(1)
+					log.Printf("prompt filter audit worker panic: %v", recovered)
+				}
+			}()
+			attempts := 1
+			if priority == PromptFilterLogPriorityHigh {
+				attempts = 2
+			}
+			for attempt := 0; attempt < attempts; attempt++ {
+				ctx, cancel := context.WithTimeout(q.ctx, promptFilterAuditTaskTimeout)
+				err := q.db.InsertPromptFilterLog(ctx, &job.input)
+				cancel()
+				if err == nil {
+					q.completed.Add(1)
+					return
+				}
+				if attempt+1 < attempts {
+					select {
+					case <-q.ctx.Done():
+						break
+					case <-time.After(25 * time.Millisecond):
+						continue
+					}
+				}
+				q.failed.Add(1)
+				log.Printf("prompt filter audit persist failed: %v", err)
+				return
+			}
+		}()
+	}
+}
+
+func (q *promptFilterAuditQueue) next() (promptFilterAuditJob, PromptFilterLogPriority, bool) {
+	select {
+	case input := <-q.high:
+		return input, PromptFilterLogPriorityHigh, true
+	default:
+	}
+	select {
+	case input := <-q.high:
+		return input, PromptFilterLogPriorityHigh, true
+	case input := <-q.low:
+		return input, PromptFilterLogPriorityLow, true
+	case <-q.stop:
+		return q.nextDraining()
+	}
+}
+
+func (q *promptFilterAuditQueue) nextDraining() (promptFilterAuditJob, PromptFilterLogPriority, bool) {
+	select {
+	case input := <-q.high:
+		return input, PromptFilterLogPriorityHigh, true
+	default:
+	}
+	select {
+	case input := <-q.high:
+		return input, PromptFilterLogPriorityHigh, true
+	case input := <-q.low:
+		return input, PromptFilterLogPriorityLow, true
+	default:
+		return promptFilterAuditJob{}, PromptFilterLogPriorityLow, false
+	}
+}
+
+func (q *promptFilterAuditQueue) drop(priority PromptFilterLogPriority, reason string) {
+	if priority == PromptFilterLogPriorityHigh {
+		q.droppedHigh.Add(1)
+	} else {
+		q.droppedLow.Add(1)
+	}
+	now := time.Now().UnixNano()
+	last := q.lastDropLog.Load()
+	if last != 0 && time.Duration(now-last) < 5*time.Second {
+		return
+	}
+	if q.lastDropLog.CompareAndSwap(last, now) {
+		log.Printf("prompt filter audit dropped: reason=%s priority_high=%t dropped_high=%d dropped_low=%d", reason, priority == PromptFilterLogPriorityHigh, q.droppedHigh.Load(), q.droppedLow.Load())
+	}
+}
+
+func promptFilterLogInputBytes(input PromptFilterLogInput) int {
+	return len(input.Source) + len(input.Endpoint) + len(input.Protocol) + len(input.Provider) + len(input.Model) +
+		len(input.Action) + len(input.Mode) + len(input.PolicyProfile) + len(input.ReasonCode) + len(input.PrimaryOrigin) +
+		len(input.MatchedPatterns) + len(input.TextPreview) + len(input.MatchContext) + len(input.FullText) +
+		len(input.APIKeyName) + len(input.APIKeyMasked) + len(input.ClientIP) + len(input.ErrorCode) + len(input.ReviewModel) + len(input.ReviewError)
+}
+
+func clonePromptFilterLogInput(input PromptFilterLogInput) PromptFilterLogInput {
+	input.Source = strings.Clone(input.Source)
+	input.Endpoint = strings.Clone(input.Endpoint)
+	input.Protocol = strings.Clone(input.Protocol)
+	input.Provider = strings.Clone(input.Provider)
+	input.Model = strings.Clone(input.Model)
+	input.Action = strings.Clone(input.Action)
+	input.Mode = strings.Clone(input.Mode)
+	input.PolicyProfile = strings.Clone(input.PolicyProfile)
+	input.ReasonCode = strings.Clone(input.ReasonCode)
+	input.PrimaryOrigin = strings.Clone(input.PrimaryOrigin)
+	input.MatchedPatterns = strings.Clone(input.MatchedPatterns)
+	input.TextPreview = strings.Clone(input.TextPreview)
+	input.MatchContext = strings.Clone(input.MatchContext)
+	input.FullText = strings.Clone(input.FullText)
+	input.APIKeyName = strings.Clone(input.APIKeyName)
+	input.APIKeyMasked = strings.Clone(input.APIKeyMasked)
+	input.ClientIP = strings.Clone(input.ClientIP)
+	input.ErrorCode = strings.Clone(input.ErrorCode)
+	input.ReviewModel = strings.Clone(input.ReviewModel)
+	input.ReviewError = strings.Clone(input.ReviewError)
+	return input
+}
+
+// EnqueuePromptFilterLog moves an already-redacted audit record off the
+// request path. Queue saturation or storage failure never changes the policy
+// decision and never falls back to a synchronous database write.
+func (db *DB) EnqueuePromptFilterLog(input *PromptFilterLogInput, priority PromptFilterLogPriority) bool {
+	if db == nil || input == nil || db.promptFilterAudit == nil {
+		return false
+	}
+	return db.promptFilterAudit.enqueue(*input, priority)
+}
+
+func (db *DB) PromptFilterAuditStats() PromptFilterAuditStats {
+	if db == nil || db.promptFilterAudit == nil {
+		return PromptFilterAuditStats{}
+	}
+	q := db.promptFilterAudit
+	return PromptFilterAuditStats{
+		Enqueued: q.enqueued.Load(), Completed: q.completed.Load(), DroppedHigh: q.droppedHigh.Load(), DroppedLow: q.droppedLow.Load(), Failed: q.failed.Load(),
+		ProcessingNanos: q.processingNanos.Load(), MaxProcessingNanos: q.maxProcessingNanos.Load(),
+		PendingHigh: len(q.high), PendingLow: len(q.low), RetainedBytes: q.retainedHigh.Load() + q.retainedLow.Load(),
+	}
+}
+
+// WaitPromptFilterAuditIdle is intended for shutdown coordination and tests;
+// request handlers must never wait for audit persistence.
+func (db *DB) WaitPromptFilterAuditIdle(ctx context.Context) bool {
+	if db == nil || db.promptFilterAudit == nil {
+		return true
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if db.promptFilterAudit.pending.Load() == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
 
 type PromptFilterLog struct {
 	ID              int64     `json:"id"`

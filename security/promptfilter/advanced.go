@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"html"
 	"io"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -74,10 +76,35 @@ type GuardPerformanceConfig struct {
 	ExactSegmentCacheEnabled    bool   `json:"exact_segment_cache_enabled"`
 	ExactSegmentCacheEntries    int    `json:"exact_segment_cache_entries"`
 	ExactSegmentCacheTTLSeconds int    `json:"exact_segment_cache_ttl_seconds"`
+	MaxSegments                 int    `json:"max_segments"`
+	MaxCurrentUserBytes         int    `json:"max_current_user_bytes"`
+	MaxAuxiliaryBytes           int    `json:"max_auxiliary_bytes"`
+	ScanChunkBytes              int    `json:"scan_chunk_bytes"`
+	ScanOverlapBytes            int    `json:"scan_overlap_bytes"`
 	ShadowWorkers               int    `json:"shadow_workers"`
 	ShadowQueueSize             int    `json:"shadow_queue_size"`
 	ShadowOverflowMode          string `json:"shadow_overflow_mode"`
 }
+
+const (
+	MinGuardMaxSegments              = 1
+	MaxGuardMaxSegments              = 256
+	MinGuardCurrentUserBytes         = 8 * 1024
+	MaxGuardCurrentUserBytes         = 1024 * 1024
+	MinGuardAuxiliaryBytes           = 0
+	MaxGuardAuxiliaryBytes           = 256 * 1024
+	MinGuardScanChunkBytes           = 1024
+	MaxGuardScanChunkBytes           = 64 * 1024
+	MinGuardScanOverlapBytes         = 64
+	MaxGuardScanOverlapBytes         = 8 * 1024
+	DefaultGuardScanChunkBytes       = 16 * 1024
+	DefaultGuardScanOverlapBytes     = 8 * 1024
+	RecommendedGuardMaxSegments      = 64
+	RecommendedGuardCurrentUserBytes = 128 * 1024
+	RecommendedGuardAuxiliaryBytes   = 32 * 1024
+	RecommendedGuardScanChunkBytes   = 8 * 1024
+	RecommendedGuardScanOverlapBytes = 512
+)
 
 // GuardRolloutConfig limits enforce mode to a stable subset of authenticated
 // users. Rollout is deliberately downgrade-only: requests outside the selected
@@ -266,9 +293,17 @@ func RecommendedAdvancedConfig() AdvancedConfig {
 	cfg.Risk.IPWeightPercent = 20
 	cfg.Risk.SessionWeightPercent = 20
 	cfg.Sidecar.FailClosed = false
-	cfg.Session.Enabled = true
+	// Session persistence still uses synchronous cache lease/get/set. Keep it
+	// disabled in the production preset until the cache interface provides the
+	// CAS semantics required for ordered, non-blocking writes.
+	cfg.Session.Enabled = false
 	cfg.Guard.DefaultProfile = GuardProfileBalanced
 	cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled = true
+	cfg.Guard.Performance.MaxSegments = RecommendedGuardMaxSegments
+	cfg.Guard.Performance.MaxCurrentUserBytes = RecommendedGuardCurrentUserBytes
+	cfg.Guard.Performance.MaxAuxiliaryBytes = RecommendedGuardAuxiliaryBytes
+	cfg.Guard.Performance.ScanChunkBytes = RecommendedGuardScanChunkBytes
+	cfg.Guard.Performance.ScanOverlapBytes = RecommendedGuardScanOverlapBytes
 	cfg.Guard.Layers = GuardLayerConfig{
 		CurrentUser:       GuardLayerModeConfig{Mode: GuardModeEnforce},
 		History:           GuardLayerModeConfig{Mode: GuardModeOff},
@@ -298,9 +333,17 @@ func DefaultGuardConfig() GuardConfig {
 			ExactSegmentCacheEnabled:    true,
 			ExactSegmentCacheEntries:    4096,
 			ExactSegmentCacheTTLSeconds: 600,
-			ShadowWorkers:               2,
-			ShadowQueueSize:             256,
-			ShadowOverflowMode:          GuardShadowOverflowDrop,
+			// Compatibility defaults intentionally mirror the pre-budget
+			// MaxTextLength behavior. Fresh installs and the explicit recommended
+			// preset use the tighter, source-specific values above.
+			MaxSegments:         MaxGuardMaxSegments,
+			MaxCurrentUserBytes: DefaultMaxTextLength,
+			MaxAuxiliaryBytes:   DefaultMaxTextLength,
+			ScanChunkBytes:      DefaultGuardScanChunkBytes,
+			ScanOverlapBytes:    DefaultGuardScanOverlapBytes,
+			ShadowWorkers:       2,
+			ShadowQueueSize:     256,
+			ShadowOverflowMode:  GuardShadowOverflowDrop,
 		},
 		Layers: GuardLayerConfig{
 			CurrentUser:       inherit,
@@ -326,6 +369,176 @@ func ParseAdvancedConfig(raw string) (AdvancedConfig, error) {
 		return AdvancedConfig{}, err
 	}
 	return NormalizeAdvancedConfig(cfg), nil
+}
+
+// AdvancedConfigDocument keeps the persisted JSON separate from the
+// normalized configuration used at runtime. Raw contains all known fields in
+// their effective form while retaining fields introduced by newer versions.
+type AdvancedConfigDocument struct {
+	Raw       string
+	Effective AdvancedConfig
+}
+
+// ParseAdvancedConfigDocument parses a persisted advanced configuration and
+// returns both its normalized runtime form and a forward-compatible JSON
+// document. Legacy partial documents are expanded with current defaults;
+// unknown fields are retained at every object level.
+func ParseAdvancedConfigDocument(raw string) (AdvancedConfigDocument, error) {
+	root, err := parseAdvancedConfigObject(raw)
+	if err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	effective, err := ParseAdvancedConfig(raw)
+	if err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	formatted, err := marshalAdvancedConfigDocument(root, effective)
+	if err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	return AdvancedConfigDocument{Raw: formatted, Effective: effective}, nil
+}
+
+// MergeAdvancedConfigDocument applies an object-level JSON merge patch to an
+// existing document. Objects are merged recursively, arrays and scalar values
+// replace the previous value, and null removes a field. This lets an older UI
+// update only fields it understands without deleting future-version fields.
+func MergeAdvancedConfigDocument(baseRaw, patchRaw string) (AdvancedConfigDocument, error) {
+	base, err := parseAdvancedConfigObject(baseRaw)
+	if err != nil {
+		return AdvancedConfigDocument{}, fmt.Errorf("parse existing advanced config: %w", err)
+	}
+	patch, err := parseAdvancedConfigObject(patchRaw)
+	if err != nil {
+		return AdvancedConfigDocument{}, fmt.Errorf("parse advanced config update: %w", err)
+	}
+	if err := mergeAdvancedConfigObjects(base, patch, ""); err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	merged, err := json.Marshal(base)
+	if err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	return ParseAdvancedConfigDocument(string(merged))
+}
+
+// MarshalAdvancedConfigDocument overlays the effective known configuration
+// onto a previously persisted document while retaining unknown fields. It is
+// used when backend code changes the runtime configuration without receiving a
+// new raw JSON document from the settings API.
+func MarshalAdvancedConfigDocument(raw string, cfg AdvancedConfig) (string, error) {
+	root, err := parseAdvancedConfigObject(raw)
+	if err != nil {
+		return "", err
+	}
+	return marshalAdvancedConfigDocument(root, cfg)
+}
+
+func parseAdvancedConfigObject(raw string) (map[string]json.RawMessage, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return make(map[string]json.RawMessage), nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
+		return nil, err
+	}
+	if object == nil {
+		return make(map[string]json.RawMessage), nil
+	}
+	return object, nil
+}
+
+func marshalAdvancedConfigDocument(root map[string]json.RawMessage, cfg AdvancedConfig) (string, error) {
+	removeAdvancedConfigSensitiveFields(root)
+	knownRaw, err := json.Marshal(NormalizeAdvancedConfig(cfg))
+	if err != nil {
+		return "", err
+	}
+	known, err := parseAdvancedConfigObject(string(knownRaw))
+	if err != nil {
+		return "", err
+	}
+	if err := mergeAdvancedConfigObjects(root, known, ""); err != nil {
+		return "", err
+	}
+	formatted, err := json.Marshal(root)
+	if err != nil {
+		return "", err
+	}
+	return string(formatted), nil
+}
+
+func removeAdvancedConfigSensitiveFields(root map[string]json.RawMessage) {
+	newAPI, ok := decodeAdvancedConfigObject(root["newapi"])
+	if !ok {
+		return
+	}
+	// The shared secret has a dedicated encrypted/database-backed endpoint and
+	// is intentionally json:"-" in NewAPIConfig. Never mistake it for a future
+	// field and persist or expose it through the general settings document.
+	for key := range newAPI {
+		if strings.EqualFold(strings.TrimSpace(key), "secret") {
+			delete(newAPI, key)
+		}
+	}
+	encoded, err := json.Marshal(newAPI)
+	if err == nil {
+		root["newapi"] = encoded
+	}
+}
+
+func mergeAdvancedConfigObjects(base, patch map[string]json.RawMessage, path string) error {
+	for key, patchValue := range patch {
+		if isJSONNull(patchValue) {
+			delete(base, key)
+			continue
+		}
+		currentPath := key
+		if path != "" {
+			currentPath = path + "." + key
+		}
+		// provider_profiles is a user-managed map, not a configuration struct.
+		// Replacing it as a unit preserves the existing add/remove semantics.
+		if currentPath == "guard.provider_profiles" {
+			base[key] = cloneRawMessage(patchValue)
+			continue
+		}
+		patchObject, patchIsObject := decodeAdvancedConfigObject(patchValue)
+		baseObject, baseIsObject := decodeAdvancedConfigObject(base[key])
+		if patchIsObject && baseIsObject {
+			if err := mergeAdvancedConfigObjects(baseObject, patchObject, currentPath); err != nil {
+				return err
+			}
+			merged, err := json.Marshal(baseObject)
+			if err != nil {
+				return err
+			}
+			base[key] = merged
+			continue
+		}
+		base[key] = cloneRawMessage(patchValue)
+	}
+	return nil
+}
+
+func decodeAdvancedConfigObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, false
+	}
+	return object, true
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func cloneRawMessage(raw json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), raw...)
 }
 
 func MarshalAdvancedConfig(cfg AdvancedConfig) string {
@@ -584,6 +797,46 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	cfg.Mode = normalizeGuardMode(cfg.Mode, d.Mode)
 	cfg.DefaultProfile = normalizeGuardProfileName(cfg.DefaultProfile, d.DefaultProfile)
 	cfg.Rollout = normalizeGuardRolloutConfig(cfg.Rollout, d.Rollout)
+	if cfg.Performance.MaxSegments < MinGuardMaxSegments {
+		cfg.Performance.MaxSegments = d.Performance.MaxSegments
+	} else if cfg.Performance.MaxSegments > MaxGuardMaxSegments {
+		cfg.Performance.MaxSegments = MaxGuardMaxSegments
+	}
+	if cfg.Performance.MaxCurrentUserBytes <= 0 {
+		cfg.Performance.MaxCurrentUserBytes = d.Performance.MaxCurrentUserBytes
+	} else if cfg.Performance.MaxCurrentUserBytes < MinGuardCurrentUserBytes {
+		cfg.Performance.MaxCurrentUserBytes = MinGuardCurrentUserBytes
+	} else if cfg.Performance.MaxCurrentUserBytes > MaxGuardCurrentUserBytes {
+		cfg.Performance.MaxCurrentUserBytes = MaxGuardCurrentUserBytes
+	}
+	if cfg.Performance.MaxAuxiliaryBytes < MinGuardAuxiliaryBytes {
+		cfg.Performance.MaxAuxiliaryBytes = d.Performance.MaxAuxiliaryBytes
+	} else if cfg.Performance.MaxAuxiliaryBytes > MaxGuardAuxiliaryBytes {
+		cfg.Performance.MaxAuxiliaryBytes = MaxGuardAuxiliaryBytes
+	}
+	if cfg.Performance.ScanChunkBytes <= 0 {
+		cfg.Performance.ScanChunkBytes = d.Performance.ScanChunkBytes
+	} else if cfg.Performance.ScanChunkBytes < MinGuardScanChunkBytes {
+		cfg.Performance.ScanChunkBytes = MinGuardScanChunkBytes
+	} else if cfg.Performance.ScanChunkBytes > MaxGuardScanChunkBytes {
+		cfg.Performance.ScanChunkBytes = MaxGuardScanChunkBytes
+	}
+	if cfg.Performance.ScanChunkBytes > cfg.Performance.MaxCurrentUserBytes {
+		cfg.Performance.ScanChunkBytes = cfg.Performance.MaxCurrentUserBytes
+	}
+	if cfg.Performance.ScanOverlapBytes <= 0 {
+		cfg.Performance.ScanOverlapBytes = d.Performance.ScanOverlapBytes
+	} else if cfg.Performance.ScanOverlapBytes < MinGuardScanOverlapBytes {
+		cfg.Performance.ScanOverlapBytes = MinGuardScanOverlapBytes
+	} else if cfg.Performance.ScanOverlapBytes > MaxGuardScanOverlapBytes {
+		cfg.Performance.ScanOverlapBytes = MaxGuardScanOverlapBytes
+	}
+	if cfg.Performance.ScanOverlapBytes >= cfg.Performance.ScanChunkBytes {
+		cfg.Performance.ScanOverlapBytes = cfg.Performance.ScanChunkBytes / 16
+		if cfg.Performance.ScanOverlapBytes < MinGuardScanOverlapBytes {
+			cfg.Performance.ScanOverlapBytes = MinGuardScanOverlapBytes
+		}
+	}
 	if cfg.Performance.ExactSegmentCacheEntries <= 0 {
 		cfg.Performance.ExactSegmentCacheEntries = d.Performance.ExactSegmentCacheEntries
 	} else if cfg.Performance.ExactSegmentCacheEntries > 32768 {
@@ -604,12 +857,11 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	} else if cfg.Performance.ShadowQueueSize > 4096 {
 		cfg.Performance.ShadowQueueSize = 4096
 	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Performance.ShadowOverflowMode)) {
-	case GuardShadowOverflowSync:
-		cfg.Performance.ShadowOverflowMode = GuardShadowOverflowSync
-	default:
-		cfg.Performance.ShadowOverflowMode = GuardShadowOverflowDrop
-	}
+	// Synchronous overflow fallback is intentionally retired: auxiliary Shadow
+	// work must never be pushed back onto the latency-sensitive request path.
+	// Normalize legacy "sync" values (and any unknown values) to "drop" so old
+	// persisted configurations migrate safely on their next read/write cycle.
+	cfg.Performance.ShadowOverflowMode = GuardShadowOverflowDrop
 
 	profiles := make(map[string]string, len(d.ProviderProfiles)+len(cfg.ProviderProfiles))
 	for provider, profile := range d.ProviderProfiles {
@@ -625,16 +877,24 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	cfg.ProviderProfiles = profiles
 
 	cfg.Layers.CurrentUser.Mode = normalizeGuardMode(cfg.Layers.CurrentUser.Mode, d.Layers.CurrentUser.Mode)
-	cfg.Layers.History.Mode = normalizeGuardMode(cfg.Layers.History.Mode, d.Layers.History.Mode)
-	cfg.Layers.System.Mode = normalizeGuardMode(cfg.Layers.System.Mode, d.Layers.System.Mode)
-	cfg.Layers.Developer.Mode = normalizeGuardMode(cfg.Layers.Developer.Mode, d.Layers.Developer.Mode)
-	cfg.Layers.Instructions.Mode = normalizeGuardMode(cfg.Layers.Instructions.Mode, d.Layers.Instructions.Mode)
-	cfg.Layers.ToolOutput.Mode = normalizeGuardMode(cfg.Layers.ToolOutput.Mode, d.Layers.ToolOutput.Mode)
-	cfg.Layers.ToolArguments.Mode = normalizeGuardMode(cfg.Layers.ToolArguments.Mode, d.Layers.ToolArguments.Mode)
-	cfg.Layers.AttachmentRefs.Mode = normalizeGuardMode(cfg.Layers.AttachmentRefs.Mode, d.Layers.AttachmentRefs.Mode)
-	cfg.Layers.SessionContext.Mode = normalizeGuardMode(cfg.Layers.SessionContext.Mode, d.Layers.SessionContext.Mode)
-	cfg.Layers.AttachmentContent.Mode = normalizeGuardMode(cfg.Layers.AttachmentContent.Mode, d.Layers.AttachmentContent.Mode)
+	cfg.Layers.History.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.History.Mode, d.Layers.History.Mode)
+	cfg.Layers.System.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.System.Mode, d.Layers.System.Mode)
+	cfg.Layers.Developer.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.Developer.Mode, d.Layers.Developer.Mode)
+	cfg.Layers.Instructions.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.Instructions.Mode, d.Layers.Instructions.Mode)
+	cfg.Layers.ToolOutput.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.ToolOutput.Mode, d.Layers.ToolOutput.Mode)
+	cfg.Layers.ToolArguments.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.ToolArguments.Mode, d.Layers.ToolArguments.Mode)
+	cfg.Layers.AttachmentRefs.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.AttachmentRefs.Mode, d.Layers.AttachmentRefs.Mode)
+	cfg.Layers.SessionContext.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.SessionContext.Mode, d.Layers.SessionContext.Mode)
+	cfg.Layers.AttachmentContent.Mode = normalizeAuxiliaryGuardMode(cfg.Layers.AttachmentContent.Mode, d.Layers.AttachmentContent.Mode)
 	return cfg
+}
+
+func normalizeAuxiliaryGuardMode(mode string, fallback string) string {
+	mode = normalizeGuardMode(mode, fallback)
+	if mode == GuardModeEnforce {
+		return GuardModeShadow
+	}
+	return mode
 }
 
 func normalizeGuardRolloutConfig(cfg GuardRolloutConfig, defaults GuardRolloutConfig) GuardRolloutConfig {
@@ -738,6 +998,28 @@ type scanView struct {
 }
 
 func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) []scanView {
+	return scanViewsWithBudget(text, cfg, 0, currentEngines...)
+}
+
+func scanViewsWithBudget(text string, cfg NormalizationConfig, maxNormalizedBytes int, currentEngines ...*Engine) []scanView {
+	performance := GuardPerformanceConfig{
+		ScanChunkBytes:   DefaultGuardScanChunkBytes,
+		ScanOverlapBytes: DefaultGuardScanOverlapBytes,
+	}
+	if len(currentEngines) > 0 && currentEngines[0] != nil {
+		performance = currentEngines[0].cfg.Advanced.Guard.Performance
+	}
+	return scanViewsWithRuntimeBudget(text, cfg, maxNormalizedBytes, performance, currentEngines...)
+}
+
+// scanViewsWithRuntimeBudget keeps operational scan-window tuning outside the
+// compiled Engine identity. Callers on a hot configuration path must pass the
+// current normalized performance config explicitly so an Engine cached under
+// otherwise-identical detection rules cannot retain stale chunk/overlap values.
+func scanViewsWithRuntimeBudget(text string, cfg NormalizationConfig, maxNormalizedBytes int, performance GuardPerformanceConfig, currentEngines ...*Engine) []scanView {
+	if maxNormalizedBytes > 0 {
+		text = limitScanTextExact(text, maxNormalizedBytes)
+	}
 	base := normalizeForScan(text)
 	if !cfg.Enabled {
 		return []scanView{{Text: base}}
@@ -748,6 +1030,7 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 		maxNormalizationSources = 32
 		maxDerivedViewBytesCap  = 4 * 1024 * 1024
 	)
+	scanChunkBytes, scanOverlapBytes := guardScanWindow(performance)
 	maxEncodedFragmentBytes := len(text)
 	if maxEncodedFragmentBytes < 16*1024 {
 		maxEncodedFragmentBytes = 16 * 1024
@@ -762,15 +1045,20 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 	if maxDerivedViewBytes > maxDerivedViewBytesCap {
 		maxDerivedViewBytes = maxDerivedViewBytesCap
 	}
+	if maxNormalizedBytes > 0 && maxDerivedViewBytes > maxNormalizedBytes {
+		maxDerivedViewBytes = maxNormalizedBytes
+	}
 	if cfg.DecodeBase64 || cfg.DecodeHex {
 		base = normalizeForScan(collapseRecognizedEncodedPayloads(text, cfg, maxEncodedFragmentBytes, nil))
 	}
 
 	views := []scanView{{Text: base}}
 	viewIndex := map[string]int{base: 0}
-	addOne := func(value string, reviewOnly, compacted bool) {
+	derivedRemaining := maxDerivedViewBytes
+	primaryAllowance := maxDerivedViewBytes / 2
+	addOne := func(value string, reviewOnly, compacted bool, allowance *int) {
 		value = normalizeForScan(value)
-		if value == "" || len(value) > maxDerivedViewBytes || len(views) >= maxNormalizationViews {
+		if value == "" || len(views) >= maxNormalizationViews {
 			return
 		}
 		if index, exists := viewIndex[value]; exists {
@@ -782,17 +1070,36 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 			views[index].Compacted = views[index].Compacted || compacted
 			return
 		}
+		available := derivedRemaining
+		if allowance != nil && *allowance < available {
+			available = *allowance
+		}
+		if available <= 0 {
+			return
+		}
+		value = safeUTF8Prefix(value, available)
+		if value == "" {
+			return
+		}
+		derivedRemaining -= len(value)
+		if allowance != nil {
+			*allowance -= len(value)
+		}
 		viewIndex[value] = len(views)
 		views = append(views, scanView{Text: value, ReviewOnly: reviewOnly, Compacted: compacted})
 	}
-	add := func(value string, reviewOnly bool) {
-		sourceCanonical := norm.NFKC.String(value)
+	add := func(value string, reviewOnly bool, primary bool) {
+		sourceCanonical := boundedNFKC(value, maxDerivedViewBytes)
 		canonical := stripInvisible(sourceCanonical)
-		addOne(canonical, reviewOnly, false)
+		var allowance *int
+		if primary {
+			allowance = &primaryAllowance
+		}
+		addOne(canonical, reviewOnly, false, allowance)
 		// Compact matching scans the cleaned value, while its enablement keeps
 		// evidence from the pre-strip source (for example zero-width separators).
 		if minorSafetyShouldInspectCompact(sourceCanonical) {
-			addOne(compactForScan(canonical), reviewOnly, true)
+			addOne(compactForScan(canonical), reviewOnly, true, allowance)
 		}
 	}
 
@@ -800,18 +1107,21 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 	if maxDecodedBytes <= 0 || maxDecodedBytes > 65536 {
 		maxDecodedBytes = 32768
 	}
+	if maxNormalizedBytes > 0 && maxDecodedBytes > maxNormalizedBytes {
+		maxDecodedBytes = maxNormalizedBytes
+	}
 	maxEncodedBlocks := cfg.MaxEncodedBlocks
 	if maxEncodedBlocks <= 0 || maxEncodedBlocks > 32 {
 		maxEncodedBlocks = 16
 	}
 	budget := decodeBudget{remainingBytes: maxDecodedBytes, maxBlocks: maxEncodedBlocks}
-	sourceNormalized := norm.NFKC.String(text)
+	sourceNormalized := boundedNFKC(text, maxDerivedViewBytes)
 	normalized := stripInvisible(sourceNormalized)
 	baseSource := sourceNormalized
 	if cfg.DecodeBase64 || cfg.DecodeHex {
 		baseSource = collapseRecognizedEncodedPayloads(sourceNormalized, cfg, maxEncodedFragmentBytes, nil)
 	}
-	add(baseSource, false)
+	add(baseSource, false, true)
 	sourceKey := func(value string, reviewOnly bool) string {
 		if reviewOnly {
 			return value + "\x00review"
@@ -825,7 +1135,11 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 	for run := 0; run < cfg.MaxDecodeRuns && len(frontier) > 0 && budget.remainingBytes > 0; run++ {
 		next := make([]scanView, 0, len(frontier))
 		enqueue := func(value string, encodedBlock bool, reviewOnly bool) bool {
-			if value == "" || len(value) > maxDerivedViewBytes || len(sourceSet) >= maxNormalizationSources {
+			if value == "" || derivedRemaining <= 0 || len(sourceSet) >= maxNormalizationSources {
+				return false
+			}
+			value = safeUTF8Prefix(value, min(maxDerivedViewBytes, derivedRemaining))
+			if value == "" {
 				return false
 			}
 			key := sourceKey(value, reviewOnly)
@@ -836,7 +1150,7 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 				return false
 			}
 			sourceSet[key] = struct{}{}
-			add(value, reviewOnly)
+			add(value, reviewOnly, false)
 			next = append(next, scanView{Text: value, ReviewOnly: reviewOnly})
 			return true
 		}
@@ -851,6 +1165,10 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 			if value == "" || len(value) > maxDerivedViewBytes {
 				return
 			}
+			value = safeUTF8Prefix(value, min(maxDerivedViewBytes, derivedRemaining))
+			if value == "" {
+				return
+			}
 			key := sourceKey(value, reviewOnly)
 			if _, exists := sourceSet[key]; !exists {
 				if len(sourceSet) >= maxNormalizationSources {
@@ -858,7 +1176,7 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 				}
 				sourceSet[key] = struct{}{}
 			}
-			add(value, reviewOnly)
+			add(value, reviewOnly, false)
 			next = append(next, scanView{Text: value, ReviewOnly: reviewOnly})
 		}
 		addScanOnly := func(value string, reviewOnly bool) {
@@ -872,7 +1190,7 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 				}
 				sourceSet[key] = struct{}{}
 			}
-			add(value, reviewOnly)
+			add(value, reviewOnly, false)
 		}
 		acceptDecodedBlock := func(value string, reviewOnly bool) bool {
 			if value == "" || len(value) > maxDerivedViewBytes || len(sourceSet) >= maxNormalizationSources {
@@ -906,7 +1224,7 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 				}
 			}
 			if cfg.DecodeBase64 || cfg.DecodeHex {
-				decodedBatch := decodeEmbeddedBlockBatch(source.Text, cfg, budget.remainingBytes, budget.maxBlocks-budget.blocks, maxEncodedFragmentBytes, currentEngines...)
+				decodedBatch := decodeEmbeddedBlockBatchWithWindow(source.Text, cfg, budget.remainingBytes, budget.maxBlocks-budget.blocks, maxEncodedFragmentBytes, scanChunkBytes, scanOverlapBytes, currentEngines...)
 				// A derived review-only source must never turn an opaque or
 				// truncated fixture into an active warning. Its incomplete state
 				// remains non-enforcing review provenance.
@@ -973,6 +1291,36 @@ func scanViews(text string, cfg NormalizationConfig, currentEngines ...*Engine) 
 		views[0].NormalizationIncomplete = true
 	}
 	return views
+}
+
+func guardScanWindow(performance GuardPerformanceConfig) (chunkBytes, overlapBytes int) {
+	chunkBytes = performance.ScanChunkBytes
+	if chunkBytes <= 0 {
+		chunkBytes = DefaultGuardScanChunkBytes
+	}
+	overlapBytes = performance.ScanOverlapBytes
+	if overlapBytes <= 0 || overlapBytes >= chunkBytes {
+		overlapBytes = DefaultGuardScanOverlapBytes
+		if overlapBytes >= chunkBytes {
+			overlapBytes = chunkBytes / 16
+			if overlapBytes < 1 {
+				overlapBytes = 1
+			}
+			if overlapBytes >= chunkBytes {
+				overlapBytes = chunkBytes - 1
+			}
+		}
+	}
+	return chunkBytes, overlapBytes
+}
+
+func boundedNFKC(value string, maxBytes int) string {
+	if value == "" || maxBytes <= 0 {
+		return ""
+	}
+	reader := transform.NewReader(strings.NewReader(value), norm.NFKC)
+	data, _ := io.ReadAll(io.LimitReader(reader, int64(maxBytes+utf8.UTFMax)))
+	return safeUTF8Prefix(string(data), maxBytes)
 }
 
 type decodeBudget struct {
@@ -1045,6 +1393,10 @@ func decodeEmbeddedBlocks(text string, cfg NormalizationConfig, remainingBytes, 
 }
 
 func decodeEmbeddedBlockBatch(text string, cfg NormalizationConfig, remainingBytes, remainingBlocks, maxFragmentBytes int, currentEngines ...*Engine) decodedBlockBatch {
+	return decodeEmbeddedBlockBatchWithWindow(text, cfg, remainingBytes, remainingBlocks, maxFragmentBytes, DefaultGuardScanChunkBytes, DefaultGuardScanOverlapBytes, currentEngines...)
+}
+
+func decodeEmbeddedBlockBatchWithWindow(text string, cfg NormalizationConfig, remainingBytes, remainingBlocks, maxFragmentBytes, scanChunkBytes, scanOverlapBytes int, currentEngines ...*Engine) decodedBlockBatch {
 	if remainingBytes <= 0 || remainingBlocks <= 0 {
 		return decodedBlockBatch{}
 	}
@@ -1258,20 +1610,21 @@ func decodeEmbeddedBlockBatch(text string, cfg NormalizationConfig, remainingByt
 			appendRiskCandidate(compressed.candidate, value, priority, compressed.reviewOnly)
 			continue
 		}
-		priority, evidence, expanded, complete, decoded := scanCompressedPayload(compressed.raw, candidateBudget, priorityScanner)
-		compressionExpansionBudget -= expanded
-		if !decoded {
+		value, expanded, overflow, ok := decompressSmallPayloadAccounted(compressed.raw, candidateBudget)
+		compressionExpansionBudget -= min(expanded, candidateBudget)
+		if ok && !overflow && len(value) <= remainingBytes {
+			priority, _ := decodedSafetyPriority(value, priorityScanner)
+			appendRiskCandidate(compressed.candidate, value, priority, compressed.reviewOnly)
 			continue
 		}
-		if priority > 0 && !appendEvidence(evidence, compressed.reviewOnly) {
-			complete = false
-		}
-		if !complete {
-			if compressed.reviewOnly {
-				reviewIncomplete = true
-			} else {
-				activeIncomplete = true
-			}
+		// A window probe cannot preserve arbitrary ExcludePatterns, defensive
+		// context, or cumulative rule semantics across windows. If this candidate
+		// cannot be fully decoded inside its bounded share, never replay a
+		// highest-scoring slice as complete rule evidence; mark it audit/warn-only.
+		if compressed.reviewOnly {
+			reviewIncomplete = true
+		} else {
+			activeIncomplete = true
 		}
 	}
 	for _, candidate := range riskCandidates {
@@ -1336,12 +1689,34 @@ func boundedEncodedCandidates(candidates []encodedCandidate, limit int) []encode
 }
 
 type decodedSafetyPriorityPattern struct {
-	pattern compiledPattern
-	hints   []string
+	pattern     compiledPattern
+	hints       []string
+	hintClauses [][]string
 }
 
 type decodedSafetyPriorityScanner struct {
-	patterns []decodedSafetyPriorityPattern
+	patterns                   []decodedSafetyPriorityPattern
+	sensitiveWords             []string
+	hintIndex                  *decodedSafetyHintIndex
+	decisionThreshold          int
+	retainAnyDecisionCandidate bool
+}
+
+type decodedSafetyHintIndex struct {
+	byFirstByte [256][]string
+	unhinted    bool
+	automaton   *decodedSafetyHintAutomaton
+}
+
+type decodedSafetyHintAutomaton struct {
+	nodes []decodedSafetyHintNode
+	root  [256]int
+}
+
+type decodedSafetyHintNode struct {
+	next    map[byte]int
+	failure int
+	outputs []string
 }
 
 var (
@@ -1373,31 +1748,286 @@ func decodedSafetyPriorityScannerForEngine(engine *Engine) decodedSafetyPriority
 }
 
 func buildDecodedSafetyPriorityScanner(compiled []compiledPattern) decodedSafetyPriorityScanner {
+	return buildDecodedSafetyScanner(compiled, false, DefaultThreshold, false)
+}
+
+func buildDecodedSafetyExactPrecheckScanner(compiled []compiledPattern, threshold int) decodedSafetyPriorityScanner {
+	return buildDecodedSafetyScanner(compiled, true, threshold, true)
+}
+
+func buildDecodedSafetyScanner(compiled []compiledPattern, includeAll bool, threshold int, retainAnyDecisionCandidate bool) decodedSafetyPriorityScanner {
+	if threshold <= 0 {
+		threshold = DefaultThreshold
+	}
 	patterns := make([]decodedSafetyPriorityPattern, 0, len(compiled))
 	for _, pattern := range compiled {
 		// Signal-only vocabulary is useful audit evidence but must not crowd
 		// enforceable candidates out of the decode budget. Strict rules and
 		// standalone decision rules cover every built-in high-risk family.
-		if pattern.cfg.SignalOnly || (!pattern.cfg.Strict && pattern.cfg.Weight < DefaultThreshold) {
+		if !includeAll && (pattern.cfg.SignalOnly || (!pattern.cfg.Strict && pattern.cfg.Weight < DefaultThreshold)) {
 			continue
 		}
+		clauses := decodedSafetyMandatoryHintClauses(pattern)
 		patterns = append(patterns, decodedSafetyPriorityPattern{
-			pattern: pattern,
-			hints:   decodedSafetyMandatoryHints(pattern),
+			pattern:     pattern,
+			hints:       flattenDecodedSafetyHintClauses(clauses),
+			hintClauses: clauses,
 		})
 	}
-	return decodedSafetyPriorityScanner{patterns: patterns}
+	return decodedSafetyPriorityScanner{
+		patterns:                   patterns,
+		decisionThreshold:          threshold,
+		retainAnyDecisionCandidate: retainAnyDecisionCandidate,
+	}
+}
+
+func buildDecodedSafetyHintIndex(scanner decodedSafetyPriorityScanner) *decodedSafetyHintIndex {
+	index := &decodedSafetyHintIndex{}
+	seen := make(map[string]struct{})
+	add := func(hint string) {
+		hint = strings.TrimSpace(hint)
+		if hint == "" {
+			return
+		}
+		if _, exists := seen[hint]; exists {
+			return
+		}
+		seen[hint] = struct{}{}
+		first := hint[0]
+		index.byFirstByte[first] = append(index.byFirstByte[first], hint)
+	}
+	for _, candidatePattern := range scanner.patterns {
+		if len(candidatePattern.hints) == 0 {
+			index.unhinted = true
+			continue
+		}
+		for _, hint := range candidatePattern.hints {
+			add(hint)
+		}
+	}
+	for _, word := range scanner.sensitiveWords {
+		add(word)
+	}
+	index.automaton = newDecodedSafetyHintAutomaton(seen)
+	return index
+}
+
+func buildGuaranteedPatternHintAutomaton(patterns []compiledPattern) *decodedSafetyHintAutomaton {
+	hints := make(map[string]struct{})
+	for _, pattern := range patterns {
+		for _, clause := range pattern.guaranteedHintClauses {
+			for _, hint := range clause {
+				if hint = strings.TrimSpace(hint); hint != "" {
+					hints[hint] = struct{}{}
+				}
+			}
+		}
+	}
+	return newDecodedSafetyHintAutomaton(hints)
+}
+
+func newDecodedSafetyHintAutomaton(hints map[string]struct{}) *decodedSafetyHintAutomaton {
+	if len(hints) == 0 {
+		return nil
+	}
+	automaton := &decodedSafetyHintAutomaton{nodes: []decodedSafetyHintNode{{next: make(map[byte]int)}}}
+	for hint := range hints {
+		state := 0
+		for index := 0; index < len(hint); index++ {
+			value := hint[index]
+			nextState, exists := automaton.nodes[state].next[value]
+			if !exists {
+				nextState = len(automaton.nodes)
+				automaton.nodes[state].next[value] = nextState
+				automaton.nodes = append(automaton.nodes, decodedSafetyHintNode{next: make(map[byte]int)})
+			}
+			state = nextState
+		}
+		automaton.nodes[state].outputs = append(automaton.nodes[state].outputs, hint)
+	}
+
+	queue := make([]int, 0, len(automaton.nodes))
+	for value, child := range automaton.nodes[0].next {
+		automaton.root[value] = child
+		queue = append(queue, child)
+	}
+	for head := 0; head < len(queue); head++ {
+		state := queue[head]
+		for value, child := range automaton.nodes[state].next {
+			queue = append(queue, child)
+			failure := automaton.nodes[state].failure
+			for failure != 0 {
+				if target, exists := automaton.nodes[failure].next[value]; exists {
+					failure = target
+					break
+				}
+				failure = automaton.nodes[failure].failure
+			}
+			if failure == 0 {
+				if target, exists := automaton.nodes[0].next[value]; exists && target != child {
+					failure = target
+				}
+			}
+			automaton.nodes[child].failure = failure
+			if inherited := automaton.nodes[failure].outputs; len(inherited) > 0 {
+				automaton.nodes[child].outputs = append(automaton.nodes[child].outputs, inherited...)
+			}
+		}
+	}
+	return automaton
+}
+
+func (a *decodedSafetyHintAutomaton) match(text string) map[string]struct{} {
+	if a == nil || len(a.nodes) == 0 || text == "" {
+		return nil
+	}
+	state := 0
+	var matched map[string]struct{}
+	for index := 0; index < len(text); index++ {
+		value := text[index]
+		for state != 0 {
+			if nextState, exists := a.nodes[state].next[value]; exists {
+				state = nextState
+				goto collectOutputs
+			}
+			state = a.nodes[state].failure
+		}
+		state = a.root[value]
+	collectOutputs:
+		for _, output := range a.nodes[state].outputs {
+			if matched == nil {
+				matched = make(map[string]struct{})
+			}
+			matched[output] = struct{}{}
+		}
+	}
+	return matched
+}
+
+// matchNormalizedSource feeds the same lowercase, whitespace-collapsed byte
+// stream produced by normalizeForScan directly into the automaton. Clean
+// overflow windows therefore avoid materializing strings.Map/Fields/Join
+// intermediates; the full normalized string is only built after a hint match
+// (or when an unhinted custom rule requires regex evaluation).
+func (a *decodedSafetyHintAutomaton) matchNormalizedSource(text string) map[string]struct{} {
+	return a.matchNormalizedSourceWithTransform(text, nil)
+}
+
+func (a *decodedSafetyHintAutomaton) matchNormalizedROT13Source(text string) map[string]struct{} {
+	return a.matchNormalizedSourceWithTransform(text, func(value rune) rune {
+		switch {
+		case value >= 'a' && value <= 'z':
+			return 'a' + (value-'a'+13)%26
+		case value >= 'A' && value <= 'Z':
+			return 'A' + (value-'A'+13)%26
+		default:
+			return value
+		}
+	})
+}
+
+func (a *decodedSafetyHintAutomaton) matchNormalizedSourceWithTransform(text string, transformRune func(rune) rune) map[string]struct{} {
+	if a == nil || len(a.nodes) == 0 || text == "" {
+		return nil
+	}
+	state := 0
+	var matched map[string]struct{}
+	emittedField := false
+	pendingSpace := false
+	emit := func(value byte) {
+		for state != 0 {
+			if nextState, exists := a.nodes[state].next[value]; exists {
+				state = nextState
+				goto collectOutputs
+			}
+			state = a.nodes[state].failure
+		}
+		state = a.root[value]
+	collectOutputs:
+		for _, output := range a.nodes[state].outputs {
+			if matched == nil {
+				matched = make(map[string]struct{})
+			}
+			matched[output] = struct{}{}
+		}
+	}
+	for offset := 0; offset < len(text); {
+		if len(text)-offset >= 3 && text[offset:offset+3] == "```" {
+			if emittedField {
+				pendingSpace = true
+			}
+			offset += 3
+			continue
+		}
+		value, size := utf8.DecodeRuneInString(text[offset:])
+		if size <= 0 {
+			break
+		}
+		offset += size
+		if unicode.IsControl(value) && value != '\n' && value != '\r' && value != '\t' {
+			value = ' '
+		}
+		if transformRune != nil {
+			value = transformRune(value)
+		}
+		value = unicode.ToLower(value)
+		if unicode.IsSpace(value) {
+			if emittedField {
+				pendingSpace = true
+			}
+			continue
+		}
+		if pendingSpace {
+			emit(' ')
+			pendingSpace = false
+		}
+		emittedField = true
+		if value < utf8.RuneSelf {
+			emit(byte(value))
+			continue
+		}
+		var encoded [utf8.UTFMax]byte
+		encodedBytes := utf8.EncodeRune(encoded[:], value)
+		for index := 0; index < encodedBytes; index++ {
+			emit(encoded[index])
+		}
+	}
+	return matched
 }
 
 func decodedSafetyPriority(value string, scanner decodedSafetyPriorityScanner) (int, string) {
 	normalized := normalizeForScan(value)
+	return decodedSafetyPriorityNormalized(normalized, scanner)
+}
+
+func decodedSafetyPriorityNormalized(normalized string, scanner decodedSafetyPriorityScanner) (int, string) {
+	matchedHints, _ := decodedSafetyPriorityMatchedHints(normalized, scanner)
+	if matchedHints == nil {
+		// A non-nil empty set means the immutable Aho index was evaluated and
+		// found no literals. Passing nil would make every pattern fall back to
+		// repeated strings.Contains scans over the full candidate.
+		matchedHints = emptyDecodedSafetyHintMatches
+	}
+	return decodedSafetyPriorityNormalizedWithHints(normalized, scanner, matchedHints)
+}
+
+var emptyDecodedSafetyHintMatches = map[string]struct{}{}
+
+func decodedSafetyPriorityNormalizedWithHints(normalized string, scanner decodedSafetyPriorityScanner, matchedHints map[string]struct{}) (int, string) {
 	priority := 0
 	evidence := ""
 	decisionScore := 0
 	decisionEvidence := make([]string, 0, 4)
 	decisionEvidenceComplete := true
 	for _, candidatePattern := range scanner.patterns {
-		if len(candidatePattern.hints) > 0 && !containsDecodedSafetyHint(normalized, candidatePattern.hints) {
+		// Signal-only rules are valuable once a bounded view has already been
+		// admitted for inspection, but they are not enforcement evidence and must
+		// never consume the finite out-of-budget candidate pool ahead of a real
+		// decision rule.
+		if candidatePattern.pattern.cfg.SignalOnly {
+			continue
+		}
+		if len(candidatePattern.hintClauses) > 0 && !containsDecodedSafetyHintClauseWithMatches(normalized, candidatePattern.hintClauses, matchedHints) {
 			continue
 		}
 		pattern := candidatePattern.pattern
@@ -1426,7 +2056,11 @@ func decodedSafetyPriority(value string, scanner decodedSafetyPriorityScanner) (
 			decisionEvidence = append(decisionEvidence, patternEvidence)
 		}
 	}
-	if decisionScore >= DefaultThreshold {
+	decisionThreshold := scanner.decisionThreshold
+	if decisionThreshold <= 0 {
+		decisionThreshold = DefaultThreshold
+	}
+	if decisionScore >= decisionThreshold {
 		candidatePriority := 200 + min(decisionScore, 99)
 		if candidatePriority > priority {
 			priority = candidatePriority
@@ -1436,9 +2070,27 @@ func decodedSafetyPriority(value string, scanner decodedSafetyPriorityScanner) (
 				evidence = ""
 			}
 		}
+	} else if scanner.retainAnyDecisionCandidate && decisionScore > 0 {
+		// The exact CurrentUser precheck evaluates every retained derived view in
+		// one shared scoring pass. Preserve individually sub-threshold candidates
+		// so rules split across several Base64/hex blocks can still accumulate under
+		// the active configuration threshold. This changes candidate admission only;
+		// the original weights, strictness, signal-only flags, and final action are
+		// applied later by inspectPreparedScanViews.
+		candidatePriority := 150 + min(decisionScore, 49)
+		if candidatePriority > priority {
+			priority = candidatePriority
+			if decisionEvidenceComplete {
+				evidence = strings.Join(decisionEvidence, " ")
+			} else {
+				evidence = ""
+			}
+		}
 	}
-	canonical := norm.NFKC.String(value)
-	if minorSafetyShouldInspectCompact(canonical) && minorSafetyCompactMaterialMatchIndex(compactForScan(stripInvisible(canonical))) != nil {
+	// Configured sensitive words are also signal-only evidence. Ordinary bounded
+	// decoded views still audit them in the main Engine, but they do not rank an
+	// otherwise out-of-budget encoded candidate.
+	if minorSafetyShouldInspectCompact(normalized) && minorSafetyCompactMaterialMatchIndex(compactForScan(normalized)) != nil {
 		if priority < 399 {
 			priority = 399
 			// Compact offsets do not map safely back to the original fragmented
@@ -1448,6 +2100,77 @@ func decodedSafetyPriority(value string, scanner decodedSafetyPriorityScanner) (
 		}
 	}
 	return priority, evidence
+}
+
+func decodedSafetyPriorityMayMatch(normalized string, scanner decodedSafetyPriorityScanner) bool {
+	matched, unhinted := decodedSafetyPriorityMatchedHints(normalized, scanner)
+	return unhinted || len(matched) > 0
+}
+
+func decodedSafetyPriorityMatchedHints(normalized string, scanner decodedSafetyPriorityScanner) (map[string]struct{}, bool) {
+	index := scanner.hintIndex
+	if index == nil {
+		index = buildDecodedSafetyHintIndex(scanner)
+	}
+	if index.automaton != nil {
+		return index.automaton.match(normalized), index.unhinted
+	}
+	var matched map[string]struct{}
+	for offset := 0; offset < len(normalized); offset++ {
+		for _, hint := range index.byFirstByte[normalized[offset]] {
+			if len(hint) <= len(normalized)-offset && strings.HasPrefix(normalized[offset:], hint) {
+				if matched == nil {
+					matched = make(map[string]struct{})
+				}
+				matched[hint] = struct{}{}
+			}
+		}
+	}
+	return matched, index.unhinted
+}
+
+func decodedSafetyPriorityMatchedHintsSource(source string, scanner decodedSafetyPriorityScanner) (map[string]struct{}, bool) {
+	index := scanner.hintIndex
+	if index == nil {
+		index = buildDecodedSafetyHintIndex(scanner)
+	}
+	if index.automaton != nil {
+		return index.automaton.matchNormalizedSource(source), index.unhinted
+	}
+	return decodedSafetyPriorityMatchedHints(normalizeForScan(source), scanner)
+}
+
+func decodedSafetyPriorityMatchedHintSetCanMatch(scanner decodedSafetyPriorityScanner, matchedHints map[string]struct{}) bool {
+	if len(matchedHints) == 0 {
+		return false
+	}
+	for _, candidate := range scanner.patterns {
+		if len(candidate.hintClauses) == 0 || containsDecodedSafetyHintClauseWithMatches("", candidate.hintClauses, matchedHints) {
+			return true
+		}
+	}
+	for _, word := range scanner.sensitiveWords {
+		if _, exists := matchedHints[word]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func decodedSafetyWordEvidence(text string, loc []int) string {
+	if len(loc) != 2 || loc[0] < 0 || loc[1] <= loc[0] || loc[1] > len(text) {
+		return ""
+	}
+	const padding = 192
+	start := max(0, loc[0]-padding)
+	end := min(len(text), loc[1]+padding)
+	for start < loc[0] && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	for end > loc[1] && end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return strings.TrimSpace(text[start:end])
 }
 
 func decodedSafetyPatternEvidence(text string, pattern compiledPattern, fallbackLoc []int) string {
@@ -1539,6 +2262,455 @@ func decodedSafetyPatternEvidence(text string, pattern compiledPattern, fallback
 	return evidence
 }
 
+const maxDecodedSafetyHintClauses = 512
+
+// decodedSafetyGuaranteedHintClauses returns only clauses that are proven by
+// the regexp syntax tree to occur in every successful match of the compiled
+// PatternConfig. Unlike decodedSafetyMandatoryHintClauses, it never uses
+// hand-maintained or heuristic fallback vocabulary, so it is safe to use as a
+// hard eligibility gate before running the regexp engine.
+func decodedSafetyGuaranteedHintClauses(pattern compiledPattern) [][]string {
+	var clauses [][]string
+	combineRequired := func(expression string) {
+		if strings.TrimSpace(expression) == "" {
+			return
+		}
+		expressionClauses, guaranteed := decodedSafetyRegexpGuaranteedHintClauses(expression)
+		if !guaranteed || len(expressionClauses) == 0 {
+			return
+		}
+		clauses = preferDecodedSafetyGuaranteedHintClauses(clauses, expressionClauses)
+	}
+
+	combineRequired(pattern.cfg.Pattern)
+	for _, expression := range pattern.cfg.AllPatterns {
+		combineRequired(expression)
+	}
+
+	// At least one AnyPatterns expression must match (or MinMatches of them).
+	// Their union is a mandatory OR-clause only when every eligible expression
+	// exposes a syntax-proven literal. A single unprovable branch disables this
+	// part of the gate rather than risking a false negative.
+	if len(pattern.cfg.AnyPatterns) > 0 {
+		anyClauses := make([][]string, 0)
+		allGuaranteed := true
+		for _, expression := range pattern.cfg.AnyPatterns {
+			expressionClauses, guaranteed := decodedSafetyRegexpGuaranteedHintClauses(expression)
+			if !guaranteed || len(expressionClauses) == 0 || len(anyClauses)+len(expressionClauses) > maxDecodedSafetyHintClauses {
+				allGuaranteed = false
+				break
+			}
+			anyClauses = append(anyClauses, expressionClauses...)
+		}
+		if allGuaranteed && len(anyClauses) > 0 {
+			anyClauses = normalizeDecodedSafetyHintClauses(anyClauses)
+			clauses = preferDecodedSafetyGuaranteedHintClauses(clauses, anyClauses)
+		}
+	}
+	return normalizeDecodedSafetyHintClauses(clauses)
+}
+
+func preferDecodedSafetyGuaranteedHintClauses(current, candidate [][]string) [][]string {
+	if len(current) == 0 {
+		return candidate
+	}
+	if len(candidate) == 0 {
+		return current
+	}
+	quality := func(clauses [][]string) (minRunes int, alternatives int) {
+		minRunes = int(^uint(0) >> 1)
+		for _, clause := range clauses {
+			clauseRunes := 0
+			for _, hint := range clause {
+				clauseRunes += utf8.RuneCountInString(hint)
+			}
+			if clauseRunes < minRunes {
+				minRunes = clauseRunes
+			}
+		}
+		return minRunes, len(clauses)
+	}
+	currentRunes, currentAlternatives := quality(current)
+	candidateRunes, candidateAlternatives := quality(candidate)
+	if candidateRunes > currentRunes || candidateRunes == currentRunes && candidateAlternatives < currentAlternatives {
+		return candidate
+	}
+	return current
+}
+
+func decodedSafetyRegexpGuaranteedHintClauses(expression string) ([][]string, bool) {
+	parsed, err := syntax.Parse(expression, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	return decodedSafetySyntaxGuaranteedHintClauses(parsed.Simplify())
+}
+
+func decodedSafetySyntaxGuaranteedHintClauses(expression *syntax.Regexp) ([][]string, bool) {
+	if expression == nil {
+		return nil, false
+	}
+	switch expression.Op {
+	case syntax.OpLiteral:
+		return decodedSafetyLiteralGuaranteedHintClauses(expression)
+	case syntax.OpCapture, syntax.OpPlus:
+		return decodedSafetySyntaxGuaranteedHintClauses(expression.Sub[0])
+	case syntax.OpRepeat:
+		if expression.Min < 1 {
+			return nil, false
+		}
+		return decodedSafetySyntaxGuaranteedHintClauses(expression.Sub[0])
+	case syntax.OpConcat:
+		clauses := make([][]string, 0)
+		for _, child := range expression.Sub {
+			childClauses, childGuaranteed := decodedSafetySyntaxGuaranteedHintClauses(child)
+			if !childGuaranteed || len(childClauses) == 0 {
+				continue
+			}
+			clauses = preferDecodedSafetyGuaranteedHintClauses(clauses, childClauses)
+		}
+		return clauses, len(clauses) > 0
+	case syntax.OpAlternate:
+		clauses := make([][]string, 0)
+		for _, child := range expression.Sub {
+			childClauses, childGuaranteed := decodedSafetySyntaxGuaranteedHintClauses(child)
+			if !childGuaranteed || len(childClauses) == 0 || len(clauses)+len(childClauses) > maxDecodedSafetyHintClauses {
+				return nil, false
+			}
+			clauses = append(clauses, childClauses...)
+		}
+		return normalizeDecodedSafetyHintClauses(clauses), len(clauses) > 0
+	default:
+		return nil, false
+	}
+}
+
+func decodedSafetyLiteralGuaranteedHintClauses(expression *syntax.Regexp) ([][]string, bool) {
+	if expression == nil || expression.Op != syntax.OpLiteral || len(expression.Rune) == 0 {
+		return nil, false
+	}
+	if expression.Flags&syntax.FoldCase == 0 {
+		hint := normalizeForScan(string(expression.Rune))
+		if utf8.RuneCountInString(hint) < 2 {
+			return nil, false
+		}
+		return [][]string{{hint}}, true
+	}
+
+	// normalizeForScan lowercases each rune. Most Unicode simple-fold cycles
+	// therefore collapse to one canonical rune, but a few (for example long-s)
+	// do not. Keep the longest contiguous fold-stable substring. Every regexp
+	// match must contain that exact normalized substring, without enumerating an
+	// exponential Cartesian product of all case-fold variants.
+	stable := func(value rune) (rune, bool) {
+		canonical := unicode.ToLower(value)
+		for candidate := unicode.SimpleFold(value); candidate != value; candidate = unicode.SimpleFold(candidate) {
+			if unicode.ToLower(candidate) != canonical {
+				return 0, false
+			}
+		}
+		if unicode.IsSpace(canonical) || unicode.IsControl(canonical) || canonical == '`' {
+			return 0, false
+		}
+		return canonical, true
+	}
+	best := make([]rune, 0, len(expression.Rune))
+	current := make([]rune, 0, len(expression.Rune))
+	for _, value := range expression.Rune {
+		canonical, ok := stable(value)
+		if !ok {
+			if len(current) > len(best) {
+				best = append(best[:0], current...)
+			}
+			current = current[:0]
+			continue
+		}
+		current = append(current, canonical)
+	}
+	if len(current) > len(best) {
+		best = append(best[:0], current...)
+	}
+	if len(best) < 2 {
+		return nil, false
+	}
+	hint := normalizeForScan(string(best))
+	if utf8.RuneCountInString(hint) < 2 {
+		return nil, false
+	}
+	return [][]string{{hint}}, true
+}
+
+func decodedSafetyMandatoryHintClauses(pattern compiledPattern) [][]string {
+	if pattern.cfg.Name == "prompt_unrestricted_mode" {
+		return singleDecodedSafetyHintClauses([]string{
+			"unrestricted mode", "unrestricted model", "unrestricted assistant", "unrestricted access",
+			"developer mode", "jailbreak", "no restriction", "content filters disabled", "content filters off",
+			"无限制模式", "开发者模式", "关闭安全过滤", "关闭内容过滤", "关闭安全限制", "关闭内容限制", "破限", "破甲", "越狱模式",
+		})
+	}
+	clauses := make([][]string, 0)
+	combineMandatory := func(expression string) bool {
+		if strings.TrimSpace(expression) == "" {
+			return false
+		}
+		expressionClauses, guaranteed := decodedSafetyRegexpMandatoryHintClauses(expression)
+		if !guaranteed || len(expressionClauses) == 0 {
+			return false
+		}
+		if len(clauses) == 0 {
+			clauses = expressionClauses
+			return true
+		}
+		combined, ok := combineDecodedSafetyHintClauses(clauses, expressionClauses)
+		if !ok {
+			clauses = nil
+			return false
+		}
+		clauses = combined
+		return true
+	}
+
+	mandatoryFound := combineMandatory(pattern.cfg.Pattern)
+	for _, expression := range pattern.cfg.AllPatterns {
+		mandatoryFound = combineMandatory(expression) || mandatoryFound
+	}
+	if mandatoryFound && len(clauses) > 0 {
+		return normalizeDecodedSafetyHintClauses(clauses)
+	}
+
+	if len(pattern.cfg.AnyPatterns) > 0 {
+		anyClauses := make([][]string, 0)
+		for _, expression := range pattern.cfg.AnyPatterns {
+			expressionClauses, guaranteed := decodedSafetyRegexpMandatoryHintClauses(expression)
+			if !guaranteed || len(expressionClauses) == 0 {
+				anyClauses = nil
+				break
+			}
+			anyClauses = append(anyClauses, expressionClauses...)
+			if len(anyClauses) > maxDecodedSafetyHintClauses {
+				anyClauses = nil
+				break
+			}
+		}
+		if len(anyClauses) > 0 {
+			return normalizeDecodedSafetyHintClauses(anyClauses)
+		}
+	}
+
+	switch pattern.cfg.Name {
+	case "prompt_unrestricted_activation_request":
+		return singleDecodedSafetyHintClauses([]string{"jailbreak", "unrestricted", "developer mode", "破限", "破甲", "越狱", "无限制", "开发者"})
+	case "minor_exploitation":
+		return singleDecodedSafetyHintClauses([]string{
+			"minor", "child", "children", "schoolchildren", "kid", "preteen", "teen", "teenager", "adolescent", "youth", "toddler", "infant", "underage", "year old", "csam",
+			"未成年", "儿童", "孩子", "小孩", "小学生", "幼童", "幼儿", "婴幼儿", "青少年", "少年", "岁", "儿童色情", "儿童性虐待材料",
+		})
+	default:
+		return singleDecodedSafetyHintClauses(strongDecodedSafetyFallbackHints(decodedSafetyMandatoryHints(pattern)))
+	}
+}
+
+func strongDecodedSafetyFallbackHints(hints []string) []string {
+	weak := map[string]struct{}{
+		"build": {}, "conduct": {}, "create": {}, "develop": {}, "execute": {}, "generate": {},
+		"give": {}, "launch": {}, "make": {}, "perform": {}, "provide": {}, "run": {}, "use": {}, "write": {},
+		"for": {}, "from": {}, "into": {}, "me": {}, "on": {}, "the": {}, "to": {}, "us": {}, "with": {},
+	}
+	out := make([]string, 0, len(hints))
+	for _, hint := range hints {
+		hint = strings.TrimSpace(hint)
+		if hint == "" {
+			continue
+		}
+		if _, exists := weak[hint]; exists {
+			continue
+		}
+		if isASCIIText(hint) && utf8.RuneCountInString(hint) < 4 {
+			continue
+		}
+		out = append(out, hint)
+	}
+	return out
+}
+
+func isASCIIText(text string) bool {
+	for index := 0; index < len(text); index++ {
+		if text[index] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func decodedSafetyRegexpMandatoryHintClauses(expression string) ([][]string, bool) {
+	parsed, err := syntax.Parse(expression, syntax.Perl)
+	if err != nil {
+		return nil, false
+	}
+	return decodedSafetySyntaxMandatoryHintClauses(parsed.Simplify())
+}
+
+func decodedSafetySyntaxMandatoryHintClauses(expression *syntax.Regexp) ([][]string, bool) {
+	if expression == nil {
+		return nil, false
+	}
+	switch expression.Op {
+	case syntax.OpLiteral:
+		hint := normalizeForScan(string(expression.Rune))
+		if utf8.RuneCountInString(hint) < 2 {
+			return nil, false
+		}
+		return [][]string{{hint}}, true
+	case syntax.OpCapture, syntax.OpPlus:
+		return decodedSafetySyntaxMandatoryHintClauses(expression.Sub[0])
+	case syntax.OpRepeat:
+		if expression.Min < 1 {
+			return nil, false
+		}
+		return decodedSafetySyntaxMandatoryHintClauses(expression.Sub[0])
+	case syntax.OpConcat:
+		clauses := make([][]string, 0)
+		found := false
+		for _, child := range expression.Sub {
+			childClauses, childGuaranteed := decodedSafetySyntaxMandatoryHintClauses(child)
+			if !childGuaranteed || len(childClauses) == 0 {
+				continue
+			}
+			if !found {
+				clauses = childClauses
+				found = true
+				continue
+			}
+			combined, ok := combineDecodedSafetyHintClauses(clauses, childClauses)
+			if !ok {
+				return nil, false
+			}
+			clauses = combined
+		}
+		return clauses, found
+	case syntax.OpAlternate:
+		clauses := make([][]string, 0)
+		for _, child := range expression.Sub {
+			childClauses, childGuaranteed := decodedSafetySyntaxMandatoryHintClauses(child)
+			if !childGuaranteed || len(childClauses) == 0 {
+				return nil, false
+			}
+			clauses = append(clauses, childClauses...)
+			if len(clauses) > maxDecodedSafetyHintClauses {
+				return nil, false
+			}
+		}
+		return clauses, len(clauses) > 0
+	default:
+		return nil, false
+	}
+}
+
+func combineDecodedSafetyHintClauses(left, right [][]string) ([][]string, bool) {
+	if len(left) == 0 {
+		return right, len(right) > 0
+	}
+	if len(right) == 0 || len(left) > maxDecodedSafetyHintClauses/len(right) {
+		return nil, false
+	}
+	out := make([][]string, 0, len(left)*len(right))
+	for _, leftClause := range left {
+		for _, rightClause := range right {
+			clause := make([]string, 0, len(leftClause)+len(rightClause))
+			clause = append(clause, leftClause...)
+			clause = append(clause, rightClause...)
+			out = append(out, clause)
+		}
+	}
+	return out, true
+}
+
+func normalizeDecodedSafetyHintClauses(clauses [][]string) [][]string {
+	seenClauses := make(map[string]struct{})
+	out := make([][]string, 0, len(clauses))
+	for _, clause := range clauses {
+		seenHints := make(map[string]struct{})
+		normalized := make([]string, 0, len(clause))
+		for _, hint := range clause {
+			hint = strings.TrimSpace(hint)
+			if hint == "" {
+				continue
+			}
+			if _, exists := seenHints[hint]; exists {
+				continue
+			}
+			seenHints[hint] = struct{}{}
+			normalized = append(normalized, hint)
+		}
+		if len(normalized) == 0 {
+			continue
+		}
+		sort.Slice(normalized, func(i, j int) bool {
+			if len(normalized[i]) == len(normalized[j]) {
+				return normalized[i] < normalized[j]
+			}
+			return len(normalized[i]) > len(normalized[j])
+		})
+		key := strings.Join(normalized, "\x00")
+		if _, exists := seenClauses[key]; exists {
+			continue
+		}
+		seenClauses[key] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func singleDecodedSafetyHintClauses(hints []string) [][]string {
+	clauses := make([][]string, 0, len(hints))
+	for _, hint := range hints {
+		clauses = append(clauses, []string{hint})
+	}
+	return normalizeDecodedSafetyHintClauses(clauses)
+}
+
+func flattenDecodedSafetyHintClauses(clauses [][]string) []string {
+	seen := make(map[string]struct{})
+	hints := make([]string, 0)
+	for _, clause := range clauses {
+		for _, hint := range clause {
+			if _, exists := seen[hint]; exists {
+				continue
+			}
+			seen[hint] = struct{}{}
+			hints = append(hints, hint)
+		}
+	}
+	return hints
+}
+
+func containsDecodedSafetyHintClause(text string, clauses [][]string) bool {
+	return containsDecodedSafetyHintClauseWithMatches(text, clauses, nil)
+}
+
+func containsDecodedSafetyHintClauseWithMatches(text string, clauses [][]string, matchedHints map[string]struct{}) bool {
+	for _, clause := range clauses {
+		matched := true
+		for _, hint := range clause {
+			if matchedHints != nil {
+				if _, exists := matchedHints[hint]; exists {
+					continue
+				}
+				matched = false
+				break
+			}
+			if !strings.Contains(text, hint) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
 func decodedSafetyMandatoryHints(pattern compiledPattern) []string {
 	sets := make([][]string, 0, 1+len(pattern.all))
 	if pattern.cfg.Pattern != "" {
@@ -1575,6 +2747,11 @@ func decodedSafetyMandatoryHints(pattern compiledPattern) []string {
 		switch pattern.cfg.Name {
 		case "prompt_unrestricted_activation_request":
 			return []string{"jailbreak", "unrestricted", "developer mode", "破限", "破甲", "越狱", "无限制", "开发者"}
+		case "minor_exploitation":
+			return []string{
+				"minor", "child", "children", "schoolchildren", "kid", "preteen", "teen", "teenager", "adolescent", "youth", "toddler", "infant", "underage", "year old", "csam",
+				"未成年", "儿童", "孩子", "小孩", "小学生", "幼童", "幼儿", "婴幼儿", "青少年", "少年", "岁", "儿童色情", "儿童性虐待材料",
+			}
 		}
 		return nil
 	}
@@ -1989,6 +3166,10 @@ func openCompressedPayload(raw []byte) (io.ReadCloser, bool) {
 // Incomplete means the cap or a stream error prevented reaching EOF; callers
 // may audit that state but must not turn it into fabricated policy evidence.
 func scanCompressedPayload(raw []byte, limit int, scanner decodedSafetyPriorityScanner) (priority int, evidence string, expanded int, complete bool, decoded bool) {
+	return scanCompressedPayloadWithWindow(raw, limit, DefaultGuardScanChunkBytes, DefaultGuardScanOverlapBytes, scanner)
+}
+
+func scanCompressedPayloadWithWindow(raw []byte, limit, chunkBytes, overlapBytes int, scanner decodedSafetyPriorityScanner) (priority int, evidence string, expanded int, complete bool, decoded bool) {
 	if limit <= 0 {
 		return 0, "", 0, false, false
 	}
@@ -1998,10 +3179,21 @@ func scanCompressedPayload(raw []byte, limit int, scanner decodedSafetyPriorityS
 	}
 	defer reader.Close()
 	decoded = true
-	const (
-		chunkBytes   = 16 * 1024
-		overlapBytes = 8 * 1024
-	)
+	if chunkBytes <= 0 {
+		chunkBytes = DefaultGuardScanChunkBytes
+	}
+	if overlapBytes <= 0 || overlapBytes >= chunkBytes {
+		overlapBytes = DefaultGuardScanOverlapBytes
+		if overlapBytes >= chunkBytes {
+			overlapBytes = chunkBytes / 16
+			if overlapBytes < 1 {
+				overlapBytes = 1
+			}
+			if overlapBytes >= chunkBytes {
+				overlapBytes = chunkBytes - 1
+			}
+		}
+	}
 	bufferSize := min(chunkBytes, limit)
 	if bufferSize <= 0 {
 		return 0, "", 0, false, true
@@ -2030,7 +3222,11 @@ func scanCompressedPayload(raw []byte, limit int, scanner decodedSafetyPriorityS
 				}
 			}
 			tailSize := min(overlapBytes, len(window))
-			tail = append(tail[:0], window[len(window)-tailSize:]...)
+			tailStart := len(window) - tailSize
+			for tailStart < len(window) && !utf8.RuneStart(window[tailStart]) {
+				tailStart++
+			}
+			tail = append(tail[:0], window[tailStart:]...)
 		} else {
 			zeroReads++
 		}

@@ -1,19 +1,39 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
+
+type countingPromptSessionCache struct {
+	cache.TokenCache
+	gets  atomic.Int32
+	block bool
+}
+
+func (c *countingPromptSessionCache) GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error) {
+	if namespace == promptSessionCorrelationNamespace {
+		c.gets.Add(1)
+		if c.block {
+			<-ctx.Done()
+			return nil, false, ctx.Err()
+		}
+	}
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
 
 func TestCleanPromptSidecarRequiresExplicitFullSampling(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -264,6 +284,100 @@ func TestSidecarCapacityExhaustionFailsOpenAndRecovers(t *testing.T) {
 	}
 }
 
+func TestPromptSessionReadsOnlyForExplicitContinuation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
+	cfg := promptSessionTestConfig()
+	handler := newPromptGuardTestHandler(cfg)
+	counting := &countingPromptSessionCache{TokenCache: handler.cache}
+	handler.SetRuntimeCache(counting)
+	fingerprint := promptSessionTestFingerprint("read-boundary")
+
+	makeRequest := func(requestID string, text string) (*gin.Context, []byte, promptfilter.RequestEnvelope) {
+		body := []byte(`{"input":` + strconv.Quote(text) + `}`)
+		c, _ := signedNewAPIPolicyContext(t, requestID, newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, "/v1/responses", body)
+		addSignedNewAPIPolicyMeta(t, c, newAPIPolicyMeta{
+			Profile: promptfilter.GuardProfileBalanced, Mode: promptfilter.GuardModeEnforce, Provider: string(promptfilter.ModelFamilyOpenAI),
+			Protocol: string(promptfilter.ProtocolResponses), SessionFingerprint: fingerprint,
+		}, true)
+		envelope := promptfilter.BuildEnvelope(body, "/v1/responses", "gpt-5.5", promptfilter.TransportHTTP, cfg.MaxTextLength)
+		return c, body, envelope
+	}
+
+	c, body, envelope := makeRequest("session-read-normal", "请继续完成普通页面布局。")
+	pending, err := handler.enrichPromptGuardSession(c, cfg, body, &envelope)
+	if err != nil || pending == nil {
+		t.Fatalf("ordinary session enrichment = pending %+v err %v", pending, err)
+	}
+	if got := counting.gets.Load(); got != 0 {
+		t.Fatalf("ordinary non-continuation performed %d session reads, want 0", got)
+	}
+
+	c, body, envelope = makeRequest("session-read-continuation", "继续")
+	if _, err := handler.enrichPromptGuardSession(c, cfg, body, &envelope); err != nil {
+		t.Fatalf("continuation session enrichment: %v", err)
+	}
+	if got := counting.gets.Load(); got != 1 {
+		t.Fatalf("explicit continuation performed %d session reads, want 1", got)
+	}
+
+	for index, text := range []string{"请继续", "麻烦继续一下"} {
+		c, body, envelope = makeRequest("session-read-polite-"+strconv.Itoa(index), text)
+		if _, err := handler.enrichPromptGuardSession(c, cfg, body, &envelope); err != nil {
+			t.Fatalf("polite continuation %q: %v", text, err)
+		}
+	}
+	if got := counting.gets.Load(); got != 3 {
+		t.Fatalf("polite continuations performed %d total session reads, want 3", got)
+	}
+}
+
+func TestPromptSessionReadTimeoutFailsOpenAndKeepsPendingWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
+	cfg := promptSessionTestConfig()
+	handler := newPromptGuardTestHandler(cfg)
+	blocking := &countingPromptSessionCache{TokenCache: handler.cache, block: true}
+	handler.SetRuntimeCache(blocking)
+	body := []byte(`{"input":"继续"}`)
+	c, _ := signedNewAPIPolicyContext(t, "session-read-timeout", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, "/v1/responses", body)
+	addSignedNewAPIPolicyMeta(t, c, newAPIPolicyMeta{
+		Profile: promptfilter.GuardProfileBalanced, Mode: promptfilter.GuardModeEnforce, Provider: string(promptfilter.ModelFamilyOpenAI),
+		Protocol: string(promptfilter.ProtocolResponses), SessionFingerprint: promptSessionTestFingerprint("timeout"),
+	}, true)
+	envelope := promptfilter.BuildEnvelope(body, "/v1/responses", "gpt-5.5", promptfilter.TransportHTTP, cfg.MaxTextLength)
+	started := time.Now()
+	pending, err := handler.enrichPromptGuardSession(c, cfg, body, &envelope)
+	if err == nil || pending == nil {
+		t.Fatalf("timeout enrichment = pending %+v err %v", pending, err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("session read timeout took %s", elapsed)
+	}
+}
+
+func TestPromptSessionWebSocketEventIDSeparatesLogicalTurns(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
+	cfg := promptSessionTestConfig()
+	handler := newPromptGuardTestHandler(cfg)
+	body := []byte(`{"input":"普通请求"}`)
+	c, _ := signedNewAPIPolicyContext(t, "shared-ws-request", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, "/v1/responses", nil)
+	c.Set(promptGuardPolicyEventIDContextKey, "responses:7")
+	addSignedNewAPIPolicyMeta(t, c, newAPIPolicyMeta{
+		Profile: promptfilter.GuardProfileBalanced, Mode: promptfilter.GuardModeEnforce, Provider: string(promptfilter.ModelFamilyOpenAI),
+		Protocol: string(promptfilter.ProtocolResponses), SessionFingerprint: promptSessionTestFingerprint("ws-event"),
+	}, true)
+	envelope := promptfilter.BuildEnvelope(body, "/v1/responses", "gpt-5.5", promptfilter.TransportWebSocket, cfg.MaxTextLength)
+	pending, err := handler.enrichPromptGuardSession(c, cfg, nil, &envelope)
+	if err != nil || pending == nil {
+		t.Fatalf("websocket session enrichment = pending %+v err %v", pending, err)
+	}
+	if !strings.Contains(pending.RequestID, "responses:7") {
+		t.Fatalf("session idempotency key %q omitted logical websocket event", pending.RequestID)
+	}
+}
+
 func TestSignedSessionCorrelationIsIdentityScoped(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
@@ -378,7 +492,7 @@ func TestApplicationPromptAuditMarkerDoesNotHideStrongerAuxiliarySignal(t *testi
 	}
 }
 
-func TestSessionContextEnforcementNeverCreatesStrikeOrTerminal(t *testing.T) {
+func TestSessionContextRequestedEnforceNormalizesToShadowWithoutPenalty(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
 	cfg := promptSessionTestConfig()
@@ -392,11 +506,16 @@ func TestSessionContextEnforcementNeverCreatesStrikeOrTerminal(t *testing.T) {
 		t.Fatalf("shadow seed was unexpectedly enforced: %+v", seed.Decision)
 	}
 	continued := evaluateSignedPromptSession(t, handler, "session-aux-2", "42", fingerprint, []byte(`{"input":"继续"}`))
-	if continued.Decision.Action != promptfilter.ActionBlock || continued.Decision.PrimaryOrigin != promptfilter.OriginSessionContext {
-		t.Fatalf("session enforcement missing: %+v", continued.Decision)
+	if continued.Decision.Action != promptfilter.ActionAllow || continued.Decision.WouldAction != promptfilter.ActionBlock || continued.Decision.PrimaryOrigin != promptfilter.OriginSessionContext {
+		t.Fatalf("session context was not retained as shadow-only evidence: %+v", continued.Decision)
 	}
 	if continued.Decision.StrikeEligible || continued.Decision.Terminal {
 		t.Fatalf("auxiliary session context created a penalty: %+v", continued.Decision)
+	}
+	for _, signal := range continued.Decision.Signals {
+		if signal.Origin == promptfilter.OriginSessionContext && signal.LayerMode != promptfilter.GuardModeShadow {
+			t.Fatalf("session context signal escaped shadow normalization: %+v", signal)
+		}
 	}
 }
 

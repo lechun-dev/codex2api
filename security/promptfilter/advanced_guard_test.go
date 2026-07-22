@@ -14,6 +14,11 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 				"exact_segment_cache_enabled": false,
 				"exact_segment_cache_entries": 1024,
 				"exact_segment_cache_ttl_seconds": 120,
+				"max_segments": 48,
+				"max_current_user_bytes": 196608,
+				"max_auxiliary_bytes": 24576,
+				"scan_chunk_bytes": 4096,
+				"scan_overlap_bytes": 256,
 				"shadow_workers": 4,
 				"shadow_queue_size": 128,
 				"shadow_overflow_mode": "sync"
@@ -49,7 +54,7 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 	if !cfg.Guard.AllowTrustedOverrides {
 		t.Fatal("allow_trusted_overrides was not parsed")
 	}
-	if !cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled || cfg.Guard.Performance.ExactSegmentCacheEnabled || cfg.Guard.Performance.ExactSegmentCacheEntries != 1024 || cfg.Guard.Performance.ShadowWorkers != 4 || cfg.Guard.Performance.ShadowOverflowMode != GuardShadowOverflowSync {
+	if !cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled || cfg.Guard.Performance.ExactSegmentCacheEnabled || cfg.Guard.Performance.ExactSegmentCacheEntries != 1024 || cfg.Guard.Performance.MaxSegments != 48 || cfg.Guard.Performance.MaxCurrentUserBytes != 196608 || cfg.Guard.Performance.MaxAuxiliaryBytes != 24576 || cfg.Guard.Performance.ScanChunkBytes != 4096 || cfg.Guard.Performance.ScanOverlapBytes != 256 || cfg.Guard.Performance.ShadowWorkers != 4 || cfg.Guard.Performance.ShadowOverflowMode != GuardShadowOverflowDrop {
 		t.Fatalf("guard performance config was not parsed: %+v", cfg.Guard.Performance)
 	}
 	if !cfg.Guard.Rollout.Enabled || cfg.Guard.Rollout.Percent != 25 || cfg.Guard.Rollout.FallbackMode != GuardModeShadow {
@@ -58,7 +63,7 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 	if cfg.Guard.ProviderProfiles[string(ModelFamilyAnthropic)] != GuardProfileStrict {
 		t.Fatalf("anthropic profile = %q, want strict", cfg.Guard.ProviderProfiles[string(ModelFamilyAnthropic)])
 	}
-	if cfg.Guard.Layers.Instructions.Mode != GuardModeEnforce || cfg.Guard.Layers.History.Mode != GuardModeShadow {
+	if cfg.Guard.Layers.Instructions.Mode != GuardModeShadow || cfg.Guard.Layers.History.Mode != GuardModeShadow {
 		t.Fatalf("guard layers were not parsed: %+v", cfg.Guard.Layers)
 	}
 
@@ -72,7 +77,7 @@ func TestGuardConfigRoundTrip(t *testing.T) {
 	if !roundTripped.Guard.AllowTrustedOverrides {
 		t.Fatal("allow_trusted_overrides changed after round trip")
 	}
-	if !roundTripped.Guard.Performance.AsyncShadowAuxiliaryEnabled || roundTripped.Guard.Performance.ExactSegmentCacheEnabled || roundTripped.Guard.Performance.ShadowQueueSize != 128 || roundTripped.Guard.Performance.ShadowOverflowMode != GuardShadowOverflowSync {
+	if !roundTripped.Guard.Performance.AsyncShadowAuxiliaryEnabled || roundTripped.Guard.Performance.ExactSegmentCacheEnabled || roundTripped.Guard.Performance.ShadowQueueSize != 128 || roundTripped.Guard.Performance.MaxSegments != 48 || roundTripped.Guard.Performance.MaxCurrentUserBytes != 196608 || roundTripped.Guard.Performance.MaxAuxiliaryBytes != 24576 || roundTripped.Guard.Performance.ScanChunkBytes != 4096 || roundTripped.Guard.Performance.ScanOverlapBytes != 256 || roundTripped.Guard.Performance.ShadowOverflowMode != GuardShadowOverflowDrop {
 		t.Fatalf("guard performance config changed after round trip: %+v", roundTripped.Guard.Performance)
 	}
 	if len(roundTripped.Guard.Rollout.NewAPIUserAllowlist) != 1 || len(roundTripped.Guard.Rollout.APIKeyAllowlist) != 1 {
@@ -120,7 +125,7 @@ func TestRecommendedAdvancedConfigUsesExplicitCurrentPromptLayers(t *testing.T) 
 	if !cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled || !cfg.Guard.Performance.ExactSegmentCacheEnabled || cfg.Guard.Performance.ShadowOverflowMode != GuardShadowOverflowDrop {
 		t.Fatalf("recommended performance config = %+v", cfg.Guard.Performance)
 	}
-	if !cfg.Session.Enabled || !cfg.Session.RequireSignedIdentity || cfg.Session.CombineShortFragments {
+	if cfg.Session.Enabled || !cfg.Session.RequireSignedIdentity || cfg.Session.CombineShortFragments {
 		t.Fatalf("recommended session config = %+v", cfg.Session)
 	}
 	if len(cfg.Enforcement.TerminalCategories) != 0 {

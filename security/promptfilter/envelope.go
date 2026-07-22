@@ -1,7 +1,9 @@
 package promptfilter
 
 import (
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 )
@@ -14,6 +16,7 @@ const (
 	ProtocolChat      Protocol = "chat_completions"
 	ProtocolMessages  Protocol = "messages"
 	ProtocolImages    Protocol = "images"
+	ProtocolSearch    Protocol = "alpha_search"
 )
 
 type Transport string
@@ -59,22 +62,32 @@ const (
 // Segment keeps request text and its provenance separate. Sequence reflects
 // wire order within the request; Role retains the protocol role when present.
 type Segment struct {
-	Origin   SegmentOrigin `json:"origin"`
-	Role     string        `json:"role,omitempty"`
-	Text     string        `json:"text"`
-	Sequence int           `json:"sequence"`
-	Linked   bool          `json:"linked,omitempty"`
-	Trust    SegmentTrust  `json:"trust"`
+	Origin         SegmentOrigin `json:"origin"`
+	Role           string        `json:"role,omitempty"`
+	Text           string        `json:"text"`
+	Sequence       int           `json:"sequence"`
+	Linked         bool          `json:"linked,omitempty"`
+	Truncated      bool          `json:"truncated,omitempty"`
+	Trust          SegmentTrust  `json:"trust"`
+	SafetyEvidence string        `json:"-"`
+	SafetyPriority int           `json:"-"`
 }
 
 type RequestEnvelope struct {
-	Endpoint       string      `json:"endpoint"`
-	Protocol       Protocol    `json:"protocol"`
-	Transport      Transport   `json:"transport"`
-	RequestedModel string      `json:"requested_model,omitempty"`
-	EffectiveModel string      `json:"effective_model,omitempty"`
-	ModelFamily    ModelFamily `json:"model_family"`
-	Segments       []Segment   `json:"segments"`
+	Endpoint             string      `json:"endpoint"`
+	Protocol             Protocol    `json:"protocol"`
+	Transport            Transport   `json:"transport"`
+	RequestedModel       string      `json:"requested_model,omitempty"`
+	EffectiveModel       string      `json:"effective_model,omitempty"`
+	ModelFamily          ModelFamily `json:"model_family"`
+	Segments             []Segment   `json:"segments"`
+	AdapterUnclassified  bool        `json:"adapter_unclassified,omitempty"`
+	Truncated            bool        `json:"truncated,omitempty"`
+	CurrentUserTruncated bool        `json:"current_user_truncated,omitempty"`
+	AuxiliaryTruncated   bool        `json:"auxiliary_truncated,omitempty"`
+	currentUserExactText string
+	currentUserPrecheck  *currentUserPrecheck
+	precheckIncomplete   bool
 }
 
 func BuildEnvelope(body []byte, endpoint string, requestedModel string, transport Transport, maxLen int) RequestEnvelope {
@@ -82,6 +95,121 @@ func BuildEnvelope(body []byte, endpoint string, requestedModel string, transpor
 }
 
 func BuildEnvelopeWithModels(body []byte, endpoint string, requestedModel string, effectiveModel string, transport Transport, maxLen int) RequestEnvelope {
+	if maxLen <= 0 {
+		maxLen = DefaultMaxTextLength
+	}
+	return buildEnvelopeWithBudget(body, endpoint, requestedModel, effectiveModel, transport, envelopeBudget{
+		maxSegments:      MaxGuardMaxSegments,
+		currentUserBytes: maxLen,
+		auxiliaryBytes:   maxLen,
+		scanChunkBytes:   DefaultGuardScanChunkBytes,
+		scanOverlapBytes: DefaultGuardScanOverlapBytes,
+		priorityScanner:  builtinDecodedSafetyPriorityScanner(),
+	})
+}
+
+// BuildEnvelopeWithModelsAndPerformance applies the normalized Guard budget at
+// extraction time. legacyMaxLen remains the compatibility fallback for callers
+// loading an older configuration that predates source-specific budgets.
+func BuildEnvelopeWithModelsAndPerformance(body []byte, endpoint string, requestedModel string, effectiveModel string, transport Transport, legacyMaxLen int, performance GuardPerformanceConfig) RequestEnvelope {
+	performance = normalizeEnvelopePerformance(performance, legacyMaxLen)
+	return buildEnvelopeWithBudget(body, endpoint, requestedModel, effectiveModel, transport, envelopeBudget{
+		maxSegments:      performance.MaxSegments,
+		currentUserBytes: performance.MaxCurrentUserBytes,
+		auxiliaryBytes:   performance.MaxAuxiliaryBytes,
+		scanChunkBytes:   performance.ScanChunkBytes,
+		scanOverlapBytes: performance.ScanOverlapBytes,
+		priorityScanner:  builtinDecodedSafetyPriorityScanner(),
+	})
+}
+
+// BuildEnvelopeWithModelsAndConfig applies the active normalized rule set to
+// overflow evidence discovery before destructive sampling. This keeps custom
+// strict rules and administrator pattern updates equivalent to built-ins when
+// their match lies outside the synchronous head/tail byte budget.
+func BuildEnvelopeWithModelsAndConfig(body []byte, endpoint string, requestedModel string, effectiveModel string, transport Transport, cfg Config) RequestEnvelope {
+	cfg = NormalizeConfig(cfg)
+	performance := normalizeEnvelopePerformance(cfg.Advanced.Guard.Performance, cfg.MaxTextLength)
+	engine, err := engineForConfig(cfg)
+	priorityScanner := builtinDecodedSafetyPriorityScanner()
+	if err == nil && engine != nil {
+		priorityScanner = decodedSafetyPriorityScannerForEngine(engine)
+	}
+	return buildEnvelopeWithBudget(body, endpoint, requestedModel, effectiveModel, transport, envelopeBudget{
+		maxSegments:      performance.MaxSegments,
+		currentUserBytes: performance.MaxCurrentUserBytes,
+		auxiliaryBytes:   performance.MaxAuxiliaryBytes,
+		scanChunkBytes:   performance.ScanChunkBytes,
+		scanOverlapBytes: performance.ScanOverlapBytes,
+		priorityScanner:  priorityScanner,
+		exactEngine:      engine,
+	})
+}
+
+// BuildTextEnvelopeWithModelsAndConfig builds the same bounded, exact-aware
+// current-user envelope used by JSON protocol adapters. It is intended for
+// transports such as multipart image edits where the prompt has already been
+// parsed separately from binary attachment data.
+func BuildTextEnvelopeWithModelsAndConfig(text string, endpoint string, requestedModel string, effectiveModel string, transport Transport, cfg Config) RequestEnvelope {
+	cfg = NormalizeConfig(cfg)
+	performance := normalizeEnvelopePerformance(cfg.Advanced.Guard.Performance, cfg.MaxTextLength)
+	engine, err := engineForConfig(cfg)
+	priorityScanner := builtinDecodedSafetyPriorityScanner()
+	if err == nil && engine != nil {
+		priorityScanner = decodedSafetyPriorityScannerForEngine(engine)
+	}
+	if transport != TransportWebSocket {
+		transport = TransportHTTP
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	effectiveModel = strings.TrimSpace(effectiveModel)
+	envelope := RequestEnvelope{
+		Endpoint:       strings.TrimSpace(endpoint),
+		Protocol:       ProtocolForEndpoint(endpoint),
+		Transport:      transport,
+		RequestedModel: requestedModel,
+		EffectiveModel: effectiveModel,
+		ModelFamily:    ResolveModelFamily(requestedModel, effectiveModel),
+	}
+	if envelope.Protocol == ProtocolUnknown {
+		envelope.AdapterUnclassified = true
+		return envelope
+	}
+	builder := envelopeBuilder{
+		envelope:         &envelope,
+		maxSegments:      performance.MaxSegments,
+		currentUserBytes: performance.MaxCurrentUserBytes,
+		auxiliaryBytes:   performance.MaxAuxiliaryBytes,
+		scanChunkBytes:   performance.ScanChunkBytes,
+		scanOverlapBytes: performance.ScanOverlapBytes,
+		priorityScanner:  priorityScanner,
+		exactEngine:      engine,
+		exactCapture:     engine != nil,
+		exactSourceOK:    engine != nil,
+	}
+	builder.append(OriginCurrentUser, "user", text)
+	builder.finalize()
+	return envelope
+}
+
+func decodedSafetyPriorityScannerForConfig(cfg Config) decodedSafetyPriorityScanner {
+	if engine, err := engineForConfig(cfg); err == nil && engine != nil {
+		return decodedSafetyPriorityScannerForEngine(engine)
+	}
+	return builtinDecodedSafetyPriorityScanner()
+}
+
+type envelopeBudget struct {
+	maxSegments      int
+	currentUserBytes int
+	auxiliaryBytes   int
+	scanChunkBytes   int
+	scanOverlapBytes int
+	priorityScanner  decodedSafetyPriorityScanner
+	exactEngine      *Engine
+}
+
+func buildEnvelopeWithBudget(body []byte, endpoint string, requestedModel string, effectiveModel string, transport Transport, budget envelopeBudget) RequestEnvelope {
 	protocol := ProtocolForEndpoint(endpoint)
 	if transport != TransportWebSocket {
 		transport = TransportHTTP
@@ -97,11 +225,26 @@ func BuildEnvelopeWithModels(body []byte, endpoint string, requestedModel string
 		EffectiveModel: strings.TrimSpace(effectiveModel),
 		ModelFamily:    ResolveModelFamily(requestedModel, effectiveModel),
 	}
+	if protocol == ProtocolUnknown {
+		envelope.AdapterUnclassified = true
+		return envelope
+	}
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return envelope
 	}
 
-	builder := envelopeBuilder{envelope: &envelope, maxLen: maxLen}
+	builder := envelopeBuilder{
+		envelope:         &envelope,
+		maxSegments:      budget.maxSegments,
+		currentUserBytes: budget.currentUserBytes,
+		auxiliaryBytes:   budget.auxiliaryBytes,
+		scanChunkBytes:   budget.scanChunkBytes,
+		scanOverlapBytes: budget.scanOverlapBytes,
+		priorityScanner:  budget.priorityScanner,
+		exactEngine:      budget.exactEngine,
+		exactCapture:     budget.exactEngine != nil,
+		exactSourceOK:    budget.exactEngine != nil,
+	}
 	switch protocol {
 	case ProtocolResponses:
 		builder.appendResult(OriginInstructions, "developer", gjson.GetBytes(body, "instructions"))
@@ -118,27 +261,27 @@ func BuildEnvelopeWithModels(body []byte, endpoint string, requestedModel string
 		builder.appendMessages(gjson.GetBytes(body, "messages"))
 	case ProtocolImages:
 		builder.appendResult(OriginCurrentUser, "user", gjson.GetBytes(body, "prompt"))
-		builder.appendResult(OriginInstructions, "developer", gjson.GetBytes(body, "style"))
+		builder.appendResult(OriginCurrentUser, "user", gjson.GetBytes(body, "style"))
 		builder.appendAttachmentReferences(gjson.ParseBytes(body), "user")
-	default:
-		builder.appendResult(OriginInstructions, "developer", gjson.GetBytes(body, "instructions"))
-		builder.appendMessages(gjson.GetBytes(body, "messages"))
-		builder.appendMessages(gjson.GetBytes(body, "input"))
-		builder.appendResult(OriginCurrentUser, "user", gjson.GetBytes(body, "prompt"))
+	case ProtocolSearch:
+		builder.appendResult(OriginCurrentUser, "user", gjson.GetBytes(body, "commands.search_query.#.q"))
 	}
+	builder.finalize()
 	return envelope
 }
 
 func ProtocolForEndpoint(endpoint string) Protocol {
 	switch strings.ToLower(strings.TrimSpace(endpoint)) {
-	case "response", "responses", "responses_compact", "/v1/responses", "/v1/responses/compact":
+	case "response", "responses", "responses_compact", "realtime", "/responses", "/realtime", "/v1/responses", "/v1/responses/compact", "/v1/realtime":
 		return ProtocolResponses
 	case "chat", "chat_completions", "/v1/chat/completions":
 		return ProtocolChat
 	case "messages", "anthropic", "/v1/messages":
 		return ProtocolMessages
-	case "image", "images", "images_generations", "images_edits", "/v1/images/generations", "/v1/images/edits":
+	case "image", "images", "images_generations", "images_edits", "images_jobs", "/v1/images/generations", "/v1/images/edits", "/v1/images/jobs", "/v1/images/jobs:edit":
 		return ProtocolImages
+	case "alpha_search", "/v1/alpha/search", "/backend-api/codex/alpha/search":
+		return ProtocolSearch
 	default:
 		return ProtocolUnknown
 	}
@@ -180,25 +323,522 @@ func envelopeHasOrigin(envelope RequestEnvelope, origin SegmentOrigin) bool {
 	return false
 }
 
+func normalizeEnvelopePerformance(performance GuardPerformanceConfig, legacyMaxLen int) GuardPerformanceConfig {
+	if legacyMaxLen <= 0 {
+		legacyMaxLen = DefaultMaxTextLength
+	}
+	allBudgetFieldsMissing := performance.MaxSegments == 0 &&
+		performance.MaxCurrentUserBytes == 0 &&
+		performance.MaxAuxiliaryBytes == 0 &&
+		performance.ScanChunkBytes == 0 &&
+		performance.ScanOverlapBytes == 0
+	if performance.MaxSegments <= 0 {
+		performance.MaxSegments = MaxGuardMaxSegments
+	}
+	if performance.MaxSegments > MaxGuardMaxSegments {
+		performance.MaxSegments = MaxGuardMaxSegments
+	}
+	if performance.MaxCurrentUserBytes <= 0 {
+		performance.MaxCurrentUserBytes = legacyMaxLen
+	}
+	if performance.MaxCurrentUserBytes > MaxGuardCurrentUserBytes {
+		performance.MaxCurrentUserBytes = MaxGuardCurrentUserBytes
+	}
+	if allBudgetFieldsMissing {
+		performance.MaxAuxiliaryBytes = legacyMaxLen
+	} else if performance.MaxAuxiliaryBytes < 0 {
+		performance.MaxAuxiliaryBytes = legacyMaxLen
+	}
+	if performance.MaxAuxiliaryBytes > MaxGuardAuxiliaryBytes {
+		performance.MaxAuxiliaryBytes = MaxGuardAuxiliaryBytes
+	}
+	return performance
+}
+
+// ApplyGuardPerformanceBudget bounds all request sources after adapters and
+// optional extensions have contributed their segments. Current-user input and
+// linked continuation context take precedence over auxiliary sources, while
+// the final slice remains in wire order. Exceeding a budget is metadata only:
+// it never creates a policy signal or blocking decision by itself.
+func ApplyGuardPerformanceBudget(envelope RequestEnvelope, performance GuardPerformanceConfig, legacyMaxLen int) RequestEnvelope {
+	return applyGuardPerformanceBudgetWithScanner(envelope, performance, legacyMaxLen, builtinDecodedSafetyPriorityScanner())
+}
+
+func applyGuardPerformanceBudgetWithScanner(envelope RequestEnvelope, performance GuardPerformanceConfig, legacyMaxLen int, priorityScanner decodedSafetyPriorityScanner) RequestEnvelope {
+	performance = normalizeEnvelopePerformance(performance, legacyMaxLen)
+	segments := append([]Segment(nil), envelope.Segments...)
+	sort.SliceStable(segments, func(i, j int) bool {
+		return segments[i].Sequence < segments[j].Sequence
+	})
+
+	currentSegments := make([]Segment, 0, len(segments))
+	auxiliarySegments := make([]Segment, 0, len(segments))
+	for _, segment := range segments {
+		if segmentUsesCurrentUserBudget(segment) {
+			currentSegments = append(currentSegments, segment)
+		} else {
+			auxiliarySegments = append(auxiliarySegments, segment)
+		}
+	}
+	selectedCurrent, currentTruncated := sampleSegmentClass(
+		currentSegments,
+		performance.MaxSegments,
+		performance.MaxCurrentUserBytes,
+		performance.ScanChunkBytes,
+		performance.ScanOverlapBytes,
+		true,
+		priorityScanner,
+	)
+	remainingSegments := performance.MaxSegments - len(selectedCurrent)
+	selectedAuxiliary, auxiliaryTruncated := sampleSegmentClass(
+		auxiliarySegments,
+		remainingSegments,
+		performance.MaxAuxiliaryBytes,
+		performance.ScanChunkBytes,
+		performance.ScanOverlapBytes,
+		false,
+		priorityScanner,
+	)
+	selected := append(selectedCurrent, selectedAuxiliary...)
+	if currentTruncated {
+		envelope.Truncated = true
+		envelope.CurrentUserTruncated = true
+	}
+	if auxiliaryTruncated {
+		envelope.Truncated = true
+		envelope.AuxiliaryTruncated = true
+	}
+	sort.SliceStable(selected, func(i, j int) bool {
+		return selected[i].Sequence < selected[j].Sequence
+	})
+	envelope.Segments = selected
+	return envelope
+}
+
+type segmentSampleAllocation struct {
+	evidence int
+	head     int
+	tail     int
+}
+
+// sampleSegmentClass retains a bounded, provenance-preserving view of one
+// source class. When the class is over budget, high-confidence evidence found
+// by the lightweight window scanner is reserved first, then the remaining
+// bytes and slots are split between the beginning and end. Length alone never
+// creates a policy signal, but an attacker cannot hide a built-in terminal
+// phrase merely by placing it after a large benign prefix or in a later part.
+func sampleSegmentClass(segments []Segment, maxSegments, maxBytes, chunkBytes, overlapBytes int, scanPriority bool, priorityScanner decodedSafetyPriorityScanner) ([]Segment, bool) {
+	if len(segments) == 0 {
+		return nil, false
+	}
+	totalBytes := 0
+	truncated := false
+	for _, segment := range segments {
+		totalBytes += len(segment.Text)
+		truncated = truncated || segment.Truncated
+	}
+	if maxSegments <= 0 || maxBytes <= 0 {
+		return nil, true
+	}
+	if !truncated && len(segments) <= maxSegments && totalBytes <= maxBytes {
+		return append([]Segment(nil), segments...), false
+	}
+	truncated = true
+	working := append([]Segment(nil), segments...)
+	if scanPriority {
+		for index := range working {
+			if working[index].SafetyEvidence != "" {
+				continue
+			}
+			working[index].SafetyPriority, working[index].SafetyEvidence = scanPlainTextPriorityWithWindow(working[index].Text, chunkBytes, overlapBytes, priorityScanner)
+		}
+	}
+
+	allocations := make(map[int]segmentSampleAllocation, min(len(working), maxSegments))
+	remainingBytes := maxBytes
+	remainingSlots := maxSegments
+	evidenceIndexes := make([]int, 0, len(working))
+	for index := range working {
+		if strings.TrimSpace(working[index].SafetyEvidence) != "" {
+			evidenceIndexes = append(evidenceIndexes, index)
+		}
+	}
+	sort.SliceStable(evidenceIndexes, func(i, j int) bool {
+		left, right := working[evidenceIndexes[i]], working[evidenceIndexes[j]]
+		if left.SafetyPriority == right.SafetyPriority {
+			return left.Sequence < right.Sequence
+		}
+		return left.SafetyPriority > right.SafetyPriority
+	})
+	for _, index := range evidenceIndexes {
+		evidence := strings.TrimSpace(working[index].SafetyEvidence)
+		if evidence == "" || remainingBytes <= 0 || remainingSlots <= 0 {
+			continue
+		}
+		allocated := min(len(evidence), remainingBytes)
+		if allocated <= 0 {
+			continue
+		}
+		allocations[index] = segmentSampleAllocation{evidence: allocated}
+		remainingBytes -= allocated
+		remainingSlots--
+	}
+
+	if remainingBytes > 0 && remainingSlots > 0 {
+		headBytes := remainingBytes * 4 / 5
+		tailBytes := remainingBytes - headBytes
+		headSlots := remainingSlots * 4 / 5
+		if headSlots == 0 {
+			headSlots = 1
+		}
+		if headSlots > remainingSlots {
+			headSlots = remainingSlots
+		}
+		tailSlots := remainingSlots - headSlots
+		if remainingSlots > 1 && tailSlots == 0 {
+			tailSlots = 1
+			headSlots--
+		}
+
+		for index := 0; index < len(working) && headBytes > 0 && headSlots > 0; index++ {
+			if _, exists := allocations[index]; exists {
+				continue
+			}
+			allocated := min(len(working[index].Text), headBytes)
+			if allocated <= 0 {
+				continue
+			}
+			allocations[index] = segmentSampleAllocation{head: allocated}
+			headBytes -= allocated
+			headSlots--
+		}
+		for index := len(working) - 1; index >= 0 && tailBytes > 0 && tailSlots > 0; index-- {
+			if _, exists := allocations[index]; exists {
+				continue
+			}
+			allocated := min(len(working[index].Text), tailBytes)
+			if allocated <= 0 {
+				continue
+			}
+			allocations[index] = segmentSampleAllocation{tail: allocated}
+			tailBytes -= allocated
+			tailSlots--
+		}
+	}
+
+	selected := make([]Segment, 0, len(allocations))
+	for index, original := range working {
+		allocation, ok := allocations[index]
+		if !ok {
+			continue
+		}
+		segment := original
+		switch {
+		case allocation.evidence > 0:
+			segment.Text = safeUTF8Prefix(strings.TrimSpace(segment.SafetyEvidence), allocation.evidence)
+		case allocation.head > 0 && allocation.tail > 0:
+			segment.Text = limitScanTextExact(segment.Text, allocation.head+allocation.tail)
+		case allocation.head > 0:
+			segment.Text = safeUTF8Prefix(segment.Text, allocation.head)
+		case allocation.tail > 0:
+			segment.Text = safeUTF8Suffix(segment.Text, allocation.tail)
+		}
+		segment.Text = strings.TrimSpace(segment.Text)
+		if segment.Text == "" {
+			continue
+		}
+		segment.Truncated = segment.Truncated || len(segment.Text) < len(original.Text)
+		selected = append(selected, segment)
+	}
+	return selected, truncated
+}
+
+func scanPlainTextPriorityWithWindow(text string, chunkBytes, overlapBytes int, scanner decodedSafetyPriorityScanner) (int, string) {
+	if text == "" {
+		return 0, ""
+	}
+	if chunkBytes <= 0 {
+		chunkBytes = DefaultGuardScanChunkBytes
+	}
+	// This pass only locates high-confidence evidence in text that would
+	// otherwise be discarded. Larger windows amortize normalization and regex
+	// setup while the configured overlap still protects cross-window phrases.
+	if chunkBytes < MaxGuardScanChunkBytes {
+		chunkBytes = MaxGuardScanChunkBytes
+	}
+	if overlapBytes <= 0 || overlapBytes >= chunkBytes {
+		overlapBytes = DefaultGuardScanOverlapBytes
+		if overlapBytes >= chunkBytes {
+			overlapBytes = max(1, chunkBytes/16)
+		}
+	}
+	priority := 0
+	evidence := ""
+	for start := 0; start < len(text); {
+		end := min(start+chunkBytes, len(text))
+		for end > start && end < len(text) && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		if end <= start {
+			_, size := utf8.DecodeRuneInString(text[start:])
+			if size <= 0 {
+				break
+			}
+			end = min(start+size, len(text))
+		}
+		windowStart := max(0, start-overlapBytes)
+		for windowStart < start && !utf8.RuneStart(text[windowStart]) {
+			windowStart++
+		}
+		source := text[windowStart:end]
+		matchedHints, unhinted := decodedSafetyPriorityMatchedHintsSource(source, scanner)
+		if !unhinted && !decodedSafetyPriorityMatchedHintSetCanMatch(scanner, matchedHints) {
+			start = end
+			continue
+		}
+		normalized := normalizeForScan(source)
+		candidatePriority, candidateEvidence := decodedSafetyPriorityNormalizedWithHints(normalized, scanner, matchedHints)
+		if candidatePriority > priority || candidatePriority == priority && evidence == "" && candidateEvidence != "" {
+			priority = candidatePriority
+			evidence = candidateEvidence
+		}
+		start = end
+	}
+	return priority, evidence
+}
+
+func segmentUsesCurrentUserBudget(segment Segment) bool {
+	return segment.Origin == OriginCurrentUser ||
+		segment.Origin == OriginApplicationCandidate ||
+		(segment.Origin == OriginHistory && segment.Linked)
+}
+
 type envelopeBuilder struct {
-	envelope *RequestEnvelope
-	maxLen   int
-	sequence int
+	envelope               *RequestEnvelope
+	maxSegments            int
+	currentUserBytes       int
+	auxiliaryBytes         int
+	scanChunkBytes         int
+	scanOverlapBytes       int
+	priorityScanner        decodedSafetyPriorityScanner
+	exactEngine            *Engine
+	exactCapture           bool
+	exactSourceParts       []string
+	exactSourceBytes       int
+	exactSourceOK          bool
+	linkedCandidateCapture bool
+	linkedCandidateParts   []string
+	linkedCandidateBytes   int
+	linkedCandidateOK      bool
+	currentSegments        int
+	auxiliarySegments      int
+	sequence               int
 }
 
 func (b *envelopeBuilder) append(origin SegmentOrigin, role string, text string) {
 	if b == nil || b.envelope == nil {
 		return
 	}
-	text = strings.TrimSpace(text)
-	if text == "" {
+	segmentCount := &b.auxiliarySegments
+	if origin == OriginCurrentUser {
+		segmentCount = &b.currentSegments
+	}
+	originalBytes := len(text)
+	if origin == OriginCurrentUser {
+		b.recordExactCurrentUser(text)
+	}
+	if origin == OriginHistory && b.linkedCandidateCapture {
+		b.recordLinkedCandidate(text)
+	}
+	fieldLimit := b.auxiliaryBytes
+	if origin == OriginCurrentUser || origin == OriginHistory {
+		fieldLimit = max(b.currentUserBytes, b.auxiliaryBytes)
+	}
+	if fieldLimit <= 0 {
+		if originalBytes > 0 {
+			b.markTruncated(origin)
+		}
 		return
 	}
-	text = limitScanText(text, b.maxLen)
-	b.envelope.Segments = append(b.envelope.Segments, Segment{
-		Origin: origin, Role: strings.ToLower(strings.TrimSpace(role)), Text: text, Sequence: b.sequence, Trust: SegmentTrustClientSupplied,
-	})
+	segmentOverflow := b.maxSegments > 0 && *segmentCount >= b.maxSegments
+	safetyPriority, safetyEvidence := 0, ""
+	if origin == OriginCurrentUser && (originalBytes > fieldLimit || segmentOverflow) && !b.exactSourceOK {
+		safetyPriority, safetyEvidence = scanPlainTextPriorityWithWindow(text, b.scanChunkBytes, b.scanOverlapBytes, b.priorityScanner)
+	}
+	text = limitScanTextExact(text, fieldLimit)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		if originalBytes > 0 && fieldLimit > 0 && originalBytes > fieldLimit {
+			b.markTruncated(origin)
+		}
+		return
+	}
+	truncated := fieldLimit > 0 && originalBytes > fieldLimit
+	segment := Segment{
+		Origin: origin, Role: strings.ToLower(strings.TrimSpace(role)), Text: text, Sequence: b.sequence, Truncated: truncated, Trust: SegmentTrustClientSupplied,
+		SafetyEvidence: safetyEvidence,
+		SafetyPriority: safetyPriority,
+	}
+	if segmentOverflow {
+		b.markTruncated(origin)
+		if origin == OriginCurrentUser {
+			b.mergeCurrentUserOverflow(segment, fieldLimit)
+			b.sequence++
+		}
+		return
+	}
+	b.envelope.Segments = append(b.envelope.Segments, segment)
+	*segmentCount++
+	if truncated {
+		b.markTruncated(origin)
+	}
 	b.sequence++
+}
+
+func (b *envelopeBuilder) mergeCurrentUserOverflow(segment Segment, fieldLimit int) {
+	if b == nil || b.envelope == nil || fieldLimit <= 0 {
+		return
+	}
+	for index := len(b.envelope.Segments) - 1; index >= 0; index-- {
+		current := b.envelope.Segments[index]
+		if current.Origin != OriginCurrentUser {
+			continue
+		}
+		combined := current.Text + "\n" + segment.Text
+		evidence := strings.TrimSpace(current.SafetyEvidence)
+		priority := current.SafetyPriority
+		if candidate := strings.TrimSpace(segment.SafetyEvidence); candidate != "" && (evidence == "" || segment.SafetyPriority > priority) {
+			evidence = candidate
+			priority = segment.SafetyPriority
+		}
+		current.Text = limitScanTextExact(combined, fieldLimit)
+		current.Sequence = segment.Sequence
+		current.Truncated = true
+		current.SafetyEvidence = evidence
+		current.SafetyPriority = priority
+		b.envelope.Segments[index] = current
+		return
+	}
+}
+
+func (b *envelopeBuilder) markTruncated(origin SegmentOrigin) {
+	if b == nil || b.envelope == nil {
+		return
+	}
+	b.envelope.Truncated = true
+	if origin == OriginCurrentUser {
+		b.envelope.CurrentUserTruncated = true
+		return
+	}
+	b.envelope.AuxiliaryTruncated = true
+}
+
+func (b *envelopeBuilder) recordExactCurrentUser(text string) {
+	if b == nil || !b.exactSourceOK || strings.TrimSpace(text) == "" {
+		return
+	}
+	separatorBytes := 0
+	if len(b.exactSourceParts) > 0 {
+		separatorBytes = 1
+	}
+	if len(text) > MaxGuardCurrentUserBytes-b.exactSourceBytes-separatorBytes {
+		b.exactSourceParts = nil
+		b.exactSourceBytes = 0
+		b.exactSourceOK = false
+		return
+	}
+	b.exactSourceParts = append(b.exactSourceParts, text)
+	b.exactSourceBytes += separatorBytes + len(text)
+}
+
+func (b *envelopeBuilder) beginLinkedCandidateCapture() {
+	if b == nil {
+		return
+	}
+	b.linkedCandidateParts = nil
+	b.linkedCandidateBytes = 0
+	b.linkedCandidateCapture = b.exactCapture
+	b.linkedCandidateOK = b.exactCapture
+}
+
+func (b *envelopeBuilder) recordLinkedCandidate(text string) {
+	if b == nil || !b.linkedCandidateCapture || !b.linkedCandidateOK || strings.TrimSpace(text) == "" {
+		return
+	}
+	separatorBytes := 0
+	if len(b.linkedCandidateParts) > 0 {
+		separatorBytes = 1
+	}
+	if len(text) > MaxGuardCurrentUserBytes-b.linkedCandidateBytes-separatorBytes {
+		b.linkedCandidateParts = nil
+		b.linkedCandidateBytes = 0
+		b.linkedCandidateOK = false
+		return
+	}
+	b.linkedCandidateParts = append(b.linkedCandidateParts, text)
+	b.linkedCandidateBytes += separatorBytes + len(text)
+}
+
+func (b *envelopeBuilder) discardLinkedCandidate() {
+	if b == nil {
+		return
+	}
+	b.linkedCandidateCapture = false
+	b.linkedCandidateParts = nil
+	b.linkedCandidateBytes = 0
+	b.linkedCandidateOK = false
+}
+
+func (b *envelopeBuilder) promoteLinkedCandidate() {
+	if b == nil {
+		return
+	}
+	defer b.discardLinkedCandidate()
+	if !b.exactCapture {
+		return
+	}
+	if !b.linkedCandidateOK || !b.exactSourceOK {
+		b.exactSourceParts = nil
+		b.exactSourceBytes = 0
+		b.exactSourceOK = false
+		return
+	}
+	if len(b.linkedCandidateParts) == 0 {
+		return
+	}
+	separatorBytes := 0
+	if len(b.exactSourceParts) > 0 {
+		separatorBytes = 1
+	}
+	if b.linkedCandidateBytes > MaxGuardCurrentUserBytes-b.exactSourceBytes-separatorBytes {
+		b.exactSourceParts = nil
+		b.exactSourceBytes = 0
+		b.exactSourceOK = false
+		return
+	}
+	parts := make([]string, 0, len(b.linkedCandidateParts)+len(b.exactSourceParts))
+	parts = append(parts, b.linkedCandidateParts...)
+	parts = append(parts, b.exactSourceParts...)
+	b.exactSourceParts = parts
+	b.exactSourceBytes += separatorBytes + b.linkedCandidateBytes
+}
+
+func (b *envelopeBuilder) finalize() {
+	if b == nil || b.envelope == nil {
+		return
+	}
+	bounded := ApplyGuardPerformanceBudget(*b.envelope, GuardPerformanceConfig{
+		MaxSegments:         b.maxSegments,
+		MaxCurrentUserBytes: b.currentUserBytes,
+		MaxAuxiliaryBytes:   b.auxiliaryBytes,
+	}, max(b.currentUserBytes, b.auxiliaryBytes))
+	if bounded.CurrentUserTruncated && b.exactSourceOK && len(b.exactSourceParts) > 0 {
+		bounded.currentUserExactText = strings.TrimSpace(strings.Join(b.exactSourceParts, " "))
+	}
+	if bounded.CurrentUserTruncated && b.exactCapture && !b.exactSourceOK {
+		bounded.precheckIncomplete = true
+	}
+	*b.envelope = bounded
 }
 
 func (b *envelopeBuilder) appendResult(origin SegmentOrigin, role string, result gjson.Result) {
@@ -218,6 +858,13 @@ func (b *envelopeBuilder) appendResult(origin SegmentOrigin, role string, result
 		case "tool_use", "function_call", "computer_call", "mcp_call":
 			b.appendToolArguments(result, role)
 		default:
+			if blockType != "" && !recognizedEnvelopeContentBlockType(blockType) {
+				// A future typed block has no proven provenance contract. Do not
+				// reinterpret its generic text/content fields as the caller-provided
+				// origin; record an adapter audit marker and fail open for this block.
+				b.markAdapterUnclassified()
+				return
+			}
 			if text := result.Get("text"); text.Type == gjson.String {
 				b.append(origin, role, text.String())
 			}
@@ -252,9 +899,20 @@ func (b *envelopeBuilder) appendMessages(result gjson.Result) {
 
 	items := result.Array()
 	currentItems := selectCurrentInputItems(items)
+	firstCurrent := -1
+	for index, selected := range currentItems {
+		if selected {
+			firstCurrent = index
+			break
+		}
+	}
+	previousUser := previousUserCandidate(items, firstCurrent)
 	segmentStarts := make([]int, len(items))
 	segmentEnds := make([]int, len(items))
 	for index, item := range items {
+		if index == previousUser {
+			b.beginLinkedCandidateCapture()
+		}
 		segmentStarts[index] = len(b.envelope.Segments)
 		if role := inputItemRole(item); role != "" {
 			b.appendMessage(item, role, currentItems[index])
@@ -262,16 +920,15 @@ func (b *envelopeBuilder) appendMessages(result gjson.Result) {
 			b.appendTypedInputItem(item, currentItems[index])
 		}
 		segmentEnds[index] = len(b.envelope.Segments)
+		if index == previousUser {
+			b.linkedCandidateCapture = false
+		}
 	}
 
-	firstCurrent := -1
 	currentText := make([]string, 0, 2)
 	for index, selected := range currentItems {
 		if !selected {
 			continue
-		}
-		if firstCurrent < 0 {
-			firstCurrent = index
 		}
 		for _, segment := range b.envelope.Segments[segmentStarts[index]:segmentEnds[index]] {
 			if segment.Origin == OriginCurrentUser {
@@ -280,10 +937,11 @@ func (b *envelopeBuilder) appendMessages(result gjson.Result) {
 		}
 	}
 	if firstCurrent < 0 || !isContinuationOnly(strings.Join(currentText, "\n")) {
+		b.discardLinkedCandidate()
 		return
 	}
-	previousUser := previousUserCandidate(items, firstCurrent)
 	if previousUser < 0 {
+		b.discardLinkedCandidate()
 		return
 	}
 	for index := segmentStarts[previousUser]; index < segmentEnds[previousUser]; index++ {
@@ -291,6 +949,7 @@ func (b *envelopeBuilder) appendMessages(result gjson.Result) {
 			b.envelope.Segments[index].Linked = true
 		}
 	}
+	b.promoteLinkedCandidate()
 }
 
 type currentInputKind uint8
@@ -491,8 +1150,8 @@ func (b *envelopeBuilder) appendTypedInputItem(item gjson.Result, currentUser bo
 		b.appendAttachmentReferences(item, "user")
 	default:
 		// An untyped object is the legacy direct-input shape. Unknown typed
-		// objects are session context so future replay item types cannot silently
-		// become current-user evidence or qualify for strikes.
+		// objects have no proven provenance contract, so they are omitted from
+		// detector input and surfaced through a non-punitive adapter audit.
 		if itemType == "" {
 			origin := OriginHistory
 			if currentUser {
@@ -501,7 +1160,34 @@ func (b *envelopeBuilder) appendTypedInputItem(item gjson.Result, currentUser bo
 			b.appendResult(origin, "user", item)
 			return
 		}
-		b.appendResult(OriginSessionContext, "context", item)
+		b.markAdapterUnclassified()
+	}
+}
+
+func (b *envelopeBuilder) markAdapterUnclassified() {
+	if b == nil || b.envelope == nil {
+		return
+	}
+	b.envelope.AdapterUnclassified = true
+}
+
+func recognizedEnvelopeContentBlockType(blockType string) bool {
+	switch blockType {
+	case "text", "input_text", "output_text", "refusal", "message",
+		"reasoning", "summary_text", "compaction", "compaction_summary", "context_compaction",
+		"thinking", "redacted_thinking",
+		"input_file", "input_image", "image_url", "file", "image", "attachment", "document", "computer_screenshot",
+		"function_call_output", "tool_call_output", "local_shell_call_output", "shell_call_output",
+		"apply_patch_call_output", "tool_search_output", "tool_search_call_output", "custom_tool_call_output",
+		"mcp_tool_call_output", "computer_call_output", "mcp_call_output", "tool_result",
+		"function_call", "tool_call", "local_shell_call", "shell_call", "apply_patch_call",
+		"tool_search_call", "custom_tool_call", "mcp_tool_call", "mcp_call", "mcp_list_tools",
+		"mcp_approval_request", "mcp_approval_response", "additional_tools", "code_interpreter_call",
+		"computer_call", "file_search_call", "image_generation_call", "web_search_call", "tool_use", "agent_message",
+		"compaction_trigger", "item_reference":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -596,6 +1282,10 @@ func (b *envelopeBuilder) appendAttachmentReferences(result gjson.Result, role s
 		}
 		return
 	}
+	if result.Type == gjson.String {
+		b.append(OriginAttachmentRefs, role, result.String())
+		return
+	}
 	if !result.IsObject() {
 		return
 	}
@@ -607,7 +1297,7 @@ func (b *envelopeBuilder) appendAttachmentReferences(result gjson.Result, role s
 			} else if value.IsObject() {
 				b.appendAttachmentReferences(value, role)
 			}
-		case "attachments", "source":
+		case "attachments", "source", "images", "input_images", "mask":
 			b.appendAttachmentReferences(value, role)
 		}
 		return true

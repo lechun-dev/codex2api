@@ -191,6 +191,8 @@ type DB struct {
 	conn   *sql.DB
 	driver string
 
+	promptFilterAudit *promptFilterAuditQueue
+
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
 	logMu   sync.Mutex
@@ -423,6 +425,8 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.ensureUsageStatsBaselineBillingColumns(ctx); err != nil {
 		return nil, err
 	}
+	db.promptFilterAudit = newPromptFilterAuditQueue(db)
+	db.promptFilterAudit.start()
 
 	return db, nil
 }
@@ -468,6 +472,9 @@ func (db *DB) Close() error {
 	close(db.logStop)
 	db.logWg.Wait()
 	db.flushLogs() // 最后一次 flush
+	if db.promptFilterAudit != nil {
+		db.promptFilterAudit.close(2 * time.Second)
+	}
 	return db.conn.Close()
 }
 
@@ -2569,7 +2576,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
-	AccountID            int64
+	AccountID int64
 	// Channel 是处理该请求的上游渠道（codex/grok），写入时固化，空值表示未知。
 	Channel              string
 	ClientIP             string

@@ -182,9 +182,11 @@ func (h *Handler) recordPromptFilterLog(c *gin.Context, input *database.PromptFi
 	if h == nil || h.db == nil || input == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = h.db.InsertPromptFilterLog(ctx, input)
+	priority := database.PromptFilterLogPriorityLow
+	if input.Action == promptfilter.ActionWarn || input.Action == promptfilter.ActionBlock {
+		priority = database.PromptFilterLogPriorityHigh
+	}
+	_ = h.db.EnqueuePromptFilterLog(input, priority)
 }
 
 func (h *Handler) ListPromptFilterLogs(c *gin.Context) {

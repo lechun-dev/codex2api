@@ -223,7 +223,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			return false
 		}
 		if model != "" && account.IsModelRateLimited(model) {
@@ -239,6 +239,52 @@ func accountFilterForModel(model string) auth.AccountFilter {
 	}
 }
 
+// requestUpstreamChannel 返回当前请求下游 Key 的上游渠道限定（空=不限）。
+func requestUpstreamChannel(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return ""
+	}
+	return row.Limits.ResolveUpstreamChannel()
+}
+
+// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
+// grok 渠道换成 Grok 专属过滤（账号未声明模型时直接透传请求模型，不再要求声明）；
+// codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
+func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	switch requestUpstreamChannel(c) {
+	case database.UpstreamChannelGrok:
+		return grokChannelAccountFilter(effectiveModel)
+	case database.UpstreamChannelCodex:
+		return func(account *auth.Account) bool {
+			if account == nil || account.IsGrokAPI() {
+				return false
+			}
+			return filter(account)
+		}
+	}
+	return filter
+}
+
+// grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
+// 账号声明了 Models 白名单则要求命中（mapping 先行），未声明则放行全部模型。
+func grokChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsGrokAPI() {
+			return false
+		}
+		routedModel := model
+		if mappedModel, ok := resolveAccountModelMapping(account, model); ok && mappedModel != "" {
+			routedModel = mappedModel
+		}
+		if routedModel != "" && account.IsModelRateLimited(routedModel) {
+			return false
+		}
+		return account.GrokChannelSupportsModel(routedModel)
+	}
+}
+
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
 	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
 }
@@ -249,9 +295,16 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	candidates := compactMappingCandidates(originalModel, effectiveModel)
-	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
+	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	})
+	return func(account *auth.Account) bool {
+		// Grok 上游没有 /responses/compact 端点，compact 请求不路由到 Grok 账号
+		if account.IsGrokAPI() {
+			return false
+		}
+		return inner(account)
+	}
 }
 
 func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
@@ -267,7 +320,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
@@ -300,7 +353,7 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account == nil || !account.IsOpenAIResponsesAPI() {
+		if account == nil || !account.IsRelayStyle() {
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
@@ -557,6 +610,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
 	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
+	h.store.SetAPIKeyUpstreamChannel(row.ID, row.Limits.ResolveUpstreamChannel())
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）。DB 故障时保守返回 false。
@@ -608,6 +662,16 @@ func (h *Handler) hasAnyKeys() bool {
 func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
+	}
+	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
+	// 账号已不在池中（如刚被删除）时按 codex 兜底。
+	if input.Channel == "" && h.store != nil {
+		input.Channel = database.UpstreamChannelCodex
+		if input.AccountID > 0 {
+			if acc := h.store.FindByID(input.AccountID); acc != nil && acc.IsGrokAPI() {
+				input.Channel = database.UpstreamChannelGrok
+			}
+		}
 	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
@@ -856,7 +920,7 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 		return false
 	}
 	for _, account := range h.store.Accounts() {
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			continue
 		}
 		if account.IsAvailable() {
@@ -866,10 +930,10 @@ func (h *Handler) storeHasAvailableCodexAccount() bool {
 	return false
 }
 
-// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转账号"约束。
+// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转/Grok 账号"约束。
 func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
-		if account == nil || account.IsOpenAIResponsesAPI() {
+		if account == nil || account.IsRelayStyle() {
 			return false
 		}
 		return inner == nil || inner(account)
@@ -1821,7 +1885,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1921,6 +1988,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if pinBodySignalToCodexAccounts {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1932,6 +2000,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	overflowCompactRetried := false
+	overflowCompactEnabled := autoCompactOverflowEnabled(c)
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1969,7 +2039,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP()
+		// relay/Grok 账号走 HTTP 执行器（下方 IsRelayStyle 分支优先于 WS），这里同步排除，
+		// 避免日志把 relay 请求错标成 via_websocket。
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -1998,7 +2070,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			if lastUpstreamCancel != nil {
 				lastUpstreamCancel()
 			}
@@ -2016,8 +2088,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftTimedOut := func() bool {
 				return ttftGuard != nil && ttftGuard.TimedOut()
 			}
-			baseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			upstreamEndpoint := relayUpstreamEndpointForAccount(account)
 			upstreamBody := getOpenAIResponsesBody()
 			var mappedBody []byte
 			var mappedModel string
@@ -2032,7 +2103,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -2167,7 +2238,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 
-			c.Set("x-account-email", baseURL)
+			account.Mu().RLock()
+			relayAccountEmail := account.Email
+			account.Mu().RUnlock()
+			c.Set("x-account-email", relayAccountEmail)
 			c.Set("x-account-proxy", proxyURL)
 			c.Set("x-model", logModel)
 			c.Set("x-reasoning-effort", reasoningEffort)
@@ -2510,6 +2584,19 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
+			// 上下文超窗 + Key 开启自动压缩：摘要旧轮次后同参重试一次 (issue #415)
+			if overflowCompactEnabled && !overflowCompactRetried &&
+				resp.StatusCode == http.StatusBadRequest && isContextLengthExceededBody(errBody) {
+				if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+					overflowCompactRetried = true
+					codexBody = compacted
+					expandedInputRaw = responsesInputRaw(codexBody)
+					log.Printf("上游报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2580,6 +2667,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
+		// contentTokenSeen: 是否已出现真正的内容事件（严格判定，与 first_token_mode 无关）。
+		// loose 模式下 codex.rate_limits 等前置事件会置位 ttftRecorded，"首 token 前"
+		// 的失败抑制/真实错误码/事件缓冲决策改用本标志，避免在 loose 部署上失效。
+		contentTokenSeen := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
@@ -2618,6 +2709,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				// contentTokenSeen 用严格判定（与 first_token_mode 无关）：loose 模式下
+				// codex.rate_limits 等前置事件也会置位 ttftRecorded，若用它做"首 token 前"
+				// 判断，失败抑制/真实错误码/超窗压缩重试在 loose 部署上全部失效。
+				if !contentTokenSeen && isFirstTokenResult(parsed) {
+					contentTokenSeen = true
+				}
 
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
@@ -2642,21 +2739,26 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, contentTokenSeen, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenEvents.Reset()
 					return false
 				}
 
 				// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 				// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 + [DONE] 让中转层误计费。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentTokenSeen, wroteAnyBody, clientGone) {
 					pendingFirstTokenEvents.Reset()
 					abortedForHTTPError = true
 					return false
 				}
 
 				if !clientGone {
-					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+					// codex.* 前置元数据事件（rate_limits / response.metadata）与生命周期
+					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
+					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
+					// 既无法按真实错误码返回，也无法走超窗压缩重试。
+					shouldDefer := !contentTokenSeen && !gotTerminal &&
+						(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
 					if err != nil {
 						writeErr = err
@@ -2858,6 +2960,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
+		// 流内报上下文超窗（HTTP SSE 与 WS 上游同路径）+ Key 开启自动压缩：
+		// 未向下游写过任何字节时，摘要旧轮次后同参重试一次 (issue #415)。
+		if overflowCompactEnabled && !overflowCompactRetried && !wroteAnyBody &&
+			(!isStream || abortedForHTTPError) &&
+			isContextLengthExceededFailedPayload(terminalFailurePayload) {
+			if compacted, ok := h.compactOverflowResponsesBody(c.Request.Context(), codexBody); ok {
+				overflowCompactRetried = true
+				codexBody = compacted
+				expandedInputRaw = responsesInputRaw(codexBody)
+				log.Printf("上游流内报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+				resp.Body.Close()
+				h.store.Release(account)
+				continue
+			}
+		}
+
 		if isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -2950,7 +3068,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -3472,7 +3593,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -3547,6 +3671,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -3593,7 +3718,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
@@ -3611,8 +3736,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -3660,7 +3784,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -4512,6 +4636,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
+	if account.IsGrokAPI() {
+		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)
+	}
 	if IsUsageLimitReachedError(body) {
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
@@ -4958,6 +5086,23 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				seen[key] = struct{}{}
 				models = append(models, alias)
 			}
+		}
+		// 全局模型映射的 from 键（Claude 模型映射：claude-* → gpt-*，用于 /v1/messages）
+		// 也要出现在 /v1/models，否则下游客户端拉不到可用的 Claude 模型名。
+		// 仅列非通配的显式映射键；通配规则（含 *）不作为具体模型暴露。
+		for _, rule := range parseModelMappingRules(h.store.GetModelMapping()) {
+			if rule.Wildcard {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(rule.From))
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, rule.From)
 		}
 	}
 	return models

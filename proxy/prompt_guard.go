@@ -190,6 +190,10 @@ type promptGuardEvaluation struct {
 
 func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
 	cfg := h.store.GetPromptFilterConfig()
+	return h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, transport)
+}
+
+func (h *Handler) evaluatePromptGuardWithConfig(c *gin.Context, cfg promptfilter.Config, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
 	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
 	envelope := promptfilter.BuildEnvelopeWithModels(rawBody, endpoint, requestedModel, effectiveModel, transport, cfg.MaxTextLength)
@@ -214,6 +218,10 @@ func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody
 
 func (h *Handler) evaluatePromptGuardText(c *gin.Context, text string, endpoint string, model string) promptGuardEvaluation {
 	cfg := h.store.GetPromptFilterConfig()
+	return h.evaluatePromptGuardTextWithConfig(c, cfg, text, endpoint, model)
+}
+
+func (h *Handler) evaluatePromptGuardTextWithConfig(c *gin.Context, cfg promptfilter.Config, text string, endpoint string, model string) promptGuardEvaluation {
 	signedBody := ingressRequestBody(c, nil)
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
 	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)

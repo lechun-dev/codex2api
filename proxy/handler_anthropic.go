@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -154,6 +153,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
@@ -202,13 +202,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -247,7 +246,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)

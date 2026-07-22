@@ -890,8 +890,12 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	if h == nil || h.store == nil {
 		return false, false
 	}
-	evaluation := h.evaluatePromptGuard(c, rawBody, nil, endpoint, model, promptfilter.TransportWebSocket)
-	cfg := evaluation.Config
+	cfg := h.store.GetPromptFilterConfig()
+	// Keep disabled filters off the WebSocket request-body hot path too.
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false, false
+	}
+	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, nil, endpoint, model, promptfilter.TransportWebSocket)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action != promptfilter.ActionBlock {

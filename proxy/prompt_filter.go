@@ -27,9 +27,14 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	if h == nil || h.store == nil {
 		return false
 	}
+	cfg := h.store.GetPromptFilterConfig()
+	// Skip envelope construction and body traversal when neither the local
+	// filter nor a body-dependent extension is enabled (issue #417).
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
 	signedBody := ingressRequestBody(c, rawBody)
-	evaluation := h.evaluatePromptGuard(c, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
-	cfg := evaluation.Config
+	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {
@@ -53,8 +58,11 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if h == nil || h.store == nil {
 		return false
 	}
-	evaluation := h.evaluatePromptGuardText(c, text, endpoint, model)
-	cfg := evaluation.Config
+	cfg := h.store.GetPromptFilterConfig()
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
+	evaluation := h.evaluatePromptGuardTextWithConfig(c, cfg, text, endpoint, model)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {
@@ -78,9 +86,12 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	if h == nil || h.store == nil {
 		return false
 	}
+	cfg := h.store.GetPromptFilterConfig()
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false
+	}
 	signedBody := ingressRequestBody(c, rawBody)
-	evaluation := h.evaluatePromptGuard(c, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
-	cfg := evaluation.Config
+	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action == promptfilter.ActionWarn {

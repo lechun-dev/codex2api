@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,15 +21,17 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// Grok CLI 请求头契约的默认值（与 Grok CLI 0.2.102 对齐），可用环境变量覆盖，
+// Grok CLI 请求头契约的默认值（与 Grok CLI 0.2.106 实抓流量对齐），可用环境变量覆盖，
 // 上游升级 CLI 版本导致指纹校验失败时无需改代码。
+// 0.2.106 契约：UA 为 "grok-pager/<v> grok-shell/<v> (<os>; <arch>)"，
+// identifier=grok-pager、mode=interactive，不再携带 client-surface / client-name 头。
 var (
-	grokClientVersion    = grokEnv("GROK_CLIENT_VERSION", "0.2.102")
-	grokClientIdentifier = grokEnv("GROK_CLIENT_IDENTIFIER", "grok-shell")
-	grokClientSurface    = grokEnv("GROK_CLIENT_SURFACE", "tui")
-	grokClientName       = grokEnv("GROK_CLIENT_NAME", "grok-shell")
-	grokClientMode       = grokEnv("GROK_CLIENT_MODE", "headless")
+	grokClientVersion    = grokEnv("GROK_CLIENT_VERSION", "0.2.106")
+	grokClientIdentifier = grokEnv("GROK_CLIENT_IDENTIFIER", "grok-pager")
+	grokClientMode       = grokEnv("GROK_CLIENT_MODE", "interactive")
 	grokTokenAuth        = grokEnv("GROK_TOKEN_AUTH", "xai-grok-cli")
+	// x-compaction-at：CLI 声明的客户端侧压缩阈值（上游 context window 500k，CLI 报 400k）。
+	grokCompactionAt = grokEnv("GROK_COMPACTION_AT", "400000")
 )
 
 func grokEnv(key, fallback string) string {
@@ -38,11 +41,19 @@ func grokEnv(key, fallback string) string {
 	return fallback
 }
 
+// grokUserAgentOS 返回 UA 里的平台名。官方 CLI 用 "macos" 而非 Go 的 "darwin"。
+func grokUserAgentOS() string {
+	if runtime.GOOS == "darwin" {
+		return "macos"
+	}
+	return runtime.GOOS
+}
+
 func grokUserAgent() string {
 	if grokClientIdentifier == "grok-shell" {
-		return fmt.Sprintf("grok-shell/%s (%s; %s)", grokClientVersion, runtime.GOOS, runtime.GOARCH)
+		return fmt.Sprintf("grok-shell/%s (%s; %s)", grokClientVersion, grokUserAgentOS(), runtime.GOARCH)
 	}
-	return fmt.Sprintf("%s/%s grok-shell/%s (%s; %s)", grokClientIdentifier, grokClientVersion, grokClientVersion, runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s/%s grok-shell/%s (%s; %s)", grokClientIdentifier, grokClientVersion, grokClientVersion, grokUserAgentOS(), runtime.GOARCH)
 }
 
 // grokAgentID 为每个账号生成稳定的 agent 标识（32 位 hex，与 Grok CLI 的
@@ -70,9 +81,10 @@ func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer st
 	req.Header.Set("User-Agent", grokUserAgent())
 	req.Header.Set("x-grok-client-version", grokClientVersion)
 	req.Header.Set("x-grok-client-identifier", grokClientIdentifier)
-	req.Header.Set("x-grok-client-surface", grokClientSurface)
-	req.Header.Set("x-grok-client-name", grokClientName)
 	req.Header.Set("x-grok-client-mode", grokClientMode)
+	if grokCompactionAt != "" {
+		req.Header.Set("x-compaction-at", grokCompactionAt)
+	}
 	if !isAPIKey {
 		req.Header.Set("x-xai-token-auth", grokTokenAuth)
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
@@ -145,7 +157,41 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 		}
 		return nil, ErrUpstream(0, "请求 Grok 上游失败", err)
 	}
+	recordGrokRateLimitHeaders(account, resp.Header)
 	return resp, nil
+}
+
+// recordGrokRateLimitHeaders 采集上游逐请求返回的配额余量头（x-ratelimit-*），
+// 写入账号运行时快照供账号列表展示。任一头缺失时不更新（避免半截观测覆盖完整值）。
+func recordGrokRateLimitHeaders(account *auth.Account, header http.Header) {
+	if account == nil || header == nil {
+		return
+	}
+	parse := func(key string) (int64, bool) {
+		raw := strings.TrimSpace(header.Get(key))
+		if raw == "" {
+			return 0, false
+		}
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			return 0, false
+		}
+		return v, true
+	}
+	limitTokens, ok1 := parse("x-ratelimit-limit-tokens")
+	remainTokens, ok2 := parse("x-ratelimit-remaining-tokens")
+	limitReqs, ok3 := parse("x-ratelimit-limit-requests")
+	remainReqs, ok4 := parse("x-ratelimit-remaining-requests")
+	if !ok1 && !ok2 && !ok3 && !ok4 {
+		return
+	}
+	account.SetGrokRateLimitSnapshot(auth.GrokRateLimitSnapshot{
+		LimitTokens:       limitTokens,
+		RemainingTokens:   remainTokens,
+		LimitRequests:     limitReqs,
+		RemainingRequests: remainReqs,
+		UpdatedAt:         time.Now(),
+	})
 }
 
 // sanitizeGrokRequestBody 剥离 Codex 管道注入的、Grok 上游不接受的字段。

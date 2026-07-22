@@ -150,3 +150,87 @@ func TestSanitizeGrokBaseURLLowerNoPanic(t *testing.T) {
 	}
 	_ = strings.ToLower("")
 }
+
+func TestBuildGrokAuthorizationURL(t *testing.T) {
+	url, err := BuildGrokAuthorizationURL(GrokAuthURLParams{
+		State:         "state-abc",
+		CodeChallenge: "challenge-xyz",
+		Nonce:         "nonce-1",
+	})
+	if err != nil {
+		t.Fatalf("BuildGrokAuthorizationURL: %v", err)
+	}
+	if !strings.HasPrefix(url, GrokDefaultAuthorizeURL+"?") {
+		t.Fatalf("unexpected prefix: %s", url)
+	}
+	if !strings.Contains(url, "code_challenge=challenge-xyz") {
+		t.Fatalf("missing challenge: %s", url)
+	}
+	if !strings.Contains(url, "client_id="+GrokDefaultOAuthClientID) {
+		t.Fatalf("missing client_id: %s", url)
+	}
+	if !strings.Contains(url, "redirect_uri=") {
+		t.Fatalf("missing redirect_uri: %s", url)
+	}
+	if !strings.Contains(url, "referrer=codex2api") {
+		t.Fatalf("missing referrer: %s", url)
+	}
+}
+
+func TestBuildGrokAuthorizationURLRequiresState(t *testing.T) {
+	if _, err := BuildGrokAuthorizationURL(GrokAuthURLParams{CodeChallenge: "x"}); err == nil {
+		t.Fatal("expected error for empty state")
+	}
+}
+
+func TestParseGrokAuthorizationInput(t *testing.T) {
+	cases := []struct {
+		name          string
+		raw           string
+		wantCode      string
+		wantState     string
+		wantRequires  bool
+	}{
+		{
+			name:         "full callback url",
+			raw:          "http://127.0.0.1:56121/callback?code=abc123&state=s1",
+			wantCode:     "abc123",
+			wantState:    "s1",
+			wantRequires: true,
+		},
+		{
+			name:         "query string",
+			raw:          "code=xyz&state=s2",
+			wantCode:     "xyz",
+			wantState:    "s2",
+			wantRequires: true,
+		},
+		{
+			name:     "bare code",
+			raw:      "bare-code-only",
+			wantCode: "bare-code-only",
+		},
+		{
+			name: "empty",
+			raw:  "  ",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ParseGrokAuthorizationInput(tc.raw)
+			if got.Code != tc.wantCode || got.State != tc.wantState || got.RequiresState != tc.wantRequires {
+				t.Fatalf("got %+v, want code=%q state=%q requires=%v", got, tc.wantCode, tc.wantState, tc.wantRequires)
+			}
+		})
+	}
+}
+
+func TestGrokSubjectFromAccessToken(t *testing.T) {
+	token := makeJWT(map[string]any{"sub": "user-sub-9"})
+	if got := GrokSubjectFromAccessToken(token); got != "user-sub-9" {
+		t.Fatalf("got %q", got)
+	}
+	if got := GrokSubjectFromAccessToken("not-a-jwt"); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}

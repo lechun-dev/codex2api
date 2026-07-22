@@ -499,6 +499,12 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 	return "gpt-5.4"
 }
 
+// defaultGrokConnectionTestModels：账号未声明 models 时的 Grok 连通性测试回落列表
+// （与 Grok CLI / 常见上游目录对齐，仅文本模型）。
+func defaultGrokConnectionTestModels() []string {
+	return []string{"grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
+}
+
 func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *auth.Account, requested string) (string, error) {
 	requested = strings.TrimSpace(requested)
 	if account == nil || !account.IsRelayStyle() {
@@ -517,6 +523,10 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 		if isTextConnectionModel(model) {
 			textModels = append(textModels, strings.TrimSpace(model))
 		}
+	}
+	// Grok 账号常不预声明 models（依赖上游 /v1/models），回落到常见文本模型。
+	if len(textModels) == 0 && account.IsGrokAPI() {
+		textModels = append(textModels, defaultGrokConnectionTestModels()...)
 	}
 	if len(textModels) == 0 {
 		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")

@@ -239,6 +239,52 @@ func accountFilterForModel(model string) auth.AccountFilter {
 	}
 }
 
+// requestUpstreamChannel 返回当前请求下游 Key 的上游渠道限定（空=不限）。
+func requestUpstreamChannel(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return ""
+	}
+	return row.Limits.ResolveUpstreamChannel()
+}
+
+// applyUpstreamChannelFilter 按下游 Key 的上游渠道限定改写账号过滤器。
+// grok 渠道换成 Grok 专属过滤（账号未声明模型时直接透传请求模型，不再要求声明）；
+// codex 渠道在原过滤器上排除 Grok 账号；未限定则原样返回。
+func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	switch requestUpstreamChannel(c) {
+	case database.UpstreamChannelGrok:
+		return grokChannelAccountFilter(effectiveModel)
+	case database.UpstreamChannelCodex:
+		return func(account *auth.Account) bool {
+			if account == nil || account.IsGrokAPI() {
+				return false
+			}
+			return filter(account)
+		}
+	}
+	return filter
+}
+
+// grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
+// 账号声明了 Models 白名单则要求命中（mapping 先行），未声明则放行全部模型。
+func grokChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsGrokAPI() {
+			return false
+		}
+		routedModel := model
+		if mappedModel, ok := resolveAccountModelMapping(account, model); ok && mappedModel != "" {
+			routedModel = mappedModel
+		}
+		if routedModel != "" && account.IsModelRateLimited(routedModel) {
+			return false
+		}
+		return account.GrokChannelSupportsModel(routedModel)
+	}
+}
+
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
 	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
 }
@@ -564,6 +610,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
 	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
+	h.store.SetAPIKeyUpstreamChannel(row.ID, row.Limits.ResolveUpstreamChannel())
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）。DB 故障时保守返回 false。
@@ -615,6 +662,16 @@ func (h *Handler) hasAnyKeys() bool {
 func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
+	}
+	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
+	// 账号已不在池中（如刚被删除）时按 codex 兜底。
+	if input.Channel == "" && h.store != nil {
+		input.Channel = database.UpstreamChannelCodex
+		if input.AccountID > 0 {
+			if acc := h.store.FindByID(input.AccountID); acc != nil && acc.IsGrokAPI() {
+				input.Channel = database.UpstreamChannelGrok
+			}
+		}
 	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
@@ -1780,7 +1837,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1880,6 +1940,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if pinBodySignalToCodexAccounts {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1930,7 +1991,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP()
+		// relay/Grok 账号走 HTTP 执行器（下方 IsRelayStyle 分支优先于 WS），这里同步排除，
+		// 避免日志把 relay 请求错标成 via_websocket。
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -2957,7 +3020,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -3479,7 +3545,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	if requestUpstreamChannel(c) != database.UpstreamChannelGrok {
+		// grok 渠道 Key 的模型由 Grok 上游校验，跳过网关侧模型白名单
+		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
+	}
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -3554,6 +3623,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)

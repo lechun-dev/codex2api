@@ -111,6 +111,8 @@ type Account struct {
 	GrokOIDCIssuer    string
 	GrokPrincipalType string
 	GrokPrincipalID   string
+	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
+	grokRateLimit *GrokRateLimitSnapshot
 	Status                  AccountStatus
 	CooldownUtil            time.Time
 	CooldownReason          string // rate_limited / rate_limited_5h / unauthorized / 空
@@ -2424,6 +2426,7 @@ type Store struct {
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
 	apiKeyAllowedPlans                 map[int64][]string
 	apiKeyAllowedPlanSets              map[int64]map[string]struct{}
+	apiKeyUpstreamChannels             map[int64]string
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
 	usageProbeBatch                    atomic.Bool
@@ -3790,6 +3793,23 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		}
 		if account.PlanType == "" {
 			account.PlanType = "api"
+		}
+		// billing 探针的周/月用量随 credentials 落库，重启后在此恢复运行时快照
+		// （周额度占用 5h 槽位、月额度占用 7d 槽位，与探针写入端一致）
+		grokUsageUpdatedAt := time.Time{}
+		if raw := row.GetCredential("grok_usage_updated_at"); raw != "" {
+			if t, err := time.Parse(time.RFC3339, raw); err == nil {
+				grokUsageUpdatedAt = t
+			}
+		}
+		if pct, ok := row.GetCredentialFloat64("grok_weekly_usage_percent"); ok {
+			account.SetUsageSnapshot5hAt(pct, grokParseTime(row.GetCredential("grok_weekly_period_end")), grokUsageUpdatedAt)
+		}
+		if pct, ok := row.GetCredentialFloat64("grok_monthly_usage_percent"); ok {
+			account.SetUsageSnapshot(pct, grokUsageUpdatedAt)
+			if end := grokParseTime(row.GetCredential("grok_monthly_period_end")); !end.IsZero() {
+				account.SetReset7dAt(end)
+			}
 		}
 	}
 	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
@@ -5617,6 +5637,43 @@ func (s *Store) GetAPIKeyAllowedGroups(apiKeyID int64) []int64 {
 	return cloneInt64Slice(s.apiKeyAllowedGroups[apiKeyID])
 }
 
+// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok，空=不限）。
+// 仅在取值真正变化时重建调度器。
+func (s *Store) SetAPIKeyUpstreamChannel(apiKeyID int64, channel string) {
+	if apiKeyID <= 0 {
+		return
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
+		channel = ""
+	}
+	s.apiKeyGroupsMu.Lock()
+	if s.apiKeyUpstreamChannels == nil {
+		s.apiKeyUpstreamChannels = make(map[int64]string)
+	}
+	if s.apiKeyUpstreamChannels[apiKeyID] == channel {
+		s.apiKeyGroupsMu.Unlock()
+		return
+	}
+	if channel == "" {
+		delete(s.apiKeyUpstreamChannels, apiKeyID)
+	} else {
+		s.apiKeyUpstreamChannels[apiKeyID] = channel
+	}
+	s.apiKeyGroupsMu.Unlock()
+	s.rebuildFastScheduler()
+}
+
+// APIKeyUpstreamChannel 返回某 API Key 的上游渠道限定（空=不限）。
+func (s *Store) APIKeyUpstreamChannel(apiKeyID int64) string {
+	if s == nil || apiKeyID <= 0 {
+		return ""
+	}
+	s.apiKeyGroupsMu.RLock()
+	defer s.apiKeyGroupsMu.RUnlock()
+	return s.apiKeyUpstreamChannels[apiKeyID]
+}
+
 func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return nil
@@ -5630,6 +5687,7 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 	s.apiKeyAllowedGroupSets = make(map[int64]map[int64]struct{}, len(keys))
 	s.apiKeyAllowedPlans = make(map[int64][]string, len(keys))
 	s.apiKeyAllowedPlanSets = make(map[int64]map[string]struct{}, len(keys))
+	s.apiKeyUpstreamChannels = make(map[int64]string, len(keys))
 	for _, key := range keys {
 		normalized := normalizeAllowedGroupIDs(key.AllowedGroupIDs)
 		if len(normalized) > 0 {
@@ -5640,6 +5698,9 @@ func (s *Store) LoadAPIKeyAllowedGroups(ctx context.Context) error {
 		if len(plans) > 0 {
 			s.apiKeyAllowedPlans[key.ID] = append([]string(nil), plans...)
 			s.apiKeyAllowedPlanSets[key.ID] = stringSet(plans)
+		}
+		if channel := key.Limits.ResolveUpstreamChannel(); channel != "" {
+			s.apiKeyUpstreamChannels[key.ID] = channel
 		}
 	}
 	s.apiKeyGroupsMu.Unlock()
@@ -5656,7 +5717,19 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	s.apiKeyGroupsMu.RLock()
 	allowedGroups := s.apiKeyAllowedGroupSets[apiKeyID]
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
+	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
+	// 渠道限定是硬门：grok 渠道只允许 Grok 账号，codex 渠道排除 Grok 账号。
+	switch channel {
+	case database.UpstreamChannelGrok:
+		if !acc.IsGrokAPI() {
+			return false
+		}
+	case database.UpstreamChannelCodex:
+		if acc.IsGrokAPI() {
+			return false
+		}
+	}
 	if len(allowedGroups) == 0 && len(allowedPlans) == 0 {
 		return true
 	}

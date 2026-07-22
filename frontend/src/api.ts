@@ -9,6 +9,14 @@ import type {
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
   FetchGrokModelsResponse,
+  GrokDeviceStartRequest,
+  GrokDeviceStartResponse,
+  GrokDevicePollRequest,
+  GrokDevicePollResponse,
+  GrokSSOImportRequest,
+  GrokSSOImportResponse,
+  GrokBatchImportRequest,
+  GrokBatchImportResponse,
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
@@ -403,6 +411,31 @@ export const api = {
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
     request<FetchGrokModelsResponse>('/accounts/grok/models', { method: 'POST', body: JSON.stringify(data) }),
+  startGrokDeviceAuth: (data: GrokDeviceStartRequest = {}) =>
+    request<GrokDeviceStartResponse>('/accounts/grok/oauth/device/start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  pollGrokDeviceAuth: (data: GrokDevicePollRequest) =>
+    request<GrokDevicePollResponse>('/accounts/grok/oauth/device/poll', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokSSO: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/sso/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  batchImportGrokAccounts: (data: GrokBatchImportRequest) =>
+    request<GrokBatchImportResponse>('/accounts/grok/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokRefreshTokens: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/refresh/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
@@ -538,10 +571,11 @@ export const api = {
     const search = buildOpsErrorSearchParams(params)
     return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
-  getUsageStats: (params: { start?: string; end?: string } = {}) => {
+  getUsageStats: (params: { start?: string; end?: string; channel?: string } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
+    if (params.channel) searchParams.set('channel', params.channel)
     const qs = searchParams.toString()
     return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
   },
@@ -564,7 +598,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -577,13 +611,15 @@ export const api = {
     if (params.accountId) searchParams.set('account_id', params.accountId)
     if (params.fast) searchParams.set('fast', params.fast)
     if (params.stream) searchParams.set('stream', params.stream)
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getChartData: (params: { start: string; end: string; bucketMinutes: number }) => {
+  getChartData: (params: { start: string; end: string; bucketMinutes: number; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
   },
   getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {

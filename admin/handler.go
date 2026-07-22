@@ -311,18 +311,18 @@ func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey stri
 	}
 }
 
-func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time) (*database.UsageStats, error) {
-	// 只对"默认今日"区间走 5 秒缓存。
+func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*database.UsageStats, error) {
+	// 只对"默认今日 + 全渠道"区间走 5 秒缓存。
 	// 带显式区间的请求种类多、命中率低,且 ClearUsageLogs 现有的失效逻辑只清 "global" key,
 	// 给区间结果做缓存反而需要扩展失效接口,得不偿失,直接每次重算更简单。
-	useCache := rangeStart.IsZero() && rangeEnd.IsZero()
+	useCache := rangeStart.IsZero() && rangeEnd.IsZero() && channel == ""
 	if useCache {
 		var cached database.UsageStats
 		if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
 			return &cached, nil
 		}
 	}
-	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd, channel)
 	if err != nil {
 		return nil, err
 	}
@@ -330,6 +330,17 @@ func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd 
 		h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
 	}
 	return stats, nil
+}
+
+// parseUsageChannel 解析 query 里的渠道过滤参数（codex/grok，其余视为不限）。
+func parseUsageChannel(c *gin.Context) string {
+	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
+	case database.UpstreamChannelCodex:
+		return database.UpstreamChannelCodex
+	case database.UpstreamChannelGrok:
+		return database.UpstreamChannelGrok
+	}
+	return ""
 }
 
 // NewHandler 创建管理后台处理器
@@ -416,6 +427,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
+	api.POST("/accounts/grok/oauth/device/start", h.StartGrokDeviceAuth)
+	api.POST("/accounts/grok/oauth/device/poll", h.PollGrokDeviceAuth)
+	api.POST("/accounts/grok/sso/import", h.ImportGrokSSO)
+	api.POST("/accounts/grok/refresh/import", h.ImportGrokRefreshTokens)
+	api.POST("/accounts/grok/import", h.BatchImportGrokAccounts)
+	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)         // 兼容旧客户端
+	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
 	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
@@ -616,12 +634,24 @@ func (h *Handler) GetStats(c *gin.Context) {
 		return
 	}
 
-	accountCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
+	accountCounts, channelCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
 
-	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{})
+	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{}, "")
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
+	}
+	todayByChannel, _ := h.db.CountTodayRequestsByChannel(ctx)
+
+	channels := make(map[string]statsChannelCounts, len(channelCounts))
+	for ch, counts := range channelCounts {
+		channels[ch] = statsChannelCounts{
+			Total:         counts.total,
+			Available:     counts.normal,
+			RateLimited:   counts.rateLimited,
+			Error:         counts.abnormal,
+			TodayRequests: todayByChannel[ch],
+		}
 	}
 
 	c.JSON(http.StatusOK, statsResponse{
@@ -630,6 +660,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		RateLimited:   accountCounts.rateLimited,
 		Error:         accountCounts.abnormal,
 		TodayRequests: todayReqs,
+		Channels:      channels,
 	})
 }
 
@@ -641,7 +672,9 @@ type dashboardAccountCounts struct {
 	disabled    int
 }
 
-func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) dashboardAccountCounts {
+// summarizeDashboardAccounts 汇总账号健康计数，并按上游渠道（codex/grok）拆分。
+// 渠道判定优先用运行时账号（IsGrokAPI），不在池中的行回退 upstream_type 凭据。
+func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) (dashboardAccountCounts, map[string]dashboardAccountCounts) {
 	runtimeByID := make(map[int64]*auth.Account, len(runtimeAccounts))
 	for _, acc := range runtimeAccounts {
 		if acc != nil {
@@ -650,6 +683,10 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 	}
 
 	var counts dashboardAccountCounts
+	channelCounts := map[string]dashboardAccountCounts{
+		database.UpstreamChannelCodex: {},
+		database.UpstreamChannelGrok:  {},
+	}
 	counts.total = len(rows)
 	for _, row := range rows {
 		if row == nil {
@@ -657,25 +694,38 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		}
 		status := strings.ToLower(strings.TrimSpace(row.Status))
 		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
+		channel := database.UpstreamChannelCodex
+		if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamGrok) {
+			channel = database.UpstreamChannelGrok
+		}
 		if acc, ok := runtimeByID[row.ID]; ok {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
+			if acc.IsGrokAPI() {
+				channel = database.UpstreamChannelGrok
+			}
 		}
+		perChannel := channelCounts[channel]
+		perChannel.total++
 
 		if !row.Enabled {
 			counts.disabled++
+			perChannel.disabled++
 		}
-		if isDashboardAbnormalAccount(status) {
+		switch {
+		case isDashboardAbnormalAccount(status):
 			counts.abnormal++
-			continue
-		}
-		if isDashboardRateLimitedAccount(status, cooldownReason) {
+			perChannel.abnormal++
+		case isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
-			continue
+			perChannel.rateLimited++
+		default:
+			counts.normal++
+			perChannel.normal++
 		}
-		counts.normal++
+		channelCounts[channel] = perChannel
 	}
-	return counts
+	return counts, channelCounts
 }
 
 func isDashboardAbnormalAccount(status string) bool {
@@ -715,6 +765,8 @@ type accountResponse struct {
 	OpenAIResponsesAPI         bool                       `json:"openai_responses_api,omitempty"`
 	GrokAPI                    bool                       `json:"grok_api,omitempty"`
 	GrokAuthKind               string                     `json:"grok_auth_kind,omitempty"`
+	GrokBilling                json.RawMessage            `json:"grok_billing,omitempty"`
+	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	BaseURL                    string                     `json:"base_url,omitempty"`
 	Models                     []string                   `json:"models,omitempty"`
 	ModelMapping               string                     `json:"model_mapping,omitempty"`
@@ -873,11 +925,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
 		grokAuthKind := ""
+		var grokBilling json.RawMessage
 		if isGrokAccount {
 			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
 				grokAuthKind = auth.GrokAuthKindAPIKey
 			} else {
 				grokAuthKind = auth.GrokAuthKindOAuth
+			}
+			if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
+				grokBilling = json.RawMessage(detail)
 			}
 		}
 		email := row.GetCredential("email")
@@ -917,6 +973,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			GrokAPI:                  isGrokAccount,
 			GrokAuthKind:             grokAuthKind,
+			GrokBilling:              grokBilling,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
 			ModelMapping:             row.GetCredential("model_mapping"),
@@ -948,6 +1005,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
+			if isGrokAccount {
+				if snap, hasSnap := acc.GetGrokRateLimitSnapshot(); hasSnap {
+					resp.GrokRateLimit = &snap
+				}
+			}
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -5005,7 +5067,7 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		return
 	}
 
-	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd)
+	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd, parseUsageChannel(c))
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -5080,8 +5142,10 @@ func (h *Handler) GetChartData(c *gin.Context) {
 		bucketMinutes = 5
 	}
 
+	channel := parseUsageChannel(c)
+
 	// 检查内存缓存（10秒 TTL）
-	cacheKey := fmt.Sprintf("%s|%s|%d", startStr, endStr, bucketMinutes)
+	cacheKey := fmt.Sprintf("%s|%s|%d|%s", startStr, endStr, bucketMinutes, channel)
 	h.chartCacheMu.RLock()
 	if entry, ok := h.chartCacheData[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		h.chartCacheMu.RUnlock()
@@ -5106,7 +5170,7 @@ func (h *Handler) GetChartData(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
+	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes, channel)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -5186,6 +5250,7 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 		IncludeCanceled: true,
 		ErrorKind:       strings.TrimSpace(c.Query("error_kind")),
 		Query:           strings.TrimSpace(c.Query("q")),
+		Channel:         parseUsageChannel(c),
 	}
 
 	status := strings.TrimSpace(c.Query("status"))
@@ -5599,6 +5664,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				Endpoint:  c.Query("endpoint"),
 				APIKeyID:  apiKeyID,
 				AccountID: accountID,
+				Channel:   parseUsageChannel(c),
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"
@@ -6041,6 +6107,8 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
+		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		UpstreamChannel:        in.ResolveUpstreamChannel(),
 	}
 	// 归一后旧 bool 与新 policy 保持一致，避免两处配置漂移。
 	out.DisableImageGeneration = out.ImageGenerationPolicy == database.ImageGenerationPolicyBlock
@@ -8571,7 +8639,34 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	catalog.GrokModels = h.grokChannelModels()
 	c.JSON(http.StatusOK, catalog)
+}
+
+// grokChannelModels 聚合全部 Grok 账号声明的模型（去重、排序），
+// 供前端在 Key 渠道选 grok 时把模型下拉切成 Grok 选项。
+func (h *Handler) grokChannelModels() []string {
+	if h == nil || h.store == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var models []string
+	for _, account := range h.store.Accounts() {
+		for _, model := range account.GrokModels() {
+			model = strings.TrimSpace(model)
+			key := strings.ToLower(model)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	return models
 }
 
 // SyncModels 从官方 Codex 模型页同步模型注册表。

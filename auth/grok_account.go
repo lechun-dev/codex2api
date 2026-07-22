@@ -29,10 +29,20 @@ const (
 
 // Grok 上游默认端点：OAuth 凭据走 Grok CLI 的 chat-proxy，API Key 走官方 xAI API。
 // base_url 凭据字段可覆盖（留空 = 按凭据类型自动选择）。
+//
+// OAuth 浏览器授权常量与官方 Grok CLI 对齐：
+//   - client_id 为 xAI 公开的 Grok CLI 客户端；
+//   - redirect_uri 固定为 127.0.0.1:56121（上游仅注册该回调，浏览器打不开也无妨，
+//     用户把跳转失败页的完整 URL 粘贴回管理台即可兑换 code）。
 const (
 	GrokDefaultChatProxyBaseURL = "https://cli-chat-proxy.grok.com/v1"
 	GrokDefaultAPIBaseURL       = "https://api.x.ai/v1"
 	GrokDefaultOIDCIssuer       = "https://auth.x.ai"
+	GrokDefaultAuthorizeURL     = GrokDefaultOIDCIssuer + "/oauth2/authorize"
+	GrokDefaultTokenURL         = GrokDefaultOIDCIssuer + "/oauth2/token"
+	GrokDefaultOAuthClientID    = "b1a00492-073a-47ea-816f-4c329264a828"
+	GrokDefaultOAuthScope       = "openid profile email offline_access grok-cli:access api:access"
+	GrokDefaultOAuthRedirectURI = "http://127.0.0.1:56121/callback"
 )
 
 func (a *Account) isGrokAPILocked() bool {
@@ -113,6 +123,79 @@ func (a *Account) GrokCredentials() (baseURL, bearer string) {
 	return baseURL, strings.TrimSpace(a.AccessToken)
 }
 
+// GrokRateLimitSnapshot 是 Grok 上游逐请求返回的配额余量（x-ratelimit-* 响应头）。
+// 仅运行时保存，重启后由下一次请求恢复。
+type GrokRateLimitSnapshot struct {
+	LimitTokens       int64     `json:"limit_tokens,omitempty"`
+	RemainingTokens   int64     `json:"remaining_tokens,omitempty"`
+	LimitRequests     int64     `json:"limit_requests,omitempty"`
+	RemainingRequests int64     `json:"remaining_requests,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// SetGrokRateLimitSnapshot 更新配额余量快照（时间倒流的旧观测被忽略）。
+func (a *Account) SetGrokRateLimitSnapshot(snap GrokRateLimitSnapshot) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.grokRateLimit != nil && snap.UpdatedAt.Before(a.grokRateLimit.UpdatedAt) {
+		return
+	}
+	copied := snap
+	a.grokRateLimit = &copied
+}
+
+// GetGrokRateLimitSnapshot 返回配额余量快照；无观测时 ok=false。
+func (a *Account) GetGrokRateLimitSnapshot() (GrokRateLimitSnapshot, bool) {
+	if a == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.grokRateLimit == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	return *a.grokRateLimit, true
+}
+
+// GrokChannelSupportsModel 判断 Grok 账号能否服务指定模型（grok 渠道 Key 专用）：
+// Models 未声明 = 放行全部模型（请求模型直接透传上游），声明了则按白名单精确匹配。
+func (a *Account) GrokChannelSupportsModel(model string) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.isGrokAPILocked() {
+		return false
+	}
+	if len(a.Models) == 0 {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
+}
+
+// GrokModels 返回 Grok 账号声明的模型白名单（空 = 放行全部模型）。
+func (a *Account) GrokModels() []string {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.isGrokAPILocked() {
+		return nil
+	}
+	return cloneStringSlice(a.Models)
+}
+
 // GrokUserID 返回 Grok 账号的上游用户标识（JWT sub，导入时存入 account_id）。
 func (a *Account) GrokUserID() string {
 	if a == nil {
@@ -158,6 +241,7 @@ type GrokImportedCredential struct {
 	TokenEndpoint string
 	OIDCIssuer    string
 	Subject       string
+	Email         string
 	PrincipalType string
 	PrincipalID   string
 	ExpiresAt     time.Time
@@ -258,6 +342,17 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 	if cred.Subject == "" && claims != nil {
 		cred.Subject = grokClaimString(claims, "sub")
 	}
+	// email：优先文件顶层字段，其次 id_token（CPA 文件把 email 放在 id_token 里），
+	// 最后回退 access_token claims。
+	cred.Email = grokFirstString(node, "email", "Email")
+	if cred.Email == "" {
+		if idClaims := grokJWTClaims(grokFirstString(node, "id_token", "idToken", "IdToken")); idClaims != nil {
+			cred.Email = grokClaimString(idClaims, "email")
+		}
+	}
+	if cred.Email == "" && claims != nil {
+		cred.Email = grokClaimString(claims, "email")
+	}
 	if cred.PrincipalID == "" && claims != nil {
 		cred.PrincipalID = grokClaimString(claims, "principal_id")
 	}
@@ -284,6 +379,20 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 		return nil, fmt.Errorf("OAuth 凭据缺少 refresh_token，无法长期使用（如为 API Key 请设置 auth_mode=api_key）")
 	}
 	return cred, nil
+}
+
+// grokParseTime 解析 Grok 上游的时间字符串（RFC3339 及带纳秒变体），失败返回零值。
+func grokParseTime(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func grokFirstString(node map[string]any, keys ...string) string {
@@ -330,15 +439,247 @@ func grokClaimString(claims map[string]any, key string) string {
 	return ""
 }
 
-// ==================== OAuth 刷新 ====================
+// ==================== OAuth 浏览器授权（PKCE） ====================
 
-// GrokTokenData 是一次 Grok OAuth 刷新的结果。
+// GrokTokenData 是一次 Grok OAuth 刷新 / 授权兑换的结果。
 type GrokTokenData struct {
 	AccessToken  string
 	RefreshToken string // 上游轮换时非空
 	IDToken      string
 	ExpiresAt    time.Time
 }
+
+// GrokAuthURLParams 描述生成 xAI 授权链接所需字段。
+type GrokAuthURLParams struct {
+	State         string
+	CodeChallenge string
+	RedirectURI   string
+	Nonce         string
+	ClientID      string
+	Scope         string
+	AuthorizeURL  string
+}
+
+// BuildGrokAuthorizationURL 组装 xAI OAuth 授权链接（S256 PKCE）。
+func BuildGrokAuthorizationURL(params GrokAuthURLParams) (string, error) {
+	state := strings.TrimSpace(params.State)
+	challenge := strings.TrimSpace(params.CodeChallenge)
+	if state == "" || challenge == "" {
+		return "", fmt.Errorf("state 与 code_challenge 均为必填")
+	}
+	redirectURI := strings.TrimSpace(params.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = GrokDefaultOAuthRedirectURI
+	}
+	clientID := strings.TrimSpace(params.ClientID)
+	if clientID == "" {
+		clientID = GrokDefaultOAuthClientID
+	}
+	scope := strings.TrimSpace(params.Scope)
+	if scope == "" {
+		scope = GrokDefaultOAuthScope
+	}
+	authorizeURL := strings.TrimSpace(params.AuthorizeURL)
+	if authorizeURL == "" {
+		authorizeURL = GrokDefaultAuthorizeURL
+	}
+	if parsed, err := url.Parse(authorizeURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", fmt.Errorf("authorize_url 无效")
+	}
+
+	query := url.Values{}
+	query.Set("response_type", "code")
+	query.Set("client_id", clientID)
+	query.Set("redirect_uri", redirectURI)
+	query.Set("scope", scope)
+	query.Set("state", state)
+	if nonce := strings.TrimSpace(params.Nonce); nonce != "" {
+		query.Set("nonce", nonce)
+	}
+	query.Set("code_challenge", challenge)
+	query.Set("code_challenge_method", "S256")
+	query.Set("plan", "generic")
+	query.Set("referrer", "codex2api")
+	return authorizeURL + "?" + query.Encode(), nil
+}
+
+// GrokAuthorizationInput 是从回调 URL / query / 裸 code 解析出的授权码。
+type GrokAuthorizationInput struct {
+	Code          string
+	State         string
+	RequiresState bool // 输入含 query 时要求校验 state
+}
+
+// ParseGrokAuthorizationInput 接受完整回调 URL、query string 或裸 authorization code。
+func ParseGrokAuthorizationInput(raw string) GrokAuthorizationInput {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return GrokAuthorizationInput{}
+	}
+	if parsed, err := url.Parse(trimmed); err == nil && parsed != nil {
+		values := parsed.Query()
+		if code := strings.TrimSpace(values.Get("code")); code != "" {
+			return GrokAuthorizationInput{
+				Code:          code,
+				State:         strings.TrimSpace(values.Get("state")),
+				RequiresState: true,
+			}
+		}
+	}
+	queryCandidate := strings.TrimPrefix(trimmed, "?")
+	if strings.Contains(queryCandidate, "=") {
+		if values, err := url.ParseQuery(queryCandidate); err == nil {
+			if code := strings.TrimSpace(values.Get("code")); code != "" {
+				return GrokAuthorizationInput{
+					Code:          code,
+					State:         strings.TrimSpace(values.Get("state")),
+					RequiresState: true,
+				}
+			}
+		}
+	}
+	return GrokAuthorizationInput{Code: trimmed}
+}
+
+// GrokExchangeCodeParams 描述 authorization_code 兑换所需字段。
+type GrokExchangeCodeParams struct {
+	Code          string
+	CodeVerifier  string
+	RedirectURI   string
+	ClientID      string
+	TokenEndpoint string
+	OIDCIssuer    string
+	ProxyURL      string
+}
+
+// ExchangeGrokAuthorizationCode 用 authorization_code + PKCE verifier 兑换 token。
+func ExchangeGrokAuthorizationCode(ctx context.Context, params GrokExchangeCodeParams) (*GrokTokenData, error) {
+	code := strings.TrimSpace(params.Code)
+	verifier := strings.TrimSpace(params.CodeVerifier)
+	if code == "" {
+		return nil, fmt.Errorf("authorization code 为空")
+	}
+	if verifier == "" {
+		return nil, fmt.Errorf("code_verifier 为空")
+	}
+	clientID := strings.TrimSpace(params.ClientID)
+	if clientID == "" {
+		clientID = GrokDefaultOAuthClientID
+	}
+	redirectURI := strings.TrimSpace(params.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = GrokDefaultOAuthRedirectURI
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if err := ConfigureTransportProxy(transport, params.ProxyURL, nil); err != nil {
+		return nil, fmt.Errorf("grok 授权兑换代理配置失败: %w", err)
+	}
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+
+	endpoint, err := grokResolveTokenEndpoint(ctx, client, params.TokenEndpoint, params.OIDCIssuer)
+	if err != nil {
+		// discovery 失败时回落到已知默认 token 端点
+		if strings.TrimSpace(params.TokenEndpoint) == "" {
+			endpoint = GrokDefaultTokenURL
+		} else {
+			return nil, err
+		}
+	}
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {clientID},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("grok 授权码兑换请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("grok 授权码兑换响应读取失败: %w", err)
+	}
+
+	var payload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
+		Code         string `json:"code"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	_ = json.Unmarshal(body, &payload)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		code := strings.ToLower(firstNonEmptyTrimmed(payload.Error, payload.Code))
+		if code == "" {
+			code = fmt.Sprintf("status_%d", resp.StatusCode)
+		}
+		detail := firstNonEmptyTrimmed(payload.ErrorDesc, code)
+		return nil, fmt.Errorf("grok 授权码兑换失败: %s (status=%d)", detail, resp.StatusCode)
+	}
+	if payload.AccessToken == "" {
+		return nil, fmt.Errorf("grok 授权码兑换响应缺少 access_token")
+	}
+	if payload.RefreshToken == "" {
+		return nil, fmt.Errorf("grok 授权码兑换响应缺少 refresh_token（需 offline_access scope）")
+	}
+
+	expiresIn := payload.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 21600
+	}
+	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
+	if claims := grokJWTClaims(payload.AccessToken); claims != nil {
+		if exp, ok := claims["exp"].(float64); ok && exp > 0 {
+			expiresAt = time.Unix(int64(exp), 0)
+		}
+	}
+	return &GrokTokenData{
+		AccessToken:  payload.AccessToken,
+		RefreshToken: payload.RefreshToken,
+		IDToken:      payload.IDToken,
+		ExpiresAt:    expiresAt,
+	}, nil
+}
+
+// GrokIdentityFromTokens 从 id_token / access_token 提取 email 与 subject（不验签）。
+// id_token 优先（含 email 声明），access_token 兜底 subject。
+func GrokIdentityFromTokens(accessToken, idToken string) (email, subject string) {
+	email, subject = parseGrokIDTokenIdentity(idToken)
+	if subject == "" {
+		subject = GrokSubjectFromAccessToken(accessToken)
+	}
+	if email == "" {
+		if claims := grokJWTClaims(accessToken); claims != nil {
+			email = grokClaimString(claims, "email")
+		}
+	}
+	return email, subject
+}
+
+// GrokSubjectFromAccessToken 从 access_token JWT 提取 sub（不验签）。
+func GrokSubjectFromAccessToken(accessToken string) string {
+	claims := grokJWTClaims(accessToken)
+	if claims == nil {
+		return ""
+	}
+	return grokClaimString(claims, "sub")
+}
+
+// ==================== OAuth 刷新 ====================
 
 // grokDiscoveryCache 缓存 OIDC discovery 出的 token_endpoint（1 小时）。
 var grokDiscoveryCache = struct {
@@ -439,7 +780,8 @@ func RefreshGrokAccessToken(ctx context.Context, params GrokRefreshParams) (*Gro
 		return nil, fmt.Errorf("grok refresh_token 为空")
 	}
 	if strings.TrimSpace(params.ClientID) == "" {
-		return nil, fmt.Errorf("grok client_id 为空，无法刷新")
+		// 浏览器授权链路默认使用 Grok CLI 公开 client_id
+		params.ClientID = GrokDefaultOAuthClientID
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()

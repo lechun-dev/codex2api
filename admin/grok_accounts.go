@@ -98,6 +98,10 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 			credentials["account_id"] = cred.Subject
 			email = cred.Subject
 		}
+		// 凭据文件带真实 email 时优先用它（CPA / 带 email 的 auth.json）。
+		if cred.Email != "" {
+			email = cred.Email
+		}
 	default:
 		return nil, "", fmt.Errorf("auth_kind 必须是 oauth 或 api_key")
 	}
@@ -168,27 +172,25 @@ func (h *Handler) AddGrokAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "added", "manual_grok")
 
 	models := auth.NormalizeAccountModels(req.Models)
-	acc := &auth.Account{
-		DBID:              id,
-		ProxyURL:          req.ProxyURL,
-		HealthTier:        auth.HealthTierHealthy,
-		UpstreamType:      auth.UpstreamGrok,
-		BaseURL:           strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"),
-		Models:            models,
-		ModelMapping:      strings.TrimSpace(req.ModelMapping),
-		Email:             email,
-		PlanType:          "api",
-		GrokClientID:      credentialStringValue(credentials, "grok_client_id"),
-		GrokTokenEndpoint: credentialStringValue(credentials, "grok_token_endpoint"),
-		GrokOIDCIssuer:    credentialStringValue(credentials, "grok_oidc_issuer"),
-		GrokPrincipalType: credentialStringValue(credentials, "grok_principal_type"),
-		GrokPrincipalID:   credentialStringValue(credentials, "grok_principal_id"),
-		AccountID:         credentialStringValue(credentials, "account_id"),
-	}
-	acc.APIKey = credentialStringValue(credentials, "api_key")
-	acc.AccessToken = credentialStringValue(credentials, "access_token")
-	acc.RefreshToken = credentialStringValue(credentials, "refresh_token")
+	acc := grokAccountFromCredentials(id, credentials, req.ProxyURL)
+	acc.Models = models
+	acc.ModelMapping = strings.TrimSpace(req.ModelMapping)
+	acc.BaseURL = strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	acc.Email = email
 	h.store.AddAccount(acc)
+
+	// 异步 billing 探针：拉取套餐/周月额度，避免被 ChatGPT wham 误封
+	if h.probeUsage != nil {
+		go func(accountID int64) {
+			a := h.store.FindByID(accountID)
+			if a == nil {
+				return
+			}
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer probeCancel()
+			_ = h.probeUsage(probeCtx, a)
+		}(id)
+	}
 
 	security.SecurityAuditLog("GROK_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d auth_kind=%s models=%d ip=%s", id, acc.GrokAuthKind(), len(models), c.ClientIP()))
 	c.JSON(http.StatusOK, gin.H{"message": "成功添加 Grok 账号", "id": id})
@@ -338,4 +340,181 @@ func credentialStringValue(credentials map[string]interface{}, key string) strin
 		return value
 	}
 	return ""
+}
+
+// grokAccountFromCredentials 从入库用的 credentials map 构造内存态 Account，
+// 供单条添加与批量文件导入共用。models/model_mapping/base_url/email 由调用方按需覆写。
+func grokAccountFromCredentials(id int64, credentials map[string]interface{}, proxyURL string) *auth.Account {
+	acc := &auth.Account{
+		DBID:              id,
+		ProxyURL:          proxyURL,
+		HealthTier:        auth.HealthTierHealthy,
+		UpstreamType:      auth.UpstreamGrok,
+		BaseURL:           strings.TrimRight(credentialStringValue(credentials, "base_url"), "/"),
+		ModelMapping:      credentialStringValue(credentials, "model_mapping"),
+		Email:             credentialStringValue(credentials, "email"),
+		PlanType:          "api",
+		GrokClientID:      credentialStringValue(credentials, "grok_client_id"),
+		GrokTokenEndpoint: credentialStringValue(credentials, "grok_token_endpoint"),
+		GrokOIDCIssuer:    credentialStringValue(credentials, "grok_oidc_issuer"),
+		GrokPrincipalType: credentialStringValue(credentials, "grok_principal_type"),
+		GrokPrincipalID:   credentialStringValue(credentials, "grok_principal_id"),
+		AccountID:         credentialStringValue(credentials, "account_id"),
+		APIKey:            credentialStringValue(credentials, "api_key"),
+		AccessToken:       credentialStringValue(credentials, "access_token"),
+		RefreshToken:      credentialStringValue(credentials, "refresh_token"),
+	}
+	if models, ok := credentials["models"].([]string); ok {
+		acc.Models = models
+	}
+	if exp := credentialStringValue(credentials, "expires_at"); exp != "" {
+		if t, err := time.Parse(time.RFC3339, exp); err == nil {
+			acc.ExpiresAt = t
+		}
+	}
+	return acc
+}
+
+// batchImportGrokReq 是 CPA / auth.json 文件批量导入的请求体。
+// Files 每项是一个凭据文件的原始 JSON 内容（CPA 单对象或 Grok CLI auth.json 均可）。
+type batchImportGrokReq struct {
+	Files    []string `json:"files"`
+	BaseURL  string   `json:"base_url"`
+	Models   []string `json:"models"`
+	ProxyURL string   `json:"proxy_url"`
+}
+
+type grokBatchImportItem struct {
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+	ID    int64  `json:"id,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+const grokBatchImportMaxFiles = 500
+
+// BatchImportGrokAccounts 批量导入 Grok 凭据文件（POST /api/admin/accounts/grok/import）。
+// 每个文件独立解析入库，按 subject / refresh_token 去重（批内 + 与现有账号）。
+func (h *Handler) BatchImportGrokAccounts(c *gin.Context) {
+	var req batchImportGrokReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	if len(req.Files) == 0 {
+		writeError(c, http.StatusBadRequest, "未提供任何文件内容")
+		return
+	}
+	if len(req.Files) > grokBatchImportMaxFiles {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("单次最多导入 %d 个文件", grokBatchImportMaxFiles))
+		return
+	}
+	baseURL, err := auth.NormalizeGrokBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeAccountModels(req.Models)
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	// 已存在 Grok 账号的 subject 集合，用于跳过重复导入（每个凭据文件 sub 唯一）。
+	existingSubjects := make(map[string]struct{})
+	if h.store != nil {
+		for _, acc := range h.store.Accounts() {
+			if !acc.IsGrokAPI() {
+				continue
+			}
+			if sub := strings.TrimSpace(acc.GrokUserID()); sub != "" {
+				existingSubjects[sub] = struct{}{}
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	items := make([]grokBatchImportItem, 0, len(req.Files))
+	imported := 0
+	for i, content := range req.Files {
+		item := grokBatchImportItem{}
+		fileReq := &addGrokAccountReq{
+			AuthKind: auth.GrokAuthKindOAuth,
+			AuthJSON: content,
+			BaseURL:  req.BaseURL,
+			Models:   req.Models,
+		}
+		credentials, email, parseErr := grokCredentialsFromRequest(fileReq)
+		if parseErr != nil {
+			item.Error = parseErr.Error()
+			items = append(items, item)
+			continue
+		}
+		item.Email = email
+		subject := credentialStringValue(credentials, "account_id")
+		if subject != "" {
+			if _, dup := existingSubjects[subject]; dup {
+				item.Error = "账号已存在，已跳过"
+				items = append(items, item)
+				continue
+			}
+		}
+
+		name := email
+		if name == "" {
+			name = fmt.Sprintf("grok-%d", i+1)
+		}
+		id, insertErr := h.db.InsertAccountWithUpstream(ctx, name, "xai", auth.UpstreamGrok, credentials, req.ProxyURL)
+		if insertErr != nil {
+			item.Error = insertErr.Error()
+			items = append(items, item)
+			continue
+		}
+		h.db.InsertAccountEventAsync(id, "added", "grok_file_import")
+
+		acc := grokAccountFromCredentials(id, credentials, req.ProxyURL)
+		acc.Models = models
+		if baseURL != "" {
+			acc.BaseURL = strings.TrimRight(baseURL, "/")
+		}
+		h.store.AddAccount(acc)
+
+		if subject != "" {
+			existingSubjects[subject] = struct{}{}
+		}
+		item.OK = true
+		item.ID = id
+		items = append(items, item)
+		imported++
+
+		if h.probeUsage != nil {
+			go func(accountID int64) {
+				a := h.store.FindByID(accountID)
+				if a == nil {
+					return
+				}
+				probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
+				defer probeCancel()
+				_ = h.probeUsage(probeCtx, a)
+			}(id)
+		}
+	}
+
+	security.SecurityAuditLog("GROK_FILE_IMPORTED", fmt.Sprintf("total=%d imported=%d ip=%s", len(req.Files), imported, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"total":    len(req.Files),
+		"imported": imported,
+		"failed":   len(req.Files) - imported,
+		"items":    items,
+	})
 }

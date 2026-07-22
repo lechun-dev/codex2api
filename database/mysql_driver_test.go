@@ -145,6 +145,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		CodexWSBusyOverflowEnabled:        true,
 		CodexWSBusyPatienceSec:            3,
 		OverflowAutoCompactEnabled:        true,
+		FirstTokenExcludesWsAcquire:       true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -168,16 +169,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_ws_busy_overflow_enabled = VALUES(codex_ws_busy_overflow_enabled)",
 		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
 		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
+		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 99 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 99", got)
+	if got := strings.Count(capture.query, "?"); got != 100 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 100", got)
 	}
-	if len(capture.args) != 99 {
-		t.Fatalf("rewritten settings argument count = %d, want 99", len(capture.args))
+	if len(capture.args) != 100 {
+		t.Fatalf("rewritten settings argument count = %d, want 100", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -194,6 +196,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexWSBusyOverflowEnabled,
 		int64(settings.CodexWSBusyPatienceSec),
 		settings.OverflowAutoCompactEnabled,
+		settings.FirstTokenExcludesWsAcquire,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value

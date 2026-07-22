@@ -170,7 +170,8 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account == nil {
 		return
 	}
-	if account.GetAccessToken() == "" {
+	// Agent Identity 无 AccessToken 但可凭签名做 /responses 探针，不能被此门拦下。
+	if account.GetAccessToken() == "" && !account.IsCodexAgentIdentity() {
 		return
 	}
 	probeFn := h.usageProbeFunc()
@@ -181,6 +182,10 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	defer cancel()
 	if err := probeFn(probeCtx, account); err != nil {
 		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
+		return
+	}
+	// Agent Identity 无 OAuth 身份合并需求（无 RT/AT），探针后直接返回。
+	if account.IsCodexAgentIdentity() {
 		return
 	}
 	// AT / codex_at 账号的 OAuth 身份（email + account_id）在插入时无法从
@@ -325,18 +330,18 @@ func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey stri
 	}
 }
 
-func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time) (*database.UsageStats, error) {
-	// 只对"默认今日"区间走 5 秒缓存。
+func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*database.UsageStats, error) {
+	// 只对"默认今日 + 全渠道"区间走 5 秒缓存。
 	// 带显式区间的请求种类多、命中率低,且 ClearUsageLogs 现有的失效逻辑只清 "global" key,
 	// 给区间结果做缓存反而需要扩展失效接口,得不偿失,直接每次重算更简单。
-	useCache := rangeStart.IsZero() && rangeEnd.IsZero()
+	useCache := rangeStart.IsZero() && rangeEnd.IsZero() && channel == ""
 	if useCache {
 		var cached database.UsageStats
 		if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
 			return &cached, nil
 		}
 	}
-	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd, channel)
 	if err != nil {
 		return nil, err
 	}
@@ -344,6 +349,17 @@ func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd 
 		h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
 	}
 	return stats, nil
+}
+
+// parseUsageChannel 解析 query 里的渠道过滤参数（codex/grok，其余视为不限）。
+func parseUsageChannel(c *gin.Context) string {
+	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
+	case database.UpstreamChannelCodex:
+		return database.UpstreamChannelCodex
+	case database.UpstreamChannelGrok:
+		return database.UpstreamChannelGrok
+	}
+	return ""
 }
 
 // NewHandler 创建管理后台处理器
@@ -425,9 +441,21 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
+	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)
+	api.POST("/accounts/codex/agent-identity/import", h.BatchImportCodexAgentIdentity)
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
+	api.POST("/accounts/grok", h.AddGrokAccount)
+	api.POST("/accounts/grok/models", h.FetchGrokModels)
+	api.POST("/accounts/grok/oauth/device/start", h.StartGrokDeviceAuth)
+	api.POST("/accounts/grok/oauth/device/poll", h.PollGrokDeviceAuth)
+	api.POST("/accounts/grok/sso/import", h.ImportGrokSSO)
+	api.POST("/accounts/grok/refresh/import", h.ImportGrokRefreshTokens)
+	api.POST("/accounts/grok/import", h.BatchImportGrokAccounts)
+	api.POST("/accounts/grok/oauth/auth-url", h.GenerateGrokAuthURL)        // 兼容旧客户端
+	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
+	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -627,12 +655,24 @@ func (h *Handler) GetStats(c *gin.Context) {
 		return
 	}
 
-	accountCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
+	accountCounts, channelCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
 
-	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{})
+	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{}, "")
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
+	}
+	todayByChannel, _ := h.db.CountTodayRequestsByChannel(ctx)
+
+	channels := make(map[string]statsChannelCounts, len(channelCounts))
+	for ch, counts := range channelCounts {
+		channels[ch] = statsChannelCounts{
+			Total:         counts.total,
+			Available:     counts.normal,
+			RateLimited:   counts.rateLimited,
+			Error:         counts.abnormal,
+			TodayRequests: todayByChannel[ch],
+		}
 	}
 
 	c.JSON(http.StatusOK, statsResponse{
@@ -641,6 +681,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		RateLimited:   accountCounts.rateLimited,
 		Error:         accountCounts.abnormal,
 		TodayRequests: todayReqs,
+		Channels:      channels,
 	})
 }
 
@@ -652,7 +693,9 @@ type dashboardAccountCounts struct {
 	disabled    int
 }
 
-func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) dashboardAccountCounts {
+// summarizeDashboardAccounts 汇总账号健康计数，并按上游渠道（codex/grok）拆分。
+// 渠道判定优先用运行时账号（IsGrokAPI），不在池中的行回退 upstream_type 凭据。
+func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) (dashboardAccountCounts, map[string]dashboardAccountCounts) {
 	runtimeByID := make(map[int64]*auth.Account, len(runtimeAccounts))
 	for _, acc := range runtimeAccounts {
 		if acc != nil {
@@ -661,6 +704,10 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 	}
 
 	var counts dashboardAccountCounts
+	channelCounts := map[string]dashboardAccountCounts{
+		database.UpstreamChannelCodex: {},
+		database.UpstreamChannelGrok:  {},
+	}
 	counts.total = len(rows)
 	for _, row := range rows {
 		if row == nil {
@@ -668,25 +715,38 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		}
 		status := strings.ToLower(strings.TrimSpace(row.Status))
 		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
+		channel := database.UpstreamChannelCodex
+		if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamGrok) {
+			channel = database.UpstreamChannelGrok
+		}
 		if acc, ok := runtimeByID[row.ID]; ok {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
+			if acc.IsGrokAPI() {
+				channel = database.UpstreamChannelGrok
+			}
 		}
+		perChannel := channelCounts[channel]
+		perChannel.total++
 
 		if !row.Enabled {
 			counts.disabled++
+			perChannel.disabled++
 		}
-		if isDashboardAbnormalAccount(status) {
+		switch {
+		case isDashboardAbnormalAccount(status):
 			counts.abnormal++
-			continue
-		}
-		if isDashboardRateLimitedAccount(status, cooldownReason) {
+			perChannel.abnormal++
+		case isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
-			continue
+			perChannel.rateLimited++
+		default:
+			counts.normal++
+			perChannel.normal++
 		}
-		counts.normal++
+		channelCounts[channel] = perChannel
 	}
-	return counts
+	return counts, channelCounts
 }
 
 func isDashboardAbnormalAccount(status string) bool {
@@ -708,88 +768,93 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	ID                         int64                      `json:"id"`
-	Name                       string                     `json:"name"`
-	Email                      string                     `json:"email"`
-	EmailDomain                string                     `json:"email_domain,omitempty"`
-	ChatGPTAccountID           string                     `json:"chatgpt_account_id,omitempty"`
-	PlanType                   string                     `json:"plan_type"`
-	SubscriptionExpiresAt      string                     `json:"subscription_expires_at,omitempty"`
-	Status                     string                     `json:"status"`
-	ErrorMessage               string                     `json:"error_message,omitempty"`
-	ATOnly                     bool                       `json:"at_only"`
-	CreditEnabled              bool                       `json:"credit_enabled"`
-	CreditSkipUsageWindow      bool                       `json:"credit_skip_usage_window"`
-	SkipWarmTier               bool                       `json:"skip_warm_tier"`
-	AccountType                string                     `json:"account_type,omitempty"`
-	AccessTokenType            string                     `json:"access_token_type,omitempty"`
-	OpenAIResponsesAPI         bool                       `json:"openai_responses_api,omitempty"`
-	BaseURL                    string                     `json:"base_url,omitempty"`
-	Models                     []string                   `json:"models,omitempty"`
-	ModelMapping               string                     `json:"model_mapping,omitempty"`
-	CodexClientMetadataMode    string                     `json:"codex_client_metadata_mode,omitempty"`
-	CustomHeaders              map[string]string          `json:"custom_headers,omitempty"`
-	HealthTier                 string                     `json:"health_tier"`
-	SchedulerScore             float64                    `json:"scheduler_score"`
-	DispatchScore              float64                    `json:"dispatch_score"`
-	ScoreBiasOverride          *int64                     `json:"score_bias_override"`
-	ScoreBiasEffective         int64                      `json:"score_bias_effective"`
-	BaseConcurrencyOverride    *int64                     `json:"base_concurrency_override"`
-	BaseConcurrencyEffective   int64                      `json:"base_concurrency_effective"`
-	ConcurrencyCap             int64                      `json:"dynamic_concurrency_limit"`
-	ProxyURL                   string                     `json:"proxy_url"`
-	CreatedAt                  string                     `json:"created_at"`
-	UpdatedAt                  string                     `json:"updated_at"`
-	CodexUsageUpdatedAt        string                     `json:"codex_usage_updated_at,omitempty"`
-	Codex5HUsageUpdatedAt      string                     `json:"codex_5h_usage_updated_at,omitempty"`
-	ActiveRequests             int64                      `json:"active_requests"`
-	TotalRequests              int64                      `json:"total_requests"`
-	LastUsedAt                 string                     `json:"last_used_at"`
-	SuccessRequests            int64                      `json:"success_requests"`
-	ErrorRequests              int64                      `json:"error_requests"`
-	RetryErrorRequests         int64                      `json:"retry_error_requests"`
-	RateLimitAttempts          int64                      `json:"rate_limit_attempts"`
-	UsagePercent7d             *float64                   `json:"usage_percent_7d"`
-	UsagePercent5h             *float64                   `json:"usage_percent_5h"`
-	RateLimitResetCredits      *int                       `json:"rate_limit_reset_credits"`
-	ApplicableResetCredits     *int                       `json:"applicable_reset_credits"`
-	CreditsBalance             *string                    `json:"credits_balance"`
-	CreditsHasCredits          *bool                      `json:"credits_has_credits"`
-	CreditsUnlimited           *bool                      `json:"credits_unlimited"`
-	CreditsOverageLimitReached *bool                      `json:"credits_overage_limit_reached"`
-	AutoPause5hThreshold       *float64                   `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold       *float64                   `json:"auto_pause_7d_threshold"`
-	AutoPause5hDisabled        bool                       `json:"auto_pause_5h_disabled"`
-	AutoPause7dDisabled        bool                       `json:"auto_pause_7d_disabled"`
-	UsageLimitOverride         *bool                      `json:"ignore_usage_limit_status_override"`
-	UsageLimitEffective        bool                       `json:"ignore_usage_limit_status_effective"`
-	DispatchCountLimit         *int64                     `json:"dispatch_count_limit"`
-	DispatchCountUsed          int64                      `json:"dispatch_count_used,omitempty"`
-	DispatchCountResetAt       string                     `json:"dispatch_count_reset_at,omitempty"`
-	DispatchCountLimited       bool                       `json:"dispatch_count_limited,omitempty"`
-	SchedulerPriority          *int64                     `json:"scheduler_priority"`
-	Usage5hDetail              *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
-	Usage7dDetail              *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
-	Reset5hAt                  string                     `json:"reset_5h_at,omitempty"`
-	Reset7dAt                  string                     `json:"reset_7d_at,omitempty"`
-	Window7dKind               string                     `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
-	Window7dSeconds            *int64                     `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
-	Billed5h                   *float64                   `json:"billed_5h"`
-	Billed7d                   *float64                   `json:"billed_7d"`
-	ScoreBreakdown             schedulerBreakdownResponse `json:"scheduler_breakdown"`
-	LastUnauthorizedAt         string                     `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt          string                     `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt              string                     `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt          string                     `json:"last_server_error_at,omitempty"`
-	CooldownReason             string                     `json:"cooldown_reason,omitempty"`
-	CooldownUntil              string                     `json:"cooldown_until,omitempty"`
-	ModelCooldowns             []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
-	Enabled                    bool                       `json:"enabled"`
-	Locked                     bool                       `json:"locked"`
-	AllowedAPIKeyIDs           []int64                    `json:"allowed_api_key_ids"`
-	Tags                       []string                   `json:"tags"`
-	GroupIDs                   []int64                    `json:"group_ids"`
-	Note                       string                     `json:"note"`
+	ID                         int64                       `json:"id"`
+	Name                       string                      `json:"name"`
+	Email                      string                      `json:"email"`
+	EmailDomain                string                      `json:"email_domain,omitempty"`
+	ChatGPTAccountID           string                      `json:"chatgpt_account_id,omitempty"`
+	PlanType                   string                      `json:"plan_type"`
+	SubscriptionExpiresAt      string                      `json:"subscription_expires_at,omitempty"`
+	Status                     string                      `json:"status"`
+	ErrorMessage               string                      `json:"error_message,omitempty"`
+	ATOnly                     bool                        `json:"at_only"`
+	CreditEnabled              bool                        `json:"credit_enabled"`
+	CreditSkipUsageWindow      bool                        `json:"credit_skip_usage_window"`
+	SkipWarmTier               bool                        `json:"skip_warm_tier"`
+	AccountType                string                      `json:"account_type,omitempty"`
+	AccessTokenType            string                      `json:"access_token_type,omitempty"`
+	OpenAIResponsesAPI         bool                        `json:"openai_responses_api,omitempty"`
+	GrokAPI                    bool                        `json:"grok_api,omitempty"`
+	AgentIdentity              bool                        `json:"agent_identity,omitempty"`
+	GrokAuthKind               string                      `json:"grok_auth_kind,omitempty"`
+	GrokBilling                json.RawMessage             `json:"grok_billing,omitempty"`
+	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
+	BaseURL                    string                      `json:"base_url,omitempty"`
+	Models                     []string                    `json:"models,omitempty"`
+	ModelMapping               string                      `json:"model_mapping,omitempty"`
+	CodexClientMetadataMode    string                      `json:"codex_client_metadata_mode,omitempty"`
+	CustomHeaders              map[string]string           `json:"custom_headers,omitempty"`
+	HealthTier                 string                      `json:"health_tier"`
+	SchedulerScore             float64                     `json:"scheduler_score"`
+	DispatchScore              float64                     `json:"dispatch_score"`
+	ScoreBiasOverride          *int64                      `json:"score_bias_override"`
+	ScoreBiasEffective         int64                       `json:"score_bias_effective"`
+	BaseConcurrencyOverride    *int64                      `json:"base_concurrency_override"`
+	BaseConcurrencyEffective   int64                       `json:"base_concurrency_effective"`
+	ConcurrencyCap             int64                       `json:"dynamic_concurrency_limit"`
+	ProxyURL                   string                      `json:"proxy_url"`
+	CreatedAt                  string                      `json:"created_at"`
+	UpdatedAt                  string                      `json:"updated_at"`
+	CodexUsageUpdatedAt        string                      `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt      string                      `json:"codex_5h_usage_updated_at,omitempty"`
+	ActiveRequests             int64                       `json:"active_requests"`
+	TotalRequests              int64                       `json:"total_requests"`
+	LastUsedAt                 string                      `json:"last_used_at"`
+	SuccessRequests            int64                       `json:"success_requests"`
+	ErrorRequests              int64                       `json:"error_requests"`
+	RetryErrorRequests         int64                       `json:"retry_error_requests"`
+	RateLimitAttempts          int64                       `json:"rate_limit_attempts"`
+	UsagePercent7d             *float64                    `json:"usage_percent_7d"`
+	UsagePercent5h             *float64                    `json:"usage_percent_5h"`
+	RateLimitResetCredits      *int                        `json:"rate_limit_reset_credits"`
+	ApplicableResetCredits     *int                        `json:"applicable_reset_credits"`
+	CreditsBalance             *string                     `json:"credits_balance"`
+	CreditsHasCredits          *bool                       `json:"credits_has_credits"`
+	CreditsUnlimited           *bool                       `json:"credits_unlimited"`
+	CreditsOverageLimitReached *bool                       `json:"credits_overage_limit_reached"`
+	AutoPause5hThreshold       *float64                    `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold       *float64                    `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled        bool                        `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled        bool                        `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride         *bool                       `json:"ignore_usage_limit_status_override"`
+	UsageLimitEffective        bool                        `json:"ignore_usage_limit_status_effective"`
+	DispatchCountLimit         *int64                      `json:"dispatch_count_limit"`
+	DispatchCountUsed          int64                       `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt       string                      `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited       bool                        `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority          *int64                      `json:"scheduler_priority"`
+	Usage5hDetail              *accountUsageWindow         `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail              *accountUsageWindow         `json:"usage_7d_detail,omitempty"`
+	Reset5hAt                  string                      `json:"reset_5h_at,omitempty"`
+	Reset7dAt                  string                      `json:"reset_7d_at,omitempty"`
+	Window7dKind               string                      `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
+	Window7dSeconds            *int64                      `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
+	Billed5h                   *float64                    `json:"billed_5h"`
+	Billed7d                   *float64                    `json:"billed_7d"`
+	ScoreBreakdown             schedulerBreakdownResponse  `json:"scheduler_breakdown"`
+	LastUnauthorizedAt         string                      `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt          string                      `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt              string                      `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt          string                      `json:"last_server_error_at,omitempty"`
+	CooldownReason             string                      `json:"cooldown_reason,omitempty"`
+	CooldownUntil              string                      `json:"cooldown_until,omitempty"`
+	ModelCooldowns             []modelCooldownResponse     `json:"model_cooldowns,omitempty"`
+	Enabled                    bool                        `json:"enabled"`
+	Locked                     bool                        `json:"locked"`
+	AllowedAPIKeyIDs           []int64                     `json:"allowed_api_key_ids"`
+	Tags                       []string                    `json:"tags"`
+	GroupIDs                   []int64                     `json:"group_ids"`
+	Note                       string                      `json:"note"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -878,14 +943,28 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
-		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		grokAuthKind := ""
+		var grokBilling json.RawMessage
+		if isGrokAccount {
+			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+				grokAuthKind = auth.GrokAuthKindAPIKey
+			} else {
+				grokAuthKind = auth.GrokAuthKindOAuth
+			}
+			if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
+				grokBilling = json.RawMessage(detail)
+			}
+		}
 		email := row.GetCredential("email")
 		baseURL := row.GetCredential("base_url")
 		if isOpenAIResponsesAccount && email == "" {
 			email = baseURL
 		}
 		planType := row.GetCredential("plan_type")
-		if isOpenAIResponsesAccount && planType == "" {
+		if (isOpenAIResponsesAccount || isGrokAccount) && planType == "" {
 			planType = "api"
 		}
 		codexClientMetadataMode := ""
@@ -907,13 +986,17 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
-			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			CreditEnabled:            row.CreditEnabled,
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
 			AccessTokenType:          accountAccessTokenType(row),
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+			GrokAPI:                  isGrokAccount,
+			AgentIdentity:            isAgentIdentityCredentialRow(row),
+			GrokAuthKind:             grokAuthKind,
+			GrokBilling:              grokBilling,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
 			ModelMapping:             row.GetCredential("model_mapping"),
@@ -945,6 +1028,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
+			if isGrokAccount {
+				if snap, hasSnap := acc.GetGrokRateLimitSnapshot(); hasSnap {
+					resp.GrokRateLimit = &snap
+				}
+			}
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -2973,8 +3061,8 @@ func (h *Handler) UpdateAccountModels(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
 		return
 	}
-	if account.IsOpenAIResponsesAPI() {
-		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号请在账号设置中编辑模型列表")
+	if account.IsRelayStyle() {
+		writeError(c, http.StatusBadRequest, "中转/Grok 账号请在账号设置中编辑模型列表")
 		return
 	}
 
@@ -3000,6 +3088,18 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	account := h.store.FindByID(id)
 	if account == nil {
 		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsGrokAPI() {
+		// Grok 账号：用自身凭据拉取 Grok 上游模型目录
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+		defer cancel()
+		models, err := proxy.FetchGrokModelIDs(ctx, account)
+		if err != nil {
+			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Grok 上游模型目录失败: %s", err.Error()))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"models": models})
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -3040,10 +3140,59 @@ type importToken struct {
 	codex5HResetAt        string
 	codex5HUsageUpdatedAt string
 	codexUsageUpdatedAt   string
+	// Agent Identity（auth_mode=agentIdentity）：无 RT/ST/AT，凭私钥动态签名。
+	agentRuntimeID  string
+	agentPrivateKey string
+	agentTaskID     string
+	chatgptUserID   string
+	agentFedRAMP    bool
+}
+
+func (t importToken) isAgentIdentity() bool {
+	return strings.TrimSpace(t.agentRuntimeID) != "" && strings.TrimSpace(t.agentPrivateKey) != ""
+}
+
+// jsonAgentIdentityNode 是 CLIProxyAPI/Sub2Api 导出里的 agent_identity 子对象。
+type jsonAgentIdentityNode struct {
+	AgentRuntimeID  string `json:"agent_runtime_id"`
+	AgentPrivateKey string `json:"agent_private_key"`
+	TaskID          string `json:"task_id"`
+	AccountID       string `json:"account_id"`
+	ChatGPTUserID   string `json:"chatgpt_user_id"`
+	Email           string `json:"email"`
+	PlanType        string `json:"plan_type"`
+	FedRAMP         bool   `json:"chatgpt_account_is_fedramp"`
+}
+
+// agentIdentityImportTokenFromNode 把 agent_identity 子对象转成 importToken（无有效字段时返回 ok=false）。
+func agentIdentityImportTokenFromNode(node *jsonAgentIdentityNode, fallbackName string) (importToken, bool) {
+	if node == nil {
+		return importToken{}, false
+	}
+	runtimeID := strings.TrimSpace(node.AgentRuntimeID)
+	privateKey := strings.TrimSpace(node.AgentPrivateKey)
+	if runtimeID == "" || privateKey == "" {
+		return importToken{}, false
+	}
+	email := strings.TrimSpace(node.Email)
+	name := firstNonEmpty(fallbackName, email)
+	return importToken{
+		name:            name,
+		email:           email,
+		accountID:       strings.TrimSpace(node.AccountID),
+		planType:        strings.TrimSpace(node.PlanType),
+		agentRuntimeID:  runtimeID,
+		agentPrivateKey: privateKey,
+		agentTaskID:     strings.TrimSpace(node.TaskID),
+		chatgptUserID:   strings.TrimSpace(node.ChatGPTUserID),
+		agentFedRAMP:    node.FedRAMP,
+	}, true
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
+	AuthMode              string                 `json:"auth_mode"`
+	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
 	RefreshToken          string                 `json:"refresh_token"`
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
@@ -3092,6 +3241,8 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
+	AuthMode              string                 `json:"auth_mode"`
+	AgentIdentity         *jsonAgentIdentityNode `json:"agent_identity"`
 	RefreshToken          string                 `json:"refresh_token"`
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
@@ -3197,6 +3348,12 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 		accID := firstNonEmpty(entry.AccountID, entry.User.ID, entry.Account.ID)
 		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
 
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。
+		if tok, ok := agentIdentityImportTokenFromNode(entry.AgentIdentity, name); ok {
+			tokens = append(tokens, tok)
+			continue
+		}
+
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
 				refreshToken:          rt,
@@ -3243,6 +3400,12 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 		planType := firstNonEmpty(c.PlanType, c.PlanTypeCamel, c.Account.PlanType, c.Account.PlanTypeCamel)
 		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
 		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
+
+		// Agent Identity 条目：无 RT/ST/AT，单独识别。
+		if tok, ok := agentIdentityImportTokenFromNode(c.AgentIdentity, name); ok {
+			tokens = append(tokens, tok)
+			continue
+		}
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
@@ -3655,6 +3818,25 @@ func sendSSEJSON(c *gin.Context, event any) {
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool, customHeaders ...map[string]string) {
 	importCustomHeaders := firstCustomHeaders(customHeaders)
+
+	// Agent Identity 条目单独处理（无 RT/ST/AT，按 runtime_id 去重、动态签名），
+	// 从常规 token 流里拆出，计数在收尾时并入总响应。
+	var agentTokens, regularTokens []importToken
+	for _, t := range tokens {
+		if t.isAgentIdentity() {
+			agentTokens = append(agentTokens, t)
+		} else {
+			regularTokens = append(regularTokens, t)
+		}
+	}
+	agentSuccess, agentDuplicate, agentFailed := 0, 0, 0
+	if len(agentTokens) > 0 {
+		agentCtx, agentCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		agentSuccess, agentDuplicate, agentFailed = h.importAgentIdentityTokens(agentCtx, agentTokens, proxyURL, allowDuplicate)
+		agentCancel()
+		log.Printf("导入: Agent Identity 条目 %d 个（新增 %d，跳过 %d，失败 %d）", len(agentTokens), agentSuccess, agentDuplicate, agentFailed)
+	}
+	tokens = regularTokens
 	// 文件内去重：
 	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
@@ -3832,19 +4014,21 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
-	total := len(unique) + ambiguousOAuthIdentityCount
+	total := len(unique) + ambiguousOAuthIdentityCount + len(agentTokens)
 	if allowDuplicate {
-		total = len(tokens)
+		total = len(tokens) + len(agentTokens)
 	}
+	duplicateCount += agentDuplicate
 
 	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
 	if len(newTokens) == 0 {
+		// 无常规 token 待导入（可能是纯 Agent Identity 文件）；反映 agent 计数。
 		c.JSON(http.StatusOK, gin.H{
-			"message":   fmt.Sprintf("所有 %d 个 Token 已存在或已跳过，无需导入", total),
-			"success":   0,
+			"message":   fmt.Sprintf("导入完成：新增 %d 个，跳过 %d 个，失败 %d 个", agentSuccess, duplicateCount, agentFailed),
+			"success":   agentSuccess,
 			"duplicate": duplicateCount,
-			"failed":    0,
+			"failed":    agentFailed,
 			"total":     total,
 		})
 		return
@@ -4018,10 +4202,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	wg.Wait()
 	close(done)
 
-	// 发送完成事件
-	suc := int(atomic.LoadInt64(&successCount))
+	// 发送完成事件（并入 Agent Identity 计数）
+	suc := int(atomic.LoadInt64(&successCount)) + agentSuccess
 	upd := int(atomic.LoadInt64(&updatedCount))
-	fai := int(atomic.LoadInt64(&failCount))
+	fai := int(atomic.LoadInt64(&failCount)) + agentFailed
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
@@ -4941,7 +5125,7 @@ func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account
 }
 
 func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
-	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() || acc.GetAccessToken() == "" {
+	if h == nil || h.store == nil || acc == nil || acc.IsRelayStyle() || acc.GetAccessToken() == "" {
 		return nil
 	}
 	model, err := h.connectionTestModelForAccount(ctx, acc, "")
@@ -4990,7 +5174,7 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		return
 	}
 
-	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd)
+	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd, parseUsageChannel(c))
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -5065,8 +5249,10 @@ func (h *Handler) GetChartData(c *gin.Context) {
 		bucketMinutes = 5
 	}
 
+	channel := parseUsageChannel(c)
+
 	// 检查内存缓存（10秒 TTL）
-	cacheKey := fmt.Sprintf("%s|%s|%d", startStr, endStr, bucketMinutes)
+	cacheKey := fmt.Sprintf("%s|%s|%d|%s", startStr, endStr, bucketMinutes, channel)
 	h.chartCacheMu.RLock()
 	if entry, ok := h.chartCacheData[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		h.chartCacheMu.RUnlock()
@@ -5091,7 +5277,7 @@ func (h *Handler) GetChartData(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
+	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes, channel)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -5171,6 +5357,7 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 		IncludeCanceled: true,
 		ErrorKind:       strings.TrimSpace(c.Query("error_kind")),
 		Query:           strings.TrimSpace(c.Query("q")),
+		Channel:         parseUsageChannel(c),
 	}
 
 	status := strings.TrimSpace(c.Query("status"))
@@ -5584,6 +5771,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				Endpoint:  c.Query("endpoint"),
 				APIKeyID:  apiKeyID,
 				AccountID: accountID,
+				Channel:   parseUsageChannel(c),
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"
@@ -6029,6 +6217,8 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
+		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		UpstreamChannel:        in.ResolveUpstreamChannel(),
 	}
 	// 归一后旧 bool 与新 policy 保持一致，避免两处配置漂移。
 	out.DisableImageGeneration = out.ImageGenerationPolicy == database.ImageGenerationPolicyBlock
@@ -6271,6 +6461,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled         bool    `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec             int     `json:"codex_ws_busy_patience_sec"`
 	OverflowAutoCompactEnabled         bool    `json:"overflow_auto_compact_enabled"`
+	FirstTokenExcludesWsAcquire        bool    `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled       bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         bool    `json:"codex_cli_version_sync_enabled"`
@@ -6388,6 +6579,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled         *bool    `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec             *int     `json:"codex_ws_busy_patience_sec"`
 	OverflowAutoCompactEnabled         *bool    `json:"overflow_auto_compact_enabled"`
+	FirstTokenExcludesWsAcquire        *bool    `json:"first_token_excludes_ws_acquire"`
 	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
@@ -7026,6 +7218,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
+		FirstTokenExcludesWsAcquire:        h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -7500,6 +7693,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetOverflowAutoCompactEnabled(*req.OverflowAutoCompactEnabled)
 		runtimeCfg.OverflowAutoCompact = *req.OverflowAutoCompactEnabled
 		log.Printf("设置已更新: overflow_auto_compact_enabled = %t", *req.OverflowAutoCompactEnabled)
+	}
+
+	if req.FirstTokenExcludesWsAcquire != nil {
+		h.store.SetFirstTokenExcludesWsAcquire(*req.FirstTokenExcludesWsAcquire)
+		runtimeCfg.FirstTokenExcludesWsAcquire = *req.FirstTokenExcludesWsAcquire
+		log.Printf("设置已更新: first_token_excludes_ws_acquire = %t", *req.FirstTokenExcludesWsAcquire)
 	}
 
 	if req.CodexContinueThinkingEnabled != nil {
@@ -7981,6 +8180,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
+		FirstTokenExcludesWsAcquire:        h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -8127,6 +8327,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:         h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:             h.store.CodexWSBusyPatienceSec(),
 		OverflowAutoCompactEnabled:         h.store.OverflowAutoCompactEnabled(),
+		FirstTokenExcludesWsAcquire:        h.store.FirstTokenExcludesWsAcquire(),
 		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
@@ -8587,7 +8788,34 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	catalog.GrokModels = h.grokChannelModels()
 	c.JSON(http.StatusOK, catalog)
+}
+
+// grokChannelModels 聚合全部 Grok 账号声明的模型（去重、排序），
+// 供前端在 Key 渠道选 grok 时把模型下拉切成 Grok 选项。
+func (h *Handler) grokChannelModels() []string {
+	if h == nil || h.store == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var models []string
+	for _, account := range h.store.Accounts() {
+		for _, model := range account.GrokModels() {
+			model = strings.TrimSpace(model)
+			key := strings.ToLower(model)
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	return models
 }
 
 // SyncModels 从官方 Codex 模型页同步模型注册表。

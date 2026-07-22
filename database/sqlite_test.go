@@ -950,7 +950,7 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
 	}
 
-	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5, "")
 	if err != nil {
 		t.Fatalf("GetChartAggregation 返回错误: %v", err)
 	}
@@ -1823,7 +1823,7 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -1922,7 +1922,7 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2154,7 +2154,7 @@ func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
 		t.Fatalf("更新旧日志时间失败: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2230,7 +2230,7 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}

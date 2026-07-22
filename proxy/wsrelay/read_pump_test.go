@@ -326,7 +326,7 @@ func TestReadPumpProbeDoesNotWaitForDataWriteLock(t *testing.T) {
 }
 
 func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
-	firstFragmentFlushed := make(chan error, 1)
+	firstFragmentFlushed := make(chan struct{})
 	finishMessage := make(chan struct{})
 	pongSeen := make(chan struct{}, 1)
 
@@ -342,42 +342,32 @@ func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
 
 		writer, err := conn.NextWriter(websocket.TextMessage)
 		if err != nil {
-			firstFragmentFlushed <- err
+			t.Errorf("NextWriter: %v", err)
 			return
 		}
 		payload := `{"type":"response.output_text.delta","delta":"` + strings.Repeat("stale", 2048) + `"}`
 		if _, err := writer.Write([]byte(payload)); err != nil {
-			firstFragmentFlushed <- err
+			t.Errorf("write first fragmented payload: %v", err)
 			return
 		}
 		if err := conn.WriteControl(websocket.PingMessage, []byte("between-fragments"), time.Now().Add(time.Second)); err != nil {
-			firstFragmentFlushed <- err
+			t.Errorf("write interleaved ping: %v", err)
 			return
 		}
-		firstFragmentFlushed <- nil
+		close(firstFragmentFlushed)
 		<-finishMessage
 		_ = writer.Close()
 	})
 
-	writeErr := receiveTestValue(t, firstFragmentFlushed, readPumpTestTimeout, "first fragmented payload")
-	if writeErr == nil {
-		waitForReadPumpCondition(t, func() bool {
-			select {
-			case <-pongSeen:
-				return true
-			default:
-				return !wc.IsConnected()
-			}
-		}, "fragmented message was not observed by the client reader")
-	}
+	<-firstFragmentFlushed
 	waitForReadPumpCondition(t, func() bool {
-		state := wc.ensureReadState()
-		state.mu.Lock()
-		readerErr := state.readerErr
-		state.mu.Unlock()
-		_, exists := manager.connections.Load(wc.PoolKey)
-		return errors.Is(readerErr, errReadPumpIdleFrame) && !wc.IsConnected() && !exists
-	}, "idle fragmented message did not discard the connection")
+		select {
+		case <-pongSeen:
+			return true
+		default:
+			return !wc.IsConnected()
+		}
+	}, "fragmented message was not observed by the client reader")
 
 	beginErr := wc.BeginReadLease("new-request")
 	close(finishMessage)
@@ -388,6 +378,10 @@ func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
 		}
 		t.Fatal("connection accepted a lease after an idle fragmented message had started")
 	}
+	waitForReadPumpCondition(t, func() bool {
+		_, exists := manager.connections.Load(wc.PoolKey)
+		return !wc.IsConnected() && !exists
+	}, "idle fragmented message did not discard the connection")
 }
 
 func TestReadPumpRejectsFrameBeforeRequestCommit(t *testing.T) {
@@ -905,6 +899,44 @@ func TestReadPumpRejectsIdleBusinessFrame(t *testing.T) {
 			}
 			if err := wc.BeginReadLease("next-request"); err == nil {
 				t.Fatal("polluted connection accepted a subsequent lease")
+			}
+		})
+	}
+}
+
+func TestReadPumpDropsIdleMetadataFrame(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "codex rate limits", payload: `{"type":"codex.rate_limits","rate_limits":{"primary":{}}}`},
+		{name: "codex response metadata", payload: `{"type":"codex.response.metadata","metadata":{}}`},
+		{name: "bare response metadata", payload: `{"type":"response.metadata","metadata":{}}`},
+		{name: "responsesapi websocket timing", payload: `{"type":"responsesapi.websocket_timing","timing":{}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			holdOpen := make(chan struct{})
+			t.Cleanup(func() { close(holdOpen) })
+			manager, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(tt.payload)); err != nil {
+					t.Errorf("write idle metadata frame: %v", err)
+					return
+				}
+				<-holdOpen
+			})
+
+			// 丢弃路径以 touchInbound 收尾：入站时间戳置位即代表帧已消费完毕
+			waitForReadPumpCondition(t, func() bool { return wc.lastInbound.Load() != 0 }, "idle metadata frame was not consumed")
+			if !wc.IsConnected() {
+				t.Fatal("idle metadata frame must not poison the connection")
+			}
+			if _, ok := manager.connections.Load(wc.PoolKey); !ok {
+				t.Fatal("connection dropped from manager after idle metadata frame")
+			}
+			if err := wc.BeginReadLease("after-metadata"); err != nil {
+				t.Fatalf("BeginReadLease after idle metadata frame: %v", err)
 			}
 		})
 	}

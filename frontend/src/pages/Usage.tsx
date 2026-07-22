@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
@@ -7,13 +7,16 @@ import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
+import ChannelLogo from '../components/ChannelLogo'
+import ModelLogo from '../components/ModelLogo'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import type { APIKeyRow, APIKeyTokenStat, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
-import { formatCompactEmail } from '../lib/utils'
+import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -562,10 +565,13 @@ function ModelStatsPanel({
                 <div key={item.model} className="space-y-1.5">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
-                        {item.model}
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ModelLogo model={item.model} variant="soft" size={22} className="shrink-0" />
+                        <div className="truncate text-sm font-semibold leading-tight tracking-tight text-foreground" title={item.model}>
+                          {item.model}
+                        </div>
                       </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 pl-[30px] text-xs text-muted-foreground">
                         <span className="tabular-nums">{t('usage.modelStatsRequests')} {formatTokens(item.requests, showFullUsageNumbers)}</span>
                         <span aria-hidden="true" className="text-border">·</span>
                         <span className="tabular-nums">{t('usage.modelStatsTokens')} {formatTokens(item.tokens, showFullUsageNumbers)}</span>
@@ -702,6 +708,8 @@ function EndpointStatsPanel({
       items={stats.map((item) => ({
         key: item.endpoint,
         label: item.endpoint,
+        // 端点是 URL 路径，用等宽字体更清晰
+        mono: true,
         requests: item.requests,
         tokens: item.tokens,
         errors: item.error_count,
@@ -769,7 +777,7 @@ function DistributionPanel({
   emptyText: string
   icon: ReactNode
   action?: ReactNode
-  items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
+  items: Array<{ key: string; label: string; mono?: boolean; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
   showFullUsageNumbers: boolean
@@ -792,7 +800,14 @@ function DistributionPanel({
                 <div className="flex min-w-0 items-start gap-2.5">
                   <RankBadge accent={accent} rank={index + 1} />
                   <div className="min-w-0">
-                    <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.label}>
+                    <div
+                      className={cn(
+                        "truncate text-sm font-semibold leading-tight tracking-tight text-foreground",
+                        // 端点是路径（代码性质）保留等宽；密钥名等宽显糙，用常规字体
+                        item.mono && "font-geist-mono text-[13px]",
+                      )}
+                      title={item.label}
+                    >
                       {item.label}
                     </div>
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-muted-foreground">
@@ -1536,6 +1551,7 @@ export default function Usage() {
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1546,6 +1562,7 @@ export default function Usage() {
   const [showAPIKeyUsageModal, setShowAPIKeyUsageModal] = useState(false)
   const [apiKeyTokenStats, setAPIKeyTokenStats] = useState<APIKeyTokenStat[]>([])
   const [apiKeyTokenStatsLoading, setAPIKeyTokenStatsLoading] = useState(false)
+  const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -1561,11 +1578,11 @@ export default function Usage() {
   const loadStats = useCallback(async () => {
     const { start, end } = resolveRangeISO(timeRange, customRange)
     const [stats, settings] = await Promise.all([
-      api.getUsageStats({ start, end }),
+      api.getUsageStats({ start, end, channel: channel || undefined }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     return { stats, settings }
-  }, [timeRange, customRange])
+  }, [timeRange, customRange, channel])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -1614,6 +1631,7 @@ export default function Usage() {
         accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
+        channel: channel || undefined,
       })
       setLogs(res.logs ?? [])
       setLogsTotal(res.total ?? 0)
@@ -1622,7 +1640,7 @@ export default function Usage() {
     } finally {
       if (!silent) setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream, channel])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1649,8 +1667,12 @@ export default function Usage() {
           ? response.items.filter((item) => item.enabled).map((item) => item.id)
           : response.models ?? []
         setModelOptions(models)
+        setGrokModelOptions(response.grok_models ?? [])
       } catch {
-        if (active) setModelOptions([])
+        if (active) {
+          setModelOptions([])
+          setGrokModelOptions([])
+        }
       }
     }
     void loadModels()
@@ -1697,6 +1719,26 @@ export default function Usage() {
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
   const modelStats = stats?.model_stats ?? []
+  // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
+  // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
+  const modelFilterOptions = useMemo(() => {
+    const seen = new Set<string>()
+    const merged: string[] = []
+    const catalog = channel === 'grok'
+      ? grokModelOptions
+      : channel === 'codex'
+        ? modelOptions
+        : [...modelOptions, ...grokModelOptions]
+    for (const m of catalog) {
+      const key = m.trim()
+      if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    for (const item of modelStats) {
+      const key = (item.model || '').trim()
+      if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    return merged
+  }, [modelOptions, grokModelOptions, modelStats, channel])
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
   const apiKeyStats = stats?.api_key_stats ?? []
@@ -1748,6 +1790,7 @@ export default function Usage() {
           title={t('usage.title')}
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
               variant="outline"
@@ -1760,7 +1803,7 @@ export default function Usage() {
           }
         />
 
-        <div className="space-y-6">
+        <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
         <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
           <Card className="min-w-0 py-0">
@@ -2010,7 +2053,7 @@ export default function Usage() {
                 placeholder={t('usage.allModels')}
                 options={[
                   { label: t('usage.allModels'), value: '' },
-                  ...modelOptions.map((m) => ({ label: m, value: m })),
+                  ...modelFilterOptions.map((m) => ({ label: m, value: m })),
                 ]}
               />
 
@@ -2295,6 +2338,14 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
+                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                                <ChannelLogo
+                                  channel={log.channel}
+                                  size={13}
+                                  className="mr-1"
+                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                />
+                              )}
                               {log.model || '-'}
                             </Badge>
                             {log.effective_model && log.effective_model !== log.model && (
@@ -2339,13 +2390,18 @@ export default function Usage() {
                           <UserAgentCell log={log} />
                         </TableCell>}
                         {visibleColumns.endpoint && <TableCell>
-                          <div className={`${usageTableMonoClass} leading-relaxed`}>
+                          <div
+                            className={`${usageTableMonoClass} leading-relaxed`}
+                            // 中转/Grok 账号的完整上游 URL 收进 tooltip，列内只显示入站端点
+                            title={
+                              log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint
+                                ? `→ ${log.upstream_endpoint}`
+                                : undefined
+                            }
+                          >
                             <span className="text-muted-foreground">
                               {log.inbound_endpoint || log.endpoint || '-'}
                             </span>
-                            {log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint && (
-                              <span className="text-muted-foreground"> → {log.upstream_endpoint}</span>
-                            )}
                           </div>
                         </TableCell>}
                         {visibleColumns.type && <TableCell>

@@ -37,6 +37,7 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_ws_busy_overflow_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_ws_busy_patience_sec", def: "INT DEFAULT 2"},
 	{table: "system_settings", name: "overflow_auto_compact_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -72,6 +73,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS usage_logs (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			account_id BIGINT DEFAULT 0,
+			channel VARCHAR(16) DEFAULT '',
 			client_ip VARCHAR(64) DEFAULT '',
 			session_id VARCHAR(255) DEFAULT '',
 			conversation_id VARCHAR(255) DEFAULT '',
@@ -279,6 +281,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "image_quota_total", "INT NULL"},
 		{"accounts", "today_used_count", "INT DEFAULT 0"},
 		{"accounts", "image_quota_reset_at", "DATETIME NULL"},
+		{"usage_logs", "channel", "VARCHAR(16) DEFAULT ''"},
 		{"usage_logs", "client_ip", "VARCHAR(64) DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INT DEFAULT 0"},
@@ -441,6 +444,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "idx_usage_logs_created_status", "CREATE INDEX idx_usage_logs_created_status ON usage_logs(created_at, status_code)"},
 		{"usage_logs", "idx_usage_logs_account_status", "CREATE INDEX idx_usage_logs_account_status ON usage_logs(account_id, status_code)"},
 		{"usage_logs", "idx_usage_logs_api_key_created_at", "CREATE INDEX idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at)"},
+		{"usage_logs", "idx_usage_logs_channel_created_at", "CREATE INDEX idx_usage_logs_channel_created_at ON usage_logs(channel, created_at)"},
 		{"api_keys", "idx_api_keys_expires_at", "CREATE INDEX idx_api_keys_expires_at ON api_keys(expires_at)"},
 		{"account_group_members", "idx_account_group_members_group", "CREATE INDEX idx_account_group_members_group ON account_group_members(group_id)"},
 		{"account_group_members", "idx_account_group_members_account", "CREATE INDEX idx_account_group_members_account ON account_group_members(account_id)"},
@@ -560,6 +564,7 @@ func systemSettingsMySQLDDL() string {
 		stream_flush_interval_ms INT DEFAULT 20,
 		first_token_mode VARCHAR(20) DEFAULT 'strict',
 		first_token_timeout_seconds INT DEFAULT 0,
+		first_token_excludes_ws_acquire TINYINT(1) DEFAULT 0,
 		test_content TEXT NULL,
 		billing_tier_policy VARCHAR(20) DEFAULT 'actual',
 		image_storage_config TEXT NULL,
@@ -683,12 +688,16 @@ func (db *DB) getTrafficSnapshotMySQL(ctx context.Context) (*TrafficSnapshot, er
 	return snapshot, nil
 }
 
-func (db *DB) getChartAggregationMySQL(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
+func (db *DB) getChartAggregationMySQL(ctx context.Context, start, end time.Time, bucketMinutes int, channel string) (*ChartAggregation, error) {
 	if bucketMinutes < 1 {
 		bucketMinutes = 5
 	}
 	result := &ChartAggregation{}
 	startArg, endArg := db.timeRangeArgs(start, end)
+	channelClause := ""
+	if channel != "" {
+		channelClause = " AND channel = ?"
+	}
 
 	timelineQuery := `
 	SELECT
@@ -703,10 +712,14 @@ func (db *DB) getChartAggregationMySQL(ctx context.Context, start, end time.Time
 		COALESCE(SUM(CASE WHEN status_code >= 500 AND status_code < 600 THEN 1 ELSE 0 END), 0) AS errors_5xx
 	FROM usage_logs
 	WHERE created_at >= ? AND created_at <= ?
-	  AND status_code <> 499
-	GROUP BY bucket
-	ORDER BY bucket`
-	rows, err := db.conn.QueryContext(ctx, timelineQuery, bucketMinutes, bucketMinutes, startArg, endArg)
+		  AND status_code <> 499` + channelClause + `
+		GROUP BY bucket
+		ORDER BY bucket`
+	timelineArgs := []interface{}{bucketMinutes, bucketMinutes, startArg, endArg}
+	if channel != "" {
+		timelineArgs = append(timelineArgs, channel)
+	}
+	rows, err := db.conn.QueryContext(ctx, timelineQuery, timelineArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -725,15 +738,19 @@ func (db *DB) getChartAggregationMySQL(ctx context.Context, start, end time.Time
 		result.Timeline = []ChartTimelinePoint{}
 	}
 
-	modelRows, err := db.conn.QueryContext(ctx, `
-		SELECT COALESCE(model, 'unknown'), COUNT(*) AS requests
-		FROM usage_logs
-		WHERE created_at >= ? AND created_at <= ?
-		  AND status_code <> 499
-		GROUP BY model
-		ORDER BY requests DESC
-		LIMIT 10
-	`, startArg, endArg)
+	modelQuery := `
+			SELECT COALESCE(model, 'unknown'), COUNT(*) AS requests
+			FROM usage_logs
+			WHERE created_at >= ? AND created_at <= ?
+			  AND status_code <> 499` + channelClause + `
+			GROUP BY model
+			ORDER BY requests DESC
+			LIMIT 10`
+	modelArgs := []interface{}{startArg, endArg}
+	if channel != "" {
+		modelArgs = append(modelArgs, channel)
+	}
+	modelRows, err := db.conn.QueryContext(ctx, modelQuery, modelArgs...)
 	if err != nil {
 		return nil, err
 	}

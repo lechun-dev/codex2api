@@ -1,12 +1,16 @@
 package promptfilter
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
 )
 
 type Signal struct {
@@ -49,6 +53,37 @@ type Decision struct {
 	Errors                []string         `json:"errors,omitempty"`
 	ReviewText            string           `json:"-"`
 	legacyVerdict         Verdict
+	deferredAudit         *DeferredAudit
+}
+
+// DeferredAudit is an immutable snapshot of auxiliary shadow-only content
+// removed from the client-visible request path. Its fields stay private so a
+// caller cannot alter the already-resolved layer/profile policy before the
+// pipeline evaluates it in a background worker.
+type DeferredAudit struct {
+	envelope         RequestEnvelope
+	request          GuardRequest
+	detectionContext DetectionContext
+}
+
+func (d Decision) DeferredAudit() (DeferredAudit, bool) {
+	if d.deferredAudit == nil || len(d.deferredAudit.envelope.Segments) == 0 {
+		return DeferredAudit{}, false
+	}
+	audit := *d.deferredAudit
+	audit.envelope.Segments = append([]Segment(nil), audit.envelope.Segments...)
+	audit.request.Envelope = audit.envelope
+	return audit, true
+}
+
+func (a DeferredAudit) SegmentCount() int { return len(a.envelope.Segments) }
+
+func (a DeferredAudit) ByteSize() int {
+	total := 0
+	for _, segment := range a.envelope.Segments {
+		total += len(segment.Text)
+	}
+	return total
 }
 
 func (d Decision) LegacyVerdict() Verdict {
@@ -102,6 +137,17 @@ type Detector interface {
 	Detect(context.Context, RequestEnvelope, DetectionContext) ([]Signal, error)
 }
 
+// SegmentLocalDeferredDetector is an explicit opt-in capability for detectors
+// whose result for an auxiliary segment is independent of every other segment
+// in the request envelope. The pipeline only removes shadow-only auxiliary
+// segments from the synchronous path when every active detector declares this
+// capability. Unknown and cross-segment detectors therefore keep the complete
+// envelope on the synchronous path by default.
+type SegmentLocalDeferredDetector interface {
+	Detector
+	SupportsDeferredSegmentAudit() bool
+}
+
 type Policy interface {
 	Decide(GuardRequest, DetectionContext, []Signal) Decision
 }
@@ -151,6 +197,63 @@ func (p *Pipeline) Evaluate(ctx context.Context, request GuardRequest) Decision 
 		return Decision{Enabled: false, Mode: globalMode, Profile: profile.Name, Action: ActionAllow, WouldAction: ActionAllow, Rollout: rolloutDecision}
 	}
 
+	syncEnvelope, deferredEnvelope := request.Envelope, RequestEnvelope{}
+	if p.supportsDeferredSegmentAudit() {
+		syncEnvelope, deferredEnvelope = partitionDeferredShadowSegments(request.Envelope, detectionContext, applicationPromptKind)
+	}
+	request.Envelope = syncEnvelope
+	decision := p.evaluateResolved(ctx, request, detectionContext)
+	decision.Rollout = rolloutDecision
+	decision.ApplicationPromptKind = applicationPromptKind
+	if applicationPromptKind != "" {
+		decision.ReviewText = envelopeOriginText(request.Envelope, OriginApplicationCandidate)
+	}
+	if len(deferredEnvelope.Segments) > 0 {
+		deferredRequest := request
+		deferredRequest.Envelope = deferredEnvelope
+		decision.deferredAudit = &DeferredAudit{
+			envelope:         deferredEnvelope,
+			request:          deferredRequest,
+			detectionContext: detectionContext,
+		}
+	}
+	return decision
+}
+
+func (p *Pipeline) supportsDeferredSegmentAudit() bool {
+	activeDetectors := 0
+	for _, detector := range p.Detectors {
+		if detector == nil {
+			continue
+		}
+		activeDetectors++
+		capable, ok := detector.(SegmentLocalDeferredDetector)
+		if !ok || !capable.SupportsDeferredSegmentAudit() {
+			return false
+		}
+	}
+	return activeDetectors > 0
+}
+
+// EvaluateDeferred executes a previously resolved shadow-only audit snapshot.
+// It deliberately bypasses profile/rollout resolution and partitioning, so a
+// later configuration update cannot raise or lower the request-time policy.
+func (p *Pipeline) EvaluateDeferred(ctx context.Context, audit DeferredAudit) Decision {
+	if len(audit.envelope.Segments) == 0 {
+		return Decision{
+			Enabled:     audit.request.Config.Enabled,
+			Mode:        audit.detectionContext.GlobalMode,
+			Profile:     audit.detectionContext.Profile.Name,
+			Action:      ActionAllow,
+			WouldAction: ActionAllow,
+		}
+	}
+	audit.request.Envelope = audit.envelope
+	return p.evaluateResolved(ctx, audit.request, audit.detectionContext)
+}
+
+func (p *Pipeline) evaluateResolved(ctx context.Context, request GuardRequest, detectionContext DetectionContext) Decision {
+
 	var signals []Signal
 	var detectionErrors []string
 	for _, detector := range p.Detectors {
@@ -170,13 +273,58 @@ func (p *Pipeline) Evaluate(ctx context.Context, request GuardRequest) Decision 
 		policy = DefaultGuardPolicy{}
 	}
 	decision := policy.Decide(request, detectionContext, signals)
-	decision.Rollout = rolloutDecision
-	decision.ApplicationPromptKind = applicationPromptKind
-	if applicationPromptKind != "" {
-		decision.ReviewText = envelopeOriginText(request.Envelope, OriginApplicationCandidate)
-	}
 	decision.Errors = detectionErrors
 	return decision
+}
+
+func partitionDeferredShadowSegments(envelope RequestEnvelope, detectionContext DetectionContext, applicationPromptKind string) (RequestEnvelope, RequestEnvelope) {
+	if !detectionContext.Guard.Performance.AsyncShadowAuxiliaryEnabled || len(envelope.Segments) == 0 {
+		return envelope, RequestEnvelope{}
+	}
+	synchronous := envelope
+	synchronous.Segments = make([]Segment, 0, len(envelope.Segments))
+	deferred := envelope
+	deferred.Segments = make([]Segment, 0, len(envelope.Segments))
+	for _, segment := range envelope.Segments {
+		if guardSegmentCanRunDeferred(segment, detectionContext, applicationPromptKind) {
+			deferred.Segments = append(deferred.Segments, segment)
+			continue
+		}
+		synchronous.Segments = append(synchronous.Segments, segment)
+	}
+	return synchronous, deferred
+}
+
+func guardSegmentCanRunDeferred(segment Segment, detectionContext DetectionContext, applicationPromptKind string) bool {
+	if segment.Origin == OriginCurrentUser || segment.Origin == OriginApplicationCandidate || (segment.Origin == OriginHistory && segment.Linked) {
+		return false
+	}
+	// In legacy shadow mode a recognized Codex application task is represented
+	// as session context. It is still application input and therefore remains on
+	// the synchronous path even though ordinary session fragments may be deferred.
+	if applicationPromptKind != "" && segment.Origin == OriginSessionContext {
+		return false
+	}
+	switch segment.Origin {
+	case OriginHistory, OriginSystem, OriginDeveloper, OriginInstructions, OriginToolOutput, OriginToolArguments, OriginAttachmentRefs, OriginSessionContext, OriginAttachmentContent:
+	default:
+		return false
+	}
+	if detectionContext.LayerMode(segment.Origin) != GuardModeShadow {
+		return false
+	}
+	return unresolvedGuardLayerIntent(detectionContext, segment.Origin) == GuardModeShadow
+}
+
+func unresolvedGuardLayerIntent(detectionContext DetectionContext, origin SegmentOrigin) string {
+	configured := guardLayerMode(detectionContext.Guard.Layers, origin)
+	if configured == GuardModeInherit {
+		configured = normalizeGuardMode(detectionContext.Profile.LayerModes[origin], GuardModeOff)
+	}
+	if configured == GuardModeInherit {
+		configured = detectionContext.GlobalMode
+	}
+	return configured
 }
 
 func envelopeOriginText(envelope RequestEnvelope, origin SegmentOrigin) string {
@@ -445,21 +593,45 @@ func containsAll(text string, anchors ...string) bool {
 	return true
 }
 
-type LegacyRegexDetector struct{}
+type LegacyRegexDetector struct {
+	cache *exactGuardSegmentCache
+}
+
+const exactGuardSegmentCacheRevision = "legacy-regex-v1"
+
+var sharedExactGuardSegmentCache = newExactGuardSegmentCache()
 
 func (LegacyRegexDetector) Name() string { return "legacy_regex" }
+
+// SupportsDeferredSegmentAudit is safe because LegacyRegexDetector evaluates
+// every auxiliary segment independently. The only intentional aggregation is
+// current-user plus linked-history content, and neither origin is eligible for
+// deferred shadow processing.
+func (LegacyRegexDetector) SupportsDeferredSegmentAudit() bool { return true }
 
 func (d LegacyRegexDetector) Detect(_ context.Context, envelope RequestEnvelope, detectionContext DetectionContext) ([]Signal, error) {
 	cfg := detectionContext.Config
 	cfg.Enabled = true
 	cfg.Mode = ModeBlock
+	cfg = NormalizeConfig(cfg)
+	engine, err := engineForConfig(cfg)
+	if err != nil {
+		// Preserve the legacy detector behavior: InspectText represented an engine
+		// construction error as a clean verdict with Reason populated, which did
+		// not create a signal or alter the request action.
+		return nil, nil
+	}
+	cache := d.cache
+	if cache == nil {
+		cache = sharedExactGuardSegmentCache
+	}
 	var signals []Signal
 	for _, aggregate := range aggregateGuardSegments(envelope) {
 		layerMode := detectionContext.LayerMode(aggregate.Origin)
 		if layerMode == GuardModeOff {
 			continue
 		}
-		verdict := InspectText(aggregate.Text, cfg)
+		verdict := cache.inspect(engine, aggregate.Text, detectionContext.Guard.Performance)
 		if len(verdict.Matched) == 0 {
 			continue
 		}
@@ -484,6 +656,294 @@ func (d LegacyRegexDetector) Detect(_ context.Context, envelope RequestEnvelope,
 		})
 	}
 	return signals, nil
+}
+
+type exactGuardSegmentCacheKey struct {
+	engine   *Engine
+	revision string
+	textHash [sha256.Size]byte
+}
+
+type exactGuardSegmentCacheEntry struct {
+	key      exactGuardSegmentCacheKey
+	verdict  Verdict
+	cachedAt time.Time
+}
+
+type exactGuardSegmentFlight struct {
+	done       chan struct{}
+	verdict    Verdict
+	panicValue any
+}
+
+// exactGuardSegmentCache is a process-wide bounded LRU. Keys contain no prompt
+// text, and values omit FullText, TextPreview, and MatchContext; request
+// evidence is rebuilt from the caller's exact current text on every cache hit.
+// The Engine identity acts as the complete normalized rule/config fingerprint,
+// so any rule or normalization update automatically misses old entries.
+type exactGuardSegmentCache struct {
+	mu       sync.Mutex
+	entries  map[exactGuardSegmentCacheKey]*list.Element
+	lru      *list.List
+	inflight map[exactGuardSegmentCacheKey]*exactGuardSegmentFlight
+}
+
+func newExactGuardSegmentCache() *exactGuardSegmentCache {
+	return &exactGuardSegmentCache{
+		entries:  make(map[exactGuardSegmentCacheKey]*list.Element),
+		lru:      list.New(),
+		inflight: make(map[exactGuardSegmentCacheKey]*exactGuardSegmentFlight),
+	}
+}
+
+func (c *exactGuardSegmentCache) inspect(engine *Engine, text string, performance GuardPerformanceConfig) Verdict {
+	if engine == nil {
+		panic("promptfilter: exact segment cache received nil engine")
+	}
+	if c == nil || !performance.ExactSegmentCacheEnabled {
+		return engine.InspectText(text)
+	}
+	key := exactGuardSegmentCacheKey{
+		engine:   engine,
+		revision: exactGuardSegmentCacheRevision,
+		textHash: exactGuardTextHash(text),
+	}
+	now := time.Now()
+	c.mu.Lock()
+	for c.lru.Len() > performance.ExactSegmentCacheEntries {
+		c.removeElement(c.lru.Back())
+	}
+	if element, ok := c.entries[key]; ok {
+		entry := element.Value.(*exactGuardSegmentCacheEntry)
+		if now.Sub(entry.cachedAt) < time.Duration(performance.ExactSegmentCacheTTLSeconds)*time.Second {
+			c.lru.MoveToFront(element)
+			cachedVerdict := entry.verdict
+			c.mu.Unlock()
+			// Evidence reconstruction can perform bounded normalization and regex
+			// work. Never hold the process-wide LRU lock while doing that work, or
+			// concurrent cache hits would serialize and recreate a latency queue.
+			return restoreExactGuardVerdict(engine, cachedVerdict, text)
+		}
+		c.removeElement(element)
+	}
+	if flight, ok := c.inflight[key]; ok {
+		done := flight.done
+		c.mu.Unlock()
+		<-done
+		if flight.panicValue != nil {
+			panic(flight.panicValue)
+		}
+		return restoreExactGuardVerdict(engine, flight.verdict, text)
+	}
+	flight := &exactGuardSegmentFlight{done: make(chan struct{})}
+	c.inflight[key] = flight
+	c.mu.Unlock()
+
+	var verdict Verdict
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				c.mu.Lock()
+				flight.panicValue = recovered
+				delete(c.inflight, key)
+				close(flight.done)
+				c.mu.Unlock()
+				panic(recovered)
+			}
+		}()
+		verdict = engine.InspectText(text)
+	}()
+	cachedVerdict := cacheExactGuardVerdict(verdict)
+
+	c.mu.Lock()
+	flight.verdict = cachedVerdict
+	delete(c.inflight, key)
+	entry := &exactGuardSegmentCacheEntry{
+		key:      key,
+		verdict:  cachedVerdict,
+		cachedAt: time.Now(),
+	}
+	element := c.lru.PushFront(entry)
+	c.entries[key] = element
+	for c.lru.Len() > performance.ExactSegmentCacheEntries {
+		c.removeElement(c.lru.Back())
+	}
+	close(flight.done)
+	c.mu.Unlock()
+	return verdict
+}
+
+func exactGuardTextHash(text string) [sha256.Size]byte {
+	hasher := sha256.New()
+	var chunk [4096]byte
+	for len(text) > 0 {
+		count := copy(chunk[:], text)
+		_, _ = hasher.Write(chunk[:count])
+		text = text[count:]
+	}
+	var digest [sha256.Size]byte
+	hasher.Sum(digest[:0])
+	return digest
+}
+
+func (c *exactGuardSegmentCache) removeElement(element *list.Element) {
+	if c == nil || element == nil {
+		return
+	}
+	entry, _ := element.Value.(*exactGuardSegmentCacheEntry)
+	if entry != nil {
+		delete(c.entries, entry.key)
+	}
+	c.lru.Remove(element)
+}
+
+func cacheExactGuardVerdict(verdict Verdict) Verdict {
+	verdict.FullText = ""
+	verdict.TextPreview = ""
+	verdict.MatchContext = ""
+	verdict.Matched = append([]Match(nil), verdict.Matched...)
+	return verdict
+}
+
+func restoreExactGuardVerdict(engine *Engine, verdict Verdict, text string) Verdict {
+	// LegacyRegexDetector immediately discards clean verdicts. Rebuilding a
+	// preview for them would allocate and redact several kilobytes per repeated
+	// benign tool segment even though no audit row can use that evidence.
+	if len(verdict.Matched) == 0 {
+		return verdict
+	}
+	verdict.FullText = text
+	verdict.TextPreview = cachedVerdictRedactedPreview(text, 500)
+	verdict.MatchContext = engine.cachedVerdictMatchContext(text, verdict.Matched)
+	verdict.ExtractedChars = utf8.RuneCountInString(text)
+	verdict.Matched = append([]Match(nil), verdict.Matched...)
+	return verdict
+}
+
+const cachedVerdictPreviewInputBytes = 2048
+
+// cachedVerdictRedactedPreview bounds redaction work before applying the
+// regular secret scrubbers. A cache hit must not rescan an arbitrarily large
+// tool result merely to rebuild its 500-rune audit preview.
+func cachedVerdictRedactedPreview(text string, maxRunes int) string {
+	if text == "" || maxRunes <= 0 {
+		return ""
+	}
+	sample := text
+	truncated := len(sample) > cachedVerdictPreviewInputBytes
+	if truncated {
+		end := cachedVerdictPreviewInputBytes
+		for end > 0 && end < len(text) && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		sample = text[:end]
+		// Exclude the trailing partial ASCII token at the byte boundary. This
+		// keeps a long credential from leaking while preserving ordinary
+		// whitespace-free CJK text up to the complete UTF-8 boundary.
+		tokenStart := len(sample)
+		for tokenStart > 0 && cachedPreviewTokenByte(sample[tokenStart-1]) {
+			tokenStart--
+		}
+		if tokenStart < len(sample) {
+			sample = sample[:tokenStart]
+		}
+	}
+	// The general private-key scrubber intentionally requires a complete PEM
+	// block. A bounded preview can end before the footer, so discard the partial
+	// block rather than retaining key material in the reconstructed evidence.
+	if begin := strings.Index(sample, "-----BEGIN"); begin >= 0 {
+		headerTail := sample[begin:]
+		if keyHeader := strings.Index(headerTail, "PRIVATE KEY-----"); keyHeader >= 0 && keyHeader <= 64 && !strings.Contains(headerTail[keyHeader:], "-----END") {
+			sample = sample[:begin] + "[REDACTED_PRIVATE_KEY]"
+		}
+	}
+	preview := RedactedPreview(sample, maxRunes)
+	if truncated && !strings.HasSuffix(preview, "...") {
+		preview += "..."
+	}
+	return preview
+}
+
+func cachedPreviewTokenByte(value byte) bool {
+	return isASCIIAlphaNumeric(value) || strings.ContainsRune("_-.:/@+=%~", rune(value))
+}
+
+// cachedVerdictMatchContext rebuilds bounded, redacted evidence from the exact
+// current request text. Cache entries retain only semantic match metadata, so
+// neither raw prompts nor derived previews/contexts remain reachable from the
+// process-wide LRU after a request completes.
+func (e *Engine) cachedVerdictMatchContext(text string, matches []Match) string {
+	if e == nil || len(matches) == 0 || strings.TrimSpace(text) == "" {
+		return ""
+	}
+	wantedPatterns := make(map[string]bool, len(matches))
+	wantSensitiveWords := false
+	for _, match := range matches {
+		wantedPatterns[match.Name] = true
+		wantSensitiveWords = wantSensitiveWords || match.Name == "sensitive_word"
+	}
+
+	limitedText := limitScanText(text, e.cfg.MaxTextLength)
+	views := scanViews(limitedText, e.cfg.Advanced.Normalization, e)
+	matchContexts := make([]string, 0, 3)
+	recordContext := func(context string) {
+		context = strings.TrimSpace(context)
+		if context == "" || len(matchContexts) >= 3 {
+			return
+		}
+		for _, existing := range matchContexts {
+			if existing == context {
+				return
+			}
+		}
+		matchContexts = append(matchContexts, context)
+	}
+
+	for _, view := range views {
+		scanText := view.Text
+		if utf8.RuneCountInString(scanText) < 2 || view.ReviewOnly {
+			continue
+		}
+		literalHits := e.literalIndex.match(scanText)
+		if wantSensitiveWords && !view.Compacted {
+			for _, word := range e.sensitiveWords {
+				if word == "" {
+					continue
+				}
+				if loc := sensitiveWordMatchIndex(scanText, literalHits, word); loc != nil {
+					_, context := regexMatchContext(scanText, loc)
+					recordContext(context)
+				}
+			}
+		}
+		for _, pattern := range e.patterns {
+			if !wantedPatterns[pattern.cfg.Name] {
+				continue
+			}
+			if view.Compacted && !isBuiltinMinorSafetyPattern(pattern) {
+				continue
+			}
+			if !patternShouldRun(scanText, pattern, literalHits) {
+				continue
+			}
+			if patternSuppressedForQuotedPolicyReview(limitedText, pattern) ||
+				patternSuppressedForDefensiveRuleArtifact(limitedText, pattern) ||
+				patternSuppressedForDefensiveDocumentation(limitedText, pattern) {
+				continue
+			}
+			var loc []int
+			if view.Compacted && isBuiltinMinorSafetyPattern(pattern) {
+				loc = minorSafetyCompactMaterialMatchIndex(scanText)
+			} else {
+				loc = compiledPatternMatchIndex(scanText, pattern)
+			}
+			if loc != nil {
+				_, context := regexMatchContext(scanText, loc)
+				recordContext(context)
+			}
+		}
+	}
+	return strings.Join(matchContexts, "\n---\n")
 }
 
 type aggregatedGuardSegment struct {

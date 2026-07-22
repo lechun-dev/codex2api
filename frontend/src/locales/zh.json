@@ -1564,6 +1564,29 @@
       "profileDescription": "档案调整检测深度，不会把单个安全技术名词直接变成终局违规。",
       "layersTitle": "请求来源层",
       "layersDescription": "每种来源可选择独立模式。建议当前用户 Prompt 执行审核，应用上下文先使用继承或影子模式观察误报。",
+      "performance": {
+        "title": "审核性能与首字延迟",
+        "description": "复用完全相同的片段检测结果，并可把纯影子辅助层移出用户等待路径，在不降低执行层审核强度的前提下减少重复扫描。",
+        "syncSafetyNotice": "无论如何配置，current_user、application_candidate 以及 Warn / Enforce 层始终同步完成审核；这些性能选项不能绕过当前用户 Prompt 的拦截。",
+        "asyncShadowAuxiliary": "异步处理影子辅助层",
+        "asyncShadowAuxiliaryHint": "仅把最终模式为 Shadow 的工具输出、历史、系统/开发者上下文、会话与附件等辅助内容放入后台队列；关闭时这些影子层仍同步扫描。旧配置默认关闭。",
+        "exactSegmentCache": "精确片段缓存",
+        "exactSegmentCacheHint": "按完整规则配置与片段摘要复用完全相同的检测结论，不做模糊匹配，也不改变分数或拦截结果。",
+        "cacheEntries": "缓存条目上限",
+        "cacheEntriesHint": "内存中最多保留的精确片段结论数量，范围 1–32768；达到上限后优先淘汰最久未使用的条目。",
+        "cacheTTL": "缓存有效期（秒）",
+        "cacheTTLHint": "精确片段结论的最长复用时间，范围 1–86400 秒；规则配置变化会使用新的缓存键。",
+        "shadowWorkers": "影子工作线程",
+        "shadowWorkersHint": "后台并行处理纯 Shadow 辅助片段的工作线程数，范围 1–16；建议从 2 开始观察 CPU。",
+        "shadowQueue": "影子队列容量",
+        "shadowQueueHint": "等待后台审核的纯 Shadow 辅助任务上限，范围 1–4096。默认溢出策略不会把扫描压回请求线程。",
+        "shadowOverflowMode": "队列溢出策略",
+        "shadowOverflowModeHint": "优先低延迟会跳过本次纯 Shadow 辅助审计并记录丢弃计数；完整审计会同步回退，可能增加首字延迟。当前用户 Prompt 与 Warn / Enforce 层不受影响。",
+        "overflowModes": {
+          "drop": "优先低延迟（推荐）",
+          "sync": "完整审计（同步回退）"
+        }
+      },
       "modes": {
         "inherit": {
           "label": "继承旧配置",

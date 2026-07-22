@@ -112,6 +112,7 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 
 func (h *Handler) logPromptGuardEvaluation(c *gin.Context, endpoint string, model string, source string, errorCode string, evaluation promptGuardEvaluation) {
 	h.logPromptFilterVerdictWithDecision(c, endpoint, model, source, errorCode, evaluation.Verdict, &evaluation.Decision, &evaluation.Envelope)
+	h.scheduleDeferredPromptGuardAudit(c, endpoint, model, source, errorCode, evaluation)
 }
 
 func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope) {
@@ -121,11 +122,55 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" {
 		return
 	}
+	logMatches := true
 	if h.store != nil {
 		cfg := h.store.GetPromptFilterConfig()
-		if source == "local_filter" && !cfg.LogMatches {
+		logMatches = cfg.LogMatches
+		if source == "local_filter" && !logMatches {
 			return
 		}
+	}
+	auditContext := h.capturePromptFilterAuditContext(c)
+	_ = h.logPromptFilterVerdictWithAuditContext(context.Background(), auditContext, endpoint, model, source, errorCode, verdict, decision, envelope, logMatches)
+}
+
+type promptFilterAuditContext struct {
+	ClientIP     string
+	APIKeyID     int64
+	APIKeyName   string
+	APIKeyMasked string
+	Endpoint     string
+	Protocol     string
+	Provider     string
+}
+
+func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAuditContext {
+	if c == nil {
+		return promptFilterAuditContext{}
+	}
+	input := &database.PromptFilterLogInput{ClientIP: c.ClientIP()}
+	h.populateVerifiedNewAPIAuditMeta(c, input)
+	populatePromptFilterAPIKeyMeta(c, input)
+	return promptFilterAuditContext{
+		ClientIP:     input.ClientIP,
+		APIKeyID:     input.APIKeyID,
+		APIKeyName:   input.APIKeyName,
+		APIKeyMasked: input.APIKeyMasked,
+		Endpoint:     input.Endpoint,
+		Protocol:     input.Protocol,
+		Provider:     input.Provider,
+	}
+}
+
+func (h *Handler) logPromptFilterVerdictWithAuditContext(ctx context.Context, auditContext promptFilterAuditContext, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope, logMatches bool) error {
+	if h == nil || h.db == nil || !verdict.Enabled {
+		return nil
+	}
+	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" {
+		return nil
+	}
+	if source == "local_filter" && !logMatches {
+		return nil
 	}
 	input := &database.PromptFilterLogInput{
 		Source:          source,
@@ -138,7 +183,7 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 		MatchedPatterns: promptfilter.MatchesJSON(verdict.Matched),
 		TextPreview:     promptfilter.RedactedPreview(verdict.TextPreview, 500),
 		MatchContext:    promptfilter.RedactedPreview(verdict.MatchContext, promptFilterMatchContextMaxRunes),
-		ClientIP:        c.ClientIP(),
+		ClientIP:        auditContext.ClientIP,
 		ErrorCode:       errorCode,
 		ReviewModel:     verdict.ReviewModel,
 		ReviewFlagged:   verdict.ReviewFlagged,
@@ -152,7 +197,15 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 			input.Provider = string(envelope.ModelFamily)
 		}
 	}
-	h.populateVerifiedNewAPIAuditMeta(c, input)
+	if auditContext.Endpoint != "" {
+		input.Endpoint = auditContext.Endpoint
+	}
+	if auditContext.Protocol != "" {
+		input.Protocol = auditContext.Protocol
+	}
+	if auditContext.Provider != "" {
+		input.Provider = auditContext.Provider
+	}
 	if decision != nil {
 		input.AuditScore = decision.AuditScore
 		input.PolicyProfile = decision.Profile
@@ -165,10 +218,15 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 	if verdict.Action == promptfilter.ActionBlock {
 		input.FullText = promptfilter.RedactedPreview(verdict.FullText, promptFilterFullTextMaxRunes)
 	}
-	populatePromptFilterAPIKeyMeta(c, input)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	input.APIKeyID = auditContext.APIKeyID
+	input.APIKeyName = auditContext.APIKeyName
+	input.APIKeyMasked = auditContext.APIKeyMasked
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	_ = h.db.InsertPromptFilterLog(ctx, input)
+	return h.db.InsertPromptFilterLog(ctx, input)
 }
 
 func (h *Handler) populateVerifiedNewAPIAuditMeta(c *gin.Context, input *database.PromptFilterLogInput) {

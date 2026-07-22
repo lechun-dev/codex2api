@@ -2,14 +2,184 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
 var defaultPromptGuardPipeline = promptfilter.NewGuardPipeline()
+
+const (
+	promptGuardShadowQueueCapacity = 4096
+	promptGuardShadowMaxBytes      = 64 * 1024 * 1024
+	promptGuardShadowTaskTimeout   = 15 * time.Second
+	promptGuardShadowDropLogEvery  = 5 * time.Second
+)
+
+var defaultPromptGuardShadowDispatcher = newPromptGuardShadowDispatcher()
+
+var (
+	promptGuardShadowEnqueued     atomic.Uint64
+	promptGuardShadowCompleted    atomic.Uint64
+	promptGuardShadowFallbackSync atomic.Uint64
+	promptGuardShadowDropped      atomic.Uint64
+	promptGuardShadowFailures     atomic.Uint64
+	promptGuardShadowLastDropLog  atomic.Int64
+)
+
+type promptGuardShadowAuditJob struct {
+	handler        *Handler
+	audit          promptfilter.DeferredAudit
+	auditContext   promptFilterAuditContext
+	envelope       promptfilter.RequestEnvelope
+	currentPreview string
+	currentChars   int
+	endpoint       string
+	model          string
+	source         string
+	errorCode      string
+	logMatches     bool
+	queuedAt       time.Time
+	retainedBytes  int64
+}
+
+type promptGuardShadowDispatcher struct {
+	queue chan promptGuardShadowAuditJob
+	mu    sync.Mutex
+
+	workers        int
+	desiredWorkers int
+	pendingJobs    int
+	pendingBytes   int64
+}
+
+type promptGuardShadowEnqueueStatus uint8
+
+const (
+	promptGuardShadowEnqueueInvalid promptGuardShadowEnqueueStatus = iota
+	promptGuardShadowEnqueueAccepted
+	promptGuardShadowEnqueueOverflow
+)
+
+func newPromptGuardShadowDispatcher() *promptGuardShadowDispatcher {
+	return &promptGuardShadowDispatcher{queue: make(chan promptGuardShadowAuditJob, promptGuardShadowQueueCapacity)}
+}
+
+func (d *promptGuardShadowDispatcher) enqueue(job promptGuardShadowAuditJob, workers int, queueLimit int) (promptGuardShadowEnqueueStatus, string) {
+	if d == nil || job.handler == nil || job.audit.SegmentCount() == 0 {
+		return promptGuardShadowEnqueueInvalid, "invalid_job"
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	if queueLimit < 1 {
+		queueLimit = 1
+	}
+	if queueLimit > promptGuardShadowQueueCapacity {
+		queueLimit = promptGuardShadowQueueCapacity
+	}
+	job.retainedBytes = int64(job.audit.ByteSize() + len(job.currentPreview))
+	if job.retainedBytes <= 0 {
+		return promptGuardShadowEnqueueInvalid, "empty_job"
+	}
+	if job.retainedBytes > promptGuardShadowMaxBytes {
+		return promptGuardShadowEnqueueOverflow, "job_too_large"
+	}
+
+	d.mu.Lock()
+	if d.pendingJobs >= queueLimit {
+		d.mu.Unlock()
+		return promptGuardShadowEnqueueOverflow, "queue_limit"
+	}
+	if d.pendingBytes+job.retainedBytes > promptGuardShadowMaxBytes {
+		d.mu.Unlock()
+		return promptGuardShadowEnqueueOverflow, "retained_bytes_limit"
+	}
+	d.desiredWorkers = workers
+	startWorkers := d.desiredWorkers - d.workers
+	if startWorkers > 0 {
+		d.workers = workers
+	}
+	d.pendingJobs++
+	d.pendingBytes += job.retainedBytes
+	d.mu.Unlock()
+	for range startWorkers {
+		go d.worker()
+	}
+
+	select {
+	case d.queue <- job:
+		promptGuardShadowEnqueued.Add(1)
+		return promptGuardShadowEnqueueAccepted, ""
+	default:
+		d.complete(job.retainedBytes)
+		return promptGuardShadowEnqueueOverflow, "queue_channel_full"
+	}
+}
+
+func (d *promptGuardShadowDispatcher) worker() {
+	for job := range d.queue {
+		func() {
+			defer d.complete(job.retainedBytes)
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					promptGuardShadowFailures.Add(1)
+					log.Printf("prompt guard shadow audit panic: %v", recovered)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), promptGuardShadowTaskTimeout)
+			err := runDeferredPromptGuardAudit(ctx, job)
+			cancel()
+			if err != nil {
+				promptGuardShadowFailures.Add(1)
+				log.Printf("prompt guard shadow audit failed: %v", err)
+				return
+			}
+			promptGuardShadowCompleted.Add(1)
+		}()
+		if d.retireWorkerIfExcess() {
+			return
+		}
+	}
+}
+
+func (d *promptGuardShadowDispatcher) retireWorkerIfExcess() bool {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.workers <= d.desiredWorkers {
+		return false
+	}
+	d.workers--
+	return true
+}
+
+func (d *promptGuardShadowDispatcher) complete(retainedBytes int64) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.pendingJobs > 0 {
+		d.pendingJobs--
+	}
+	d.pendingBytes -= retainedBytes
+	if d.pendingBytes < 0 {
+		d.pendingBytes = 0
+	}
+	d.mu.Unlock()
+}
 
 type promptGuardEvaluation struct {
 	Config   promptfilter.Config
@@ -174,6 +344,141 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 	verdict.RawScore = decision.RawScore
 	verdict.Reason = decision.Reason
 	return promptGuardEvaluation{Config: cfg, Envelope: envelope, Decision: decision, Verdict: verdict}
+}
+
+func (h *Handler) scheduleDeferredPromptGuardAudit(c *gin.Context, endpoint string, model string, source string, errorCode string, evaluation promptGuardEvaluation) {
+	if h == nil || h.db == nil || source != "local_filter" || !evaluation.Config.LogMatches {
+		return
+	}
+	audit, ok := evaluation.Decision.DeferredAudit()
+	if !ok {
+		return
+	}
+	envelopeMeta := evaluation.Envelope
+	envelopeMeta.Segments = nil
+	job := promptGuardShadowAuditJob{
+		handler:        h,
+		audit:          audit,
+		auditContext:   h.capturePromptFilterAuditContext(c),
+		envelope:       envelopeMeta,
+		currentPreview: promptfilter.RedactedPreview(evaluation.Verdict.TextPreview, 500),
+		currentChars:   evaluation.Verdict.ExtractedChars,
+		endpoint:       endpoint,
+		model:          model,
+		source:         source,
+		errorCode:      errorCode,
+		logMatches:     evaluation.Config.LogMatches,
+		queuedAt:       time.Now(),
+	}
+	performance := evaluation.Config.Advanced.Guard.Performance
+	status, reason := defaultPromptGuardShadowDispatcher.enqueue(job, performance.ShadowWorkers, performance.ShadowQueueSize)
+	if status == promptGuardShadowEnqueueAccepted {
+		return
+	}
+	if status == promptGuardShadowEnqueueOverflow && performance.ShadowOverflowMode == promptfilter.GuardShadowOverflowSync {
+		promptGuardShadowFallbackSync.Add(1)
+		ctx, cancel := context.WithTimeout(context.Background(), promptGuardShadowTaskTimeout)
+		err := runDeferredPromptGuardAudit(ctx, job)
+		cancel()
+		if err != nil {
+			promptGuardShadowFailures.Add(1)
+			log.Printf("prompt guard shadow synchronous overflow audit failed: %v", err)
+		}
+		return
+	}
+	promptGuardShadowDropped.Add(1)
+	logPromptGuardShadowDrop(job, reason)
+}
+
+func logPromptGuardShadowDrop(job promptGuardShadowAuditJob, reason string) {
+	now := time.Now().UnixNano()
+	last := promptGuardShadowLastDropLog.Load()
+	if last != 0 && time.Duration(now-last) < promptGuardShadowDropLogEvery {
+		return
+	}
+	if !promptGuardShadowLastDropLog.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf(
+		"prompt guard shadow audit dropped: reason=%s dropped_total=%d segments=%d bytes=%d endpoint=%s model=%s",
+		reason,
+		promptGuardShadowDropped.Load(),
+		job.audit.SegmentCount(),
+		job.audit.ByteSize(),
+		job.endpoint,
+		job.model,
+	)
+}
+
+func runDeferredPromptGuardAudit(ctx context.Context, job promptGuardShadowAuditJob) error {
+	if job.handler == nil || job.audit.SegmentCount() == 0 {
+		return nil
+	}
+	if !promptGuardShadowLoggingEnabled(job) {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if wait := time.Since(job.queuedAt); wait >= 5*time.Second {
+		log.Printf("prompt guard shadow audit queue wait=%dms segments=%d bytes=%d endpoint=%s model=%s", wait.Milliseconds(), job.audit.SegmentCount(), job.audit.ByteSize(), job.endpoint, job.model)
+	}
+	decision := defaultPromptGuardPipeline.EvaluateDeferred(ctx, job.audit)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("deferred evaluation deadline: %w", err)
+	}
+	if len(decision.Signals) == 0 && len(decision.Errors) == 0 {
+		return nil
+	}
+	decision.ReasonCode = "prompt_policy_shadow_async"
+	decision.Action = promptfilter.ActionAllow
+	decision.Score = 0
+	decision.RawScore = 0
+	decision.StrikeEligible = false
+	decision.Terminal = false
+	verdict := decision.LegacyVerdict()
+	verdict.Mode = legacyModeForPromptGuard(decision.Mode)
+	verdict.Action = promptfilter.ActionAllow
+	verdict.Score = 0
+	verdict.RawScore = 0
+	verdict.TextPreview = job.currentPreview
+	verdict.ExtractedChars = job.currentChars
+	verdict.Reason = decision.Reason
+	if len(decision.Errors) > 0 {
+		verdict.ReviewError = "shadow audit: " + strings.Join(decision.Errors, "; ")
+	}
+	// Configuration may change while this job waits or scans. The detector uses
+	// the immutable request-time snapshot, but a newly disabled master/logging
+	// switch must stop stale queued evidence from being persisted.
+	if !promptGuardShadowLoggingEnabled(job) {
+		return nil
+	}
+	if err := job.handler.logPromptFilterVerdictWithAuditContext(
+		ctx,
+		job.auditContext,
+		job.endpoint,
+		job.model,
+		job.source,
+		job.errorCode,
+		verdict,
+		&decision,
+		&job.envelope,
+		job.logMatches,
+	); err != nil {
+		return fmt.Errorf("persist deferred audit: %w", err)
+	}
+	return nil
+}
+
+func promptGuardShadowLoggingEnabled(job promptGuardShadowAuditJob) bool {
+	if job.handler == nil || !job.logMatches {
+		return false
+	}
+	if job.handler.store == nil {
+		return true
+	}
+	cfg := job.handler.store.GetPromptFilterConfig()
+	return cfg.Enabled && cfg.LogMatches
 }
 
 // Guard mode off disables the extensible pipeline, not the existing prompt

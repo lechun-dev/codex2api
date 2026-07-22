@@ -1564,6 +1564,29 @@
       "profileDescription": "Profiles change inspection depth; a single security-related noun never becomes a terminal violation by itself.",
       "layersTitle": "Request Source Layers",
       "layersDescription": "Select a mode for every source. Enforce the current user prompt, while application-owned context should normally begin in Inherit or Shadow to measure false positives.",
+      "performance": {
+        "title": "Guard Performance and First-token Latency",
+        "description": "Reuse exact segment decisions and optionally move shadow-only auxiliary scans off the client wait path, reducing repeated work without weakening enforcement-layer inspection.",
+        "syncSafetyNotice": "current_user, application_candidate, and every Warn or Enforce layer always finish synchronously. These settings can never bypass inspection of the current user prompt.",
+        "asyncShadowAuxiliary": "Process Shadow Auxiliary Layers Asynchronously",
+        "asyncShadowAuxiliaryHint": "Queues only auxiliary content resolved to Shadow, such as tool output, history, system/developer context, session data, and attachments. When disabled, those shadow layers remain synchronous. Existing configurations default to disabled.",
+        "exactSegmentCache": "Exact Segment Cache",
+        "exactSegmentCacheHint": "Reuses a decision only when the complete rule configuration and segment digest match exactly. It never performs fuzzy matching or changes scores and block decisions.",
+        "cacheEntries": "Maximum Cache Entries",
+        "cacheEntriesHint": "Maximum exact segment decisions retained in memory, from 1 to 32768. Least-recently-used entries are evicted first.",
+        "cacheTTL": "Cache TTL (seconds)",
+        "cacheTTLHint": "Maximum reuse time for an exact segment decision, from 1 to 86400 seconds. Rule changes automatically use a different cache key.",
+        "shadowWorkers": "Shadow Workers",
+        "shadowWorkersHint": "Workers that process Shadow-only auxiliary segments in the background, from 1 to 16. Start with 2 and observe CPU usage.",
+        "shadowQueue": "Shadow Queue Capacity",
+        "shadowQueueHint": "Maximum queued Shadow-only auxiliary jobs, from 1 to 4096. The default overflow policy never pushes scanning back onto the request goroutine.",
+        "shadowOverflowMode": "Queue Overflow Policy",
+        "shadowOverflowModeHint": "Prefer low latency skips this Shadow-only auxiliary audit and increments the dropped counter. Complete audit falls back synchronously and may increase first-token latency. Current-user and Warn / Enforce layers are unaffected.",
+        "overflowModes": {
+          "drop": "Prefer Low Latency (Recommended)",
+          "sync": "Complete Audit (Synchronous Fallback)"
+        }
+      },
       "modes": {
         "inherit": {
           "label": "Inherit Existing",

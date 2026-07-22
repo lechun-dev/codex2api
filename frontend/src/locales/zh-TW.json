@@ -70,6 +70,29 @@
       "profileDescription": "檔案會調整檢測深度，不會把單一安全技術名詞直接判定為終局違規。",
       "layersTitle": "請求來源層",
       "layersDescription": "每種來源可選擇獨立模式。建議對目前使用者 Prompt 執行審核，應用程式上下文先使用繼承或影子模式觀察誤報。",
+      "performance": {
+        "title": "審核效能與首字延遲",
+        "description": "重用完全相同的片段檢測結果，並可把純影子輔助層移出使用者等待路徑，在不降低執行層審核強度的前提下減少重複掃描。",
+        "syncSafetyNotice": "無論如何設定，current_user、application_candidate 以及 Warn / Enforce 層一律同步完成審核；這些效能選項無法略過目前使用者 Prompt 的攔截。",
+        "asyncShadowAuxiliary": "非同步處理影子輔助層",
+        "asyncShadowAuxiliaryHint": "只把最終模式為 Shadow 的工具輸出、歷史、系統/開發者上下文、工作階段與附件等輔助內容放入背景佇列；關閉時這些影子層仍同步掃描。舊設定預設關閉。",
+        "exactSegmentCache": "精確片段快取",
+        "exactSegmentCacheHint": "依完整規則設定與片段摘要重用完全相同的檢測結論，不做模糊比對，也不改變分數或攔截結果。",
+        "cacheEntries": "快取項目上限",
+        "cacheEntriesHint": "記憶體中最多保留的精確片段結論數量，範圍 1–32768；達到上限後優先淘汰最久未使用的項目。",
+        "cacheTTL": "快取有效期（秒）",
+        "cacheTTLHint": "精確片段結論的最長重用時間，範圍 1–86400 秒；規則設定變更會使用新的快取鍵。",
+        "shadowWorkers": "影子工作執行緒",
+        "shadowWorkersHint": "背景並行處理純 Shadow 輔助片段的工作執行緒數，範圍 1–16；建議從 2 開始觀察 CPU。",
+        "shadowQueue": "影子佇列容量",
+        "shadowQueueHint": "等待背景審核的純 Shadow 輔助工作上限，範圍 1–4096。預設溢出策略不會把掃描壓回請求執行緒。",
+        "shadowOverflowMode": "佇列溢出策略",
+        "shadowOverflowModeHint": "優先低延遲會略過本次純 Shadow 輔助稽核並記錄丟棄計數；完整稽核會同步回退，可能增加首字延遲。目前使用者 Prompt 與 Warn / Enforce 層不受影響。",
+        "overflowModes": {
+          "drop": "優先低延遲（建議）",
+          "sync": "完整稽核（同步回退）"
+        }
+      },
       "modes": {
         "inherit": {
           "label": "繼承舊設定",

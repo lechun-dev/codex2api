@@ -14,7 +14,7 @@ import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
 import { createDefaultPromptGuardRollout, parsePromptGuardRollout } from '../lib/promptGuardRollout'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptGuardRolloutFallbackMode, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
+import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardPerformanceConfig, PromptGuardProfile, PromptGuardProvider, PromptGuardRolloutFallbackMode, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
 import ChipInput from '../components/ChipInput'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -163,12 +163,23 @@ const promptGuardRolloutProviders = ['openai', 'anthropic', 'xai', 'unknown'] as
 const sidecarModes: AdvancedProtectionConfig['sidecar']['mode'][] = ['shadow', 'warn', 'enforce']
 const inheritedPromptGuardProfile = '__default__'
 
+const defaultPromptGuardPerformance: PromptGuardPerformanceConfig = {
+  async_shadow_auxiliary_enabled: false,
+  exact_segment_cache_enabled: true,
+  exact_segment_cache_entries: 4096,
+  exact_segment_cache_ttl_seconds: 600,
+  shadow_workers: 2,
+  shadow_queue_size: 256,
+  shadow_overflow_mode: 'drop',
+}
+
 const defaultPromptGuard: PromptGuardConfig = {
   mode: 'inherit',
   default_profile: 'balanced',
   allow_trusted_overrides: false,
   provider_profiles: {},
   rollout: createDefaultPromptGuardRollout(),
+  performance: defaultPromptGuardPerformance,
   layers: {
     current_user: { mode: 'enforce' },
     history: { mode: 'off' },
@@ -251,6 +262,28 @@ function parsePromptGuardProfile(value: unknown, fallback: PromptGuardProfile = 
   return typeof value === 'string' && promptGuardProfiles.includes(value as PromptGuardProfile) ? value as PromptGuardProfile : fallback
 }
 
+function parsePromptGuardPerformance(value: unknown): PromptGuardPerformanceConfig {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const boundedInteger = (key: keyof PromptGuardPerformanceConfig, min: number, max: number) => {
+    const candidate = raw[key]
+    if (typeof candidate !== 'number' || !Number.isFinite(candidate)) return defaultPromptGuardPerformance[key] as number
+    return Math.min(max, Math.max(min, Math.trunc(candidate)))
+  }
+  return {
+    async_shadow_auxiliary_enabled: typeof raw.async_shadow_auxiliary_enabled === 'boolean'
+      ? raw.async_shadow_auxiliary_enabled
+      : defaultPromptGuardPerformance.async_shadow_auxiliary_enabled,
+    exact_segment_cache_enabled: typeof raw.exact_segment_cache_enabled === 'boolean'
+      ? raw.exact_segment_cache_enabled
+      : defaultPromptGuardPerformance.exact_segment_cache_enabled,
+    exact_segment_cache_entries: boundedInteger('exact_segment_cache_entries', 1, 32768),
+    exact_segment_cache_ttl_seconds: boundedInteger('exact_segment_cache_ttl_seconds', 1, 86400),
+    shadow_workers: boundedInteger('shadow_workers', 1, 16),
+    shadow_queue_size: boundedInteger('shadow_queue_size', 1, 4096),
+    shadow_overflow_mode: raw.shadow_overflow_mode === 'sync' ? 'sync' : 'drop',
+  }
+}
+
 function parsePromptGuard(value: unknown): PromptGuardConfig {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const rawProviders = raw.provider_profiles && typeof raw.provider_profiles === 'object'
@@ -283,6 +316,7 @@ function parsePromptGuard(value: unknown): PromptGuardConfig {
     provider_profiles: providerProfiles,
     layers,
     rollout: parsePromptGuardRollout(raw.rollout),
+    performance: parsePromptGuardPerformance(raw.performance),
   }
 }
 
@@ -739,6 +773,10 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
     value: mode,
     label: t(`promptFilter.guard.rollout.fallbackModes.${mode}`),
   }))
+  const guardShadowOverflowOptions = (['drop', 'sync'] as const).map((mode) => ({
+    value: mode,
+    label: t(`promptFilter.guard.performance.overflowModes.${mode}`),
+  }))
   const sidecarModeOptions = sidecarModes.map((mode) => ({
     value: mode,
     label: t(`promptFilter.extensions.sidecar.modes.${mode}`),
@@ -760,6 +798,11 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
   const updateGuardRollout = (patch: Partial<PromptGuardConfig['rollout']>) => {
     updateGuard({
       rollout: { ...config.guard.rollout, ...patch },
+    })
+  }
+  const updateGuardPerformance = (patch: Partial<PromptGuardPerformanceConfig>) => {
+    updateGuard({
+      performance: { ...config.guard.performance, ...patch },
     })
   }
   const toggleGuardRolloutFilter = (key: 'protocols' | 'providers', value: string) => {
@@ -1004,6 +1047,93 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
                   />
                 </CompactField>
               ))}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.025] p-3 dark:border-emerald-400/20 dark:bg-emerald-400/[0.035]">
+            <div className="mb-3 flex items-start gap-2.5">
+              <Activity className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300" />
+              <div className="min-w-0">
+                <h4 className="text-sm font-semibold">{t('promptFilter.guard.performance.title')}</h4>
+                <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.performance.description')}</p>
+              </div>
+            </div>
+
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-sky-500/20 bg-sky-500/[0.06] px-3 py-2.5 text-xs leading-5 dark:border-sky-400/20 dark:bg-sky-400/[0.07]">
+              <Shield className="mt-0.5 size-4 shrink-0 text-sky-600 dark:text-sky-300" />
+              <span>{t('promptFilter.guard.performance.syncSafetyNotice')}</span>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <SwitchField
+                label={t('promptFilter.guard.performance.asyncShadowAuxiliary')}
+                hint={t('promptFilter.guard.performance.asyncShadowAuxiliaryHint')}
+                checked={config.guard.performance.async_shadow_auxiliary_enabled}
+                onCheckedChange={(next) => updateGuardPerformance({ async_shadow_auxiliary_enabled: next })}
+              />
+              <SwitchField
+                label={t('promptFilter.guard.performance.exactSegmentCache')}
+                hint={t('promptFilter.guard.performance.exactSegmentCacheHint')}
+                checked={config.guard.performance.exact_segment_cache_enabled}
+                onCheckedChange={(next) => updateGuardPerformance({ exact_segment_cache_enabled: next })}
+              />
+            </div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              <CompactField
+                label={t('promptFilter.guard.performance.cacheEntries')}
+                hint={t('promptFilter.guard.performance.cacheEntriesHint')}
+              >
+                <DraftNumberInput
+                  min={1}
+                  max={32768}
+                  value={config.guard.performance.exact_segment_cache_entries}
+                  onValueChange={(next) => updateGuardPerformance({ exact_segment_cache_entries: next })}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.performance.cacheTTL')}
+                hint={t('promptFilter.guard.performance.cacheTTLHint')}
+              >
+                <DraftNumberInput
+                  min={1}
+                  max={86400}
+                  value={config.guard.performance.exact_segment_cache_ttl_seconds}
+                  onValueChange={(next) => updateGuardPerformance({ exact_segment_cache_ttl_seconds: next })}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.performance.shadowWorkers')}
+                hint={t('promptFilter.guard.performance.shadowWorkersHint')}
+              >
+                <DraftNumberInput
+                  min={1}
+                  max={16}
+                  value={config.guard.performance.shadow_workers}
+                  onValueChange={(next) => updateGuardPerformance({ shadow_workers: next })}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.performance.shadowQueue')}
+                hint={t('promptFilter.guard.performance.shadowQueueHint')}
+              >
+                <DraftNumberInput
+                  min={1}
+                  max={4096}
+                  value={config.guard.performance.shadow_queue_size}
+                  onValueChange={(next) => updateGuardPerformance({ shadow_queue_size: next })}
+                />
+              </CompactField>
+              <CompactField
+                label={t('promptFilter.guard.performance.shadowOverflowMode')}
+                hint={t('promptFilter.guard.performance.shadowOverflowModeHint')}
+              >
+                <Select
+                  value={config.guard.performance.shadow_overflow_mode}
+                  onValueChange={(next) => updateGuardPerformance({ shadow_overflow_mode: next as PromptGuardPerformanceConfig['shadow_overflow_mode'] })}
+                  options={guardShadowOverflowOptions}
+                />
+              </CompactField>
             </div>
           </div>
         </div>

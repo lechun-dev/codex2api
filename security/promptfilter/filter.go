@@ -272,34 +272,44 @@ func engineCacheKey(cfg Config) string {
 		Threshold             int             `json:"threshold"`
 		StrictThreshold       int             `json:"strict_threshold"`
 		StrictTerminalEnabled bool            `json:"strict_terminal_enabled"`
-		LogMatches            bool            `json:"log_matches"`
 		MaxTextLength         int             `json:"max_text_length"`
 		SensitiveWords        string          `json:"sensitive_words"`
 		CustomPatterns        []PatternConfig `json:"custom_patterns"`
 		DisabledPatterns      []string        `json:"disabled_patterns"`
-		Advanced              AdvancedConfig  `json:"advanced"`
+		DetectionAdvanced     struct {
+			Normalization   NormalizationConfig   `json:"normalization"`
+			ContextDiscount ContextDiscountConfig `json:"context_discount"`
+			Enforcement     EnforcementConfig     `json:"enforcement"`
+		} `json:"advanced"`
 	}{
 		Enabled:               cfg.Enabled,
 		Mode:                  cfg.Mode,
 		Threshold:             cfg.Threshold,
 		StrictThreshold:       cfg.StrictThreshold,
 		StrictTerminalEnabled: cfg.StrictTerminalEnabled,
-		LogMatches:            cfg.LogMatches,
 		MaxTextLength:         cfg.MaxTextLength,
 		SensitiveWords:        cfg.SensitiveWords,
 		CustomPatterns:        cfg.CustomPatterns,
 		DisabledPatterns:      cfg.DisabledPatterns,
-		Advanced:              cfg.Advanced,
 	}
+	key.DetectionAdvanced.Normalization = cfg.Advanced.Normalization
+	key.DetectionAdvanced.ContextDiscount = cfg.Advanced.ContextDiscount
+	key.DetectionAdvanced.Enforcement = cfg.Advanced.Enforcement
 	data, err := json.Marshal(key)
 	if err != nil {
-		return fmt.Sprintf("%t|%s|%d|%d|%t|%t|%d|%s|%s|%s|%s", cfg.Enabled, cfg.Mode, cfg.Threshold, cfg.StrictThreshold, cfg.StrictTerminalEnabled, cfg.LogMatches, cfg.MaxTextLength, cfg.SensitiveWords, MarshalCustomPatterns(cfg.CustomPatterns), MarshalDisabledPatterns(cfg.DisabledPatterns), MarshalAdvancedConfig(cfg.Advanced))
+		detectionAdvanced, _ := json.Marshal(key.DetectionAdvanced)
+		return fmt.Sprintf("%t|%s|%d|%d|%t|%d|%s|%s|%s|%s", cfg.Enabled, cfg.Mode, cfg.Threshold, cfg.StrictThreshold, cfg.StrictTerminalEnabled, cfg.MaxTextLength, cfg.SensitiveWords, MarshalCustomPatterns(cfg.CustomPatterns), MarshalDisabledPatterns(cfg.DisabledPatterns), string(detectionAdvanced))
 	}
 	return string(data)
 }
 
 func NewEngine(cfg Config) (*Engine, error) {
 	cfg = NormalizeConfig(cfg)
+	// The regex engine never uses remote-review or signed NewAPI secrets. Clear
+	// them before the normalized config is retained by the process-wide engine
+	// cache so operational credential rotation cannot leave old secrets reachable.
+	cfg.Review.APIKey = ""
+	cfg.Advanced.NewAPI.Secret = ""
 	disabled := disabledPatternSet(cfg.DisabledPatterns)
 	merged := append([]PatternConfig{}, defaultPatternConfigs...)
 	merged = append(merged, cfg.CustomPatterns...)

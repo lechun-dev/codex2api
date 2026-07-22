@@ -45,6 +45,9 @@ const (
 	GuardProfileBalanced = "balanced"
 	GuardProfileStrict   = "strict"
 	GuardProfileResearch = "research"
+
+	GuardShadowOverflowDrop = "drop"
+	GuardShadowOverflowSync = "sync"
 )
 
 // GuardConfig controls the extensible request guard pipeline. The existing
@@ -53,12 +56,27 @@ const (
 // New source layers default to profile-controlled behavior; the balanced
 // profile scans only the current user prompt, preserving legacy behavior.
 type GuardConfig struct {
-	Mode                  string             `json:"mode"`
-	DefaultProfile        string             `json:"default_profile"`
-	AllowTrustedOverrides bool               `json:"allow_trusted_overrides"`
-	ProviderProfiles      map[string]string  `json:"provider_profiles,omitempty"`
-	Rollout               GuardRolloutConfig `json:"rollout"`
-	Layers                GuardLayerConfig   `json:"layers"`
+	Mode                  string                 `json:"mode"`
+	DefaultProfile        string                 `json:"default_profile"`
+	AllowTrustedOverrides bool                   `json:"allow_trusted_overrides"`
+	ProviderProfiles      map[string]string      `json:"provider_profiles,omitempty"`
+	Rollout               GuardRolloutConfig     `json:"rollout"`
+	Layers                GuardLayerConfig       `json:"layers"`
+	Performance           GuardPerformanceConfig `json:"performance"`
+}
+
+// GuardPerformanceConfig controls transparent local scan acceleration and the
+// optional removal of audit-only auxiliary shadow scans from the client-visible
+// first-token path. Current-user/application input and every warn/enforce layer
+// always remain synchronous regardless of these settings.
+type GuardPerformanceConfig struct {
+	AsyncShadowAuxiliaryEnabled bool   `json:"async_shadow_auxiliary_enabled"`
+	ExactSegmentCacheEnabled    bool   `json:"exact_segment_cache_enabled"`
+	ExactSegmentCacheEntries    int    `json:"exact_segment_cache_entries"`
+	ExactSegmentCacheTTLSeconds int    `json:"exact_segment_cache_ttl_seconds"`
+	ShadowWorkers               int    `json:"shadow_workers"`
+	ShadowQueueSize             int    `json:"shadow_queue_size"`
+	ShadowOverflowMode          string `json:"shadow_overflow_mode"`
 }
 
 // GuardRolloutConfig limits enforce mode to a stable subset of authenticated
@@ -250,6 +268,7 @@ func RecommendedAdvancedConfig() AdvancedConfig {
 	cfg.Sidecar.FailClosed = false
 	cfg.Session.Enabled = true
 	cfg.Guard.DefaultProfile = GuardProfileBalanced
+	cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled = true
 	cfg.Guard.Layers = GuardLayerConfig{
 		CurrentUser:       GuardLayerModeConfig{Mode: GuardModeEnforce},
 		History:           GuardLayerModeConfig{Mode: GuardModeOff},
@@ -274,6 +293,14 @@ func DefaultGuardConfig() GuardConfig {
 		Rollout: GuardRolloutConfig{
 			Percent:      0,
 			FallbackMode: GuardModeWarn,
+		},
+		Performance: GuardPerformanceConfig{
+			ExactSegmentCacheEnabled:    true,
+			ExactSegmentCacheEntries:    4096,
+			ExactSegmentCacheTTLSeconds: 600,
+			ShadowWorkers:               2,
+			ShadowQueueSize:             256,
+			ShadowOverflowMode:          GuardShadowOverflowDrop,
 		},
 		Layers: GuardLayerConfig{
 			CurrentUser:       inherit,
@@ -557,6 +584,32 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	cfg.Mode = normalizeGuardMode(cfg.Mode, d.Mode)
 	cfg.DefaultProfile = normalizeGuardProfileName(cfg.DefaultProfile, d.DefaultProfile)
 	cfg.Rollout = normalizeGuardRolloutConfig(cfg.Rollout, d.Rollout)
+	if cfg.Performance.ExactSegmentCacheEntries <= 0 {
+		cfg.Performance.ExactSegmentCacheEntries = d.Performance.ExactSegmentCacheEntries
+	} else if cfg.Performance.ExactSegmentCacheEntries > 32768 {
+		cfg.Performance.ExactSegmentCacheEntries = 32768
+	}
+	if cfg.Performance.ExactSegmentCacheTTLSeconds <= 0 {
+		cfg.Performance.ExactSegmentCacheTTLSeconds = d.Performance.ExactSegmentCacheTTLSeconds
+	} else if cfg.Performance.ExactSegmentCacheTTLSeconds > 86400 {
+		cfg.Performance.ExactSegmentCacheTTLSeconds = 86400
+	}
+	if cfg.Performance.ShadowWorkers <= 0 {
+		cfg.Performance.ShadowWorkers = d.Performance.ShadowWorkers
+	} else if cfg.Performance.ShadowWorkers > 16 {
+		cfg.Performance.ShadowWorkers = 16
+	}
+	if cfg.Performance.ShadowQueueSize <= 0 {
+		cfg.Performance.ShadowQueueSize = d.Performance.ShadowQueueSize
+	} else if cfg.Performance.ShadowQueueSize > 4096 {
+		cfg.Performance.ShadowQueueSize = 4096
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Performance.ShadowOverflowMode)) {
+	case GuardShadowOverflowSync:
+		cfg.Performance.ShadowOverflowMode = GuardShadowOverflowSync
+	default:
+		cfg.Performance.ShadowOverflowMode = GuardShadowOverflowDrop
+	}
 
 	profiles := make(map[string]string, len(d.ProviderProfiles)+len(cfg.ProviderProfiles))
 	for provider, profile := range d.ProviderProfiles {

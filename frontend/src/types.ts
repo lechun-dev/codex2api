@@ -822,6 +822,16 @@ export interface PromptGuardRolloutConfig {
   providers: string[]
 }
 
+export interface PromptGuardPerformanceConfig {
+  async_shadow_auxiliary_enabled: boolean
+  exact_segment_cache_enabled: boolean
+  exact_segment_cache_entries: number
+  exact_segment_cache_ttl_seconds: number
+  shadow_workers: number
+  shadow_queue_size: number
+  shadow_overflow_mode: 'drop' | 'sync'
+}
+
 export type PromptGuardLayer =
   | 'current_user'
   | 'history'
@@ -841,6 +851,7 @@ export interface PromptGuardConfig {
   provider_profiles: Partial<Record<PromptGuardProvider, PromptGuardProfile>>
   layers: Record<PromptGuardLayer, { mode: PromptGuardMode }>
   rollout: PromptGuardRolloutConfig
+  performance: PromptGuardPerformanceConfig
 }
 
 export interface PromptFilterRule {

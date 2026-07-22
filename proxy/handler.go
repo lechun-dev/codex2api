@@ -5039,6 +5039,23 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				models = append(models, alias)
 			}
 		}
+		// 全局模型映射的 from 键（Claude 模型映射：claude-* → gpt-*，用于 /v1/messages）
+		// 也要出现在 /v1/models，否则下游客户端拉不到可用的 Claude 模型名。
+		// 仅列非通配的显式映射键；通配规则（含 *）不作为具体模型暴露。
+		for _, rule := range parseModelMappingRules(h.store.GetModelMapping()) {
+			if rule.Wildcard {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(rule.From))
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, rule.From)
+		}
 	}
 	return models
 }

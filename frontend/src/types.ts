@@ -815,6 +815,7 @@ export interface SystemSettings {
   codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
+  codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string

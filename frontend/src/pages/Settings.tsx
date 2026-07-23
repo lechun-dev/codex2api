@@ -1158,6 +1158,7 @@ export default function Settings() {
     codex_ws_busy_patience_sec: 2,
     codex_continue_thinking_enabled: false,
     overflow_auto_compact_enabled: false,
+    codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
@@ -2491,6 +2492,17 @@ export default function Settings() {
                 <Switch
                   checked={settingsForm.overflow_auto_compact_enabled}
                   onCheckedChange={(checked) => autoSaveBooleanField('overflow_auto_compact_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.codex_preflight_sse_passthrough_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('codex_preflight_sse_passthrough_enabled', checked)}
                 />
               </SettingField>
             </div>

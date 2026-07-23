@@ -2521,7 +2521,11 @@
     "overflowAutoCompact": "超窗自动压缩（实验性）",
     "overflowAutoCompactDesc": "上游报上下文超窗（context_length_exceeded）时，网关自动把旧轮次摘要成一条上下文说明并重试一次，代替直接向客户端返回 400。",
     "overflowAutoCompactEnabled": "启用超窗自动压缩",
-    "overflowAutoCompactEnabledDesc": "实验性功能，默认关闭。摘要通过内部模型调用完成，会消耗账号额度并增加约 10 秒延迟；摘要有损，最近轮次保留原文。也可在 API 密钥的 limits.auto_compact_overflow 按 Key 单独开启。"
+    "overflowAutoCompactEnabledDesc": "实验性功能，默认关闭。摘要通过内部模型调用完成，会消耗账号额度并增加约 10 秒延迟；摘要有损，最近轮次保留原文。也可在 API 密钥的 limits.auto_compact_overflow 按 Key 单独开启。",
+    "codexPreflightSSEPassthrough": "前置元数据事件立即透传（旧版兼容）",
+    "codexPreflightSSEPassthroughDesc": "把内容生成前的上游元数据事件（codex.rate_limits / codex.response.metadata / response.metadata）立即转发给下游，而不是缓冲到首个真实内容事件。适配把“首条 SSE 数据帧”当作首响应时间的多层网关。",
+    "codexPreflightSSEPassthroughEnabled": "启用立即透传",
+    "codexPreflightSSEPassthroughEnabledDesc": "警告：旧版兼容模式，默认关闭。开启后首个内容事件之前就会提交 HTTP 200，此窗口内的上游失败只能以 200 + SSE failed 帧下发——真实 HTTP 错误码、首包前静默换号重试、超窗自动压缩在该窗口内全部失效。热更新即时生效，无需重启。"
   },
   "proxies": {
     "description": "管理代理池，支持轮询分配给账号使用",

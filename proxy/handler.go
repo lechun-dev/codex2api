@@ -2676,6 +2676,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
 			var pendingFirstTokenEvents bytes.Buffer
+			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
+			// 热更新对新请求生效，流转发中途不切换缓冲策略。
+			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			forward := func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -2741,8 +2744,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
 					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
 					// 既无法按真实错误码返回，也无法走超窗压缩重试。
-					shouldDefer := !contentTokenSeen && !gotTerminal &&
-						(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
+					// preflightPassthrough（issue #425）恢复旧版语义：元数据事件立即下发，
+					// 管理员显式接受上述代价；生命周期事件（created/in_progress）不受开关影响。
+					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough)
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
 					if err != nil {
 						writeErr = err

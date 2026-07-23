@@ -121,11 +121,11 @@ type Account struct {
 	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
 	grokRateLimit *GrokRateLimitSnapshot
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
-	grokFreeQuota *GrokFreeQuotaSnapshot
-	Status                  AccountStatus
-	CooldownUtil            time.Time
-	CooldownReason          string // rate_limited / rate_limited_5h / unauthorized / 空
-	ErrorMsg                string
+	grokFreeQuota  *GrokFreeQuotaSnapshot
+	Status         AccountStatus
+	CooldownUtil   time.Time
+	CooldownReason string // rate_limited / rate_limited_5h / unauthorized / 空
+	ErrorMsg       string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -2495,6 +2495,9 @@ type Store struct {
 	overflowAutoCompactEnabled  atomic.Bool  // 上下文超窗自动摘要重试（实验性，默认关闭，issue #415）
 	firstTokenExcludesWsAcquire atomic.Bool  // 落库 first_token_ms 扣除 WS 取连耗时，默认关闭
 
+	// 前置元数据 SSE 事件立即透传下游（旧版兼容，默认关闭，issue #425）
+	codexPreflightSSEPassthroughEnabled atomic.Bool
+
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
 	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
 	codexContinueMaxRounds       atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
@@ -3018,6 +3021,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
 	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(settings.CodexWSBusyPatienceSec)))
 	s.overflowAutoCompactEnabled.Store(settings.OverflowAutoCompactEnabled)
+	s.codexPreflightSSEPassthroughEnabled.Store(settings.CodexPreflightSSEPassthroughEnabled)
 	s.firstTokenExcludesWsAcquire.Store(settings.FirstTokenExcludesWsAcquire)
 	s.codexContinueThinkingEnabled.Store(settings.CodexContinueThinkingEnabled)
 	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(settings.CodexContinueMaxRounds)))
@@ -3318,6 +3322,22 @@ func (s *Store) OverflowAutoCompactEnabled() bool {
 		return false
 	}
 	return s.overflowAutoCompactEnabled.Load()
+}
+
+// SetCodexPreflightSSEPassthroughEnabled 设置是否将前置元数据 SSE 事件立即透传下游（旧版兼容）。
+func (s *Store) SetCodexPreflightSSEPassthroughEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexPreflightSSEPassthroughEnabled.Store(enabled)
+}
+
+// CodexPreflightSSEPassthroughEnabled 返回是否将前置元数据 SSE 事件立即透传下游（旧版兼容）。
+func (s *Store) CodexPreflightSSEPassthroughEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexPreflightSSEPassthroughEnabled.Load()
 }
 
 // SetFirstTokenExcludesWsAcquire 设置落库 first_token_ms 是否扣除 WS 取连耗时。

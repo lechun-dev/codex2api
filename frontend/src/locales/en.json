@@ -2521,7 +2521,11 @@
     "overflowAutoCompact": "Overflow Auto-Compact (Experimental)",
     "overflowAutoCompactDesc": "When the upstream rejects a request with context_length_exceeded, the gateway summarizes older turns into a single context note and retries once instead of returning 400 to the client.",
     "overflowAutoCompactEnabled": "Enable overflow auto-compact",
-    "overflowAutoCompactEnabledDesc": "Experimental, off by default. Summarization runs an internal model call, consuming account quota and adding roughly 10s latency; the summary is lossy while recent turns are kept verbatim. Can also be enabled per key via limits.auto_compact_overflow."
+    "overflowAutoCompactEnabledDesc": "Experimental, off by default. Summarization runs an internal model call, consuming account quota and adding roughly 10s latency; the summary is lossy while recent turns are kept verbatim. Can also be enabled per key via limits.auto_compact_overflow.",
+    "codexPreflightSSEPassthrough": "Preflight SSE Passthrough (Legacy Compat)",
+    "codexPreflightSSEPassthroughDesc": "Forward pre-content upstream metadata events (codex.rate_limits / codex.response.metadata / response.metadata) to the downstream immediately instead of buffering them until the first real content event. For multi-tier gateways that treat the first SSE data frame as time-to-first-response.",
+    "codexPreflightSSEPassthroughEnabled": "Enable immediate passthrough",
+    "codexPreflightSSEPassthroughEnabledDesc": "Warning: legacy compatibility mode, off by default. When enabled, HTTP 200 is committed before the first content event; upstream failures in that window can only be delivered as 200 + SSE failed frames — real HTTP error codes, pre-first-token silent account rotation, and overflow auto-compact are all unavailable in that window. Hot-reloads without restart."
   },
   "proxies": {
     "description": "Manage proxy pool with round-robin distribution to accounts",

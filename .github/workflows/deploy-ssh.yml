@@ -33,6 +33,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       TARGET_GOARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.goarch || 'amd64' }}
       DEPLOY_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_dir || '/deploy/codex2api' }}
@@ -88,27 +89,63 @@ jobs:
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy binary
+        timeout-minutes: 30
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           set -euo pipefail
           test -n "$DEPLOY_USER"
+          [[ "$DEPLOY_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          [[ "$DEPLOY_DIR" != *".."* ]]
+          [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]
+
           release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           upload_tmp="/tmp/codex2api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           remote="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh_opts=(
+            -i ~/.ssh/deploy_key
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+            -o StrictHostKeyChecking=yes
+          )
 
-          ssh -i ~/.ssh/deploy_key "$remote" "mkdir -p '$release' '$DEPLOY_DIR/shared'"
-          ssh -i ~/.ssh/deploy_key "$remote" "cat > '$upload_tmp'" < build/codex2api
-          ssh -i ~/.ssh/deploy_key "$remote" "
+          echo "::group::Prepare remote release directory"
+          ssh "${ssh_opts[@]}" "$remote" "mkdir -p '$release' '$DEPLOY_DIR/shared'"
+          echo "::endgroup::"
+
+          echo "::group::Upload binary"
+          echo "Uploading $(du -h build/codex2api | cut -f1) to $DEPLOY_HOST"
+          scp -C "${ssh_opts[@]}" build/codex2api "$remote:$upload_tmp"
+          echo "::endgroup::"
+
+          echo "::group::Activate release"
+          ssh "${ssh_opts[@]}" "$remote" "
             set -eu
             test -f '$DEPLOY_DIR/shared/.env'
             install -m 755 '$upload_tmp' '$release/codex2api'
             rm -f '$upload_tmp'
             ln -sfn '$release' '$DEPLOY_DIR/current'
-            sudo systemctl restart '$SERVICE_NAME'
-            sudo systemctl --no-pager --full status '$SERVICE_NAME' >/dev/null
           "
+          echo "::endgroup::"
+
+          echo "::group::Restart service"
+          if ! timeout --signal=TERM 120s ssh "${ssh_opts[@]}" "$remote" "
+            set -eu
+            sudo -n systemctl restart '$SERVICE_NAME'
+            sudo -n systemctl is-active --quiet '$SERVICE_NAME'
+          "; then
+            echo "Service restart failed or timed out; collecting diagnostics" >&2
+            ssh "${ssh_opts[@]}" "$remote" "
+              sudo -n systemctl --no-pager --full status '$SERVICE_NAME' || true
+              sudo -n journalctl -u '$SERVICE_NAME' --no-pager -n 50 || true
+            " || true
+            exit 1
+          fi
+          echo "Service $SERVICE_NAME is active"
+          echo "::endgroup::"
 
       - name: Healthcheck
         if: ${{ inputs.healthcheck_url != '' }}

@@ -2139,6 +2139,7 @@ export default function Settings() {
           </SettingsCard>
 
           <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<Layers className="size-4" />}>
+            {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
                 <SettingField label={t('settings.grokAffinityMode')} description={t('settings.grokAffinityModeDesc')}>
@@ -2148,15 +2149,11 @@ export default function Settings() {
                     options={grokAffinityModeOptions}
                   />
                 </SettingField>
-              </div>
-              <div className={SETTINGS_SWITCH_GRID}>
-                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
-                  <Switch
-                    checked={settingsForm.grok_probe_enabled}
-                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.grokProbeInterval')} description={t('settings.grokProbeIntervalDesc')}>
+                <SettingField
+                  label={t('settings.grokProbeInterval')}
+                  description={t('settings.grokProbeIntervalDesc')}
+                  suffix={t('settings.unit.min')}
+                >
                   <DraftNumberInput
                     min={5}
                     max={1440}
@@ -2174,9 +2171,11 @@ export default function Settings() {
                     }}
                   />
                 </SettingField>
-              </div>
-              <div className={SETTINGS_FIELD_GRID_3}>
-                <SettingField label={t('settings.grokMaxRateLimitRetries')} description={t('settings.grokMaxRateLimitRetriesDesc')}>
+                <SettingField
+                  label={t('settings.grokMaxRateLimitRetries')}
+                  description={t('settings.grokMaxRateLimitRetriesDesc')}
+                  suffix={t('settings.unit.times')}
+                >
                   <DraftNumberInput
                     min={0}
                     max={20}
@@ -2191,6 +2190,14 @@ export default function Settings() {
                       const v = value < 0 ? 0 : value
                       void autoSaveSettingsPatch({ grok_max_rate_limit_retries: v })
                     }}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_probe_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
                   />
                 </SettingField>
               </div>

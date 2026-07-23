@@ -130,22 +130,23 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 
 	db := &DB{conn: conn, driver: "mysql"}
 	settings := &SystemSettings{
-		PayloadRules:                      `{"override":[{"path":"service_tier","value":"priority"}]}`,
-		PromptFilterStrictTerminalEnabled: true,
-		PromptFilterAdvancedConfig:        `{"normalization":{"enabled":true}}`,
-		PublicImageStudioPageEnabled:      true,
-		PublicAccountPortalPageEnabled:    true,
-		ModelPricingOverrides:             `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
-		ModelPricingSyncURL:               "https://example.test/pricing.json",
-		IgnoreUsageLimitStatus:            true,
-		AutoResetCreditsEnabled:           true,
-		AutoResetCreditsBeforeExpiryMin:   75,
-		CodexWSSizeRouterEnabled:          true,
-		CodexWSBusyAcquireMaxWaitSec:      45,
-		CodexWSBusyOverflowEnabled:        true,
-		CodexWSBusyPatienceSec:            3,
-		OverflowAutoCompactEnabled:        true,
-		FirstTokenExcludesWsAcquire:       true,
+		PayloadRules:                        `{"override":[{"path":"service_tier","value":"priority"}]}`,
+		PromptFilterStrictTerminalEnabled:   true,
+		PromptFilterAdvancedConfig:          `{"normalization":{"enabled":true}}`,
+		PublicImageStudioPageEnabled:        true,
+		PublicAccountPortalPageEnabled:      true,
+		ModelPricingOverrides:               `{"gpt-5.4":{"input":2.5,"source":"custom"}}`,
+		ModelPricingSyncURL:                 "https://example.test/pricing.json",
+		IgnoreUsageLimitStatus:              true,
+		AutoResetCreditsEnabled:             true,
+		AutoResetCreditsBeforeExpiryMin:     75,
+		CodexWSSizeRouterEnabled:            true,
+		CodexWSBusyAcquireMaxWaitSec:        45,
+		CodexWSBusyOverflowEnabled:          true,
+		CodexWSBusyPatienceSec:              3,
+		OverflowAutoCompactEnabled:          true,
+		FirstTokenExcludesWsAcquire:         true,
+		CodexPreflightSSEPassthroughEnabled: true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -170,16 +171,18 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
 		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
+		"grok_config = VALUES(grok_config)",
+		"codex_preflight_sse_passthrough_enabled = VALUES(codex_preflight_sse_passthrough_enabled)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 100 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 100", got)
+	if got := strings.Count(capture.query, "?"); got != 102 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 102", got)
 	}
-	if len(capture.args) != 100 {
-		t.Fatalf("rewritten settings argument count = %d, want 100", len(capture.args))
+	if len(capture.args) != 102 {
+		t.Fatalf("rewritten settings argument count = %d, want 102", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -197,6 +200,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		int64(settings.CodexWSBusyPatienceSec),
 		settings.OverflowAutoCompactEnabled,
 		settings.FirstTokenExcludesWsAcquire,
+		settings.CodexPreflightSSEPassthroughEnabled,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value

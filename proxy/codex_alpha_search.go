@@ -12,6 +12,7 @@ import (
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // codexAlphaSearchURL 是 ChatGPT 后端的 Codex standalone 联网搜索端点。
@@ -34,6 +35,11 @@ func (h *Handler) CodexAlphaSearchHandler(c *gin.Context) {
 	rawBody, err := io.ReadAll(io.LimitReader(c.Request.Body, codexAlphaSearchBodyLimit))
 	if err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
+		return
+	}
+	h.capturePromptRequestIngress(c, rawBody)
+	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/alpha/search", model) {
 		return
 	}
 

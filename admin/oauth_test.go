@@ -206,6 +206,7 @@ func TestExchangeOAuthCodeUpdatesDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "existing-refresh",
 		"email":         "duplicate@example.com",
 		"account_id":    "acc-duplicate",
+		"workspace_id":  "acc-duplicate",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials: %v", err)
@@ -528,6 +529,7 @@ func TestUpdateOAuthAccountCodeRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "target-refresh",
 		"email":         "target@example.com",
 		"account_id":    "acc-target",
+		"workspace_id":  "acc-target",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert target: %v", err)
@@ -536,6 +538,7 @@ func TestUpdateOAuthAccountCodeRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "duplicate-refresh",
 		"email":         "duplicate@example.com",
 		"account_id":    "acc-duplicate",
+		"workspace_id":  "acc-duplicate",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert duplicate: %v", err)
@@ -692,6 +695,7 @@ func TestUpsertOAuthIdentityAccountClearsBanOnReimport(t *testing.T) {
 		"access_token":  "old-access",
 		"email":         "banned@example.com",
 		"account_id":    "acc-banned",
+		"workspace_id":  "acc-banned",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials: %v", err)
@@ -718,6 +722,7 @@ func TestUpsertOAuthIdentityAccountClearsBanOnReimport(t *testing.T) {
 		accessToken: "fresh-access",
 		email:       "banned@example.com",
 		accountID:   "acc-banned",
+		workspaceID: "acc-banned",
 	}
 	newID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "banned", "", seed, "manual_at")
 	if err != nil {

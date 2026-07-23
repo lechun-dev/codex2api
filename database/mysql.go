@@ -22,6 +22,7 @@ const (
 )
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	{table: "system_settings", name: "grok_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "payload_rules", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "prompt_filter_strict_terminal_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "prompt_filter_advanced_config", def: "MEDIUMTEXT NULL"},
@@ -38,6 +39,18 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_ws_busy_patience_sec", def: "INT DEFAULT 2"},
 	{table: "system_settings", name: "overflow_auto_compact_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_preflight_sse_passthrough_enabled", def: "TINYINT(1) DEFAULT 0"},
+}
+
+var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
+	{table: "prompt_filter_logs", name: "request_protocol", def: "VARCHAR(64) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "request_provider", def: "VARCHAR(64) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "audit_score", def: "INT DEFAULT 0"},
+	{table: "prompt_filter_logs", name: "policy_profile", def: "VARCHAR(32) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "reason_code", def: "VARCHAR(100) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "primary_origin", def: "VARCHAR(50) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "strike_eligible", def: "TINYINT(1) DEFAULT 0"},
+	{table: "prompt_filter_logs", name: "match_context", def: "TEXT NULL"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -234,28 +247,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			revised_prompt MEDIUMTEXT NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
-		`CREATE TABLE IF NOT EXISTS prompt_filter_logs (
-			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			source VARCHAR(50) DEFAULT '',
-			endpoint VARCHAR(100) DEFAULT '',
-			model VARCHAR(100) DEFAULT '',
-			action VARCHAR(20) DEFAULT '',
-			mode VARCHAR(20) DEFAULT '',
-			score INT DEFAULT 0,
-			threshold_value INT DEFAULT 0,
-			matched_patterns TEXT NULL,
-			text_preview TEXT NULL,
-			api_key_id BIGINT DEFAULT 0,
-			api_key_name VARCHAR(255) DEFAULT '',
-			api_key_masked VARCHAR(64) DEFAULT '',
-			client_ip VARCHAR(64) DEFAULT '',
-			error_code VARCHAR(100) DEFAULT '',
-			review_model VARCHAR(100) DEFAULT '',
-			review_flagged TINYINT(1) DEFAULT 0,
-			review_error TEXT NULL,
-			full_text MEDIUMTEXT NULL
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		promptFilterLogsMySQLDDL(),
 		promptFilterSecretsMySQLDDL(),
 	}
 	for _, stmt := range statements {
@@ -424,10 +416,14 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"proxies", "test_latency_ms", "INT DEFAULT 0"},
 	}
 	columns = append(columns, mysql56SystemSettingsColumns...)
+	columns = append(columns, mysql56PromptFilterLogColumns...)
 	for _, column := range columns {
 		if err := db.ensureMySQLColumn(ctx, column.table, column.name, column.def); err != nil {
 			return err
 		}
+	}
+	if err := db.ensureMySQLVarcharMinLength(ctx, "prompt_filter_logs", "endpoint", 256, "VARCHAR(256) DEFAULT ''"); err != nil {
+		return err
 	}
 
 	indexes := []struct {
@@ -499,6 +495,39 @@ func accountGroupsMySQLDDL() string {
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 
+func promptFilterLogsMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS prompt_filter_logs (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		source VARCHAR(50) DEFAULT '',
+		endpoint VARCHAR(256) DEFAULT '',
+		request_protocol VARCHAR(64) DEFAULT '',
+		request_provider VARCHAR(64) DEFAULT '',
+		model VARCHAR(100) DEFAULT '',
+		action VARCHAR(20) DEFAULT '',
+		mode VARCHAR(20) DEFAULT '',
+		score INT DEFAULT 0,
+		audit_score INT DEFAULT 0,
+		threshold_value INT DEFAULT 0,
+		policy_profile VARCHAR(32) DEFAULT '',
+		reason_code VARCHAR(100) DEFAULT '',
+		primary_origin VARCHAR(50) DEFAULT '',
+		strike_eligible TINYINT(1) DEFAULT 0,
+		matched_patterns TEXT NULL,
+		text_preview TEXT NULL,
+		match_context TEXT NULL,
+		api_key_id BIGINT DEFAULT 0,
+		api_key_name VARCHAR(255) DEFAULT '',
+		api_key_masked VARCHAR(64) DEFAULT '',
+		client_ip VARCHAR(64) DEFAULT '',
+		error_code VARCHAR(100) DEFAULT '',
+		review_model VARCHAR(100) DEFAULT '',
+		review_flagged TINYINT(1) DEFAULT 0,
+		review_error TEXT NULL,
+		full_text MEDIUMTEXT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
 // 2026-07-04 coder(lq): 单独抽出 MySQL 的 system_settings DDL，便于测试并避免再次漏掉新字段。
 // MySQL 5.6/5.7 不支持 TEXT/BLOB 默认值，因此 JSON 文本配置列统一使用 TEXT NULL，
 // 运行时再由读取逻辑做 COALESCE/兜底。
@@ -508,6 +537,7 @@ func systemSettingsMySQLDDL() string {
 		site_name VARCHAR(255) DEFAULT 'CodexProxy',
 		site_logo VARCHAR(1024) DEFAULT '',
 		background_config TEXT NULL,
+		grok_config TEXT NULL,
 		max_concurrency INT DEFAULT 2,
 		global_rpm INT DEFAULT 0,
 		test_model VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -592,6 +622,7 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0,
 		codex_ws_busy_patience_sec INT DEFAULT 2,
 		overflow_auto_compact_enabled TINYINT(1) DEFAULT 0,
+		codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_thinking_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_max_rounds INT DEFAULT 8,
 		retry_interval_ms INT DEFAULT 0,
@@ -631,6 +662,24 @@ func (db *DB) ensureMySQLColumn(ctx context.Context, table, name, columnDef stri
 		return nil
 	}
 	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `%s` %s", table, name, columnDef))
+	return err
+}
+
+func (db *DB) ensureMySQLVarcharMinLength(ctx context.Context, table, name string, minLength int64, columnDef string) error {
+	var length sql.NullInt64
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT CHARACTER_MAXIMUM_LENGTH
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME = ?
+	`, table, name).Scan(&length); err != nil {
+		return err
+	}
+	if length.Valid && length.Int64 >= minLength {
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` %s", table, name, columnDef))
 	return err
 }
 

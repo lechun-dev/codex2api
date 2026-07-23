@@ -34,6 +34,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"model_pricing_overrides MEDIUMTEXT NULL",
 		"model_pricing_sync_url TEXT NULL",
 		"payload_rules MEDIUMTEXT NULL",
+		"grok_config TEXT NULL",
 		"prompt_filter_strict_terminal_enabled TINYINT(1) DEFAULT 0",
 		"prompt_filter_advanced_config MEDIUMTEXT NULL",
 		"public_image_studio_page_enabled TINYINT(1) DEFAULT 1",
@@ -46,6 +47,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0",
 		"codex_ws_busy_patience_sec INT DEFAULT 2",
 		"overflow_auto_compact_enabled TINYINT(1) DEFAULT 0",
+		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -64,6 +66,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"payload_rules MEDIUMTEXT DEFAULT",
 		"prompt_filter_advanced_config TEXT DEFAULT",
 		"prompt_filter_advanced_config MEDIUMTEXT DEFAULT",
+		"grok_config TEXT DEFAULT",
 		"note TEXT DEFAULT",
 		"client_user_agent TEXT DEFAULT",
 		"upstream_user_agent TEXT DEFAULT",
@@ -107,6 +110,55 @@ func TestMySQLPromptFilterSecretsSchemaIsMySQL56Compatible(t *testing.T) {
 		if strings.Contains(strings.ToUpper(ddl), strings.ToUpper(incompatible)) {
 			t.Fatalf("MySQL 5.6 incompatible syntax leaked into prompt_filter_secrets DDL: %q", incompatible)
 		}
+	}
+}
+
+func TestMySQLPromptFilterLogsSchemaIncludesAuditFields(t *testing.T) {
+	ddl := promptFilterLogsMySQLDDL()
+	for _, needle := range []string{
+		"endpoint VARCHAR(256) DEFAULT ''",
+		"request_protocol VARCHAR(64) DEFAULT ''",
+		"request_provider VARCHAR(64) DEFAULT ''",
+		"audit_score INT DEFAULT 0",
+		"policy_profile VARCHAR(32) DEFAULT ''",
+		"reason_code VARCHAR(100) DEFAULT ''",
+		"primary_origin VARCHAR(50) DEFAULT ''",
+		"strike_eligible TINYINT(1) DEFAULT 0",
+		"match_context TEXT NULL",
+	} {
+		if !strings.Contains(ddl, needle) {
+			t.Fatalf("MySQL prompt_filter_logs DDL missing %q: %s", needle, ddl)
+		}
+	}
+	for _, column := range mysql56PromptFilterLogColumns {
+		if column.table != "prompt_filter_logs" || !strings.Contains(ddl, column.name+" "+column.def) {
+			t.Fatalf("MySQL prompt_filter_logs upgrade column is inconsistent with create DDL: %+v", column)
+		}
+	}
+	for _, incompatible := range []string{
+		"TIMESTAMPTZ",
+		"BOOLEAN",
+		"TEXT DEFAULT",
+		"::jsonb",
+	} {
+		if strings.Contains(strings.ToUpper(ddl), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 incompatible syntax leaked into prompt_filter_logs DDL: %q", incompatible)
+		}
+	}
+}
+
+func TestWorkspaceIdentityCredentialsUpdateSQLByDriver(t *testing.T) {
+	mysqlQuery := (&DB{driver: "mysql"}).workspaceIdentityCredentialsUpdateSQL()
+	if strings.Contains(mysqlQuery, "::jsonb") {
+		t.Fatalf("PostgreSQL cast leaked into MySQL workspace identity migration: %s", mysqlQuery)
+	}
+	postgresQuery := (&DB{driver: "postgres"}).workspaceIdentityCredentialsUpdateSQL()
+	if !strings.Contains(postgresQuery, "::jsonb") {
+		t.Fatalf("PostgreSQL workspace identity migration lost jsonb cast: %s", postgresQuery)
+	}
+	sqliteQuery := (&DB{driver: "sqlite"}).workspaceIdentityCredentialsUpdateSQL()
+	if strings.Contains(sqliteQuery, "::jsonb") {
+		t.Fatalf("PostgreSQL cast leaked into SQLite workspace identity migration: %s", sqliteQuery)
 	}
 }
 

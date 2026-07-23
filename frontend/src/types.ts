@@ -64,6 +64,14 @@ export interface GrokRateLimitSnapshot {
   updated_at?: string
 }
 
+// 免费额度耗尽时从上游 429 错误体解析的权威用量(滚动 24h 窗口)。
+export interface GrokFreeQuotaSnapshot {
+  used_tokens: number
+  limit_tokens: number
+  model?: string
+  exhausted_at: string
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -84,6 +92,7 @@ export interface AccountRow {
   grok_billing?: GrokBillingDetail
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
   grok_rate_limit?: GrokRateLimitSnapshot
+  grok_free_quota?: GrokFreeQuotaSnapshot
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -806,9 +815,14 @@ export interface SystemSettings {
   codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
+  codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
+  grok_affinity_mode?: string
+  grok_probe_enabled?: boolean
+  grok_probe_interval_minutes?: number
+  grok_max_rate_limit_retries?: number
   max_retries: number
   max_rate_limit_retries: number
   retry_interval_ms: number
@@ -936,12 +950,20 @@ export interface PromptFilterLog {
   created_at: ISODateString
   source: string
   endpoint: string
+  protocol?: string
+  provider?: string
   model: string
   action: string
   mode: string
   score: number
+  audit_score?: number
   threshold: number
+  policy_profile?: string
+  reason_code?: string
+  primary_origin?: string
+  strike_eligible?: boolean
   matched_patterns: string
+  match_context?: string
   text_preview: string
   full_text: string
   api_key_id: number
@@ -968,6 +990,154 @@ export interface PromptFilterTestResponse {
 export interface PromptFilterRulePatternTestResponse {
   matched: boolean
   error?: string
+}
+
+export type PromptGuardMode = 'inherit' | 'off' | 'shadow' | 'warn' | 'enforce'
+
+export type PromptGuardProfile = 'balanced' | 'strict' | 'research'
+
+export type PromptGuardProvider = 'openai' | 'anthropic' | 'xai' | 'unknown'
+
+export type PromptGuardRolloutFallbackMode = 'warn' | 'shadow'
+
+export interface PromptGuardRolloutConfig {
+  enabled: boolean
+  percent: number
+  fallback_mode: PromptGuardRolloutFallbackMode
+  newapi_user_allowlist: string[]
+  api_key_allowlist: string[]
+  protocols: string[]
+  providers: string[]
+}
+
+export interface PromptGuardPerformanceConfig {
+  async_shadow_auxiliary_enabled: boolean
+  exact_segment_cache_enabled: boolean
+  exact_segment_cache_entries: number
+  exact_segment_cache_ttl_seconds: number
+  max_segments: number
+  max_current_user_bytes: number
+  max_auxiliary_bytes: number
+  scan_chunk_bytes: number
+  scan_overlap_bytes: number
+  shadow_workers: number
+  shadow_queue_size: number
+  shadow_overflow_mode: 'drop'
+}
+
+export type PromptGuardLayer =
+  | 'current_user'
+  | 'history'
+  | 'system'
+  | 'developer'
+  | 'instructions'
+  | 'tool_output'
+  | 'tool_arguments'
+  | 'attachment_refs'
+  | 'session_context'
+  | 'attachment_content'
+
+export interface PromptGuardConfig {
+  mode: PromptGuardMode
+  default_profile: PromptGuardProfile
+  allow_trusted_overrides: boolean
+  provider_profiles: Partial<Record<PromptGuardProvider, PromptGuardProfile>>
+  layers: Record<PromptGuardLayer, { mode: PromptGuardMode }>
+  rollout: PromptGuardRolloutConfig
+  performance: PromptGuardPerformanceConfig
+}
+
+export type AdvancedConfigObject = Record<string, unknown>
+
+export interface AdvancedConfigDocument {
+  ok: boolean
+  value: AdvancedConfigObject | null
+  error: 'invalid_json' | 'root_not_object' | null
+}
+
+export interface AdvancedConfigPatch {
+  path: readonly string[]
+  value?: unknown
+  remove?: boolean
+}
+
+export interface AdvancedConfigPatchResult extends AdvancedConfigDocument {
+  serialized: string
+}
+
+function isAdvancedConfigObject(value: unknown): value is AdvancedConfigObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Parse the persisted advanced configuration without normalizing or rebuilding
+ * it. Callers can derive a typed view separately while retaining this original
+ * tree as the source of truth for compatible field-level updates.
+ */
+export function parseAdvancedConfigDocument(raw: string): AdvancedConfigDocument {
+  try {
+    const value = JSON.parse(raw || '{}') as unknown
+    if (!isAdvancedConfigObject(value)) {
+      return { ok: false, value: null, error: 'root_not_object' }
+    }
+    return { ok: true, value, error: null }
+  } catch {
+    return { ok: false, value: null, error: 'invalid_json' }
+  }
+}
+
+export function readAdvancedConfigPath(
+  value: AdvancedConfigObject | null,
+  path: readonly string[],
+): unknown {
+  let current: unknown = value
+  for (const key of path) {
+    if (!isAdvancedConfigObject(current)) return undefined
+    current = current[key]
+  }
+  return current
+}
+
+/**
+ * Apply only explicitly edited JSON paths to a freshly parsed document. This
+ * preserves unknown top-level and nested fields, including future enum values.
+ * Invalid JSON is returned untouched so the UI can block saving instead of
+ * silently replacing it with defaults.
+ */
+export function patchAdvancedConfigDocument(
+  raw: string,
+  patches: readonly AdvancedConfigPatch[],
+): AdvancedConfigPatchResult {
+  const parsed = parseAdvancedConfigDocument(raw)
+  if (!parsed.ok || !parsed.value) {
+    return { ...parsed, serialized: raw }
+  }
+
+  const root = parsed.value
+  for (const patch of patches) {
+    if (patch.path.length === 0) continue
+    let current = root
+    for (const key of patch.path.slice(0, -1)) {
+      const child = current[key]
+      if (isAdvancedConfigObject(child)) {
+        current = child
+      } else {
+        const next: AdvancedConfigObject = {}
+        current[key] = next
+        current = next
+      }
+    }
+    const leaf = patch.path[patch.path.length - 1]
+    if (patch.remove) delete current[leaf]
+    else current[leaf] = patch.value
+  }
+
+  return {
+    ok: true,
+    value: root,
+    error: null,
+    serialized: JSON.stringify(root),
+  }
 }
 
 export interface PromptFilterRule {

@@ -1716,6 +1716,16 @@ func IsDeactivatedWorkspaceError(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "deactivated_workspace")
 }
 
+// IsAgentRuntimeDeletedError 判断响应体是否表示 Agent runtime 已删除。
+func IsAgentRuntimeDeletedError(body []byte) bool {
+	code := strings.ToLower(firstGJSONString(body, "error.code", "detail.code", "code"))
+	if code != "biscuit_baker_service_agent_error_status" {
+		return false
+	}
+	message := strings.ToLower(firstGJSONString(body, "error.message", "detail.message", "message"))
+	return strings.Contains(message, "agent runtime has been deleted")
+}
+
 func upstreamAccountErrorMessage(statusCode int, body []byte) string {
 	if IsDeactivatedWorkspaceError(body) {
 		return fmt.Sprintf("上游返回 %d: deactivated_workspace", statusCode)
@@ -1752,6 +1762,9 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
+			return "agent_runtime_deleted"
+		}
 		if IsDeactivatedWorkspaceError(body) {
 			return "deactivated_workspace"
 		}
@@ -4663,6 +4676,13 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
+			atomic.StoreInt32(&account.Disabled, 1)
+			errorMsg := upstreamAccountErrorMessage(statusCode, body)
+			log.Printf("账号 %d 的 Agent runtime 已删除，标记为封禁", account.ID())
+			h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
+			return codex429Decision{}
+		}
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
 			if h.store != nil {

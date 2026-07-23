@@ -117,6 +117,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
 				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+			case http.StatusForbidden:
+				if proxy.IsAgentRuntimeDeletedError(errBody) {
+					h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errMsg)
+				}
 			case http.StatusTooManyRequests:
 				// Grok 虽是 relay 风格，但有自己的免费额度语义（free-usage-exhausted → 24h），
 				// 不能并入"relay 一律 1 分钟 rate_limited"，否则耗尽会被标成短冷却、1 分钟即恢复。
@@ -987,6 +991,10 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
 		msg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+		if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
+			h.store.MarkCooldownWithErrorExactDuration(acc, 24*time.Hour, "unauthorized", msg)
+			return "banned", msg
+		}
 		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
 			h.store.MarkError(acc, "批量测试"+msg)
 		}

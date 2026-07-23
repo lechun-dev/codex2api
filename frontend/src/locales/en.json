@@ -2306,7 +2306,7 @@
         "b4": "SSE / WebSocket output scan: inspect streamed model output; can limit to terminal rules only.",
         "b5": "NewAPI audit identity: verify HMAC identity headers and emit ban instructions on policy hits.",
         "b6": "Scheduled intelligence: periodic public search and optional candidate rule generation.",
-        "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency."
+        "callout": "Use Redis-backed cache for multi-replica cumulative risk. Keep decode runs at 1–2 to control latency. Output scanning holds a small window for cross-frame detection: when combined with preflight passthrough (codex_preflight_sse_passthrough), tiny metadata frames may still be briefly buffered so first-frame speed is not guaranteed to recover; and once HTTP 200 is committed before the first content event, upstream error status-code recovery changes — grayscale the two together."
       },
       "review": {
         "title": "Secondary review",

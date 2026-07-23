@@ -268,6 +268,13 @@ func (h *Handler) UpdateGrokAccount(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	// proxy_url 是独立列，不在 credentials 里；UpdateCredentials 不会写它。
+	// 编辑是整体重写语义（空值即清空代理），须单独持久化，否则代理只落到内存
+	// store，重载 / 重启 / 后台刷新后被 DB 旧值覆盖，表现为"添加代理不生效"。
+	if err := h.db.UpdateAccountProxyURL(ctx, id, req.ProxyURL); err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	if req.Name != "" {
 		_ = h.db.UpdateAccountName(ctx, id, req.Name)
 	}

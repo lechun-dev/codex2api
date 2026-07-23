@@ -325,13 +325,31 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
-			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
+			return relayAccountSupportsModel(account, routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
 		}
 		if !allowCodexAccounts {
 			return false
 		}
 		return codexFilter(account)
 	}
+}
+
+// relayAccountSupportsModel 判断 relay 风格账号能否服务指定模型。
+// 普通 relay 中转必须显式声明 models 白名单；Grok 账号未声明白名单时按默认
+// Grok 模型集放行——与 /v1/models 的默认集注册（supportedModelIDs）保持一致，
+// 否则通用 Key 在模型列表里看得到 grok-4.5 却永远调度不到（恒 503）。
+// 声明了白名单的 Grok 账号仍以白名单为准。
+func relayAccountSupportsModel(account *auth.Account, model string) bool {
+	if account == nil {
+		return false
+	}
+	if account.SupportsOpenAIResponsesModel(model) {
+		return true
+	}
+	if !account.IsGrokAPI() || len(account.GrokModels()) > 0 {
+		return false
+	}
+	return modelIDInList(model, DefaultGrokModelIDs())
 }
 
 func modelIDInList(model string, models []string) bool {
@@ -357,7 +375,7 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
-		if ok && mappedModel != "" && account.SupportsOpenAIResponsesModel(mappedModel) {
+		if ok && mappedModel != "" && relayAccountSupportsModel(account, mappedModel) {
 			return true
 		}
 	}

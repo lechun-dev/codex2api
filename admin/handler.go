@@ -479,6 +479,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.POST("/accounts/clean-error", h.CleanError)
+	api.POST("/accounts/grok/clean-banned", h.CleanGrokBanned)
+	api.POST("/accounts/grok/clean-error", h.CleanGrokError)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
@@ -8943,6 +8945,26 @@ func (h *Handler) CleanRateLimited(c *gin.Context) {
 // CleanError 清理错误（error）账号
 func (h *Handler) CleanError(c *gin.Context) {
 	h.cleanByStatus(c, "error")
+}
+
+// CleanGrokBanned 清理封禁（unauthorized）的 Grok 账号
+func (h *Handler) CleanGrokBanned(c *gin.Context) {
+	h.cleanGrokByStatus(c, "unauthorized")
+}
+
+// CleanGrokError 清理错误（error）的 Grok 账号
+func (h *Handler) CleanGrokError(c *gin.Context) {
+	h.cleanGrokByStatus(c, "error")
+}
+
+// cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
+func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	cleaned := h.store.CleanGrokByRuntimeStatus(ctx, targetStatus)
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }
 
 // cleanByStatus 按运行时状态清理账号

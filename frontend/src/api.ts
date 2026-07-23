@@ -800,6 +800,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  cleanGrokBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
+  cleanGrokError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))

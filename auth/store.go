@@ -4120,11 +4120,24 @@ func (s *Store) Stop() {
 // premium 5h 限流账号会被跳过，因为它们会在 5h 内自然恢复，无需删除。
 // 手动一键清理请改用 CleanRateLimitedManual——它会清掉所有限流账号。
 func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) int {
+	return s.cleanByRuntimeStatusMatch(ctx, targetStatus, nil)
+}
+
+// CleanGrokByRuntimeStatus 按运行时状态清理 Grok 上游账号（Grok 账号页专用，不触碰其它平台账号）。
+func (s *Store) CleanGrokByRuntimeStatus(ctx context.Context, targetStatus string) int {
+	return s.cleanByRuntimeStatusMatch(ctx, targetStatus, (*Account).IsGrokAPI)
+}
+
+// cleanByRuntimeStatusMatch 按运行时状态清理账号，match 非 nil 时仅清理命中的账号。
+func (s *Store) cleanByRuntimeStatusMatch(ctx context.Context, targetStatus string, match func(*Account) bool) int {
 	accounts := s.Accounts()
 	cleaned := 0
 
 	for _, acc := range accounts {
 		if acc == nil || acc.RuntimeStatus() != targetStatus {
+			continue
+		}
+		if match != nil && !match(acc) {
 			continue
 		}
 		if targetStatus == "rate_limited" && acc.IsPremium5hRateLimited() {

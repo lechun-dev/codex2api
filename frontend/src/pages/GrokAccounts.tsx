@@ -52,6 +52,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "../hooks/useToast";
+import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useOperationProgress } from "../hooks/useOperationProgress";
 import OperationProgressToast from "../components/OperationProgressToast";
 import { getErrorMessage } from "../utils/error";
@@ -92,7 +93,9 @@ function getInitialGrokViewMode(): GrokViewMode {
 
 // addMethod：Device 授权 / 粘贴 auth.json / xAI API Key / SSO 批量导入
 type AddMethod = "oauth_link" | "oauth" | "api_key" | "sso";
-type StatusFilter = "all" | "active" | "disabled" | "error";
+type StatusFilter = "all" | "active" | "disabled" | "banned" | "error";
+// 套餐筛选：free / 付费档（SuperGrok 等）/ api / 其它。
+type PlanFilter = "all" | "free" | "premium" | "api" | "other";
 type AuthFilter = "all" | "oauth" | "api_key";
 type DeviceStep = "idle" | "waiting";
 
@@ -198,8 +201,21 @@ function isAccountError(account: AccountRow): boolean {
   return account.status === "error" || account.status === "unauthorized";
 }
 
+function isAccountBanned(account: AccountRow): boolean {
+  return account.status === "unauthorized";
+}
+
 function isAccountActive(account: AccountRow): boolean {
   return account.enabled !== false && !isAccountError(account);
+}
+
+// 套餐归类：free / 付费档（SuperGrok 等）/ api / 其它（空、unknown）。
+function planCategory(account: AccountRow): Exclude<PlanFilter, "all"> {
+  const p = (account.plan_type ?? "").trim().toLowerCase();
+  if (p === "free") return "free";
+  if (p === "api") return "api";
+  if (isPremiumPlan(p)) return "premium";
+  return "other";
 }
 
 export default function GrokAccounts({
@@ -210,6 +226,8 @@ export default function GrokAccounts({
 } = {}) {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  // 与 Codex 账号页一致：用系统自定义确认弹窗，不用 window.confirm。
+  const { confirm, confirmDialog } = useConfirmDialog();
   // 批量测试的右上角进度浮层，与 Codex 账号页共用同一实现。
   const { operationProgress, runStreamingOperation, closeOperationProgress } =
     useOperationProgress();
@@ -273,6 +291,8 @@ export default function GrokAccounts({
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [authFilter, setAuthFilter] = useState<AuthFilter>("all");
+  const [planFilter, setPlanFilter] = useState<PlanFilter>("all");
+  const [cleaning, setCleaning] = useState(false);
   const [viewMode, setViewMode] = useState<GrokViewMode>(getInitialGrokViewMode);
 
   useEffect(() => {
@@ -320,10 +340,11 @@ export default function GrokAccounts({
     const total = accounts.length;
     const active = accounts.filter(isAccountActive).length;
     const disabled = accounts.filter((a) => a.enabled === false).length;
-    const errored = accounts.filter(isAccountError).length;
+    const banned = accounts.filter(isAccountBanned).length;
+    const errorOnly = accounts.filter((a) => a.status === "error").length;
     const oauth = accounts.filter((a) => a.grok_auth_kind === "oauth").length;
     const apiKey = accounts.filter((a) => a.grok_auth_kind === "api_key").length;
-    return { total, active, disabled, errored, oauth, apiKey };
+    return { total, active, disabled, banned, errorOnly, oauth, apiKey };
   }, [accounts]);
 
   const filteredAccounts = useMemo(() => {
@@ -331,9 +352,12 @@ export default function GrokAccounts({
     return accounts.filter((account) => {
       if (statusFilter === "active" && !isAccountActive(account)) return false;
       if (statusFilter === "disabled" && account.enabled !== false) return false;
-      if (statusFilter === "error" && !isAccountError(account)) return false;
+      if (statusFilter === "banned" && !isAccountBanned(account)) return false;
+      if (statusFilter === "error" && account.status !== "error") return false;
       if (authFilter === "oauth" && account.grok_auth_kind !== "oauth") return false;
       if (authFilter === "api_key" && account.grok_auth_kind !== "api_key")
+        return false;
+      if (planFilter !== "all" && planCategory(account) !== planFilter)
         return false;
       if (!q) return true;
       const haystack = [
@@ -348,7 +372,7 @@ export default function GrokAccounts({
         .toLowerCase();
       return haystack.includes(q);
     });
-  }, [accounts, authFilter, searchQuery, statusFilter]);
+  }, [accounts, authFilter, planFilter, searchQuery, statusFilter]);
 
   // 批量选择：全选/半选状态按当前过滤结果计算。
   const filteredIds = useMemo(
@@ -760,7 +784,16 @@ export default function GrokAccounts({
   };
 
   const handleDelete = async (account: AccountRow) => {
-    if (!window.confirm(t("grok.deleteConfirm"))) return;
+    const confirmed = await confirm({
+      title: t("grok.deleteTitle"),
+      description: t("grok.deleteDesc", {
+        account: account.email || account.name || `ID ${account.id}`,
+      }),
+      confirmText: t("grok.deleteConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
     setBusyId(account.id);
     try {
       await api.deleteAccount(account.id);
@@ -872,8 +905,14 @@ export default function GrokAccounts({
 
   const handleBatchDelete = async () => {
     if (selectedIds.length === 0) return;
-    if (!window.confirm(t("accounts.batchDeleteDesc", { count: selectedIds.length })))
-      return;
+    const confirmed = await confirm({
+      title: t("accounts.batchDeleteTitle"),
+      description: t("accounts.batchDeleteDesc", { count: selectedIds.length }),
+      confirmText: t("accounts.deleteConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
     setBatchBusy(true);
     try {
       const res = await api.batchDeleteAccounts(selectedIds);
@@ -892,6 +931,49 @@ export default function GrokAccounts({
       );
     } finally {
       setBatchBusy(false);
+    }
+  };
+
+  // 一键清理封禁/错误账号：仅作用于 Grok 账号，走 grok 专用端点。
+  const handleCleanBanned = async () => {
+    const confirmed = await confirm({
+      title: t("grok.cleanBannedTitle"),
+      description: t("grok.cleanBannedDesc", { count: stats.banned }),
+      confirmText: t("grok.cleanConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    setCleaning(true);
+    try {
+      const res = await api.cleanGrokBanned();
+      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      await reload();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  const handleCleanError = async () => {
+    const confirmed = await confirm({
+      title: t("grok.cleanErrorTitle"),
+      description: t("grok.cleanErrorDesc", { count: stats.errorOnly }),
+      confirmText: t("grok.cleanConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    setCleaning(true);
+    try {
+      const res = await api.cleanGrokError();
+      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      await reload();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setCleaning(false);
     }
   };
 
@@ -954,6 +1036,26 @@ export default function GrokAccounts({
                     : t("accounts.testConnection")}
                 </span>
               </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={cleaning || stats.banned === 0}
+                onClick={() => void handleCleanBanned()}
+              >
+                <Trash2 className="size-3.5" />
+                <span className="hidden sm:inline">{t("grok.cleanBanned")}</span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={cleaning || stats.errorOnly === 0}
+                onClick={() => void handleCleanError()}
+              >
+                <Trash2 className="size-3.5" />
+                <span className="hidden sm:inline">{t("grok.cleanError")}</span>
+              </Button>
             </div>
           }
         />
@@ -1007,7 +1109,8 @@ export default function GrokAccounts({
                 ["all", t("accounts.filterAll"), stats.total],
                 ["active", t("accounts.filterNormal"), stats.active],
                 ["disabled", t("accounts.filterDisabled"), stats.disabled],
-                ["error", t("accounts.filterError"), stats.errored],
+                ["banned", t("accounts.filterBanned"), stats.banned],
+                ["error", t("accounts.filterError"), stats.errorOnly],
               ] as const
             ).map(([key, label, count]) => (
               <button
@@ -1053,6 +1156,31 @@ export default function GrokAccounts({
                   className={cn(
                     "shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors",
                     authFilter === key
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="flex max-w-full shrink-0 items-center gap-0.5 overflow-x-auto rounded-lg border border-border bg-muted/30 p-0.5">
+              {(
+                [
+                  ["all", t("accounts.filterAll")],
+                  ["free", t("grok.planFree")],
+                  ["premium", t("grok.planPremium")],
+                  ["api", t("grok.planApi")],
+                  ["other", t("grok.planOther")],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setPlanFilter(key)}
+                  className={cn(
+                    "shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors",
+                    planFilter === key
                       ? "bg-background text-foreground shadow-sm"
                       : "text-muted-foreground hover:text-foreground",
                   )}
@@ -1220,6 +1348,7 @@ export default function GrokAccounts({
                   setSearchQuery("");
                   setStatusFilter("all");
                   setAuthFilter("all");
+                  setPlanFilter("all");
                 }}
               >
                 {t("grok.clearFilters")}
@@ -2023,6 +2152,8 @@ export default function GrokAccounts({
           </div>
         ) : null}
       </Modal>
+
+      {confirmDialog}
     </div>
   );
 }

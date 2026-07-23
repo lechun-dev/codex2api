@@ -191,6 +191,8 @@ type DB struct {
 	conn   *sql.DB
 	driver string
 
+	promptFilterAudit *promptFilterAuditQueue
+
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
 	logMu   sync.Mutex
@@ -424,6 +426,8 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.ensureUsageStatsBaselineBillingColumns(ctx); err != nil {
 		return nil, err
 	}
+	db.promptFilterAudit = newPromptFilterAuditQueue(db)
+	db.promptFilterAudit.start()
 
 	return db, nil
 }
@@ -469,6 +473,9 @@ func (db *DB) Close() error {
 	close(db.logStop)
 	db.logWg.Wait()
 	db.flushLogs() // 最后一次 flush
+	if db.promptFilterAudit != nil {
+		db.promptFilterAudit.close(2 * time.Second)
+	}
 	return db.conn.Close()
 }
 
@@ -875,14 +882,22 @@ func (db *DB) migrate(ctx context.Context) error {
 				id               SERIAL PRIMARY KEY,
 				created_at       TIMESTAMPTZ DEFAULT NOW(),
 				source           VARCHAR(50) DEFAULT '',
-				endpoint         VARCHAR(100) DEFAULT '',
+				endpoint         VARCHAR(256) DEFAULT '',
+				request_protocol VARCHAR(64) DEFAULT '',
+				request_provider VARCHAR(64) DEFAULT '',
 				model            VARCHAR(100) DEFAULT '',
 				action           VARCHAR(20) DEFAULT '',
 				mode             VARCHAR(20) DEFAULT '',
 				score            INT DEFAULT 0,
+				audit_score      INT DEFAULT 0,
 				threshold_value  INT DEFAULT 0,
+				policy_profile   VARCHAR(32) DEFAULT '',
+				reason_code      VARCHAR(100) DEFAULT '',
+				primary_origin   VARCHAR(50) DEFAULT '',
+				strike_eligible  BOOLEAN DEFAULT FALSE,
 				matched_patterns TEXT DEFAULT '[]',
 				text_preview     TEXT DEFAULT '',
+				match_context    TEXT DEFAULT '',
 				api_key_id       INT DEFAULT 0,
 				api_key_name     VARCHAR(255) DEFAULT '',
 				api_key_masked   VARCHAR(64) DEFAULT '',
@@ -897,6 +912,15 @@ func (db *DB) migrate(ctx context.Context) error {
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_error TEXT DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS full_text TEXT DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS match_context TEXT DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS audit_score INT DEFAULT 0;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS policy_profile VARCHAR(32) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS reason_code VARCHAR(100) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS primary_origin VARCHAR(50) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS strike_eligible BOOLEAN DEFAULT FALSE;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS request_protocol VARCHAR(64) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS request_provider VARCHAR(64) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ALTER COLUMN endpoint TYPE VARCHAR(256);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);
 			CREATE TABLE IF NOT EXISTS prompt_filter_secrets (

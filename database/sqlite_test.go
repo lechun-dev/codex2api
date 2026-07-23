@@ -26,6 +26,29 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.conn.ExecContext(context.Background(), `INSERT INTO system_settings (id) VALUES (1)`); err != nil {
+		t.Fatalf("insert default settings row: %v", err)
+	}
+	settings, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings returned error: %v", err)
+	}
+	if settings.PromptFilterEnabled || settings.PromptFilterMode != "monitor" || settings.PromptFilterStrictTerminalEnabled {
+		t.Fatalf("compatibility defaults = enabled:%t mode:%q strict_terminal:%t", settings.PromptFilterEnabled, settings.PromptFilterMode, settings.PromptFilterStrictTerminalEnabled)
+	}
+	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
+		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1175,6 +1198,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		StreamFlushIntervalMS:             20,
 		FirstTokenMode:                    "loose",
 		FirstTokenTimeoutSeconds:          17,
+		FirstTokenExcludesWsAcquire:       true,
 		BillingTierPolicy:                 "requested",
 		ImageStorageConfig:                "{}",
 		SchedulerMode:                     "round_robin",
@@ -1202,6 +1226,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.FirstTokenExcludesWsAcquire {
+		t.Fatal("FirstTokenExcludesWsAcquire = false, want true")
 	}
 	if !settings.PromptFilterStrictTerminalEnabled {
 		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
@@ -1295,6 +1322,21 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PublicImageStudioPageEnabled {
 		t.Fatal("PublicImageStudioPageEnabled = true, want false")
+	}
+
+	settings.FirstTokenExcludesWsAcquire = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false FirstTokenExcludesWsAcquire 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false FirstTokenExcludesWsAcquire 返回错误: %v", err)
+	}
+	if settings.FirstTokenExcludesWsAcquire {
+		t.Fatal("FirstTokenExcludesWsAcquire = true, want false")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig after FirstTokenExcludesWsAcquire update = %q", settings.PromptFilterAdvancedConfig)
 	}
 }
 
@@ -3028,14 +3070,22 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	ctx := context.Background()
 	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
 		Source:          "local_filter",
-		Endpoint:        "/v1/responses",
+		Endpoint:        "/v1/messages",
+		Protocol:        "claude",
+		Provider:        "anthropic",
 		Model:           "gpt-5.4",
 		Action:          "allow",
 		Mode:            "block",
-		Score:           100,
+		Score:           70,
+		AuditScore:      100,
 		Threshold:       50,
+		PolicyProfile:   "strict",
+		ReasonCode:      "terminal_policy_match",
+		PrimaryOrigin:   "current_user",
+		StrikeEligible:  true,
 		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
 		TextPreview:     "preview",
+		MatchContext:    "actual trigger excerpt",
 		ReviewModel:     "omni-moderation-latest",
 		ReviewFlagged:   false,
 		ReviewError:     "temporary failure",
@@ -3053,6 +3103,78 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ReviewModel != "omni-moderation-latest" || got.ReviewFlagged || got.ReviewError != "temporary failure" {
 		t.Fatalf("review metadata = %+v", got)
+	}
+	if got.Score != 70 || got.AuditScore != 100 || got.PolicyProfile != "strict" || got.ReasonCode != "terminal_policy_match" || got.PrimaryOrigin != "current_user" || !got.StrikeEligible {
+		t.Fatalf("guard metadata = %+v", got)
+	}
+	if got.Endpoint != "/v1/messages" || got.Protocol != "claude" || got.Provider != "anthropic" {
+		t.Fatalf("original request metadata = %+v", got)
+	}
+	if got.MatchContext != "actual trigger excerpt" {
+		t.Fatalf("match context = %q, want persisted trigger excerpt", got.MatchContext)
+	}
+
+	matched, matchTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "trigger excerpt"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(match context) 返回错误: %v", err)
+	}
+	if matchTotal != 1 || len(matched) != 1 || matched[0].MatchContext != "actual trigger excerpt" {
+		t.Fatalf("match context search total=%d logs=%+v", matchTotal, matched)
+	}
+
+	nearest, err := db.FindNearestPromptFilterLog(ctx, got.CreatedAt, "local_filter", "/v1/messages", 0, 5)
+	if err != nil {
+		t.Fatalf("FindNearestPromptFilterLog 返回错误: %v", err)
+	}
+	if nearest == nil || nearest.MatchContext != "actual trigger excerpt" {
+		t.Fatalf("nearest prompt filter log = %+v", nearest)
+	}
+}
+
+func TestSQLiteMigratesPromptFilterMatchContextColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close sqlite 返回错误: %v", err)
+	}
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite 返回错误: %v", err)
+	}
+	if _, err := legacy.Exec(`ALTER TABLE prompt_filter_logs DROP COLUMN match_context`); err != nil {
+		legacy.Close()
+		t.Fatalf("remove match_context to simulate legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite 返回错误: %v", err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite legacy) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
+		Source:       "local_filter",
+		Endpoint:     "/v1/responses",
+		Action:       "allow",
+		Mode:         "monitor",
+		MatchContext: "migrated trigger excerpt",
+	}); err != nil {
+		t.Fatalf("InsertPromptFilterLog after migration 返回错误: %v", err)
+	}
+	logs, err := db.ListPromptFilterLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogs after migration 返回错误: %v", err)
+	}
+	if len(logs) != 1 || logs[0].MatchContext != "migrated trigger excerpt" {
+		t.Fatalf("migrated prompt filter logs = %+v", logs)
 	}
 }
 

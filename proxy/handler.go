@@ -875,6 +875,31 @@ func readRawRequestBody(c *gin.Context) ([]byte, error) {
 	return body, nil
 }
 
+const ingressRequestBodyContextKey = "ingress_raw_body"
+
+func setIngressRequestBodyIfAbsent(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+	if _, exists := c.Get(ingressRequestBodyContextKey); exists {
+		return
+	}
+	// The request-size middleware already owns this immutable buffer for the
+	// request lifetime. Retain the same slice instead of copying the full body.
+	c.Set(ingressRequestBodyContextKey, body)
+}
+
+func ingressRequestBody(c *gin.Context, fallback []byte) []byte {
+	if c != nil {
+		if value, exists := c.Get(ingressRequestBodyContextKey); exists {
+			if body, ok := value.([]byte); ok {
+				return body
+			}
+		}
+	}
+	return fallback
+}
+
 func setRawRequestBody(c *gin.Context, body []byte) {
 	if c != nil {
 		c.Set("raw_body", body)
@@ -1473,6 +1498,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
 	v1.GET("/responses", h.ResponsesWebSocket)
+	v1.GET("/realtime", h.RealtimeWebSocket)
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.POST("/images/edits", h.ImagesEdits)
@@ -1490,6 +1516,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/chat/completions", auth, h.ChatCompletions)
 	r.POST("/responses", auth, h.Responses)
 	r.GET("/responses", auth, h.ResponsesWebSocket)
+	r.GET("/realtime", auth, h.RealtimeWebSocket)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.POST("/images/edits", auth, h.ImagesEdits)
@@ -1550,6 +1577,16 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		}
 
 		authHeader := c.GetHeader("Authorization")
+		// OpenAI-compatible WebSocket clients may carry the API key in the
+		// standard subprotocol list instead of an Authorization header:
+		//   Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.<key>
+		// Only honor it on an actual WebSocket upgrade so an ordinary HTTP
+		// request cannot smuggle authentication through an unrelated header.
+		if authHeader == "" && isResponsesWebSocketUpgradeRequest(c.Request) {
+			if key := apiKeyFromWebSocketSubprotocol(c.GetHeader("Sec-WebSocket-Protocol")); key != "" {
+				authHeader = "Bearer " + key
+			}
+		}
 		// 兼容 Anthropic 客户端的多种认证方式:
 		// - x-api-key: Anthropic SDK 默认方式
 		// - ANTHROPIC_AUTH_TOKEN: Claude Code 通过此环境变量设置，
@@ -1612,6 +1649,17 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		c.Set("apiKey", key)
 		c.Next()
 	}
+}
+
+func apiKeyFromWebSocketSubprotocol(header string) string {
+	for _, item := range strings.Split(header, ",") {
+		item = strings.TrimSpace(item)
+		const prefix = "openai-insecure-api-key."
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(item, prefix))
+		}
+	}
+	return ""
 }
 
 // ==================== /v1/responses ====================
@@ -1846,6 +1894,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	bodyReadDone := time.Now()
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
@@ -2272,7 +2321,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.Release(account)
 					return
 				}
-				streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+				streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -2688,7 +2737,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -3064,6 +3113,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3592,6 +3642,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -3962,7 +4013,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -4247,7 +4298,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		return
 	}
 
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {

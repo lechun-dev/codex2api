@@ -6,9 +6,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 var mysqlCaptureDriverSequence uint64
@@ -43,6 +45,88 @@ func TestAccountChannelPredicateUsesMySQL56CompatibleSQL(t *testing.T) {
 			t.Fatalf("MySQL 5.6 incompatible syntax %q leaked into predicate: %s", incompatible, got)
 		}
 	}
+}
+
+func TestListActiveByChannelGeneratesMySQL56CompatibleSQL(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	if _, err := db.ListActiveByChannel(context.Background(), UpstreamChannelGrok); err != nil {
+		t.Fatalf("ListActiveByChannel() error = %v", err)
+	}
+
+	for _, fragment := range []string{"CAST(credentials AS CHAR)", "REGEXP", "[[:space:]]"} {
+		if !strings.Contains(capture.query, fragment) {
+			t.Fatalf("rewritten channel query missing %q: %s", fragment, capture.query)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
+}
+
+func TestListAPIKeyAccountStatsGeneratesMySQL56CompatibleSQL(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	if _, err := db.ListAPIKeyAccountStats(context.Background(), 7, start, end); err != nil {
+		t.Fatalf("ListAPIKeyAccountStats() error = %v", err)
+	}
+
+	for _, fragment := range []string{"CAST(a.credentials AS CHAR)", "u.api_key_id = ?", "u.created_at >= ?", "u.created_at < ?"} {
+		if !strings.Contains(capture.query, fragment) {
+			t.Fatalf("rewritten API key account query missing %q: %s", fragment, capture.query)
+		}
+	}
+	if got := strings.Count(capture.query, "?"); got != 3 {
+		t.Fatalf("rewritten API key account placeholder count = %d, want 3: %s", got, capture.query)
+	}
+	if len(capture.args) != 3 || capture.args[0].Value != int64(7) {
+		t.Fatalf("rewritten API key account args = %#v", capture.args)
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
+}
+
+func TestAttachAPIKeyAccountGroupsGeneratesMySQL56CompatibleSQL(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	items := []APIKeyAccountStat{{AccountID: 11}, {AccountID: 22}, {AccountID: 11}}
+	if err := db.attachAPIKeyAccountGroups(context.Background(), items); err != nil {
+		t.Fatalf("attachAPIKeyAccountGroups() error = %v", err)
+	}
+
+	if !strings.Contains(capture.query, "m.account_id IN (?,?)") {
+		t.Fatalf("rewritten account group query has unexpected placeholders: %s", capture.query)
+	}
+	if len(capture.args) != 2 || capture.args[0].Value != int64(11) || capture.args[1].Value != int64(22) {
+		t.Fatalf("rewritten account group args = %#v", capture.args)
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
 }
 
 func TestRewriteSQLForMySQLRepeatedPlaceholders(t *testing.T) {
@@ -375,6 +459,18 @@ func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []d
 	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: 1}, nil
 }
 
+func (c *mysqlCaptureConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.capture.query = query
+	c.capture.args = append([]driver.NamedValue(nil), args...)
+	return mysqlCaptureRows{}, nil
+}
+
+type mysqlCaptureRows struct{}
+
+func (mysqlCaptureRows) Columns() []string         { return nil }
+func (mysqlCaptureRows) Close() error              { return nil }
+func (mysqlCaptureRows) Next([]driver.Value) error { return io.EOF }
+
 type mysqlCaptureResult struct {
 	lastInsertID int64
 	rowsAffected int64
@@ -395,4 +491,26 @@ func containsAll(value string, needles ...string) bool {
 		}
 	}
 	return true
+}
+
+func assertNoMySQL56IncompatibleSQL(t *testing.T, query string) {
+	t.Helper()
+	for _, incompatible := range []string{
+		"JSON_EXTRACT",
+		"->>",
+		" AS TEXT)",
+		"::",
+		"ON CONFLICT",
+		"RETURNING",
+		"TIMESTAMPTZ",
+	} {
+		if strings.Contains(strings.ToUpper(query), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q leaked into query: %s", incompatible, query)
+		}
+	}
+	for i := 0; i+1 < len(query); i++ {
+		if query[i] == '$' && query[i+1] >= '0' && query[i+1] <= '9' {
+			t.Fatalf("PostgreSQL placeholders leaked into MySQL query: %s", query)
+		}
+	}
 }

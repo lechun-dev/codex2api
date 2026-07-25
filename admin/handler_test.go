@@ -592,6 +592,96 @@ func TestCreateAPIKeyPersistsQuotaAndExpiration(t *testing.T) {
 	}
 }
 
+func TestRegenerateAPIKeyReplacesSecretAndInvalidatesCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	oldKey := "sk-test-regenerate-old-1234567890"
+	id, err := db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:       "Client A",
+		Key:        oldKey,
+		QuotaLimit: 2.5,
+		QuotaUsed:  1.25,
+		Limits:     database.APIKeyLimits{RPM: 10},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions() error = %v", err)
+	}
+
+	tc := cache.NewMemory(4)
+	defer tc.Close()
+	if err := tc.SetRuntime(ctx, adminAPIKeyCacheNamespace, oldKey, json.RawMessage(`{"id":1}`), time.Minute); err != nil {
+		t.Fatalf("seed API key cache: %v", err)
+	}
+	if err := tc.SetRuntime(ctx, adminAPIKeyCountNamespace, "all", json.RawMessage(`1`), time.Minute); err != nil {
+		t.Fatalf("seed API key count cache: %v", err)
+	}
+
+	handler := &Handler{db: db, cache: tc}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/keys/%d/regenerate", id), nil)
+
+	handler.RegenerateAPIKey(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload regenerateAPIKeyResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.ID != id || payload.Name != "Client A" || payload.Key == "" || payload.Key == oldKey {
+		t.Fatalf("payload = %#v, want a new key for id=%d", payload, id)
+	}
+	if _, err := db.GetAPIKeyByValue(ctx, oldKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("old key lookup error = %v, want sql.ErrNoRows", err)
+	}
+	row, err := db.GetAPIKeyByValue(ctx, payload.Key)
+	if err != nil {
+		t.Fatalf("new key lookup error = %v", err)
+	}
+	if row.QuotaLimit != 2.5 || row.QuotaUsed != 1.25 || row.Limits.RPM != 10 {
+		t.Fatalf("row = %#v, want quota, usage, and limits preserved", row)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCacheNamespace, oldKey); err != nil || ok {
+		t.Fatalf("old key cache after regeneration = (ok=%v, err=%v), want miss", ok, err)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCountNamespace, "all"); err != nil || ok {
+		t.Fatalf("key count cache after regeneration = (ok=%v, err=%v), want miss", ok, err)
+	}
+}
+
+func TestRegenerateAPIKeyReturnsNotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: "999"}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/keys/999/regenerate", nil)
+
+	handler.RegenerateAPIKey(ginCtx)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
 func TestUpdateAPIKeyPreservesOmittedFieldsAndUpdatesLimits(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

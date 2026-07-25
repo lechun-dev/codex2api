@@ -31,6 +31,7 @@ import type {
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
+  RegenerateAPIKeyResponse,
   FetchOpenAIResponsesModelsRequest,
   FetchOpenAIResponsesModelsResponse,
   CreateImageJobPayload,
@@ -666,6 +667,8 @@ export const api = {
     }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
+  regenerateAPIKey: (id: number) =>
+    request<RegenerateAPIKeyResponse>(`/keys/${id}/regenerate`, { method: 'POST' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {

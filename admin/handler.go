@@ -552,6 +552,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
+	api.POST("/keys/:id/regenerate", h.RegenerateAPIKey)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/account-groups", h.ListAccountGroups)
@@ -6085,10 +6086,12 @@ type createKeyReq struct {
 }
 
 // generateKey 生成随机 API Key
-func generateKey() string {
+func generateKey() (string, error) {
 	b := make([]byte, 24)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 // CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
@@ -6145,7 +6148,11 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	key := req.Key
 	if key == "" {
-		key = generateKey()
+		key, err = generateKey()
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "生成 API Key 失败")
+			return
+		}
 	} else {
 		// 验证用户提供的key格式
 		key = security.SanitizeInput(key)
@@ -6217,6 +6224,42 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		QuotaUsed:       0,
 		ExpiresAt:       expiresAtResponse,
 		AllowedGroupIDs: dedupeInt64(allowedGroupIDs.Values),
+	})
+}
+
+// RegenerateAPIKey 重新生成 API 密钥值，保留原记录的额度、权限和统计。
+func (h *Handler) RegenerateAPIKey(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+
+	newKey, err := generateKey()
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "生成 API Key 失败")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	oldKey, name, err := h.db.RegenerateAPIKey(ctx, id, newKey)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+
+	h.invalidateAPIKeyRuntimeCaches(ctx, oldKey)
+	h.invalidateAPIKeyRuntimeCaches(ctx, newKey)
+	security.SecurityAuditLog("API_KEY_REGENERATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(name), c.ClientIP()))
+	c.JSON(http.StatusOK, regenerateAPIKeyResponse{
+		ID:   id,
+		Key:  newKey,
+		Name: name,
 	})
 }
 

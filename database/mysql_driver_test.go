@@ -201,6 +201,19 @@ func TestRewriteSQLForMySQLAPIKeyInsertIdentifier(t *testing.T) {
 	}
 }
 
+func TestRewriteSQLForMySQLAPIKeyRegeneration(t *testing.T) {
+	selectQuery := rewriteSQLForMySQL(`SELECT key, name FROM api_keys WHERE id = $1 FOR UPDATE`)
+	if selectQuery != "SELECT `key`, name FROM api_keys WHERE id = ? FOR UPDATE" {
+		t.Fatalf("rewritten select = %q", selectQuery)
+	}
+	updateQuery := rewriteSQLForMySQL(`UPDATE api_keys SET key = $1 WHERE id = $2`)
+	if updateQuery != "UPDATE api_keys SET `key` = ? WHERE id = ?" {
+		t.Fatalf("rewritten update = %q", updateQuery)
+	}
+	assertNoMySQL56IncompatibleSQL(t, selectQuery)
+	assertNoMySQL56IncompatibleSQL(t, updateQuery)
+}
+
 func TestRewriteSQLForMySQLAPIKeyDDLDoesNotRewritePrimaryKey(t *testing.T) {
 	got := rewriteSQLForMySQL("CREATE TABLE api_keys (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(255) NOT NULL UNIQUE)")
 	want := "CREATE TABLE api_keys (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(255) NOT NULL UNIQUE)"

@@ -1654,6 +1654,12 @@ export interface CreateAPIKeyResponse {
   allowed_group_ids?: number[]
 }
 
+export interface RegenerateAPIKeyResponse {
+  id: number
+  key: string
+  name: string
+}
+
 export interface ImagePromptTemplate {
   id: number
   name: string

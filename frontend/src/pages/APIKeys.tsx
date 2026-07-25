@@ -59,6 +59,7 @@ import {
   LockKeyhole,
   Pencil,
   Plus,
+  RefreshCw,
   RotateCcw,
   Search,
   ShieldAlert,
@@ -201,6 +202,7 @@ export default function APIKeys() {
     id: number;
     name: string;
     key: string;
+    mode: "created" | "regenerated";
   } | null>(null);
   const [createdRevealAck, setCreatedRevealAck] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
@@ -212,6 +214,9 @@ export default function APIKeys() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
+  const [regeneratingIds, setRegeneratingIds] = useState<Set<number>>(
+    new Set(),
+  );
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
@@ -604,6 +609,7 @@ export default function APIKeys() {
         id: result.id,
         name: result.name,
         key: result.key,
+        mode: "created",
       });
       setCreatedRevealAck(false);
       setCreateForm(initialCreateForm);
@@ -665,6 +671,59 @@ export default function APIKeys() {
   };
 
   const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
+
+  const handleRegenerateKey = async (keyRow: APIKeyRow) => {
+    const confirmed = await confirm({
+      title: t("apiKeys.regenerateTitle"),
+      description: t("apiKeys.regenerateDesc"),
+      confirmText: t("apiKeys.regenerateConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setRegeneratingIds((prev) => new Set(prev).add(keyRow.id));
+    try {
+      const result = await api.regenerateAPIKey(keyRow.id);
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.id === keyRow.id
+            ? {
+                ...item,
+                key: maskAPIKey(result.key),
+                raw_key: result.key,
+              }
+            : item,
+        ),
+      }));
+      setVisibleKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(keyRow.id);
+        return next;
+      });
+      setCreatedReveal({
+        id: result.id,
+        name: result.name,
+        key: result.key,
+        mode: "regenerated",
+      });
+      setCreatedRevealAck(false);
+      showToast(t("apiKeys.regenerateSuccess"));
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.regenerateFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setRegeneratingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(keyRow.id);
+        return next;
+      });
+    }
+  };
 
   const handleResetQuota = async (keyRow: APIKeyRow) => {
     const confirmed = await confirm({
@@ -799,6 +858,20 @@ export default function APIKeys() {
     if (!createdRevealAck) {
       showToast(t("apiKeys.createdRevealAckRequired"), "error");
       return;
+    }
+    if (createdReveal?.mode === "regenerated") {
+      const regeneratedID = createdReveal.id;
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.id === regeneratedID
+            ? {
+                ...item,
+                raw_key: "",
+              }
+            : item,
+        ),
+      }));
     }
     setCreatedReveal(null);
     setCreatedRevealAck(false);
@@ -1250,7 +1323,8 @@ export default function APIKeys() {
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
                           deletingIds.has(keyRow.id) ||
-                          resettingIds.has(keyRow.id);
+                          resettingIds.has(keyRow.id) ||
+                          regeneratingIds.has(keyRow.id);
                         const displayKey = isVisible
                           ? keyRow.raw_key || keyRow.key
                           : keyRow.key;
@@ -1394,6 +1468,22 @@ export default function APIKeys() {
                                 variant="outline"
                                 size="sm"
                                 disabled={isBusy}
+                                onClick={() =>
+                                  void handleRegenerateKey(keyRow)
+                                }
+                                className="min-w-[7rem] flex-1"
+                              >
+                                {regeneratingIds.has(keyRow.id) ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <RefreshCw className="size-3.5" />
+                                )}
+                                {t("apiKeys.regenerate")}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isBusy}
                                 onClick={() => startEditing(keyRow)}
                                 className="min-w-[6rem] flex-1"
                               >
@@ -1442,7 +1532,8 @@ export default function APIKeys() {
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
                               deletingIds.has(keyRow.id) ||
-                              resettingIds.has(keyRow.id);
+                              resettingIds.has(keyRow.id) ||
+                              regeneratingIds.has(keyRow.id);
                             const displayKey = isVisible
                               ? keyRow.raw_key || keyRow.key
                               : keyRow.key;
@@ -1605,6 +1696,22 @@ export default function APIKeys() {
                                         {t("apiKeys.resetQuota")}
                                       </Button>
                                     ) : null}
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={isBusy}
+                                      onClick={() =>
+                                        void handleRegenerateKey(keyRow)
+                                      }
+                                      title={t("apiKeys.regenerate")}
+                                    >
+                                      {regeneratingIds.has(keyRow.id) ? (
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <RefreshCw className="size-3.5" />
+                                      )}
+                                      {t("apiKeys.regenerate")}
+                                    </Button>
                                     <Button
                                       variant="outline"
                                       size="sm"
@@ -2309,7 +2416,11 @@ export default function APIKeys() {
 
         <Modal
           show={Boolean(createdReveal)}
-          title={t("apiKeys.createdRevealTitle")}
+          title={t(
+            createdReveal?.mode === "regenerated"
+              ? "apiKeys.regeneratedRevealTitle"
+              : "apiKeys.createdRevealTitle",
+          )}
           onClose={closeCreatedReveal}
           contentClassName="sm:max-w-[560px]"
           footer={
@@ -2346,7 +2457,11 @@ export default function APIKeys() {
                     {t("apiKeys.createdRevealWarnTitle")}
                   </div>
                   <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {t("apiKeys.createdRevealWarnDesc")}
+                    {t(
+                      createdReveal.mode === "regenerated"
+                        ? "apiKeys.regeneratedRevealWarnDesc"
+                        : "apiKeys.createdRevealWarnDesc",
+                    )}
                   </p>
                 </div>
               </div>
@@ -2528,6 +2643,11 @@ function buildAPIKeysCSV(
   return [headers, ...rows]
     .map((row) => row.map((value) => csvEscape(String(value ?? ""))).join(","))
     .join("\n");
+}
+
+function maskAPIKey(key: string) {
+  if (key.length <= 8) return "****";
+  return `${key.slice(0, 4)}****...****${key.slice(-4)}`;
 }
 
 function formatExportGroups(

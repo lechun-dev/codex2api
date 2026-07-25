@@ -1560,6 +1560,48 @@ func (db *DB) UpdateAPIKeyLimits(ctx context.Context, id int64, limits APIKeyLim
 	return nil
 }
 
+// RegenerateAPIKey replaces only the secret value and returns the previous
+// value and display name. The row lock prevents concurrent rotations from
+// returning a key that has already been replaced by another request.
+func (db *DB) RegenerateAPIKey(ctx context.Context, id int64, newKey string) (oldKey, name string, err error) {
+	run := func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		selectQuery := `SELECT key, name FROM api_keys WHERE id = $1`
+		updateQuery := `UPDATE api_keys SET key = $1 WHERE id = $2`
+		if db.isSQLite() {
+			selectQuery = `SELECT key, name FROM api_keys WHERE id = ?`
+			updateQuery = `UPDATE api_keys SET key = ? WHERE id = ?`
+		} else {
+			selectQuery += ` FOR UPDATE`
+		}
+		if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&oldKey, &name); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, updateQuery, newKey, id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return sql.ErrNoRows
+		}
+		return tx.Commit()
+	}
+
+	if err := db.withSQLiteWriteLock(ctx, run); err != nil {
+		return "", "", err
+	}
+	return oldKey, name, nil
+}
+
 // UpdateAPIKey applies multiple editable fields in one transaction.
 // Omitted fields keep their existing values.
 func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) error {

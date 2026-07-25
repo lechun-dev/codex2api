@@ -132,6 +132,12 @@ type createAPIKeyResponse struct {
 	AllowedGroupIDs []int64 `json:"allowed_group_ids"`
 }
 
+type regenerateAPIKeyResponse struct {
+	ID   int64  `json:"id"`
+	Key  string `json:"key"`
+	Name string `json:"name"`
+}
+
 type opsOverviewResponse struct {
 	UpdatedAt      string              `json:"updated_at"`
 	UptimeSeconds  int64               `json:"uptime_seconds"`

@@ -3,9 +3,11 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,79 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 
 	if got := db.Driver(); got != "sqlite" {
 		t.Fatalf("Driver() = %q, want %q", got, "sqlite")
+	}
+}
+
+func TestSQLiteRegenerateAPIKeyPreservesMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	oldKey := "sk-old-key-12345678901234567890"
+	newKey := "sk-new-key-12345678901234567890"
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name:            "Client A",
+		Key:             oldKey,
+		QuotaLimit:      12.5,
+		QuotaUsed:       3.25,
+		ExpiresAt:       sql.NullTime{Time: time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second), Valid: true},
+		AllowedGroupIDs: []int64{3, 7},
+		Limits: APIKeyLimits{
+			ModelAllow:     []string{"gpt-5.4"},
+			RPM:            20,
+			MaxConcurrency: 3,
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions() error = %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET total_used = ?, reset_count = ? WHERE id = ?`, 8.5, 2, id); err != nil {
+		t.Fatalf("seed usage metadata: %v", err)
+	}
+
+	before, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(before) error = %v", err)
+	}
+	gotOldKey, gotName, err := db.RegenerateAPIKey(ctx, id, newKey)
+	if err != nil {
+		t.Fatalf("RegenerateAPIKey() error = %v", err)
+	}
+	if gotOldKey != oldKey || gotName != before.Name {
+		t.Fatalf("RegenerateAPIKey() = (%q, %q), want (%q, %q)", gotOldKey, gotName, oldKey, before.Name)
+	}
+
+	after, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(after) error = %v", err)
+	}
+	before.Key = newKey
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("row after regeneration = %#v, want %#v", after, before)
+	}
+	if _, err := db.GetAPIKeyByValue(ctx, oldKey); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("old key lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if row, err := db.GetAPIKeyByValue(ctx, newKey); err != nil || row.ID != id {
+		t.Fatalf("new key lookup = (%#v, %v), want id=%d", row, err, id)
+	}
+}
+
+func TestSQLiteRegenerateAPIKeyRejectsMissingID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	_, _, err = db.RegenerateAPIKey(context.Background(), 999, "sk-new-key-12345678901234567890")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("RegenerateAPIKey() error = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -756,10 +831,10 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 		t.Fatalf("InsertAccount codex 返回错误: %v", err)
 	}
 	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
-		"upstream_type":  "grok",
-		"refresh_token":  "rt-grok",
-		"access_token":   "at-grok",
-		"email":          "g@example.com",
+		"upstream_type": "grok",
+		"refresh_token": "rt-grok",
+		"access_token":  "at-grok",
+		"email":         "g@example.com",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)

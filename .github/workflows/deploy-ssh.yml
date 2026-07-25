@@ -135,12 +135,12 @@ jobs:
           if ! timeout --signal=TERM 120s ssh "${ssh_opts[@]}" "$remote" "
             set -eu
             sudo -n systemctl restart '$SERVICE_NAME'
-            sudo -n systemctl is-active --quiet '$SERVICE_NAME'
+            systemctl is-active --quiet '$SERVICE_NAME'
           "; then
             echo "Service restart failed or timed out; collecting diagnostics" >&2
             ssh "${ssh_opts[@]}" "$remote" "
-              sudo -n systemctl --no-pager --full status '$SERVICE_NAME' || true
-              sudo -n journalctl -u '$SERVICE_NAME' --no-pager -n 50 || true
+              systemctl --no-pager --full status '$SERVICE_NAME' || true
+              journalctl -u '$SERVICE_NAME' --no-pager -n 50 || true
             " || true
             exit 1
           fi

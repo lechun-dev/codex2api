@@ -94,6 +94,10 @@ type Handler struct {
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
 	mergeDuplicateMu sync.Mutex
+
+	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
+	// 防止并发请求在“检查不存在”后同时建号。
+	agentIdentityImportMu sync.Mutex
 }
 
 type chartCacheEntry struct {
@@ -541,6 +545,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
+	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
@@ -968,7 +973,10 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	h.store.TriggerUsageProbeAsync()
 	h.store.TriggerRecoveryProbeAsync()
 
-	rows, err := h.db.ListActive(ctx)
+	// Optional ?channel=codex|grok — server-side filter so Grok/Codex admin
+	// pages only transfer and enrich their own account set.
+	channel := parseUsageChannel(c)
+	rows, err := h.db.ListActiveByChannel(ctx, channel)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -5354,6 +5362,36 @@ func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
 	}
 	if items == nil {
 		items = []database.APIKeyTokenStat{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
+// GetAPIKeyAccountStats 返回单个 API Key 按上游账号拆分的用量（账号明细"按 Key 分解"的转置视图）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// GET /api/admin/usage/api-keys/:id/accounts
+func (h *Handler) GetAPIKeyAccountStats(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的 API Key ID")
+		return
+	}
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	items, err := h.db.ListAPIKeyAccountStats(ctx, id, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyAccountStat{}
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }

@@ -29,6 +29,22 @@ func TestRewriteSQLForMySQLJSONCasts(t *testing.T) {
 	}
 }
 
+func TestAccountChannelPredicateUsesMySQL56CompatibleSQL(t *testing.T) {
+	db := &DB{driver: "mysql"}
+	got := db.accountUpstreamTypeIsGrokPredicate()
+
+	for _, fragment := range []string{"CAST(credentials AS CHAR)", "REGEXP", "[[:space:]]"} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("MySQL account channel predicate missing %q: %s", fragment, got)
+		}
+	}
+	for _, incompatible := range []string{"JSON_EXTRACT", "->>"} {
+		if strings.Contains(strings.ToUpper(got), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q leaked into predicate: %s", incompatible, got)
+		}
+	}
+}
+
 func TestRewriteSQLForMySQLRepeatedPlaceholders(t *testing.T) {
 	query, order := rewriteSQLForMySQLWithParamOrder(`SELECT $1, $2, $2 FROM usage_logs WHERE created_at >= $1`)
 	wantQuery := `SELECT ?, ?, ? FROM usage_logs WHERE created_at >= ?`

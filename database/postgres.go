@@ -3783,6 +3783,17 @@ type AccountUsageDayStat struct {
 	UserBilled    float64 `json:"user_billed"`
 }
 
+// AccountKeyStat 单账号内按下游 Key 拆分的用量：某个 Key 调用了这个账号多少。
+type AccountKeyStat struct {
+	APIKeyID      int64   `json:"api_key_id"`
+	APIKeyName    string  `json:"api_key_name"`
+	APIKeyMasked  string  `json:"api_key_masked"`
+	Requests      int64   `json:"requests"`
+	Tokens        int64   `json:"tokens"`
+	AccountBilled float64 `json:"account_billed"`
+	UserBilled    float64 `json:"user_billed"`
+}
+
 // AccountUsageDetail 单账号用量详情
 type AccountUsageDetail struct {
 	PeriodDays            int                   `json:"period_days"`
@@ -3816,6 +3827,7 @@ type AccountUsageDetail struct {
 	HighestRequestDay     *AccountUsageDayStat  `json:"highest_request_day,omitempty"`
 	History               []AccountUsageDayStat `json:"history"`
 	Models                []AccountModelStat    `json:"models"`
+	ByAPIKey              []AccountKeyStat      `json:"by_api_key"`
 }
 
 // GetChartAggregation 在数据库层完成图表数据的分桶聚合（无需传输原始行）
@@ -4155,8 +4167,52 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 	if result.Models == nil {
 		result.Models = []AccountModelStat{}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	return result, rows.Err()
+	// 按下游 Key 拆分：这个账号被哪些 Key 各调用了多少（成本核算用）。
+	keyQuery := `
+	SELECT
+		COALESCE(api_key_id, 0),
+		COALESCE(NULLIF(api_key_name, ''), ''),
+		COALESCE(api_key_masked, ''),
+		COUNT(*) AS requests,
+		COALESCE(SUM(total_tokens), 0) AS tokens,
+		COALESCE(SUM(account_billed), 0) AS account_billed,
+		COALESCE(SUM(user_billed), 0) AS user_billed
+	FROM usage_logs
+	WHERE account_id = $1
+	  AND ` + timeWhere + `
+	  AND status_code <> 499
+	GROUP BY 1, 2, 3
+	ORDER BY 4 DESC`
+
+	keyRows, err := db.conn.QueryContext(ctx, keyQuery, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer keyRows.Close()
+	for keyRows.Next() {
+		var k AccountKeyStat
+		if err := keyRows.Scan(
+			&k.APIKeyID,
+			&k.APIKeyName,
+			&k.APIKeyMasked,
+			&k.Requests,
+			&k.Tokens,
+			&k.AccountBilled,
+			&k.UserBilled,
+		); err != nil {
+			return nil, err
+		}
+		result.ByAPIKey = append(result.ByAPIKey, k)
+	}
+	if result.ByAPIKey == nil {
+		result.ByAPIKey = []AccountKeyStat{}
+	}
+
+	return result, keyRows.Err()
 }
 
 // ListUsageLogsByTimeRange 按时间范围查询请求日志
@@ -4729,10 +4785,39 @@ func (db *DB) getAccountsBilledSinceChunk(ctx context.Context, ids []int64, wind
 
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
+	return db.ListActiveByChannel(ctx, "")
+}
+
+// accountUpstreamTypeIsGrokPredicate returns a driver-specific predicate.
+func (db *DB) accountUpstreamTypeIsGrokPredicate() string {
+	if db.isSQLite() {
+		return `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
+	}
+	if db.isMySQL() {
+		// MySQL 5.6 has no JSON_EXTRACT; credentials is stored as MEDIUMTEXT.
+		return `LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+	}
+	return `LOWER(COALESCE(credentials->>'upstream_type', '')) = 'grok'`
+}
+
+// ListActiveByChannel 返回未删除账号；channel 为空返回全部，
+// "grok" 仅 Grok 上游，"codex" 为非 Grok（含默认 Codex / OpenAI Responses 等）。
+// 过滤依据 credentials.upstream_type，与管理后台列表的 grok_api 判定一致。
+func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*AccountRow, error) {
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	switch channel {
+	case UpstreamChannelGrok:
+		where += ` AND ` + db.accountUpstreamTypeIsGrokPredicate()
+	case UpstreamChannelCodex:
+		// 非 grok 一律归入 codex 视图（缺省 upstream_type 的历史号也算 codex 侧）。
+		where += ` AND NOT (` + db.accountUpstreamTypeIsGrokPredicate() + `)`
+	}
+
 	query := `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
 		FROM accounts
-		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
+		WHERE ` + where + `
 		ORDER BY id
 	`
 	rows, err := db.conn.QueryContext(ctx, query)

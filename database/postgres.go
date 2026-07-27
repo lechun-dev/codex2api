@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/internal/openaiidentity"
 	"github.com/lib/pq"
@@ -208,6 +209,10 @@ type DB struct {
 	logStop chan struct{}
 	logWg   sync.WaitGroup
 
+	// 缓冲溢出/脏数据丢弃的累计条数，暴露在运行状态里供运维观察
+	usageLogDropped   int64
+	usageLogDropLogAt time.Time // 溢出日志的限流时间戳，由 logMu 保护
+
 	usageLogMode                 atomic.Value // string: full|errors|off
 	usageLogBatchSize            int64
 	usageLogFlushInterval        int64        // ns
@@ -216,6 +221,12 @@ type DB struct {
 	accountInsertMu              sync.Mutex
 	sqliteWriteSem               chan struct{}
 	sqliteSingleConn             bool
+
+	// 配了 scope 累计额度的 API Key 集合（issue #439 v2）。落库热路径靠它跳过
+	// 绝大多数 Key，60s 刷新一次；管理端保存后会主动失效。
+	scopeQuotaMu        sync.Mutex
+	scopeQuotaKeys      map[int64]struct{}
+	scopeQuotaExpiresAt time.Time
 }
 
 const (
@@ -227,9 +238,20 @@ const (
 	defaultUsageLogBatchSize            = 200
 	defaultUsageLogFlushIntervalSeconds = 5
 	minUsageLogBatchSize                = 1
-	maxUsageLogBatchSize                = 10000
+	maxUsageLogBatchSize                = 1000
 	minUsageLogFlushIntervalSeconds     = 1
 	maxUsageLogFlushIntervalSeconds     = 300
+
+	postgresMaxBindParams       = 65535
+	usageLogInsertColumnCount   = 49
+	maxUsageLogInsertRowsPerSQL = 1000
+	maxPostgresBindParams       = postgresMaxBindParams
+	maxUsageLogRowsPerBatch     = maxPostgresBindParams / usageLogInsertColumnCount
+
+	// usageLogBufferHardLimit 内存缓冲的硬上限。PG 长时间不可用时（维护、主从切换、
+	// 磁盘写满）失败批次会一直被放回缓冲区，没有上限的话内存一路涨到 OOM——那会把
+	// 整个网关拖死，比丢日志严重得多。超限时丢最旧的，丢弃条数计入运行状态。
+	usageLogBufferHardLimit = 20000
 )
 
 var ErrDuplicateAccountCredential = errors.New("duplicate account credential")
@@ -320,12 +342,6 @@ type usageLogEntry struct {
 	UpstreamErrorKind    string
 	ErrorMessage         string
 }
-
-const (
-	usageLogInsertColumnCount = 49
-	maxPostgresBindParams     = 65535
-	maxUsageLogRowsPerBatch   = maxPostgresBindParams / usageLogInsertColumnCount
-)
 
 // New 创建数据库连接并自动建表。
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
@@ -540,10 +556,12 @@ func (db *DB) Close() error {
 	if !db.DrainBackgroundTasks(2 * time.Second) {
 		log.Printf("数据库后台任务超过优雅关闭窗口，已取消并等待退出")
 	}
-	// 停止批量写入并刷完缓冲
+	// 停止批量写入并刷完缓冲。这里必须用 FlushUsageLogs 而不是 flushLogs：
+	// 后者每次只取 usage_log_batch_size 条，剩余部分靠 notifyLogFlush 让后台协程接着刷，
+	// 而此刻 flusher 已经退出，没人消费这个信号，超出一个批次的日志会被静默丢弃。
 	close(db.logStop)
 	db.logWg.Wait()
-	db.flushLogs() // 最后一次 flush
+	db.FlushUsageLogs() // 最后一次 flush，刷完整个缓冲
 	if db.promptFilterAudit != nil {
 		db.promptFilterAudit.close(2 * time.Second)
 	}
@@ -675,6 +693,9 @@ type UsageLogRuntimeStats struct {
 	FlushIntervalSeconds int
 	BufferLength         int
 	BufferCapacity       int
+	// BufferLimit 内存缓冲硬上限，DroppedTotal 是启动以来因溢出或脏数据丢掉的日志条数。
+	BufferLimit  int
+	DroppedTotal int64
 }
 
 // GetUsageLogRuntimeStats 返回 usage_logs 配置和当前内存缓冲长度。
@@ -698,6 +719,8 @@ func (db *DB) GetUsageLogRuntimeStats() UsageLogRuntimeStats {
 	stats.BufferLength = len(db.logBuf)
 	stats.BufferCapacity = cap(db.logBuf)
 	db.logMu.Unlock()
+	stats.BufferLimit = usageLogBufferHardLimit
+	stats.DroppedTotal = atomic.LoadInt64(&db.usageLogDropped)
 
 	return stats
 }
@@ -842,7 +865,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS reasoning_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS first_token_ms INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS ws_acquire_ms INT DEFAULT 0;
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS reasoning_effort VARCHAR(20) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS reasoning_effort VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS via_websocket BOOLEAN DEFAULT FALSE;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS effective_model VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS inbound_endpoint VARCHAR(100) DEFAULT '';
@@ -850,10 +873,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS stream BOOLEAN DEFAULT false;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS compact BOOLEAN DEFAULT false;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS cached_tokens INT DEFAULT 0;
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS service_tier VARCHAR(20) DEFAULT '';
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS requested_service_tier VARCHAR(20) DEFAULT '';
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS actual_service_tier VARCHAR(20) DEFAULT '';
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS billing_service_tier VARCHAR(20) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS service_tier VARCHAR(100) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS requested_service_tier VARCHAR(100) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS actual_service_tier VARCHAR(100) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS billing_service_tier VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_id INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_name VARCHAR(255) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS api_key_masked VARCHAR(64) DEFAULT '';
@@ -869,7 +892,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_width INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_height INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_bytes INT DEFAULT 0;
-	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_format VARCHAR(20) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_format VARCHAR(100) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS image_size VARCHAR(32) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS account_billed DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS user_billed DOUBLE PRECISION DEFAULT 0;
@@ -879,6 +902,12 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT '';
 	-- 上游渠道（codex/grok），写入时按调度账号固化，供仪表盘/用量分渠道聚合
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS channel VARCHAR(16) DEFAULT '';
+	ALTER TABLE usage_logs ALTER COLUMN reasoning_effort TYPE VARCHAR(100);
+	ALTER TABLE usage_logs ALTER COLUMN service_tier TYPE VARCHAR(100);
+	ALTER TABLE usage_logs ALTER COLUMN requested_service_tier TYPE VARCHAR(100);
+	ALTER TABLE usage_logs ALTER COLUMN actual_service_tier TYPE VARCHAR(100);
+	ALTER TABLE usage_logs ALTER COLUMN billing_service_tier TYPE VARCHAR(100);
+	ALTER TABLE usage_logs ALTER COLUMN image_format TYPE VARCHAR(100);
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_channel_created_at ON usage_logs(channel, created_at);
@@ -927,6 +956,18 @@ func (db *DB) migrate(ctx context.Context) error {
 				recovery_probe_interval_minutes INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
+	CREATE TABLE IF NOT EXISTS api_key_scope_counters (
+		api_key_id BIGINT NOT NULL,
+		scope_type VARCHAR(16) NOT NULL,
+		scope_id BIGINT NOT NULL,
+		used_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+		used_tokens BIGINT NOT NULL DEFAULT 0,
+		used_requests BIGINT NOT NULL DEFAULT 0,
+		reset_count INTEGER NOT NULL DEFAULT 0,
+		last_reset_at TIMESTAMPTZ,
+		updated_at TIMESTAMPTZ DEFAULT NOW(),
+		PRIMARY KEY (api_key_id, scope_type, scope_id)
+	);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
 		account_id BIGINT NOT NULL,
 		model VARCHAR(100) NOT NULL,
@@ -1033,6 +1074,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1256,21 +1298,24 @@ const (
 )
 
 type APIKeyLimits struct {
-	ModelAllow          []string `json:"model_allow,omitempty"`
-	ModelDeny           []string `json:"model_deny,omitempty"`
-	PlanAllow           []string `json:"plan_allow,omitempty"`
-	RPM                 int      `json:"rpm,omitempty"`
-	RPD                 int      `json:"rpd,omitempty"`
-	MaxConcurrency      int      `json:"max_concurrency,omitempty"`
-	MaxClients          int      `json:"max_clients,omitempty"`
-	ClientWindowMinutes int      `json:"client_window_minutes,omitempty"`
-	ClientLimitMode     string   `json:"client_limit_mode,omitempty"`
-	CostLimit5h         float64  `json:"cost_limit_5h,omitempty"`
-	CostLimit7d         float64  `json:"cost_limit_7d,omitempty"`
-	CostLimit30d        float64  `json:"cost_limit_30d,omitempty"`
-	TokenLimit5h        int64    `json:"token_limit_5h,omitempty"`
-	TokenLimit7d        int64    `json:"token_limit_7d,omitempty"`
-	TokenLimit30d       int64    `json:"token_limit_30d,omitempty"`
+	ModelAllow []string `json:"model_allow,omitempty"`
+	ModelDeny  []string `json:"model_deny,omitempty"`
+	PlanAllow  []string `json:"plan_allow,omitempty"`
+	// NoAffinityGroupIDs 指定未携带 Codex 引擎指纹或 X-Codex2API-Affinity-Key 的请求使用的账号分组。
+	// 空表示不启用分流，继续沿用 AllowedGroupIDs 的现有行为。
+	NoAffinityGroupIDs  []int64 `json:"no_affinity_group_ids,omitempty"`
+	RPM                 int     `json:"rpm,omitempty"`
+	RPD                 int     `json:"rpd,omitempty"`
+	MaxConcurrency      int     `json:"max_concurrency,omitempty"`
+	MaxClients          int     `json:"max_clients,omitempty"`
+	ClientWindowMinutes int     `json:"client_window_minutes,omitempty"`
+	ClientLimitMode     string  `json:"client_limit_mode,omitempty"`
+	CostLimit5h         float64 `json:"cost_limit_5h,omitempty"`
+	CostLimit7d         float64 `json:"cost_limit_7d,omitempty"`
+	CostLimit30d        float64 `json:"cost_limit_30d,omitempty"`
+	TokenLimit5h        int64   `json:"token_limit_5h,omitempty"`
+	TokenLimit7d        int64   `json:"token_limit_7d,omitempty"`
+	TokenLimit30d       int64   `json:"token_limit_30d,omitempty"`
 	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
 	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
 	// 保留为向后兼容字段：新配置改用 ImageGenerationPolicy；未设 policy 时该 bool=true
@@ -1290,6 +1335,10 @@ type APIKeyLimits struct {
 	//   - codex:   仅非 Grok 账号（Codex OAuth / OpenAI Responses 中转）
 	//   - grok:    仅 Grok 账号（此时不再要求账号声明模型，直接透传请求模型）
 	UpstreamChannel string `json:"upstream_channel,omitempty"`
+	// ScopeLimits 是「该 Key × 某账号分组 / 某账号」维度的用量上限（issue #439）。
+	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
+	// 把该 scope 的账号从候选池剔除（自动落到其它分组），详见 APIKeyScopeLimit。
+	ScopeLimits []APIKeyScopeLimit `json:"scope_limits,omitempty"`
 }
 
 // 图片工具策略取值。
@@ -1338,10 +1387,12 @@ func (l APIKeyLimits) ResolveImageGenerationPolicy() string {
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
+		len(l.NoAffinityGroupIDs) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.MaxClients == 0 && l.ClientWindowMinutes == 0 && strings.TrimSpace(l.ClientLimitMode) == "" &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 &&
+		len(l.ScopeLimits) == 0 &&
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
@@ -1799,6 +1850,7 @@ type SystemSettings struct {
 	FirstTokenExcludesWsAcquire         bool // 落库 first_token_ms 扣除 WS 取连耗时，默认 false（原始值 = first_token_ms + ws_acquire_ms）
 	CodexContinueThinkingEnabled        bool // 检测到上游截断思考时自动续想并折叠成单响应，默认 false
 	CodexContinueMaxRounds              int  // 单次请求最大续想轮数（含首轮），默认 8
+	UTLSShutdownTimeoutMinutes          int  // uTLS 连接被摘出池后等待在途 stream 收尾的上限（分钟，默认 30，范围 1-240，issue #446）
 	AutoPause5hThreshold                float64
 	AutoPause7dThreshold                float64
 	AutoPause5hGuardBandPercent         float64
@@ -1988,7 +2040,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_busy_patience_sec, 2),
 			       COALESCE(overflow_auto_compact_enabled, false),
 			       COALESCE(first_token_excludes_ws_acquire, false),
-			       COALESCE(codex_preflight_sse_passthrough_enabled, false)
+			       COALESCE(codex_preflight_sse_passthrough_enabled, false),
+			       COALESCE(utls_shutdown_timeout_minutes, 30)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2051,6 +2104,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.OverflowAutoCompactEnabled,
 		&s.FirstTokenExcludesWsAcquire,
 		&s.CodexPreflightSSEPassthroughEnabled,
+		&s.UTLSShutdownTimeoutMinutes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2162,9 +2216,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_busy_patience_sec,
 					overflow_auto_compact_enabled,
 					first_token_excludes_ws_acquire,
-					codex_preflight_sse_passthrough_enabled
+					codex_preflight_sse_passthrough_enabled,
+					utls_shutdown_timeout_minutes
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2264,7 +2319,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_busy_patience_sec = EXCLUDED.codex_ws_busy_patience_sec,
 					overflow_auto_compact_enabled = EXCLUDED.overflow_auto_compact_enabled,
 					first_token_excludes_ws_acquire = EXCLUDED.first_token_excludes_ws_acquire,
-					codex_preflight_sse_passthrough_enabled = EXCLUDED.codex_preflight_sse_passthrough_enabled
+					codex_preflight_sse_passthrough_enabled = EXCLUDED.codex_preflight_sse_passthrough_enabled,
+					utls_shutdown_timeout_minutes = EXCLUDED.utls_shutdown_timeout_minutes
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2297,7 +2353,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexWSBusyPatienceSec(s.CodexWSBusyPatienceSec),
 		s.OverflowAutoCompactEnabled,
 		s.FirstTokenExcludesWsAcquire,
-		s.CodexPreflightSSEPassthroughEnabled)
+		s.CodexPreflightSSEPassthroughEnabled,
+		NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMinutes))
 	return err
 }
 
@@ -2410,6 +2467,28 @@ func normalizeCodexWSSilentMaxRetries(retries int) int {
 	return retries
 }
 
+// UTLS 优雅关闭等待上限的边界（分钟，issue #446）。
+const (
+	defaultUTLSShutdownTimeoutMinutes = 30
+	minUTLSShutdownTimeoutMinutes     = 1
+	maxUTLSShutdownTimeoutMinutes     = 240
+)
+
+// NormalizeUTLSShutdownTimeoutMinutes 把 uTLS 连接优雅关闭的等待上限夹到
+// 1-240 分钟，非正值回落默认 30。
+func NormalizeUTLSShutdownTimeoutMinutes(minutes int) int {
+	if minutes <= 0 {
+		return defaultUTLSShutdownTimeoutMinutes
+	}
+	if minutes < minUTLSShutdownTimeoutMinutes {
+		return minUTLSShutdownTimeoutMinutes
+	}
+	if minutes > maxUTLSShutdownTimeoutMinutes {
+		return maxUTLSShutdownTimeoutMinutes
+	}
+	return minutes
+}
+
 // NormalizeCodexContinueMaxRounds 把续想最大轮数限制在 1-32,非正值回落默认 8。
 func NormalizeCodexContinueMaxRounds(rounds int) int {
 	if rounds <= 0 {
@@ -2445,8 +2524,15 @@ func normalizeGrokConfig(raw string) string {
 
 // DeleteAPIKey 删除 API 密钥
 func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
-	_, err := db.conn.ExecContext(ctx, `DELETE FROM api_keys WHERE id = $1`, id)
-	return err
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM api_keys WHERE id = $1`, id); err != nil {
+		return err
+	}
+	// scope 累计计数器没有外键约束，删 Key 时顺带清掉，避免留下永远不会再被读到的孤行。
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM api_key_scope_counters WHERE api_key_id = $1`, id); err != nil {
+		return err
+	}
+	db.InvalidateScopeQuotaKeyCache()
+	return nil
 }
 
 // GetAllAPIKeyValues 获取所有密钥值（用于鉴权）
@@ -2731,6 +2817,55 @@ type UsageLog struct {
 	ErrorMessage         string    `json:"error_message"`
 }
 
+// usage_logs 中受 varchar 长度约束的列宽。这些字段大多直接来自下游请求体或上游响应
+// （reasoning_effort、service_tier、image_format 等），长度不受网关控制。一条超长值会让
+// 整条批量 INSERT 回滚，失败的 batch 又会被原样放回缓冲区头部，下一轮继续失败——
+// 单条脏数据就能永久堵死整个日志写入。因此写入前按列宽截断。
+const (
+	usageLogChannelMaxLen    = 16  // channel
+	usageLogImageSizeMaxLen  = 32  // image_size
+	usageLogShortTextMaxLen  = 64  // client_ip / api_key_masked / upstream_error_kind
+	usageLogTextMaxLen       = 100 // endpoint / model / *_service_tier / reasoning_effort ...
+	usageLogIDMaxLen         = 255 // session_id / conversation_id / previous_response_id
+	usageLogAPIKeyNameMaxLen = 255 // api_key_name
+)
+
+// clampUsageLogText 按字符数截断：PostgreSQL varchar(n) 限制的是字符而非字节，
+// 且按字节切会切出非法 UTF-8 序列。
+func clampUsageLogText(s string, maxRunes int) string {
+	if maxRunes <= 0 || len(s) <= maxRunes {
+		return s
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	count := 0
+	for i := range s {
+		count++
+		if count > maxRunes {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// trimUsageLogBufferLocked 把缓冲裁到硬上限以内，丢最旧的日志。调用方必须持有 logMu。
+// 丢弃的日志同时会丢掉它们那份 API Key 额度累加（额度计数器和日志在同一个事务里落库），
+// 这是过载/长时间断库下的取舍：宁可少记一段用量，也不能让进程 OOM。
+func (db *DB) trimUsageLogBufferLocked() {
+	overflow := len(db.logBuf) - usageLogBufferHardLimit
+	if overflow <= 0 {
+		return
+	}
+	db.logBuf = append(db.logBuf[:0], db.logBuf[overflow:]...)
+	total := atomic.AddInt64(&db.usageLogDropped, int64(overflow))
+	if now := time.Now(); now.Sub(db.usageLogDropLogAt) >= 30*time.Second {
+		db.usageLogDropLogAt = now
+		log.Printf("用量日志缓冲已达上限 %d 条，丢弃最旧的 %d 条（累计丢弃 %d 条），请检查数据库是否可写",
+			usageLogBufferHardLimit, overflow, total)
+	}
+}
+
 // InsertUsageLog 将用量事件追加到内存缓冲（非阻塞）。
 func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 	if db == nil || input == nil {
@@ -2738,20 +2873,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 	}
 	storeUsageLog := db.shouldStoreUsageLog(input)
 
-	// 计算计费金额（基于 input/output tokens 和模型）
-	// 使用 EffectiveModel 作为计费模型（如果有映射则使用映射后的模型）
-	billingModel := input.EffectiveModel
-	if billingModel == "" {
-		billingModel = input.Model
-	}
-
-	billingServiceTier := input.BillingServiceTier
-	if billingServiceTier == "" {
-		billingServiceTier = input.ActualServiceTier
-	}
-	if billingServiceTier == "" {
-		billingServiceTier = input.ServiceTier
-	}
+	billingServiceTier := usageLogBillingServiceTier(input)
 
 	serviceTier := input.ServiceTier
 	if serviceTier == "" {
@@ -2762,7 +2884,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 	}
 
 	// 计算账号计费金额（基于实际计费 service tier）
-	accountBilled := calculateCost(input.InputTokens, input.OutputTokens, input.CachedTokens, billingModel, billingServiceTier)
+	accountBilled := UsageLogBilledCost(input)
 
 	// 用户计费金额与账号计费金额相同（简化版，未来可支持倍率）
 	userBilled := accountBilled
@@ -2773,18 +2895,18 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 	entry := usageLogEntry{
 		StoreUsageLog:        storeUsageLog,
 		AccountID:            input.AccountID,
-		Channel:              input.Channel,
-		ClientIP:             input.ClientIP,
-		SessionID:            input.SessionID,
-		ConversationID:       input.ConversationID,
-		PreviousResponseID:   input.PreviousResponseID,
+		Channel:              clampUsageLogText(input.Channel, usageLogChannelMaxLen),
+		ClientIP:             clampUsageLogText(input.ClientIP, usageLogShortTextMaxLen),
+		SessionID:            clampUsageLogText(input.SessionID, usageLogIDMaxLen),
+		ConversationID:       clampUsageLogText(input.ConversationID, usageLogIDMaxLen),
+		PreviousResponseID:   clampUsageLogText(input.PreviousResponseID, usageLogIDMaxLen),
 		RequestText:          input.RequestText,
 		ClientUserAgent:      input.ClientUserAgent,
 		UpstreamUserAgent:    input.UpstreamUserAgent,
 		UserAgentOverridden:  input.UserAgentOverridden,
-		Endpoint:             input.Endpoint,
-		Model:                input.Model,
-		EffectiveModel:       input.EffectiveModel,
+		Endpoint:             clampUsageLogText(input.Endpoint, usageLogTextMaxLen),
+		Model:                clampUsageLogText(input.Model, usageLogTextMaxLen),
+		EffectiveModel:       clampUsageLogText(input.EffectiveModel, usageLogTextMaxLen),
 		PromptTokens:         input.PromptTokens,
 		CompletionTokens:     input.CompletionTokens,
 		TotalTokens:          input.TotalTokens,
@@ -2795,31 +2917,31 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 		ReasoningTokens:      input.ReasoningTokens,
 		FirstTokenMs:         input.FirstTokenMs,
 		WsAcquireMs:          input.WsAcquireMs,
-		ReasoningEffort:      input.ReasoningEffort,
-		InboundEndpoint:      input.InboundEndpoint,
-		UpstreamEndpoint:     input.UpstreamEndpoint,
+		ReasoningEffort:      clampUsageLogText(input.ReasoningEffort, usageLogTextMaxLen),
+		InboundEndpoint:      clampUsageLogText(input.InboundEndpoint, usageLogTextMaxLen),
+		UpstreamEndpoint:     clampUsageLogText(input.UpstreamEndpoint, usageLogTextMaxLen),
 		Stream:               input.Stream,
 		Compact:              input.Compact,
 		ViaWebsocket:         input.ViaWebsocket,
 		CachedTokens:         input.CachedTokens,
-		ServiceTier:          serviceTier,
-		RequestedServiceTier: input.RequestedServiceTier,
-		ActualServiceTier:    input.ActualServiceTier,
-		BillingServiceTier:   billingServiceTier,
+		ServiceTier:          clampUsageLogText(serviceTier, usageLogTextMaxLen),
+		RequestedServiceTier: clampUsageLogText(input.RequestedServiceTier, usageLogTextMaxLen),
+		ActualServiceTier:    clampUsageLogText(input.ActualServiceTier, usageLogTextMaxLen),
+		BillingServiceTier:   clampUsageLogText(billingServiceTier, usageLogTextMaxLen),
 		APIKeyID:             input.APIKeyID,
-		APIKeyName:           input.APIKeyName,
-		APIKeyMasked:         input.APIKeyMasked,
+		APIKeyName:           clampUsageLogText(input.APIKeyName, usageLogAPIKeyNameMaxLen),
+		APIKeyMasked:         clampUsageLogText(input.APIKeyMasked, usageLogShortTextMaxLen),
 		ImageCount:           input.ImageCount,
 		ImageWidth:           input.ImageWidth,
 		ImageHeight:          input.ImageHeight,
 		ImageBytes:           input.ImageBytes,
-		ImageFormat:          input.ImageFormat,
-		ImageSize:            input.ImageSize,
+		ImageFormat:          clampUsageLogText(input.ImageFormat, usageLogTextMaxLen),
+		ImageSize:            clampUsageLogText(input.ImageSize, usageLogImageSizeMaxLen),
 		AccountBilled:        accountBilled,
 		UserBilled:           userBilled,
 		IsRetryAttempt:       input.IsRetryAttempt,
 		AttemptIndex:         input.AttemptIndex,
-		UpstreamErrorKind:    input.UpstreamErrorKind,
+		UpstreamErrorKind:    clampUsageLogText(input.UpstreamErrorKind, usageLogShortTextMaxLen),
 		ErrorMessage:         input.ErrorMessage,
 	}
 	if err := db.protectUsageLogEntryForStorage(&entry); err != nil {
@@ -2830,6 +2952,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, entry)
+	db.trimUsageLogBufferLocked()
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
 
@@ -2992,36 +3115,160 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-// flushLogs 将缓冲中的日志批量写入 PG
+// FlushUsageLogs 同步刷完当前用量日志缓冲。正常运行由后台 flusher 按批/按间隔触发，
+// 这里给需要「写入后立刻可查」的调用方（测试、诊断路径）一个确定性入口。
+func (db *DB) FlushUsageLogs() {
+	if db == nil {
+		return
+	}
+	for db.flushLogBatch(true) {
+	}
+}
+
+// flushLogs 将缓冲中的日志按配置批量写入 PG。
+// 高并发下 logBuf 可能在一个 flush 间隔内积累到数千条；这里每次只取
+// usage_log_batch_size，避免一次事务过大，也避免 PostgreSQL 65535 bind 参数上限。
 func (db *DB) flushLogs() {
+	db.flushLogBatch(false)
+}
+
+func (db *DB) flushLogBatch(drain bool) bool {
+	if db == nil {
+		return false
+	}
+	batchSize := db.GetUsageLogBatchSize()
+	if batchSize <= 0 {
+		batchSize = defaultUsageLogBatchSize
+	}
+
 	db.logMu.Lock()
 	if len(db.logBuf) == 0 {
 		db.logMu.Unlock()
-		return
+		return false
 	}
-	batch := db.logBuf
-	db.logBuf = make([]usageLogEntry, 0, db.GetUsageLogBatchSize())
+	take := len(db.logBuf)
+	if take > batchSize {
+		take = batchSize
+	}
+	batch := make([]usageLogEntry, take)
+	copy(batch, db.logBuf[:take])
+	remaining := len(db.logBuf) - take
+	if remaining == 0 {
+		db.logBuf = make([]usageLogEntry, 0, batchSize)
+	} else {
+		next := make([]usageLogEntry, remaining, remaining+batchSize)
+		copy(next, db.logBuf[take:])
+		db.logBuf = next
+	}
 	db.logMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
-	var err error
-	// 使用批处理插入优化性能
-	if db.driver == "postgres" {
-		err = db.batchInsertLogs(ctx, batch)
-	} else {
-		err = db.insertSQLiteUsageLogBatch(ctx, batch)
-	}
-	if err != nil {
-		log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
-		db.requeueUsageLogBatch(batch)
-		return
+	if err := db.insertUsageLogBatch(ctx, batch); err != nil {
+		// 瞬时故障（连接断开、超时、死锁）原样放回缓冲区重试，一条都不能丢。
+		if !isUsageLogDataError(err) {
+			log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
+			db.requeueUsageLogBatch(batch)
+			return false
+		}
+		// 脏数据重试多少次都写不进去，隔离出来丢掉，其余照常落库。
+		pending, dropped := db.salvageUsageLogBatch(ctx, batch, err)
+		if dropped > 0 {
+			total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
+			log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
+				dropped, total, err)
+		}
+		if len(pending) > 0 {
+			log.Printf("批量写入日志部分失败，%d 条已放回缓冲区等待重试", len(pending))
+			db.requeueUsageLogBatch(pending)
+			return false
+		}
 	}
 
 	if storedLogCount := countStoredUsageLogs(batch); storedLogCount > 10 {
 		log.Printf("批量写入 %d 条使用日志", storedLogCount)
 	}
+	if remaining > 0 {
+		if drain {
+			return true
+		}
+		db.notifyLogFlush()
+	}
+	return false
+}
+
+// insertUsageLogBatch 按驱动把一批日志写进去。整批是一个事务：日志行、API Key 累计额度
+// 计数器、api_keys.quota_used 要么一起成功，要么一起回滚。
+func (db *DB) insertUsageLogBatch(ctx context.Context, batch []usageLogEntry) error {
+	if db.driver == "postgres" {
+		return db.batchInsertLogs(ctx, batch)
+	}
+	return db.insertSQLiteUsageLogBatch(ctx, batch)
+}
+
+// isUsageLogDataError 判断失败是不是「这批数据本身写不进去」。PostgreSQL 的 SQLSTATE
+// class 22（数据异常：超长、非法 UTF-8 字节、数值溢出…）和 class 23（约束冲突）重试多少次
+// 都不会成功；其余错误（连接断开、超时、死锁、只读事务）是瞬时故障，必须继续重试，
+// 绝不能顺手把日志丢掉。
+func isUsageLogDataError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pqErr *pq.Error
+	if !errors.As(err, &pqErr) {
+		return false
+	}
+	switch pqErr.Code.Class() {
+	case "22", "23":
+		return true
+	}
+	return false
+}
+
+// salvageUsageLogBatch 二分隔离写不进去的日志：能写的照常落库，脏数据丢掉并计数，
+// 途中遇到瞬时故障就把还没落库的部分交回调用方重试（已经写进去的不会再交回，避免重复计费）。
+//
+// 不做隔离的话，一条脏数据会让整批回滚、原样放回缓冲区头部、下一轮继续失败——日志永久停更，
+// 同一事务里的 API Key 额度计数器也跟着冻结，带预算的 Key 会一直判定为未超额。
+func (db *DB) salvageUsageLogBatch(ctx context.Context, batch []usageLogEntry, cause error) (pending []usageLogEntry, dropped int) {
+	return salvageUsageLogBatchWith(batch, cause,
+		func(chunk []usageLogEntry) error { return db.insertUsageLogBatch(ctx, chunk) },
+		func(e usageLogEntry, err error) {
+			log.Printf("丢弃 1 条写不进去的用量日志(endpoint=%s model=%s status=%d api_key_id=%d): %v",
+				e.Endpoint, e.Model, e.StatusCode, e.APIKeyID, err)
+		})
+}
+
+func salvageUsageLogBatchWith(
+	batch []usageLogEntry,
+	cause error,
+	insert func([]usageLogEntry) error,
+	onDrop func(usageLogEntry, error),
+) (pending []usageLogEntry, dropped int) {
+	if len(batch) == 0 {
+		return nil, 0
+	}
+	if len(batch) == 1 {
+		onDrop(batch[0], cause)
+		return nil, 1
+	}
+
+	mid := len(batch) / 2
+	for _, half := range [][]usageLogEntry{batch[:mid], batch[mid:]} {
+		err := insert(half)
+		if err == nil {
+			continue
+		}
+		if !isUsageLogDataError(err) {
+			pending = append(pending, half...)
+			continue
+		}
+		halfPending, halfDropped := salvageUsageLogBatchWith(half, err, insert, onDrop)
+		pending = append(pending, halfPending...)
+		dropped += halfDropped
+	}
+	return pending, dropped
 }
 
 func countStoredUsageLogs(batch []usageLogEntry) int {
@@ -3059,6 +3306,7 @@ func (db *DB) requeueUsageLogBatch(batch []usageLogEntry) {
 		requeued := make([]usageLogEntry, len(batch), len(batch)+db.GetUsageLogBatchSize())
 		copy(requeued, batch)
 		db.logBuf = requeued
+		db.trimUsageLogBufferLocked()
 		return
 	}
 
@@ -3066,6 +3314,7 @@ func (db *DB) requeueUsageLogBatch(batch []usageLogEntry) {
 	requeued = append(requeued, batch...)
 	requeued = append(requeued, db.logBuf...)
 	db.logBuf = requeued
+	db.trimUsageLogBufferLocked()
 }
 
 func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEntry) error {
@@ -3108,6 +3357,9 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 		}
 	}
 
+	if err := db.applyAPIKeyScopeCountersWithExec(ctx, tx, batch); err != nil {
+		return fmt.Errorf("更新 scope 累计额度: %w", err)
+	}
 	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
 		return fmt.Errorf("更新 API Key 额度用量: %w", err)
 	}
@@ -3117,8 +3369,9 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	return nil
 }
 
-// batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 参数上限（65535）被 usage log 的多列 INSERT 撑爆。
+// batchInsertLogs 使用 PostgreSQL 的批量插入优化。
+// PostgreSQL 单条语句最多 65535 个 bind 参数；usage_logs 当前每行 49 个参数，
+// 分批时同时受固定批次上限和 bind 参数上限约束。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -3131,10 +3384,14 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	defer tx.Rollback()
 
 	logsToStore := storedUsageLogs(batch)
+	maxRowsPerBatch := maxUsageLogInsertRowsPerSQL
+	if paramSafeRows := postgresMaxBindParams / usageLogInsertColumnCount; paramSafeRows > 0 && maxRowsPerBatch > paramSafeRows {
+		maxRowsPerBatch = paramSafeRows
+	}
 
 	// 分批处理
-	for start := 0; start < len(logsToStore); start += maxUsageLogRowsPerBatch {
-		end := start + maxUsageLogRowsPerBatch
+	for start := 0; start < len(logsToStore); start += maxRowsPerBatch {
+		end := start + maxRowsPerBatch
 		if end > len(logsToStore) {
 			end = len(logsToStore)
 		}
@@ -3143,6 +3400,9 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 		if err := db.batchInsertLogsChunk(ctx, tx, subBatch); err != nil {
 			return err
 		}
+	}
+	if err := db.applyAPIKeyScopeCountersWithExec(ctx, tx, batch); err != nil {
+		return fmt.Errorf("更新 scope 累计额度: %w", err)
 	}
 	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
 		return err
@@ -3194,6 +3454,9 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 func (db *DB) applyAPIKeyQuotaUsage(ctx context.Context, batch []usageLogEntry) error {
 	if db == nil {
 		return nil
+	}
+	if err := db.applyAPIKeyScopeCountersWithExec(ctx, db.conn, batch); err != nil {
+		return err
 	}
 	return db.applyAPIKeyQuotaUsageWithExec(ctx, db.conn, batch)
 }

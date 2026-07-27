@@ -40,6 +40,7 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "overflow_auto_compact_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_preflight_sse_passthrough_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "utls_shutdown_timeout_minutes", def: "INT DEFAULT 30"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -108,7 +109,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			reasoning_tokens INT DEFAULT 0,
 			first_token_ms INT DEFAULT 0,
 			ws_acquire_ms INT DEFAULT 0,
-			reasoning_effort VARCHAR(20) DEFAULT '',
+			reasoning_effort VARCHAR(100) DEFAULT '',
 			effective_model VARCHAR(100) DEFAULT '',
 			inbound_endpoint VARCHAR(100) DEFAULT '',
 			upstream_endpoint VARCHAR(100) DEFAULT '',
@@ -116,10 +117,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			compact TINYINT(1) DEFAULT 0,
 			via_websocket TINYINT(1) DEFAULT 0,
 			cached_tokens INT DEFAULT 0,
-			service_tier VARCHAR(20) DEFAULT '',
-			requested_service_tier VARCHAR(20) DEFAULT '',
-			actual_service_tier VARCHAR(20) DEFAULT '',
-			billing_service_tier VARCHAR(20) DEFAULT '',
+			service_tier VARCHAR(100) DEFAULT '',
+			requested_service_tier VARCHAR(100) DEFAULT '',
+			actual_service_tier VARCHAR(100) DEFAULT '',
+			billing_service_tier VARCHAR(100) DEFAULT '',
 			api_key_id BIGINT DEFAULT 0,
 			api_key_name VARCHAR(255) DEFAULT '',
 			api_key_masked VARCHAR(64) DEFAULT '',
@@ -127,7 +128,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			image_width INT DEFAULT 0,
 			image_height INT DEFAULT 0,
 			image_bytes INT DEFAULT 0,
-			image_format VARCHAR(20) DEFAULT '',
+			image_format VARCHAR(100) DEFAULT '',
 			image_size VARCHAR(32) DEFAULT '',
 			account_billed DOUBLE DEFAULT 0,
 			user_billed DOUBLE DEFAULT 0,
@@ -150,6 +151,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			expires_at DATETIME NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		apiKeyScopeCountersMySQLDDL(),
 		accountGroupsMySQLDDL(),
 		`CREATE TABLE IF NOT EXISTS account_group_members (
 			account_id BIGINT NOT NULL,
@@ -280,7 +282,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "reasoning_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "first_token_ms", "INT DEFAULT 0"},
 		{"usage_logs", "ws_acquire_ms", "INT DEFAULT 0"},
-		{"usage_logs", "reasoning_effort", "VARCHAR(20) DEFAULT ''"},
+		{"usage_logs", "reasoning_effort", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "effective_model", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "inbound_endpoint", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "VARCHAR(100) DEFAULT ''"},
@@ -288,10 +290,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "compact", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "via_websocket", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INT DEFAULT 0"},
-		{"usage_logs", "service_tier", "VARCHAR(20) DEFAULT ''"},
-		{"usage_logs", "requested_service_tier", "VARCHAR(20) DEFAULT ''"},
-		{"usage_logs", "actual_service_tier", "VARCHAR(20) DEFAULT ''"},
-		{"usage_logs", "billing_service_tier", "VARCHAR(20) DEFAULT ''"},
+		{"usage_logs", "service_tier", "VARCHAR(100) DEFAULT ''"},
+		{"usage_logs", "requested_service_tier", "VARCHAR(100) DEFAULT ''"},
+		{"usage_logs", "actual_service_tier", "VARCHAR(100) DEFAULT ''"},
+		{"usage_logs", "billing_service_tier", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "api_key_id", "BIGINT DEFAULT 0"},
 		{"usage_logs", "api_key_name", "VARCHAR(255) DEFAULT ''"},
 		{"usage_logs", "api_key_masked", "VARCHAR(64) DEFAULT ''"},
@@ -306,7 +308,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "image_width", "INT DEFAULT 0"},
 		{"usage_logs", "image_height", "INT DEFAULT 0"},
 		{"usage_logs", "image_bytes", "INT DEFAULT 0"},
-		{"usage_logs", "image_format", "VARCHAR(20) DEFAULT ''"},
+		{"usage_logs", "image_format", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "image_size", "VARCHAR(32) DEFAULT ''"},
 		{"usage_logs", "account_billed", "DOUBLE DEFAULT 0"},
 		{"usage_logs", "user_billed", "DOUBLE DEFAULT 0"},
@@ -425,6 +427,18 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 	if err := db.ensureMySQLVarcharMinLength(ctx, "prompt_filter_logs", "endpoint", 256, "VARCHAR(256) DEFAULT ''"); err != nil {
 		return err
 	}
+	for _, column := range []string{
+		"reasoning_effort",
+		"service_tier",
+		"requested_service_tier",
+		"actual_service_tier",
+		"billing_service_tier",
+		"image_format",
+	} {
+		if err := db.ensureMySQLVarcharMinLength(ctx, "usage_logs", column, 100, "VARCHAR(100) DEFAULT ''"); err != nil {
+			return err
+		}
+	}
 
 	indexes := []struct {
 		table string
@@ -492,6 +506,21 @@ func accountGroupsMySQLDDL() string {
 		base_concurrency_override INT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
+func apiKeyScopeCountersMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS api_key_scope_counters (
+		api_key_id BIGINT NOT NULL,
+		scope_type VARCHAR(16) NOT NULL,
+		scope_id BIGINT NOT NULL,
+		used_cost DOUBLE NOT NULL DEFAULT 0,
+		used_tokens BIGINT NOT NULL DEFAULT 0,
+		used_requests BIGINT NOT NULL DEFAULT 0,
+		reset_count INT NOT NULL DEFAULT 0,
+		last_reset_at DATETIME NULL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (api_key_id, scope_type, scope_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 
@@ -635,7 +664,8 @@ func systemSettingsMySQLDDL() string {
 		payload_rules MEDIUMTEXT NULL,
 		ignore_usage_limit_status TINYINT(1) DEFAULT 0,
 		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
-		auto_reset_credits_before_expiry_min INT DEFAULT 60
+		auto_reset_credits_before_expiry_min INT DEFAULT 60,
+		utls_shutdown_timeout_minutes INT DEFAULT 30
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

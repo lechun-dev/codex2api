@@ -167,6 +167,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			expires_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS api_key_scope_counters (
+			api_key_id INTEGER NOT NULL,
+			scope_type TEXT NOT NULL,
+			scope_id INTEGER NOT NULL,
+			used_cost REAL DEFAULT 0,
+			used_tokens INTEGER DEFAULT 0,
+			used_requests INTEGER DEFAULT 0,
+			reset_count INTEGER DEFAULT 0,
+			last_reset_at TIMESTAMP NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (api_key_id, scope_type, scope_id)
+		);`,
 		`CREATE TABLE IF NOT EXISTS account_groups (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT UNIQUE NOT NULL,
@@ -263,7 +275,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					model_pricing_sync_url TEXT DEFAULT '',
 					ignore_usage_limit_status INTEGER DEFAULT 0,
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
-					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60
+					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
+					utls_shutdown_timeout_minutes INTEGER DEFAULT 30
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -501,6 +514,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
+		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

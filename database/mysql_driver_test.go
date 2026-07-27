@@ -260,6 +260,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		OverflowAutoCompactEnabled:          true,
 		FirstTokenExcludesWsAcquire:         true,
 		CodexPreflightSSEPassthroughEnabled: true,
+		UTLSShutdownTimeoutMinutes:          45,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -286,16 +287,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
 		"grok_config = VALUES(grok_config)",
 		"codex_preflight_sse_passthrough_enabled = VALUES(codex_preflight_sse_passthrough_enabled)",
+		"utls_shutdown_timeout_minutes = VALUES(utls_shutdown_timeout_minutes)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 102 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 102", got)
+	if got := strings.Count(capture.query, "?"); got != 103 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 103", got)
 	}
-	if len(capture.args) != 102 {
-		t.Fatalf("rewritten settings argument count = %d, want 102", len(capture.args))
+	if len(capture.args) != 103 {
+		t.Fatalf("rewritten settings argument count = %d, want 103", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -314,11 +316,42 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.OverflowAutoCompactEnabled,
 		settings.FirstTokenExcludesWsAcquire,
 		settings.CodexPreflightSSEPassthroughEnabled,
+		int64(settings.UTLSShutdownTimeoutMinutes),
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
 		if got != want {
 			t.Fatalf("settings tail argument %d = %#v, want %#v", i, got, want)
+		}
+	}
+}
+
+func TestAPIKeyScopeCounterSQLUsesMySQL56Upserts(t *testing.T) {
+	db := &DB{driver: "mysql"}
+	queries := []string{db.resetAPIKeyScopeCounterSQL()}
+	accountQuery, groupQuery := db.apiKeyScopeCounterUpsertSQL()
+	queries = append(queries, accountQuery, groupQuery)
+
+	for _, query := range queries {
+		rewritten, order := rewriteSQLForMySQLWithParamOrder(query)
+		assertNoMySQL56IncompatibleSQL(t, rewritten)
+		if !strings.Contains(rewritten, "ON DUPLICATE KEY UPDATE") {
+			t.Fatalf("MySQL scope counter query is not an upsert: %s", rewritten)
+		}
+		if len(order) == 0 {
+			t.Fatalf("MySQL scope counter query lost placeholder order: %s", rewritten)
+		}
+	}
+	for _, fragment := range []string{
+		"VALUES(used_cost)",
+		"VALUES(used_tokens)",
+		"VALUES(used_requests)",
+	} {
+		if !strings.Contains(rewriteSQLForMySQL(accountQuery), fragment) {
+			t.Fatalf("MySQL account scope upsert missing %q: %s", fragment, accountQuery)
+		}
+		if !strings.Contains(rewriteSQLForMySQL(groupQuery), fragment) {
+			t.Fatalf("MySQL group scope upsert missing %q: %s", fragment, groupQuery)
 		}
 	}
 }

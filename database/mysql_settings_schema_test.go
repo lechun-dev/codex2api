@@ -48,6 +48,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_ws_busy_patience_sec INT DEFAULT 2",
 		"overflow_auto_compact_enabled TINYINT(1) DEFAULT 0",
 		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
+		"utls_shutdown_timeout_minutes INT DEFAULT 30",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -166,5 +167,26 @@ func TestMySQLAccountGroupSchemaIncludesBaseConcurrencyOverride(t *testing.T) {
 	ddl := accountGroupsMySQLDDL()
 	if !strings.Contains(ddl, "base_concurrency_override INT NULL") {
 		t.Fatalf("MySQL account_groups DDL missing base_concurrency_override: %s", ddl)
+	}
+}
+
+func TestMySQLAPIKeyScopeCountersSchemaIsMySQL56Compatible(t *testing.T) {
+	ddl := apiKeyScopeCountersMySQLDDL()
+	for _, needle := range []string{
+		"api_key_id BIGINT NOT NULL",
+		"scope_type VARCHAR(16) NOT NULL",
+		"scope_id BIGINT NOT NULL",
+		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+		"PRIMARY KEY (api_key_id, scope_type, scope_id)",
+		"ENGINE=InnoDB",
+	} {
+		if !strings.Contains(ddl, needle) {
+			t.Fatalf("MySQL api_key_scope_counters DDL missing %q: %s", needle, ddl)
+		}
+	}
+	for _, incompatible := range []string{"TIMESTAMPTZ", "BOOLEAN", "ON CONFLICT", "TEXT DEFAULT"} {
+		if strings.Contains(strings.ToUpper(ddl), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 incompatible syntax leaked into api_key_scope_counters DDL: %q", incompatible)
+		}
 	}
 }

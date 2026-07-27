@@ -55,6 +55,8 @@ type Handler struct {
 	promptRiskMu sync.Mutex
 	apiKeyGate   *apiKeyConcurrencyLimiter
 	convRecorder *conversationRecorder
+	scopeUsageMu sync.Mutex
+	scopeUsage   *apiKeyScopeUsageTracker
 }
 
 const (
@@ -178,6 +180,9 @@ const (
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
 	contextAPIKeyRow    = "apiKeyRow"
+	// contextScopeBudgetGate 存放本次请求的 scope 预算闸门（issue #439），
+	// 由 enforceAPIKeyLimits 计算一次，供账号过滤链与「无可用账号」分支复用。
+	contextScopeBudgetGate = "apiKeyScopeBudgetGate"
 )
 
 func requestAPIKeyID(c *gin.Context) int64 {
@@ -201,6 +206,60 @@ func sessionAffinityKey(sessionID string, apiKeyID int64) string {
 		return sessionID
 	}
 	return fmt.Sprintf("%s::api-key:%d", sessionID, apiKeyID)
+}
+
+// applyAffinityGroupRouting keeps fingerprinted requests on the API key's original groups
+// and routes requests without either a Codex engine fingerprint or the dedicated local
+// affinity header to the configured split groups.
+//
+// 当 Key 没配「允许账号分组」（= 不限分组）时，带指纹的请求改为「除分流组以外的全部账号」：
+// 否则分流组既服务无指纹请求、又照常接真 Codex 流量，隔离等于没做——而不限分组恰恰是
+// 绝大多数 Key 的默认配置。
+func applyAffinityGroupRouting(c *gin.Context, identity requestSessionIdentity, filter auth.AccountFilter) auth.AccountFilter {
+	row := apiKeyRowFromContext(c)
+	if row == nil || len(row.Limits.NoAffinityGroupIDs) == 0 {
+		return filter
+	}
+
+	splitGroups := int64GroupSet(row.Limits.NoAffinityGroupIDs)
+	if len(splitGroups) == 0 {
+		return filter
+	}
+
+	if !identity.hasRequestFingerprint {
+		return groupMembershipFilter(splitGroups, true, filter)
+	}
+
+	allowedGroups := int64GroupSet(row.AllowedGroupIDs)
+	if len(allowedGroups) == 0 {
+		// 不限分组：把分流组排除掉，其余（含未分组账号）照常可用。
+		return groupMembershipFilter(splitGroups, false, filter)
+	}
+	return groupMembershipFilter(allowedGroups, true, filter)
+}
+
+func int64GroupSet(ids []int64) map[int64]struct{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	set := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			set[id] = struct{}{}
+		}
+	}
+	return set
+}
+
+// groupMembershipFilter 在 filter 之上叠加分组门：want=true 要求账号命中 groups，
+// want=false 要求账号不在 groups 里。
+func groupMembershipFilter(groups map[int64]struct{}, want bool, filter auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || account.InAnyGroup(groups) != want {
+			return false
+		}
+		return filter == nil || filter(account)
+	}
 }
 
 const proOnlySparkModel = "gpt-5.3-codex-spark"
@@ -639,6 +698,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 		return
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
+	h.store.SetAPIKeyNoAffinityGroups(row.ID, row.Limits.NoAffinityGroupIDs)
 	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
 	h.store.SetAPIKeyUpstreamChannel(row.ID, row.Limits.ResolveUpstreamChannel())
 }
@@ -693,6 +753,8 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
+	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
+	h.recordAPIKeyScopeUsage(input)
 	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
 	// 账号已不在池中（如刚被删除）时按 codex 兜底。
 	if input.Channel == "" && h.store != nil {
@@ -2050,6 +2112,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -2083,6 +2149,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
+			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
@@ -2090,6 +2161,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if attempt == 0 {
 			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
 		}
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -3235,6 +3307,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
 	openAIResponsesBody := PrepareOpenAIResponsesCompactBody(rawBody)
@@ -3258,11 +3334,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
@@ -3754,8 +3835,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 
@@ -3788,10 +3873,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
+			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {

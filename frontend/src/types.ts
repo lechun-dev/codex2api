@@ -263,6 +263,8 @@ export interface AddAccountRequest {
   proxy_url: string
   allow_duplicate?: boolean
   custom_headers?: Record<string, string> | null
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 export interface AddATAccountRequest {
@@ -271,6 +273,8 @@ export interface AddATAccountRequest {
   proxy_url: string
   allow_duplicate?: boolean
   custom_headers?: Record<string, string> | null
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 // Codex Agent Identity auth.json 导入（auth_mode=agentIdentity，动态签名，不存 AT/RT）。
@@ -351,6 +355,8 @@ export interface AddGrokAccountRequest {
   models?: string[]
   model_mapping?: string
   proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 export type UpdateGrokAccountRequest = AddGrokAccountRequest
@@ -400,6 +406,8 @@ export interface GrokSSOImportRequest {
   base_url?: string
   models?: string[]
   proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 export interface GrokSSOImportItem {
@@ -423,6 +431,8 @@ export interface GrokBatchImportRequest {
   base_url?: string
   models?: string[]
   proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 // 结果结构与 SSO 导入一致，复用 GrokSSOImportItem。
@@ -742,6 +752,8 @@ export interface RuntimeStatusResponse {
     flush_interval_seconds: number
     buffer_length: number
     buffer_capacity: number
+    buffer_limit?: number
+    dropped_total?: number
   }
   probes: {
     status: RuntimeHealthStatus
@@ -828,12 +840,18 @@ export interface SystemSettings {
   overflow_auto_compact_enabled: boolean
   codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
+  utls_shutdown_timeout_minutes: number
   scheduler_mode: string
   affinity_mode?: string
   grok_affinity_mode?: string
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
   grok_max_rate_limit_retries?: number
+  grok_oauth_client_id?: string
+  /** 环境变量 GROK_OAUTH_CLIENT_ID 是否正压着上面的设置（只读，后端下发）。 */
+  grok_oauth_client_id_env_override?: boolean
+  /** 实际生效的 client_id（只读，后端下发）。 */
+  grok_oauth_client_id_effective?: string
   max_retries: number
   max_rate_limit_retries: number
   retry_interval_ms: number
@@ -1466,10 +1484,93 @@ export interface ModelPricingOverride {
   output_long?: number
 }
 
+/**
+ * 单条「该 Key × 某账号分组 / 某账号」的用量上限（issue #439）。
+ * 0 或缺省表示该维度不限；超额后默认把该 scope 的账号从调度候选中剔除。
+ */
+export interface APIKeyScopeLimit {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  /** skip: 剔除该 scope 后继续用其它账号（默认）；reject: 直接 429。 */
+  on_exhausted?: 'skip' | 'reject'
+  cost_5h?: number
+  cost_1d?: number
+  cost_7d?: number
+  cost_30d?: number
+  token_5h?: number
+  token_1d?: number
+  token_7d?: number
+  token_30d?: number
+  requests_1d?: number
+  /** 该 Key 在这条 scope 上的最大在途请求数（进程内软上限）。 */
+  max_concurrency?: number
+  /** 累计额度：不随时间回落，用完需手动重置。 */
+  quota_cost?: number
+  quota_tokens?: number
+  quota_requests?: number
+}
+
+/** 某条 scope 限额在某窗口的当前用量（GET /api/admin/keys/:id/scope-usage）。 */
+export interface APIKeyScopeUsageWindow {
+  window: string
+  requests: number
+  tokens: number
+  user_billed: number
+  cost_limit?: number
+  token_limit?: number
+  request_limit?: number
+  exhausted: boolean
+}
+
+export interface APIKeyScopeCumulativeUsage {
+  used_cost: number
+  used_tokens: number
+  used_requests: number
+  quota_cost?: number
+  quota_tokens?: number
+  quota_requests?: number
+  reset_count: number
+  last_reset_at?: string
+  exhausted: boolean
+}
+
+/** 一条 scope 预算被判定耗尽的运行态统计（网关进程内，重启清零）。 */
+export interface APIKeyScopeSkipStat {
+  requests: number
+  first_at: string
+  last_at: string
+  last_message: string
+}
+
+export interface APIKeyScopeUsageItem {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  scope_name: string
+  scope_exists: boolean
+  on_exhausted: 'skip' | 'reject'
+  windows: APIKeyScopeUsageWindow[]
+  cumulative?: APIKeyScopeCumulativeUsage
+  skips?: APIKeyScopeSkipStat
+}
+
+/** 列表页用的 scope 预算概览（只给最紧的那个窗口）。 */
+export interface APIKeyScopeSummaryItem {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  scope_name: string
+  on_exhausted: 'skip' | 'reject'
+  window: string
+  metric: string
+  ratio: number
+  exhausted: boolean
+  skip_requests?: number
+}
+
 export interface APIKeyLimits {
   model_allow?: string[]
   model_deny?: string[]
   plan_allow?: string[]
+  no_affinity_group_ids?: number[]
   rpm?: number
   rpd?: number
   max_concurrency?: number
@@ -1486,6 +1587,8 @@ export interface APIKeyLimits {
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
   upstream_channel?: "codex" | "grok"
+  /** 分组 / 账号维度的用量预算（issue #439）。 */
+  scope_limits?: APIKeyScopeLimit[]
 }
 
 export interface APIKeyWindowUsage {

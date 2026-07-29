@@ -257,6 +257,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		CodexWSBusyAcquireMaxWaitSec:        45,
 		CodexWSBusyOverflowEnabled:          true,
 		CodexWSBusyPatienceSec:              3,
+		CodexWSWeakNetworkMode:              true,
 		OverflowAutoCompactEnabled:          true,
 		FirstTokenExcludesWsAcquire:         true,
 		CodexPreflightSSEPassthroughEnabled: true,
@@ -283,6 +284,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_ws_busy_acquire_max_wait_sec = VALUES(codex_ws_busy_acquire_max_wait_sec)",
 		"codex_ws_busy_overflow_enabled = VALUES(codex_ws_busy_overflow_enabled)",
 		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
+		"codex_ws_weak_network_mode = VALUES(codex_ws_weak_network_mode)",
 		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
 		"grok_config = VALUES(grok_config)",
@@ -293,11 +295,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 103 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 103", got)
+	if got := strings.Count(capture.query, "?"); got != 104 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 104", got)
 	}
-	if len(capture.args) != 103 {
-		t.Fatalf("rewritten settings argument count = %d, want 103", len(capture.args))
+	if len(capture.args) != 104 {
+		t.Fatalf("rewritten settings argument count = %d, want 104", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -317,6 +319,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.FirstTokenExcludesWsAcquire,
 		settings.CodexPreflightSSEPassthroughEnabled,
 		int64(settings.UTLSShutdownTimeoutMinutes),
+		settings.CodexWSWeakNetworkMode,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
@@ -403,16 +406,17 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 
 	db := &DB{conn: conn, driver: "mysql"}
 	entry := usageLogEntry{
-		AccountID:           7,
-		ClientIP:            "127.0.0.1",
-		SessionID:           "session-1",
-		ConversationID:      "conversation-1",
-		PreviousResponseID:  "response-1",
-		RequestText:         "hello",
-		WsAcquireMs:         1234,
-		ClientUserAgent:     "Codex Desktop/0.144.2",
-		UpstreamUserAgent:   "codex_cli_rs/0.144.2",
-		UserAgentOverridden: true,
+		AccountID:            7,
+		ClientIP:             "127.0.0.1",
+		SessionID:            "session-1",
+		ConversationID:       "conversation-1",
+		PreviousResponseID:   "response-1",
+		RequestText:          "hello",
+		HasCompactionHistory: true,
+		WsAcquireMs:          1234,
+		ClientUserAgent:      "Codex Desktop/0.144.2",
+		UpstreamUserAgent:    "codex_cli_rs/0.144.2",
+		UserAgentOverridden:  true,
 	}
 	if err := db.batchInsertLogsChunk(context.Background(), conn, []usageLogEntry{entry}); err != nil {
 		t.Fatalf("batchInsertLogsChunk() error = %v", err)
@@ -422,6 +426,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		"session_id",
 		"request_text",
 		"ws_acquire_ms",
+		"has_compaction_history",
 		"client_user_agent",
 		"upstream_user_agent",
 		"user_agent_overridden",

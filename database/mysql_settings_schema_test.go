@@ -46,6 +46,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_ws_busy_acquire_max_wait_sec INT DEFAULT 30",
 		"codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0",
 		"codex_ws_busy_patience_sec INT DEFAULT 2",
+		"codex_ws_weak_network_mode TINYINT(1) DEFAULT 0",
 		"overflow_auto_compact_enabled TINYINT(1) DEFAULT 0",
 		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
 		"utls_shutdown_timeout_minutes INT DEFAULT 30",

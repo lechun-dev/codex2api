@@ -115,6 +115,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			upstream_endpoint VARCHAR(100) DEFAULT '',
 			stream TINYINT(1) DEFAULT 0,
 			compact TINYINT(1) DEFAULT 0,
+			has_compaction_history TINYINT(1) DEFAULT 0,
 			via_websocket TINYINT(1) DEFAULT 0,
 			cached_tokens INT DEFAULT 0,
 			service_tier VARCHAR(100) DEFAULT '',
@@ -191,6 +192,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			test_ip VARCHAR(100) DEFAULT '',
 			test_location VARCHAR(255) DEFAULT '',
 			test_latency_ms INT DEFAULT 0,
+			test_status VARCHAR(20) NOT NULL DEFAULT 'untested',
 			UNIQUE KEY uniq_proxies_url (url)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		`CREATE TABLE IF NOT EXISTS account_events (
@@ -288,6 +290,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "upstream_endpoint", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "stream", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "compact", "TINYINT(1) DEFAULT 0"},
+		{"usage_logs", "has_compaction_history", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "via_websocket", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "service_tier", "VARCHAR(100) DEFAULT ''"},
@@ -379,7 +382,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "scheduler_mode", "VARCHAR(20) DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "VARCHAR(16) DEFAULT 'bounded'"},
 		{"system_settings", "client_compat_mode", "VARCHAR(20) DEFAULT 'preserve'"},
-		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.118.0'"},
+		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.144.1'"},
 		{"system_settings", "codex_user_agent_config", "TEXT NULL"},
 		{"system_settings", "usage_log_mode", "VARCHAR(20) DEFAULT 'full'"},
 		{"system_settings", "usage_log_batch_size", "INT DEFAULT 200"},
@@ -413,9 +416,11 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "codex_ws_hide_upstream_errors", "TINYINT(1) DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_retry_enabled", "TINYINT(1) DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_max_retries", "INT DEFAULT 2"},
+		{"system_settings", "codex_ws_weak_network_mode", "TINYINT(1) DEFAULT 0"},
 		{"proxies", "test_ip", "VARCHAR(100) DEFAULT ''"},
 		{"proxies", "test_location", "VARCHAR(255) DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INT DEFAULT 0"},
+		{"proxies", "test_status", "VARCHAR(20) NOT NULL DEFAULT 'untested'"},
 	}
 	columns = append(columns, mysql56SystemSettingsColumns...)
 	columns = append(columns, mysql56PromptFilterLogColumns...)
@@ -423,6 +428,14 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		if err := db.ensureMySQLColumn(ctx, column.table, column.name, column.def); err != nil {
 			return err
 		}
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE proxies
+		SET test_status = 'success'
+		WHERE COALESCE(test_status, 'untested') = 'untested'
+		  AND (COALESCE(test_ip, '') <> '' OR COALESCE(test_location, '') <> '' OR COALESCE(test_latency_ms, 0) > 0)
+	`); err != nil {
+		return err
 	}
 	if err := db.ensureMySQLVarcharMinLength(ctx, "prompt_filter_logs", "endpoint", 256, "VARCHAR(256) DEFAULT ''"); err != nil {
 		return err
@@ -614,7 +627,7 @@ func systemSettingsMySQLDDL() string {
 		prompt_filter_review_timeout_seconds INT DEFAULT 10,
 		prompt_filter_review_fail_closed TINYINT(1) DEFAULT 1,
 		client_compat_mode VARCHAR(20) DEFAULT 'preserve',
-		codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0',
+		codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1',
 		codex_user_agent_config TEXT NULL,
 		usage_log_mode VARCHAR(20) DEFAULT 'full',
 		usage_log_batch_size INT DEFAULT 200,
@@ -646,6 +659,7 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_hide_upstream_errors TINYINT(1) DEFAULT 1,
 		codex_ws_silent_retry_enabled TINYINT(1) DEFAULT 1,
 		codex_ws_silent_max_retries INT DEFAULT 2,
+		codex_ws_weak_network_mode TINYINT(1) DEFAULT 0,
 		codex_ws_size_router_enabled TINYINT(1) DEFAULT 1,
 		codex_ws_busy_acquire_max_wait_sec INT DEFAULT 30,
 		codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0,

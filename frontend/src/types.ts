@@ -72,6 +72,13 @@ export interface GrokFreeQuotaSnapshot {
   exhausted_at: string
 }
 
+export interface GrokPlanInfo {
+  key: string
+  display: string
+  paid: boolean
+  billing: boolean
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -89,6 +96,7 @@ export interface AccountRow {
   grok_api?: boolean
   agent_identity?: boolean
   grok_auth_kind?: string
+  grok_plan?: GrokPlanInfo
   grok_billing?: GrokBillingDetail
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
   grok_rate_limit?: GrokRateLimitSnapshot
@@ -827,6 +835,7 @@ export interface SystemSettings {
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean
+  codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
   codex_ws_keepalive_interval_sec: number
   codex_ws_hide_upstream_errors: boolean
@@ -1394,6 +1403,7 @@ export interface UsageLog {
   upstream_endpoint: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket?: boolean
   cached_tokens: number
   service_tier: string
@@ -1725,6 +1735,7 @@ export interface PublicAPIKeyUsageLog {
   service_tier: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket: boolean
   upstream_error_kind: string
   created_at: ISODateString

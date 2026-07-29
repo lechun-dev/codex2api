@@ -56,6 +56,10 @@ type Handler struct {
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	recordAccountEvent     func(int64, string, string)
+	proxyProbe             func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn      func() error
+	proxyBatchEventSender  func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu       sync.Mutex
 	cpuSampler             *cpuSampler
 	startedAt              time.Time
 	pgMaxConns             int
@@ -611,7 +615,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/proxies/:id", h.DeleteProxy)
 	api.PATCH("/proxies/:id", h.UpdateProxy)
 	api.POST("/proxies/batch-delete", h.BatchDeleteProxies)
+	api.POST("/proxies/clean-error", h.CleanErrorProxies)
 	api.POST("/proxies/test", h.TestProxy)
+	api.POST("/proxies/test-all", h.TestAllProxies)
 
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
@@ -838,6 +844,7 @@ type accountResponse struct {
 	GrokAPI                    bool                        `json:"grok_api,omitempty"`
 	AgentIdentity              bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind               string                      `json:"grok_auth_kind,omitempty"`
+	GrokPlan                   *auth.GrokPlan              `json:"grok_plan,omitempty"`
 	GrokBilling                json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota              *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
@@ -1019,8 +1026,24 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			email = baseURL
 		}
 		planType := row.GetCredential("plan_type")
-		if (isOpenAIResponsesAccount || isGrokAccount) && planType == "" {
+		if isOpenAIResponsesAccount && planType == "" {
 			planType = "api"
+		}
+		if isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey {
+			planType = "api"
+		}
+		if isGrokAccount {
+			if runtimeAccount, ok := accountMap[row.ID]; ok {
+				if runtimePlan := runtimeAccount.GetPlanType(); runtimePlan != "" {
+					planType = runtimePlan
+				}
+			}
+		}
+		var grokPlan *auth.GrokPlan
+		if isGrokAccount {
+			if resolved, ok := auth.ResolveGrokPlan(planType); ok {
+				grokPlan = &resolved
+			}
 		}
 		codexClientMetadataMode := ""
 		if isOpenAIResponsesAccount {
@@ -1051,6 +1074,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			GrokAPI:                  isGrokAccount,
 			AgentIdentity:            isAgentIdentityCredentialRow(row),
 			GrokAuthKind:             grokAuthKind,
+			GrokPlan:                 grokPlan,
 			GrokBilling:              grokBilling,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
@@ -3974,17 +3998,18 @@ func setupSSE(c *gin.Context) {
 	c.Writer.Flush()
 }
 
-func sendSSEJSON(c *gin.Context, event any) {
+func sendSSEJSON(c *gin.Context, event any) bool {
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Printf("序列化 SSE 事件失败: %v", err)
-		return
+		return false
 	}
 	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
 		log.Printf("写入 SSE 事件失败: %v", err)
-		return
+		return false
 	}
 	c.Writer.Flush()
+	return true
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
@@ -5160,16 +5185,20 @@ func emitBatchRefreshProgress(
 	}
 	current := int(atomic.AddInt64(completedCount, 1))
 	event := batchOperationEvent{
-		Type:      "progress",
-		Action:    "batch_refresh",
-		Current:   current,
-		Total:     total,
-		Success:   atomic.LoadInt64(successCount),
-		Failed:    atomic.LoadInt64(failedCount),
-		AccountID: accountID,
-		Message:   message,
+		Type:       "progress",
+		Action:     "batch_refresh",
+		Status:     "success",
+		HTTPStatus: http.StatusOK,
+		Current:    current,
+		Total:      total,
+		Success:    atomic.LoadInt64(successCount),
+		Failed:     atomic.LoadInt64(failedCount),
+		AccountID:  accountID,
+		Message:    message,
 	}
 	if failed {
+		event.Status = "failed"
+		event.HTTPStatus = batchOperationHTTPStatus(event.Status, message)
 		event.Error = message
 	}
 	onProgress(event)
@@ -5962,6 +5991,24 @@ func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
 	return append(values, value)
 }
 
+func parseUsageLogBoolFilter(c *gin.Context, name string) (*bool, bool) {
+	raw, exists := c.GetQuery(name)
+	if !exists {
+		return nil, true
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		value := true
+		return &value, true
+	case "false":
+		value := false
+		return &value, true
+	default:
+		writeError(c, http.StatusBadRequest, name+" 参数无效，需要 true 或 false")
+		return nil, false
+	}
+}
+
 // GetOpsErrorSummary 获取运维错误日志概览
 func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -6042,6 +6089,15 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 			if streamStr := c.Query("stream"); streamStr != "" {
 				v := streamStr == "true"
 				filter.StreamOnly = &v
+			}
+			var ok bool
+			filter.CompactOnly, ok = parseUsageLogBoolFilter(c, "compact")
+			if !ok {
+				return
+			}
+			filter.CompactionHistoryOnly, ok = parseUsageLogBoolFilter(c, "has_compaction_history")
+			if !ok {
+				return
 			}
 
 			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
@@ -6842,6 +6898,7 @@ type settingsResponse struct {
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
+	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
 	CodexWSHideUpstreamErrors           bool   `json:"codex_ws_hide_upstream_errors"`
@@ -6971,6 +7028,7 @@ type updateSettingsReq struct {
 	ProxyPoolEnabled                    *bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled                *bool    `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                 *bool    `json:"codex_force_websocket"`
+	CodexWSWeakNetworkMode              *bool    `json:"codex_ws_weak_network_mode"`
 	CodexWSKeepaliveEnabled             *bool    `json:"codex_ws_keepalive_enabled"`
 	CodexWSKeepaliveIntervalSec         *int     `json:"codex_ws_keepalive_interval_sec"`
 	CodexWSHideUpstreamErrors           *bool    `json:"codex_ws_hide_upstream_errors"`
@@ -7656,6 +7714,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
 		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
@@ -8087,6 +8146,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexForceWebsocket(*req.CodexForceWebsocket)
 		runtimeCfg.CodexForceWebsocket = *req.CodexForceWebsocket
 		log.Printf("设置已更新: codex_force_websocket = %t", *req.CodexForceWebsocket)
+	}
+
+	if req.CodexWSWeakNetworkMode != nil {
+		runtimeCfg.CodexWSWeakNetworkMode = *req.CodexWSWeakNetworkMode
+		log.Printf("设置已更新: codex_ws_weak_network_mode = %t", *req.CodexWSWeakNetworkMode)
 	}
 
 	if req.CodexWSKeepaliveEnabled != nil {
@@ -8699,6 +8763,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
 		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
@@ -8855,6 +8920,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:                h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                 h.store.CodexForceWebsocket(),
+		CodexWSWeakNetworkMode:              runtimeCfg.CodexWSWeakNetworkMode,
 		CodexWSKeepaliveEnabled:             h.store.CodexWSKeepaliveEnabled(),
 		CodexWSKeepaliveIntervalSec:         h.store.CodexWSKeepaliveIntervalSec(),
 		CodexWSHideUpstreamErrors:           h.store.CodexWSHideUpstreamErrors(),
@@ -9492,6 +9558,17 @@ func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
 
 // ==================== Proxies ====================
 
+func normalizeManagedProxyURL(raw string) (string, error) {
+	normalized := strings.TrimSpace(raw)
+	if err := security.ValidateProxyURL(normalized); err != nil {
+		return "", err
+	}
+	if _, err := security.ParseProxyURL(normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
 // ListProxies 获取代理列表
 func (h *Handler) ListProxies(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -9533,10 +9610,18 @@ func (h *Handler) AddProxies(c *gin.Context) {
 	// 过滤空行
 	cleaned := make([]string, 0, len(urls))
 	for _, u := range urls {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			cleaned = append(cleaned, u)
+		if strings.TrimSpace(u) != "" {
+			normalizedURL, err := normalizeManagedProxyURL(u)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+				return
+			}
+			cleaned = append(cleaned, normalizedURL)
 		}
+	}
+	if len(cleaned) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供至少一个有效的代理 URL")
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -9602,6 +9687,14 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	if req.URL != nil {
+		normalizedURL, err := normalizeManagedProxyURL(*req.URL)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+			return
+		}
+		req.URL = &normalizedURL
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -9644,6 +9737,73 @@ func (h *Handler) BatchDeleteProxies(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已删除 %d 个代理", deleted), "deleted": deleted})
 }
 
+// CleanErrorProxies 一键清理测试错误的代理，并解绑引用这些代理的账号。
+func (h *Handler) CleanErrorProxies(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	result, err := h.db.CleanErrorProxies(ctx)
+	if err != nil {
+		log.Printf("清理错误代理失败: %v", err)
+		writeError(c, http.StatusInternalServerError, "清理错误代理失败")
+		return
+	}
+
+	if h.store != nil {
+		for _, accountID := range result.UnboundAccountIDs {
+			h.store.ClearAccountProxyURLIfMatches(accountID, result.DeletedProxyURLs)
+		}
+		h.removeProxyURLsFromRuntime(result.DeletedProxyURLs)
+	}
+	if err := h.reloadProxyPool(); err != nil {
+		log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "错误代理已清理，但代理池刷新失败",
+			"cleaned": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已清理 %d 个错误代理并解绑 %d 个账号", result.Deleted, result.Unbound),
+		"cleaned": result.Deleted,
+		"unbound": result.Unbound,
+	})
+}
+
+func (h *Handler) persistProxyTestResult(ctx context.Context, id int64, expectedURL, status, ip, location string, latencyMs int) error {
+	if id <= 0 {
+		return nil
+	}
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.db.UpdateProxyTestResult(saveCtx, id, expectedURL, status, ip, location, latencyMs); err != nil {
+		return err
+	}
+	if status == database.ProxyTestStatusError {
+		h.removeProxyURLsFromRuntime([]string{expectedURL})
+	}
+	if err := h.reloadProxyPool(); err != nil {
+		return fmt.Errorf("代理测试状态已保存，但代理池刷新失败: %w", err)
+	}
+	return nil
+}
+
+func respondProxyTestSaveError(c *gin.Context, err error, probeMessage string) {
+	if errors.Is(err, database.ErrProxyTestTargetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "代理在测试期间已被修改，请重新测试"})
+		return
+	}
+	if strings.TrimSpace(probeMessage) == "" {
+		probeMessage = "代理测试已完成"
+	}
+	log.Printf("同步代理测试结果失败: probe_error=%q err=%v", probeMessage, err)
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": fmt.Sprintf("%s；保存测试结果或刷新代理池失败: %v", probeMessage, err),
+	})
+}
+
 // TestProxy 测试代理连通性与出口 IP 位置
 func (h *Handler) TestProxy(c *gin.Context) {
 	var req struct {
@@ -9660,64 +9820,44 @@ func (h *Handler) TestProxy(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请提供代理 URL")
 		return
 	}
-
-	// 创建使用指定代理的 HTTP client
-	transport := &http.Transport{}
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	transport.DialContext = baseDialer.DialContext
-	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("代理 URL 格式错误: %v", err)})
-		return
-	}
-	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-
-	apiLang := req.Lang
-	if apiLang == "" {
-		apiLang = "en"
-	}
-	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/?lang=%s&fields=status,message,country,regionName,city,isp,query", apiLang))
-	latencyMs := int(time.Since(start).Milliseconds())
-
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("连接失败: %v", err), "latency_ms": latencyMs})
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	result := gjson.ParseBytes(body)
-
-	if result.Get("status").String() != "success" {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": result.Get("message").String(), "latency_ms": latencyMs})
-		return
-	}
-
-	ip := result.Get("query").String()
-	country := result.Get("country").String()
-	region := result.Get("regionName").String()
-	city := result.Get("city").String()
-	isp := result.Get("isp").String()
-	location := country + "·" + region + "·" + city
-
-	// 持久化测试结果
+	expectedURL := proxyURL
 	if req.ID > 0 {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-		defer cancel()
-		if err := h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs); err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": false, "error": "代理测试结果保存失败: " + err.Error(), "latency_ms": latencyMs})
+		row, err := h.db.GetProxy(c.Request.Context(), req.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "代理不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+			return
+		}
+		storedURL := row.URL
+		if strings.TrimSpace(storedURL) != proxyURL {
+			c.JSON(http.StatusConflict, gin.H{"error": "代理已被修改，请刷新后重新测试"})
+			return
+		}
+		expectedURL = storedURL
+		proxyURL = strings.TrimSpace(storedURL)
+	}
+
+	result := h.runProxyProbe(c.Request.Context(), proxyURL, req.Lang)
+	if result.Conclusive {
+		status := database.ProxyTestStatusError
+		if result.Success {
+			status = database.ProxyTestStatusSuccess
+		}
+		if err := h.persistProxyTestResult(
+			c.Request.Context(),
+			req.ID,
+			expectedURL,
+			status,
+			result.IP,
+			result.Location,
+			result.LatencyMs,
+		); err != nil {
+			respondProxyTestSaveError(c, err, result.Error)
 			return
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":    true,
-		"ip":         ip,
-		"country":    country,
-		"region":     region,
-		"city":       city,
-		"isp":        isp,
-		"latency_ms": latencyMs,
-		"location":   location,
-	})
+	c.JSON(http.StatusOK, result)
 }

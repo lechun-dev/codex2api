@@ -484,6 +484,8 @@ type mysqlCaptureDriver struct {
 	query        string
 	args         []driver.NamedValue
 	lastInsertID int64
+	queryRow     []driver.Value
+	execCount    int
 }
 
 func (d *mysqlCaptureDriver) Open(string) (driver.Conn, error) {
@@ -507,20 +509,39 @@ func (c *mysqlCaptureConn) Begin() (driver.Tx, error) {
 func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.capture.query = query
 	c.capture.args = append([]driver.NamedValue(nil), args...)
+	c.capture.execCount++
 	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: 1}, nil
 }
 
 func (c *mysqlCaptureConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.capture.query = query
 	c.capture.args = append([]driver.NamedValue(nil), args...)
-	return mysqlCaptureRows{}, nil
+	return &mysqlCaptureRows{values: c.capture.queryRow}, nil
 }
 
-type mysqlCaptureRows struct{}
+type mysqlCaptureRows struct {
+	values  []driver.Value
+	emitted bool
+}
 
-func (mysqlCaptureRows) Columns() []string         { return nil }
-func (mysqlCaptureRows) Close() error              { return nil }
-func (mysqlCaptureRows) Next([]driver.Value) error { return io.EOF }
+func (r *mysqlCaptureRows) Columns() []string {
+	columns := make([]string, len(r.values))
+	for i := range columns {
+		columns[i] = fmt.Sprintf("column_%d", i)
+	}
+	return columns
+}
+
+func (*mysqlCaptureRows) Close() error { return nil }
+
+func (r *mysqlCaptureRows) Next(dest []driver.Value) error {
+	if r.emitted || len(r.values) == 0 {
+		return io.EOF
+	}
+	copy(dest, r.values)
+	r.emitted = true
+	return nil
+}
 
 type mysqlCaptureResult struct {
 	lastInsertID int64

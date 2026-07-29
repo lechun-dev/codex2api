@@ -1,7 +1,12 @@
 package database
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -77,6 +82,63 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
 		}
 	}
+}
+
+func TestEnsureMySQLColumnDefaultSkipsCurrentDefault(t *testing.T) {
+	capture := &mysqlCaptureDriver{queryRow: []driver.Value{"0.144.1"}}
+	driverName := fmt.Sprintf("codex2api-mysql-default-current-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	if err := db.ensureMySQLColumnDefault(
+		context.Background(),
+		"system_settings",
+		"codex_min_cli_version",
+		"0.144.1",
+		"VARCHAR(32) DEFAULT '0.144.1'",
+	); err != nil {
+		t.Fatalf("ensureMySQLColumnDefault() error = %v", err)
+	}
+	if capture.execCount != 0 {
+		t.Fatalf("ensureMySQLColumnDefault() executed ALTER for current default")
+	}
+}
+
+func TestEnsureMySQLColumnDefaultUpdatesStaleDefault(t *testing.T) {
+	capture := &mysqlCaptureDriver{queryRow: []driver.Value{"0.118.0"}}
+	driverName := fmt.Sprintf("codex2api-mysql-default-stale-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	if err := db.ensureMySQLColumnDefault(
+		context.Background(),
+		"system_settings",
+		"codex_min_cli_version",
+		"0.144.1",
+		"VARCHAR(32) DEFAULT '0.144.1'",
+	); err != nil {
+		t.Fatalf("ensureMySQLColumnDefault() error = %v", err)
+	}
+	if capture.execCount != 1 {
+		t.Fatalf("ensureMySQLColumnDefault() ALTER count = %d, want 1", capture.execCount)
+	}
+	want := "ALTER TABLE `system_settings` MODIFY COLUMN `codex_min_cli_version` VARCHAR(32) DEFAULT '0.144.1'"
+	if capture.query != want {
+		t.Fatalf("ensureMySQLColumnDefault() query = %q, want %q", capture.query, want)
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
 }
 
 func TestMySQL56AccountAndUsageAuditColumns(t *testing.T) {

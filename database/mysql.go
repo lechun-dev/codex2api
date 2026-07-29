@@ -429,6 +429,15 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := db.ensureMySQLColumnDefault(
+		ctx,
+		"system_settings",
+		"codex_min_cli_version",
+		"0.144.1",
+		"VARCHAR(32) DEFAULT '0.144.1'",
+	); err != nil {
+		return err
+	}
 	if _, err := db.conn.ExecContext(ctx, `
 		UPDATE proxies
 		SET test_status = 'success'
@@ -706,6 +715,24 @@ func (db *DB) ensureMySQLColumn(ctx context.Context, table, name, columnDef stri
 		return nil
 	}
 	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `%s` %s", table, name, columnDef))
+	return err
+}
+
+func (db *DB) ensureMySQLColumnDefault(ctx context.Context, table, name, expectedDefault, columnDef string) error {
+	var currentDefault sql.NullString
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT COLUMN_DEFAULT
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME = ?
+	`, table, name).Scan(&currentDefault); err != nil {
+		return err
+	}
+	if currentDefault.Valid && currentDefault.String == expectedDefault {
+		return nil
+	}
+	_, err := db.conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `%s` %s", table, name, columnDef))
 	return err
 }
 

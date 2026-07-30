@@ -185,6 +185,31 @@ ON CONFLICT(url) DO NOTHING RETURNING id`)
 	}
 }
 
+func TestResponseCacheSettingsSQLUsesMySQL56Syntax(t *testing.T) {
+	insert := rewriteSQLForMySQL(`
+		INSERT INTO system_settings (id) VALUES (1)
+		ON CONFLICT (id) DO NOTHING
+	`)
+	if !strings.Contains(insert, "INSERT IGNORE INTO system_settings") {
+		t.Fatalf("response cache settings insert was not rewritten: %s", insert)
+	}
+
+	selectForUpdate := rewriteSQLForMySQL(responseCacheSettingsSelectQuery(true))
+	for _, fragment := range []string{
+		"response_cache_local_max_bytes",
+		"response_cache_local_max_entry_bytes",
+		"response_cache_reconstruct_max_bytes",
+		"response_cache_config_generation",
+		"FOR UPDATE",
+	} {
+		if !strings.Contains(selectForUpdate, fragment) {
+			t.Fatalf("response cache settings query missing %q: %s", fragment, selectForUpdate)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, insert)
+	assertNoMySQL56IncompatibleSQL(t, selectForUpdate)
+}
+
 func TestRewriteSQLForMySQLAPIKeyIdentifier(t *testing.T) {
 	got := rewriteSQLForMySQL(`SELECT id, name, key, created_at FROM api_keys WHERE key = $1`)
 	want := "SELECT id, name, `key`, created_at FROM api_keys WHERE `key` = ?"

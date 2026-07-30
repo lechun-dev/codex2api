@@ -41,6 +41,10 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_preflight_sse_passthrough_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "utls_shutdown_timeout_minutes", def: "INT DEFAULT 30"},
+	{table: "system_settings", name: "response_cache_local_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
+	{table: "system_settings", name: "response_cache_local_max_entry_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
+	{table: "system_settings", name: "response_cache_reconstruct_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
+	{table: "system_settings", name: "response_cache_config_generation", def: "BIGINT NOT NULL DEFAULT 1"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -688,7 +692,11 @@ func systemSettingsMySQLDDL() string {
 		ignore_usage_limit_status TINYINT(1) DEFAULT 0,
 		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
 		auto_reset_credits_before_expiry_min INT DEFAULT 60,
-		utls_shutdown_timeout_minutes INT DEFAULT 30
+		utls_shutdown_timeout_minutes INT DEFAULT 30,
+		response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
+		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+		response_cache_config_generation BIGINT NOT NULL DEFAULT 1
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

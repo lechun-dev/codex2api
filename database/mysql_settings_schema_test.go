@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,6 +57,10 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"overflow_auto_compact_enabled TINYINT(1) DEFAULT 0",
 		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
 		"utls_shutdown_timeout_minutes INT DEFAULT 30",
+		"response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864",
+		"response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608",
+		"response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864",
+		"response_cache_config_generation BIGINT NOT NULL DEFAULT 1",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -80,6 +86,24 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 	} {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
+		}
+	}
+}
+
+func TestMySQL56V268MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_v2.6.8.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 v2.6.8 migration: %v", err)
+	}
+	script := string(raw)
+	for _, column := range mysql56SystemSettingsColumns[len(mysql56SystemSettingsColumns)-4:] {
+		if !strings.Contains(script, "ADD COLUMN "+column.name+" "+column.def) {
+			t.Fatalf("MySQL 5.6 v2.6.8 migration missing %+v", column)
+		}
+	}
+	for _, incompatible := range []string{"ADD COLUMN IF NOT EXISTS", "BOOLEAN", "ON CONFLICT", "TIMESTAMPTZ"} {
+		if strings.Contains(strings.ToUpper(script), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in migration", incompatible)
 		}
 	}
 }

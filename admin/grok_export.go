@@ -179,6 +179,7 @@ func grokExportFileName(email, sub string, id int64) string {
 // 单个账号直接返回裸 JSON；多个账号打包成 ZIP，内部每账号一个 <邮箱>.json，
 // 解开即可逐个导入。
 func (h *Handler) ExportGrokAccounts(c *gin.Context) {
+	setCredentialExportHeaders(c)
 	filter := c.DefaultQuery("filter", "all")
 	idsParam := c.Query("ids")
 
@@ -256,6 +257,14 @@ func (h *Handler) ExportGrokAccounts(c *gin.Context) {
 	}
 	c.Header("Content-Disposition", `attachment; filename="`+grokExportDownloadName(len(entries), "zip")+`"`)
 	c.Data(http.StatusOK, "application/zip", archive)
+}
+
+// setCredentialExportHeaders 防止包含 access_token、refresh_token 或 API Key 的
+// 导出响应被浏览器、反向代理或共享缓存持久化。
+func setCredentialExportHeaders(c *gin.Context) {
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 }
 
 // grokExportDownloadName 生成下载文件名，沿用仓库既有的导出命名约定

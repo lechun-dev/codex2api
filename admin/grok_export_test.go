@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 )
 
 func grokOAuthRow() *database.AccountRow {
@@ -479,5 +481,19 @@ func TestMarshalGrokExportEntryFormatting(t *testing.T) {
 	akIdx := strings.Index(string(encoded), `"auth_kind"`)
 	if atIdx < 0 || akIdx < 0 || atIdx > akIdx {
 		t.Errorf("键未按字母序排列: %s", encoded)
+	}
+}
+
+func TestSetCredentialExportHeadersDisablesCaching(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+
+	setCredentialExportHeaders(ctx)
+
+	if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") || !strings.Contains(got, "private") {
+		t.Fatalf("Cache-Control = %q, want private no-store", got)
+	}
+	if got := recorder.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("Pragma = %q, want no-cache", got)
 	}
 }

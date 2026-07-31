@@ -848,6 +848,9 @@ func TestGetAccountAuthJSONReturnsCodexAuthFile(t *testing.T) {
 	if got := recorder.Header().Get("Content-Disposition"); got != `attachment; filename="auth.json"` {
 		t.Fatalf("Content-Disposition = %q, want auth.json attachment", got)
 	}
+	if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
 
 	var payload struct {
 		AuthMode     string  `json:"auth_mode"`

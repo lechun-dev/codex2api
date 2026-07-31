@@ -9346,6 +9346,8 @@ type accountAuthJSON struct {
 
 // GetAccountAuthJSON 生成单账号可用于 Codex CLI 的 auth.json。
 func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
+	setCredentialExportHeaders(c)
+
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
@@ -9461,6 +9463,7 @@ func parseExportIDSet(idsParam string) map[int64]bool {
 
 // ExportAccounts 导出账号（CPA JSON 格式）
 func (h *Handler) ExportAccounts(c *gin.Context) {
+	setCredentialExportHeaders(c)
 	filter := c.DefaultQuery("filter", "healthy")
 	idsParam := c.Query("ids")
 	remote := c.Query("remote")
@@ -9521,6 +9524,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 // GET /api/admin/accounts/recycle-bin/export?ids=1,2,3
 // ids 可选：不传则导出回收站全部；传了则只导出指定 ID（须在回收站中）。
 func (h *Handler) ExportRecycleBinAccounts(c *gin.Context) {
+	setCredentialExportHeaders(c)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 

@@ -83,15 +83,27 @@ func decodeGrokResponseEncoding(resp *http.Response) {
 		return
 	}
 	// 多读 1 字节用于判断是否已超限：读满即说明压缩体比上限还大。
-	data, err := io.ReadAll(io.LimitReader(resp.Body, grokMaxCompressedBody+1))
-	_ = resp.Body.Close()
-	if err != nil || len(data) > grokMaxCompressedBody {
-		if len(data) > grokMaxCompressedBody {
-			log.Printf("Grok 非流式响应压缩体超过 %dMB，跳过解压原样透传", grokMaxCompressedBody>>20)
-		}
+	originalBody := resp.Body
+	data, err := io.ReadAll(io.LimitReader(originalBody, grokMaxCompressedBody+1))
+	if err != nil {
+		_ = originalBody.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(data))
 		return
 	}
+	if len(data) > grokMaxCompressedBody {
+		log.Printf("Grok 非流式响应压缩体超过 %dMB，跳过解压原样透传", grokMaxCompressedBody>>20)
+		// 已读取的前缀与尚未读取的原始响应体重新拼接。不能在这里关闭 originalBody，
+		// 否则所谓“原样透传”会实际变成只返回前 32 MiB 的截断响应。
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{
+			Reader: io.MultiReader(bytes.NewReader(data), originalBody),
+			Closer: originalBody,
+		}
+		return
+	}
+	_ = originalBody.Close()
 	decoded, derr := decodeContentEncoding(data, encoding)
 	if derr != nil {
 		// 解码失败时原样返回，避免把问题放大成空响应。

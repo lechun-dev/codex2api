@@ -100,6 +100,28 @@ func TestDecodeGrokResponseEncodingHighRatioBomb(t *testing.T) {
 	}
 }
 
+// TestDecodeGrokResponseEncodingOversizedCompressedBody 验证压缩体本身超过上限时
+// 仍完整透传。旧实现读取 limit+1 后关闭上游 Body，会静默截断剩余内容。
+func TestDecodeGrokResponseEncodingOversizedCompressedBody(t *testing.T) {
+	prefix := bytes.Repeat([]byte("x"), grokMaxCompressedBody+1)
+	suffix := []byte("must-not-be-truncated")
+	body := append(prefix, suffix...)
+	resp := responseWithBody(body, "gzip", "application/json")
+
+	decodeGrokResponseEncoding(resp)
+
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("超限时不应声明已解压")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取失败: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("超限压缩体被截断: got=%d want=%d", len(got), len(body))
+	}
+}
+
 func TestDecodeContentEncodingRejectsOversizedDecode(t *testing.T) {
 	bomb := gzipBytes(t, make([]byte, grokMaxDecodedBody+1))
 	if _, err := decodeContentEncoding(bomb, "gzip"); err == nil {

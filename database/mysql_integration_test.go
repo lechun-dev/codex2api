@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"os"
 	"testing"
 	"time"
@@ -37,21 +36,11 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemSettings before smoke failed: %v", err)
 	}
-	previousPromptFilterSecret, secretErr := db.GetPromptFilterNewAPISecret(ctx)
-	hadPromptFilterSecret := secretErr == nil
-	if secretErr != nil && !errors.Is(secretErr, sql.ErrNoRows) {
-		t.Fatalf("GetPromptFilterNewAPISecret before smoke failed: %v", secretErr)
-	}
 	t.Cleanup(func() {
 		if previousSettings != nil {
 			_ = db.UpdateSystemSettings(ctx, previousSettings)
 		} else {
 			_, _ = db.conn.ExecContext(ctx, "DELETE FROM system_settings WHERE id = 1")
-		}
-		if hadPromptFilterSecret {
-			_ = db.SetPromptFilterNewAPISecret(ctx, previousPromptFilterSecret)
-		} else {
-			_, _ = db.conn.ExecContext(ctx, "DELETE FROM prompt_filter_secrets WHERE id = 1")
 		}
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM usage_logs WHERE client_user_agent = ?", clientUserAgent)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM conversation_records WHERE request_id = ?", conversationRequestID)
@@ -60,6 +49,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM model_registry WHERE id = ?", modelID)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM proxies WHERE url = ?", proxyURL)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM account_groups WHERE name = ?", groupName)
+		_, _ = db.conn.ExecContext(ctx, "DELETE FROM prompt_filter_newapi_bindings WHERE api_key_id IN (SELECT id FROM api_keys WHERE `key` = ?)", smokeKey)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM api_keys WHERE `key` = ?", smokeKey)
 		_, _ = db.conn.ExecContext(ctx, "DELETE FROM accounts WHERE name IN (?, ?)", "mysql smoke account "+suffix, "mysql smoke responses "+suffix)
 	})
@@ -168,18 +158,6 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 		t.Fatalf("system settings were not persisted correctly: %#v", savedSettings)
 	}
 
-	promptFilterSecret := "mysql-smoke-prompt-filter-" + suffix
-	if err := db.SetPromptFilterNewAPISecret(ctx, promptFilterSecret); err != nil {
-		t.Fatalf("SetPromptFilterNewAPISecret failed: %v", err)
-	}
-	savedPromptFilterSecret, err := db.GetPromptFilterNewAPISecret(ctx)
-	if err != nil {
-		t.Fatalf("GetPromptFilterNewAPISecret failed: %v", err)
-	}
-	if savedPromptFilterSecret != promptFilterSecret {
-		t.Fatalf("prompt filter secret = %q, want %q", savedPromptFilterSecret, promptFilterSecret)
-	}
-
 	keyID, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
 		Name:            "mysql smoke key",
 		Key:             smokeKey,
@@ -201,6 +179,24 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	if row.ID != keyID || row.Key != smokeKey || len(row.AllowedGroupIDs) != 3 || row.Limits.RPM != 10 ||
 		row.Limits.ResolveImageGenerationPolicy() != ImageGenerationPolicyStrip {
 		t.Fatalf("unexpected API key row: %#v", row)
+	}
+	promptFilterSecret := "mysql-smoke-prompt-filter-secret-" + suffix
+	if err := db.CreatePromptFilterNewAPIBinding(ctx, &PromptFilterNewAPIBinding{
+		APIKeyID:              keyID,
+		PlatformCode:          "mysql-smoke",
+		PlatformName:          "MySQL Smoke",
+		Secret:                promptFilterSecret,
+		Enabled:               true,
+		RequireSignedIdentity: true,
+	}); err != nil {
+		t.Fatalf("CreatePromptFilterNewAPIBinding failed: %v", err)
+	}
+	savedBinding, err := db.GetPromptFilterNewAPIBinding(ctx, keyID)
+	if err != nil {
+		t.Fatalf("GetPromptFilterNewAPIBinding failed: %v", err)
+	}
+	if savedBinding.Secret != promptFilterSecret || savedBinding.PlatformCode != "mysql-smoke" || !savedBinding.RequireSignedIdentity {
+		t.Fatalf("unexpected prompt filter NewAPI binding: %#v", savedBinding)
 	}
 
 	groupID, err := db.CreateAccountGroup(ctx, groupName, "integration", "#123456", 0, 0, sql.NullInt64{Int64: 6, Valid: true})

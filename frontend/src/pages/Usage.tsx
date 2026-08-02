@@ -16,7 +16,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, APIKeyTokenStat, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
+import type { APIKeyRow, APIKeyTokenStat, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
 import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
@@ -71,6 +71,30 @@ function ReasoningEffortBadge({ effort }: { effort: string }) {
       title={`reasoning: ${label}`}
       className={`text-[11px] font-semibold lowercase tracking-wide ${getReasoningEffortBadgeClassName(label)}`}
     >
+      {label}
+    </Badge>
+  )
+}
+
+function InternalRequestBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const reason = log.internal_reason?.trim()
+  if (!reason) return null
+
+  const label = reason === 'overflow_compact_summary'
+    ? t('usage.internalOverflowSummary')
+    : t('usage.internalRequest')
+  const title = log.parent_request_id?.trim()
+    ? t('usage.internalRequestParentTooltip', { parentRequestId: log.parent_request_id.trim() })
+    : t('usage.internalRequestTooltip')
+
+  return (
+    <Badge
+      variant="outline"
+      className="gap-0.5 whitespace-nowrap border-transparent bg-fuchsia-500/12 text-[11px] font-semibold text-fuchsia-700 dark:bg-fuchsia-500/20 dark:text-fuchsia-300"
+      title={title}
+    >
+      <Brain className="size-3" />
       {label}
     </Badge>
   )
@@ -1114,13 +1138,15 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
   )
 }
 
-// CyberPolicyDetailButton: 对 cyber_policy 报错的请求，点击关联到提示词过滤日志，
-// 展示触发拦截的完整请求内容（为什么 & 是什么）。
+// New usage rows resolve by immutable incident ID. Only historical rows without
+// an ID fall back to the legacy nearest-timestamp inference endpoint.
 function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [detail, setDetail] = useState<PromptFilterLog | null>(null)
+  const [detail, setDetail] = useState<PromptPolicyIncidentDetailResponse | null>(null)
+  const [legacyDetail, setLegacyDetail] = useState<PromptFilterLog | null>(null)
+  const [legacyInferred, setLegacyInferred] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
 
@@ -1130,12 +1156,17 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     setLoading(true)
     setError(null)
     try {
-      const res = await api.matchPromptFilterLog({
-        at: log.created_at,
-        endpoint: log.endpoint,
-        apiKeyId: log.api_key_id || undefined,
-      })
-      setDetail(res.log)
+      if (log.prompt_policy_incident_id) {
+        setDetail(await api.getPromptPolicyIncident(log.prompt_policy_incident_id))
+      } else {
+        const res = await api.matchPromptFilterLog({
+          at: log.created_at,
+          endpoint: log.endpoint,
+          apiKeyId: log.api_key_id || undefined,
+        })
+        setLegacyDetail(res.log)
+        setLegacyInferred(res.legacy_inferred)
+      }
       setLoaded(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -1144,7 +1175,9 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     }
   }
 
-  const content = (detail?.full_text || detail?.text_preview || '').trim()
+  const incident = detail?.incident
+  const content = (incident?.prompt_text || incident?.prompt_preview || legacyDetail?.full_text || legacyDetail?.text_preview || '').trim()
+  const score = (value: number | null | undefined) => value === null || value === undefined ? t('usage.cyberPolicyUnscored') : String(value)
 
   return (
     <>
@@ -1173,8 +1206,49 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
             <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
           ) : error ? (
             <div className="py-4 text-sm text-red-500">{error}</div>
+          ) : incident ? (
+            <div className="space-y-3">
+              <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                <CyberPolicyField label={t('usage.cyberPolicyUpstreamResult')} value={`${incident.status_code || '-'} · ${incident.upstream_error_code || 'cyber_policy'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalResult')} value={`${t(`usage.cyberPolicyState.${incident.local_evaluation_state}`)} · ${t(`usage.cyberPolicyOutcome.${incident.local_outcome}`)}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalMiss')} value={incident.local_miss ? t('promptFilter.testResultYes') : t('promptFilter.testResultNo')} danger={incident.local_miss} />
+                <CyberPolicyField label={t('usage.cyberPolicyExecutionScore')} value={score(incident.local_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyAuditScore')} value={score(incident.local_audit_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyTransport')} value={`${incident.protocol || '-'} · ${incident.transport || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyAccountAttempt')} value={`${incident.account_id || '-'} · #${incident.attempt_index || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyReview')} value={incident.local_review_model ? `${incident.local_review_model} · ${incident.local_review_flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared')}` : t('promptFilter.testReviewSkipped')} />
+                <CyberPolicyField label={t('usage.cyberPolicyCandidate')} value={detail.candidate ? `${detail.candidate.status} · #${detail.candidate.id}` : '-'} />
+              </div>
+              {incident.local_evaluation_state === 'legacy_unknown' ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyUnknown')}</div>
+              ) : null}
+              {(incident.local_reason || incident.local_reason_code) ? (
+                <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+                  <div className="font-semibold text-muted-foreground">{t('usage.cyberPolicyReason')}</div>
+                  <div className="mt-1 break-words">{incident.local_reason || incident.local_reason_code}</div>
+                </div>
+              ) : null}
+              {detail.matches.length > 0 ? (
+                <div>
+                  <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyMatches')}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {detail.matches.map((match, index) => <Badge key={`${match.name}-${index}`} variant="secondary">{match.name} · {match.weight}</Badge>)}
+                  </div>
+                </div>
+              ) : null}
+              {content ? (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
+                    <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
+                  </div>
+                  <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground">{content}</pre>
+                </div>
+              ) : null}
+            </div>
           ) : content ? (
-            <div>
+            <div className="space-y-2">
+              {legacyInferred ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyInferred')}</div> : null}
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
                 <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
@@ -1187,6 +1261,15 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
         </div>
       </Modal>
     </>
+  )
+}
+
+function CyberPolicyField({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return (
+    <div className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
+      <div className="font-semibold text-muted-foreground">{label}</div>
+      <div className={cn('mt-1 break-words font-mono text-foreground', danger && 'text-red-600 dark:text-red-300')}>{value}</div>
+    </div>
   )
 }
 
@@ -2346,6 +2429,7 @@ export default function Usage() {
                             compact={log.compact}
                             hasCompactionHistory={log.has_compaction_history}
                           />
+                          <InternalRequestBadge log={log} />
                         </div>
                         <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
                           {formatBeijingTime(log.created_at)}
@@ -2562,6 +2646,7 @@ export default function Usage() {
                               compact={log.compact}
                               hasCompactionHistory={log.has_compaction_history}
                             />
+                            <InternalRequestBadge log={log} />
                           </div>
                         </TableCell>}
                         {visibleColumns.token && <TableCell>

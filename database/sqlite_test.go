@@ -883,7 +883,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "session_id", "conversation_id", "previous_response_id", "request_text", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "has_compaction_history", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "session_id", "conversation_id", "previous_response_id", "request_text", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "internal_reason", "parent_request_id", "prompt_policy_incident_id", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "has_compaction_history", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -1813,6 +1813,52 @@ func TestUsageLogsPersistUserAgentAudit(t *testing.T) {
 	}
 	if !logs[0].UserAgentOverridden {
 		t.Fatal("UserAgentOverridden = false, want true")
+	}
+}
+
+func TestUsageLogsPersistAttributedInternalRequest(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:       7,
+		Endpoint:        "/v1/responses",
+		Model:           "gpt-5.4",
+		StatusCode:      200,
+		InputTokens:     1_000_000,
+		TotalTokens:     1_000_000,
+		APIKeyID:        42,
+		APIKeyName:      "team-key",
+		APIKeyMasked:    "sk-...test",
+		InternalReason:  "overflow_compact_summary",
+		ParentRequestID: "req-parent-42",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if logs[0].APIKeyID != 42 || logs[0].InternalReason != "overflow_compact_summary" || logs[0].ParentRequestID != "req-parent-42" {
+		t.Fatalf("internal usage attribution = %+v", logs[0])
+	}
+
+	usage, err := db.GetAPIKeyWindowUsage(ctx, 42, time.Hour)
+	if err != nil {
+		t.Fatalf("GetAPIKeyWindowUsage 返回错误: %v", err)
+	}
+	if usage.Requests != 1 || usage.Tokens != 1_000_000 || usage.UserBilled <= 0 {
+		t.Fatalf("attributed internal usage aggregate = %+v", usage)
 	}
 }
 
@@ -3286,6 +3332,60 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if nearest == nil || nearest.MatchContext != "actual trigger excerpt" {
 		t.Fatalf("nearest prompt filter log = %+v", nearest)
+	}
+}
+
+func TestPromptFilterReviewHistorySeparatesIntelligenceAndNullableScores(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	confidence := 0.86
+	threshold := 0.70
+	latencyMS := int64(143)
+	ctx := context.Background()
+	inputs := []*PromptFilterLogInput{
+		{Source: "intel_run", Endpoint: "prompt_intelligence", Action: "completed", Mode: "audit", FullText: `{}`},
+		{Source: "local_filter", Endpoint: "/v1/responses", Model: "gpt-5.6-sol", Action: "block", Mode: "block", TextPreview: "redacted request", Reviewed: true, ReviewModel: "review-model", ReviewFlagged: true, ReviewConfidence: &confidence, ReviewThreshold: &threshold, ReviewReason: "攻击他人系统", ReviewEndpoint: "https://review.example/chat/completions", ReviewRequestMode: "chat_completions", ReviewLatencyMS: &latencyMS},
+		{Source: "local_filter", Endpoint: "/v1/messages", Model: "claude-sonnet", Action: "warn", Mode: "warn", Score: 70},
+	}
+	for _, input := range inputs {
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog(%s): %v", input.Source, err)
+		}
+	}
+
+	reviews, reviewTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewState: "reviewed", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(reviewed): %v", err)
+	}
+	if reviewTotal != 1 || len(reviews) != 1 {
+		t.Fatalf("review total=%d len=%d, want 1", reviewTotal, len(reviews))
+	}
+	got := reviews[0]
+	if !got.Reviewed || got.ReviewConfidence == nil || *got.ReviewConfidence != confidence || got.ReviewThreshold == nil || *got.ReviewThreshold != threshold || got.ReviewLatencyMS == nil || *got.ReviewLatencyMS != latencyMS {
+		t.Fatalf("nullable review metadata = %+v", got)
+	}
+	if got.ReviewReason != "攻击他人系统" || got.ReviewEndpoint != "https://review.example/chat/completions" || got.ReviewRequestMode != "chat_completions" {
+		t.Fatalf("review request/response metadata = %+v", got)
+	}
+
+	local, localTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewState: "not_reviewed", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(not reviewed): %v", err)
+	}
+	if localTotal != 1 || len(local) != 1 || local[0].Endpoint != "/v1/messages" {
+		t.Fatalf("local logs total=%d logs=%+v", localTotal, local)
+	}
+
+	intelligence, intelligenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "intel_run", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(intelligence history): %v", err)
+	}
+	if intelligenceTotal != 1 || len(intelligence) != 1 || intelligence[0].Action != "completed" {
+		t.Fatalf("intelligence history total=%d logs=%+v", intelligenceTotal, intelligence)
 	}
 }
 

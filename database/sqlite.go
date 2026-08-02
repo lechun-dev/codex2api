@@ -118,6 +118,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			client_user_agent TEXT DEFAULT '',
 			upstream_user_agent TEXT DEFAULT '',
 			user_agent_overridden INTEGER DEFAULT 0,
+			internal_reason TEXT DEFAULT '',
+			parent_request_id TEXT DEFAULT '',
 			endpoint TEXT DEFAULT '',
 			model TEXT DEFAULT '',
 			prompt_tokens INTEGER DEFAULT 0,
@@ -394,13 +396,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			review_model TEXT DEFAULT '',
 			review_flagged INTEGER DEFAULT 0,
 			review_error TEXT DEFAULT '',
+			reviewed INTEGER DEFAULT 0,
+			review_confidence REAL NULL,
+			review_threshold REAL NULL,
+			review_reason TEXT DEFAULT '',
+			review_endpoint TEXT DEFAULT '',
+			review_request_mode TEXT DEFAULT '',
+			review_latency_ms INTEGER NULL,
 			full_text TEXT DEFAULT ''
 		);`,
-		`CREATE TABLE IF NOT EXISTS prompt_filter_secrets (
-			id INTEGER PRIMARY KEY,
-			newapi_secret TEXT NOT NULL DEFAULT '',
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		);`,
+		`DROP TABLE IF EXISTS prompt_filter_secrets;`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -450,6 +455,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "client_user_agent", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_user_agent", "TEXT DEFAULT ''"},
 		{"usage_logs", "user_agent_overridden", "INTEGER DEFAULT 0"},
+		{"usage_logs", "internal_reason", "TEXT DEFAULT ''"},
+		{"usage_logs", "parent_request_id", "TEXT DEFAULT ''"},
 		{"usage_logs", "image_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_width", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_height", "INTEGER DEFAULT 0"},
@@ -557,6 +564,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "reviewed", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "review_confidence", "REAL NULL"},
+		{"prompt_filter_logs", "review_threshold", "REAL NULL"},
+		{"prompt_filter_logs", "review_reason", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_endpoint", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_request_mode", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_latency_ms", "INTEGER NULL"},
 		{"prompt_filter_logs", "full_text", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "match_context", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "audit_score", "INTEGER DEFAULT 0"},
@@ -645,6 +659,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_source_id ON prompt_filter_logs(source, id DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_reviewed_id ON prompt_filter_logs(reviewed, id DESC);`,
 	}
 	for _, stmt := range indexStatements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {

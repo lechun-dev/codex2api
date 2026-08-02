@@ -320,11 +320,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 104 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 104", got)
+	if got := strings.Count(capture.query, "?"); got != 105 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 105", got)
 	}
-	if len(capture.args) != 104 {
-		t.Fatalf("rewritten settings argument count = %d, want 104", len(capture.args))
+	if len(capture.args) != 105 {
+		t.Fatalf("rewritten settings argument count = %d, want 105", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -345,6 +345,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexPreflightSSEPassthroughEnabled,
 		int64(settings.UTLSShutdownTimeoutMinutes),
 		settings.CodexWSWeakNetworkMode,
+		settings.PreservePromptFilterCustomPatterns,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
@@ -384,7 +385,7 @@ func TestAPIKeyScopeCounterSQLUsesMySQL56Upserts(t *testing.T) {
 	}
 }
 
-func TestSetPromptFilterNewAPISecretRewritesUpsertForMySQL56(t *testing.T) {
+func TestCreatePromptFilterNewAPIBindingRewritesForMySQL56(t *testing.T) {
 	capture := &mysqlCaptureDriver{}
 	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
 	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
@@ -396,25 +397,29 @@ func TestSetPromptFilterNewAPISecretRewritesUpsertForMySQL56(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 
 	db := &DB{conn: conn, driver: "mysql"}
-	const secret = "prompt-filter-test-secret"
-	if err := db.SetPromptFilterNewAPISecret(context.Background(), secret); err != nil {
-		t.Fatalf("SetPromptFilterNewAPISecret() error = %v", err)
+	const secret = "01234567890123456789012345678901"
+	if err := db.CreatePromptFilterNewAPIBinding(context.Background(), &PromptFilterNewAPIBinding{
+		APIKeyID:              17,
+		PlatformCode:          "newapi-test",
+		PlatformName:          "NewAPI Test",
+		Secret:                secret,
+		Enabled:               true,
+		RequireSignedIdentity: true,
+	}); err != nil {
+		t.Fatalf("CreatePromptFilterNewAPIBinding() error = %v", err)
 	}
 
-	if strings.Contains(strings.ToUpper(capture.query), "ON CONFLICT") {
-		t.Fatalf("PostgreSQL ON CONFLICT leaked into MySQL query: %s", capture.query)
-	}
 	for _, fragment := range []string{
-		"ON DUPLICATE KEY UPDATE",
-		"newapi_secret = VALUES(newapi_secret)",
-		"updated_at = NOW()",
+		"INSERT INTO prompt_filter_newapi_bindings",
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', NULL, CURRENT_TIMESTAMP)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
-			t.Fatalf("rewritten prompt-filter secret query missing %q: %s", fragment, capture.query)
+			t.Fatalf("rewritten prompt-filter binding query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if len(capture.args) != 1 || capture.args[0].Value != secret {
-		t.Fatalf("rewritten prompt-filter secret args = %#v, want %q", capture.args, secret)
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
+	if len(capture.args) != 8 || capture.args[0].Value != int64(17) || capture.args[3].Value != secret {
+		t.Fatalf("rewritten prompt-filter binding args = %#v", capture.args)
 	}
 }
 
@@ -431,17 +436,20 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 
 	db := &DB{conn: conn, driver: "mysql"}
 	entry := usageLogEntry{
-		AccountID:            7,
-		ClientIP:             "127.0.0.1",
-		SessionID:            "session-1",
-		ConversationID:       "conversation-1",
-		PreviousResponseID:   "response-1",
-		RequestText:          "hello",
-		HasCompactionHistory: true,
-		WsAcquireMs:          1234,
-		ClientUserAgent:      "Codex Desktop/0.144.2",
-		UpstreamUserAgent:    "codex_cli_rs/0.144.2",
-		UserAgentOverridden:  true,
+		AccountID:              7,
+		ClientIP:               "127.0.0.1",
+		SessionID:              "session-1",
+		ConversationID:         "conversation-1",
+		PreviousResponseID:     "response-1",
+		RequestText:            "hello",
+		HasCompactionHistory:   true,
+		WsAcquireMs:            1234,
+		ClientUserAgent:        "Codex Desktop/0.144.2",
+		UpstreamUserAgent:      "codex_cli_rs/0.144.2",
+		UserAgentOverridden:    true,
+		InternalReason:         "policy_intercept",
+		ParentRequestID:        "parent-request-1",
+		PromptPolicyIncidentID: "incident-1",
 	}
 	if err := db.batchInsertLogsChunk(context.Background(), conn, []usageLogEntry{entry}); err != nil {
 		t.Fatalf("batchInsertLogsChunk() error = %v", err)
@@ -455,6 +463,9 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		"client_user_agent",
 		"upstream_user_agent",
 		"user_agent_overridden",
+		"internal_reason",
+		"parent_request_id",
+		"prompt_policy_incident_id",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten usage-log insert missing %q: %s", fragment, capture.query)
@@ -466,7 +477,14 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 	if len(capture.args) != usageLogInsertColumnCount {
 		t.Fatalf("rewritten usage-log argument count = %d, want %d", len(capture.args), usageLogInsertColumnCount)
 	}
-	wantTail := []interface{}{entry.ClientUserAgent, entry.UpstreamUserAgent, entry.UserAgentOverridden}
+	wantTail := []interface{}{
+		entry.ClientUserAgent,
+		entry.UpstreamUserAgent,
+		entry.UserAgentOverridden,
+		entry.InternalReason,
+		entry.ParentRequestID,
+		entry.PromptPolicyIncidentID,
+	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
 		if got != want {

@@ -182,21 +182,99 @@ func TestMySQL56AccountAndUsageAuditColumns(t *testing.T) {
 	}
 }
 
-func TestMySQLPromptFilterSecretsSchemaIsMySQL56Compatible(t *testing.T) {
-	ddl := promptFilterSecretsMySQLDDL()
+func TestMySQLPromptFilterNewAPIBindingsSchemaIsMySQL56Compatible(t *testing.T) {
+	ddl := mysql56PromptFilterNewAPIBindingsDDL
 	for _, needle := range []string{
-		"id INT NOT NULL PRIMARY KEY",
-		"newapi_secret TEXT NOT NULL",
+		"api_key_id BIGINT NOT NULL PRIMARY KEY",
+		"platform_code VARCHAR(32) NOT NULL UNIQUE",
+		"secret TEXT NOT NULL",
+		"require_signed_identity TINYINT(1) NOT NULL DEFAULT 0",
+		"previous_secret_expires_at DATETIME NULL",
 		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
 		"ENGINE=InnoDB",
 	} {
 		if !strings.Contains(ddl, needle) {
-			t.Fatalf("MySQL prompt_filter_secrets DDL missing %q: %s", needle, ddl)
+			t.Fatalf("MySQL prompt_filter_newapi_bindings DDL missing %q: %s", needle, ddl)
 		}
 	}
-	for _, incompatible := range []string{"TIMESTAMPTZ", "ON CONFLICT", "TEXT NOT NULL DEFAULT"} {
+	for _, incompatible := range []string{"TIMESTAMPTZ", "BOOLEAN", "ON CONFLICT", "TEXT NOT NULL DEFAULT"} {
 		if strings.Contains(strings.ToUpper(ddl), strings.ToUpper(incompatible)) {
-			t.Fatalf("MySQL 5.6 incompatible syntax leaked into prompt_filter_secrets DDL: %q", incompatible)
+			t.Fatalf("MySQL 5.6 incompatible syntax leaked into prompt_filter_newapi_bindings DDL: %q", incompatible)
+		}
+	}
+}
+
+func TestMySQLPromptIntelligenceSchemasAreMySQL56Compatible(t *testing.T) {
+	ddls := map[string]string{
+		"rule candidates":  mysql56PromptRuleCandidatesDDL,
+		"rule evidence":    mysql56PromptRuleCandidateEvidenceDDL,
+		"policy incidents": mysql56PromptPolicyIncidentsDDL,
+	}
+	for name, ddl := range ddls {
+		for _, incompatible := range []string{
+			"BIGSERIAL",
+			"TIMESTAMPTZ",
+			"BOOLEAN",
+			"ON CONFLICT",
+			"CREATE INDEX IF NOT EXISTS",
+			"ADD COLUMN IF NOT EXISTS",
+			"TEXT NOT NULL DEFAULT",
+			"MEDIUMTEXT NOT NULL DEFAULT",
+		} {
+			if strings.Contains(strings.ToUpper(ddl), incompatible) {
+				t.Fatalf("MySQL 5.6 incompatible syntax leaked into %s DDL: %q", name, incompatible)
+			}
+		}
+		if !strings.Contains(ddl, "ENGINE=InnoDB DEFAULT CHARSET=utf8") {
+			t.Fatalf("MySQL %s DDL is missing its MySQL 5.6 table options", name)
+		}
+	}
+	if !strings.Contains(mysql56PromptRuleCandidatesDDL, "fingerprint VARCHAR(64) CHARACTER SET ascii") {
+		t.Fatal("candidate fingerprint must use ASCII to stay inside legacy InnoDB index limits")
+	}
+	if !strings.Contains(mysql56PromptRuleCandidateEvidenceDDL, "source_ref_hash VARCHAR(64) CHARACTER SET ascii") {
+		t.Fatal("evidence hash must use ASCII to stay inside legacy InnoDB index limits")
+	}
+}
+
+func TestMySQL56UpstreamC5007B6MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_upstream_c5007b6.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 upstream migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS prompt_filter_newapi_bindings",
+		"CREATE TABLE IF NOT EXISTS prompt_rule_candidates",
+		"CREATE TABLE IF NOT EXISTS prompt_rule_candidate_evidence",
+		"CREATE TABLE IF NOT EXISTS prompt_policy_incidents",
+		"CREATE TABLE IF NOT EXISTS prompt_risk_events",
+		"CREATE TABLE IF NOT EXISTS prompt_risk_event_sources",
+		"CREATE TABLE IF NOT EXISTS prompt_risk_identities",
+		"CREATE TABLE IF NOT EXISTS prompt_risk_trust_policies",
+		"CREATE TABLE IF NOT EXISTS prompt_risk_trust_events",
+		"c2a_add_column_if_missing('usage_logs', 'internal_reason'",
+		"c2a_add_column_if_missing('usage_logs', 'parent_request_id'",
+		"c2a_add_column_if_missing('usage_logs', 'prompt_policy_incident_id'",
+		"c2a_add_index_if_missing('prompt_policy_incidents', 'idx_prompt_policy_incidents_endpoint', '`endpoint`(191), `created_at`')",
+		"c2a_add_index_if_missing('prompt_risk_identities', 'idx_prompt_risk_identities_external', '`platform`(64), `external_user_id`(128)')",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 upstream migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{
+		"ADD COLUMN IF NOT EXISTS",
+		"CREATE INDEX IF NOT EXISTS",
+		"BIGSERIAL",
+		"TIMESTAMPTZ",
+		"BOOLEAN",
+		"ON CONFLICT",
+		"TEXT NOT NULL DEFAULT",
+		"MEDIUMTEXT NOT NULL DEFAULT",
+	} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in upstream migration", incompatible)
 		}
 	}
 }

@@ -56,6 +56,13 @@ var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
 	{table: "prompt_filter_logs", name: "primary_origin", def: "VARCHAR(50) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "strike_eligible", def: "TINYINT(1) DEFAULT 0"},
 	{table: "prompt_filter_logs", name: "match_context", def: "TEXT NULL"},
+	{table: "prompt_filter_logs", name: "request_correlation_id", def: "VARCHAR(64) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "newapi_policy_status", def: "VARCHAR(32) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "newapi_platform", def: "VARCHAR(100) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "newapi_user_id", def: "VARCHAR(255) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "newapi_request_id", def: "VARCHAR(255) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "newapi_decision_id", def: "VARCHAR(64) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "session_hash", def: "VARCHAR(64) DEFAULT ''"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -140,7 +147,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			is_retry_attempt TINYINT(1) DEFAULT 0,
 			attempt_index INT DEFAULT 0,
 			upstream_error_kind VARCHAR(64) DEFAULT '',
-			error_message VARCHAR(2048) DEFAULT ''
+			error_message VARCHAR(2048) DEFAULT '',
+			internal_reason VARCHAR(64) DEFAULT '',
+			parent_request_id VARCHAR(128) DEFAULT '',
+			prompt_policy_incident_id VARCHAR(64) NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -256,7 +266,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		promptFilterLogsMySQLDDL(),
-		promptFilterSecretsMySQLDDL(),
+		`DROP TABLE IF EXISTS prompt_filter_secrets`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -323,6 +333,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INT DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "VARCHAR(64) DEFAULT ''"},
 		{"usage_logs", "error_message", "VARCHAR(2048) DEFAULT ''"},
+		{"usage_logs", "internal_reason", "VARCHAR(64) DEFAULT ''"},
+		{"usage_logs", "parent_request_id", "VARCHAR(128) DEFAULT ''"},
+		{"usage_logs", "prompt_policy_incident_id", "VARCHAR(64) NULL"},
 		{"api_keys", "total_used", "DOUBLE DEFAULT 0"},
 		{"api_keys", "reset_count", "INT DEFAULT 0"},
 		{"api_keys", "last_reset_at", "DATETIME NULL"},
@@ -571,6 +584,13 @@ func promptFilterLogsMySQLDDL() string {
 		matched_patterns TEXT NULL,
 		text_preview TEXT NULL,
 		match_context TEXT NULL,
+		request_correlation_id VARCHAR(64) DEFAULT '',
+		newapi_policy_status VARCHAR(32) DEFAULT '',
+		newapi_platform VARCHAR(100) DEFAULT '',
+		newapi_user_id VARCHAR(255) DEFAULT '',
+		newapi_request_id VARCHAR(255) DEFAULT '',
+		newapi_decision_id VARCHAR(64) DEFAULT '',
+		session_hash VARCHAR(64) DEFAULT '',
 		api_key_id BIGINT DEFAULT 0,
 		api_key_name VARCHAR(255) DEFAULT '',
 		api_key_masked VARCHAR(64) DEFAULT '',
@@ -697,14 +717,6 @@ func systemSettingsMySQLDDL() string {
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_config_generation BIGINT NOT NULL DEFAULT 1
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
-}
-
-func promptFilterSecretsMySQLDDL() string {
-	return `CREATE TABLE IF NOT EXISTS prompt_filter_secrets (
-		id INT NOT NULL PRIMARY KEY,
-		newapi_secret TEXT NOT NULL,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

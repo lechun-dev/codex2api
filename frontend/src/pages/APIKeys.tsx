@@ -1718,9 +1718,13 @@ export default function APIKeys() {
                         <TableHeader>
                           <TableRow>
                             <TableHead>{t("common.name")}</TableHead>
-                            <TableHead>{t("apiKeys.keyColumn")}</TableHead>
+                            <TableHead className="w-[220px]">
+                              {t("apiKeys.keyColumn")}
+                            </TableHead>
                             <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
-                            <TableHead>{t("apiKeys.clientCountColumn")}</TableHead>
+                            <TableHead className="w-[140px]">
+                              {t("apiKeys.clientCountColumn")}
+                            </TableHead>
                             <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
                             <TableHead>{t("apiKeys.lastUsedColumn")}</TableHead>
                             <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
@@ -1781,10 +1785,10 @@ export default function APIKeys() {
                                     </div>
                                   </div>
                                 </TableCell>
-                                <TableCell>
-                                  <div className="flex min-w-[240px] items-center gap-1">
+                                <TableCell className="w-[220px] max-w-[220px]">
+                                  <div className="flex w-[220px] items-center gap-1">
                                     <code
-                                      className="min-w-0 max-w-[360px] truncate rounded-md bg-muted/70 px-2 py-1 font-mono text-[12px] tabular-nums text-foreground"
+                                      className="min-w-0 flex-1 truncate rounded-md bg-muted/70 px-2 py-1 font-mono text-[12px] tabular-nums text-foreground"
                                       title={displayKey}
                                     >
                                       {displayKey}
@@ -1833,7 +1837,7 @@ export default function APIKeys() {
                                     t={t}
                                   />
                                 </TableCell>
-                                <TableCell className="whitespace-nowrap text-sm">
+                                <TableCell className="w-[140px] max-w-[140px] whitespace-normal text-sm leading-5">
                                   <ClientCountDisplay keyRow={keyRow} t={t} />
                                 </TableCell>
                                 <TableCell className="min-w-[160px] text-sm text-muted-foreground">

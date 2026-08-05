@@ -89,10 +89,13 @@ func TestListAPIKeyAccountStatsGeneratesMySQL56CompatibleSQL(t *testing.T) {
 		t.Fatalf("ListAPIKeyAccountStats() error = %v", err)
 	}
 
-	for _, fragment := range []string{"CAST(a.credentials AS CHAR)", "u.api_key_id = ?", "u.created_at >= ?", "u.created_at < ?"} {
+	for _, fragment := range []string{"CAST(a.credentials AS CHAR)", "api_key_id = ?", "created_at >= ?", "created_at < ?", "FROM ("} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten API key account query missing %q: %s", fragment, capture.query)
 		}
+	}
+	if strings.Contains(strings.ToUpper(capture.query), "WITH AGGREGATED") {
+		t.Fatalf("MySQL 5.6 query still uses a CTE: %s", capture.query)
 	}
 	if got := strings.Count(capture.query, "?"); got != 3 {
 		t.Fatalf("rewritten API key account placeholder count = %d, want 3: %s", got, capture.query)
@@ -525,6 +528,7 @@ func TestCreateAccountGroupUsesMySQL56InsertPath(t *testing.T) {
 
 type mysqlCaptureDriver struct {
 	query        string
+	queries      []string
 	args         []driver.NamedValue
 	lastInsertID int64
 	queryRow     []driver.Value
@@ -551,6 +555,7 @@ func (c *mysqlCaptureConn) Begin() (driver.Tx, error) {
 
 func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	c.capture.query = query
+	c.capture.queries = append(c.capture.queries, query)
 	c.capture.args = append([]driver.NamedValue(nil), args...)
 	c.capture.execCount++
 	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: 1}, nil
@@ -558,6 +563,7 @@ func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []d
 
 func (c *mysqlCaptureConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.capture.query = query
+	c.capture.queries = append(c.capture.queries, query)
 	c.capture.args = append([]driver.NamedValue(nil), args...)
 	return &mysqlCaptureRows{values: c.capture.queryRow}, nil
 }
@@ -618,6 +624,10 @@ func assertNoMySQL56IncompatibleSQL(t *testing.T, query string) {
 		"ON CONFLICT",
 		"RETURNING",
 		"TIMESTAMPTZ",
+		"AS MATERIALIZED",
+		"ROW_NUMBER(",
+		"CREATE INDEX IF NOT EXISTS",
+		"BIGSERIAL",
 	} {
 		if strings.Contains(strings.ToUpper(query), incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible syntax %q leaked into query: %s", incompatible, query)

@@ -679,6 +679,7 @@ type PromptFilterLogQuery struct {
 	APIKeyID            int64
 	Query               string
 	ReviewState         string
+	ReviewResult        string
 	ExcludeIntelligence bool
 }
 
@@ -843,6 +844,14 @@ func promptFilterLogWhere(query PromptFilterLogQuery) (string, []any) {
 	case "not_reviewed", "false":
 		clauses = append(clauses, "reviewed = false")
 	}
+	switch strings.ToLower(strings.TrimSpace(query.ReviewResult)) {
+	case "flagged":
+		clauses = append(clauses, "reviewed = true", "COALESCE(TRIM(review_error), '') = ''", "review_flagged = true")
+	case "cleared":
+		clauses = append(clauses, "reviewed = true", "COALESCE(TRIM(review_error), '') = ''", "review_flagged = false")
+	case "error":
+		clauses = append(clauses, "reviewed = true", "COALESCE(TRIM(review_error), '') <> ''")
+	}
 	if query.APIKeyID > 0 {
 		args = append(args, query.APIKeyID)
 		clauses = append(clauses, fmt.Sprintf("api_key_id = $%d", len(args)))
@@ -960,20 +969,26 @@ func (db *DB) ClearPromptFilterLogs(ctx context.Context) error {
 		return nil
 	}
 	if db.isSQLite() {
-		if _, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_filter_logs; DELETE FROM prompt_policy_incidents; DELETE FROM prompt_risk_events; DELETE FROM prompt_risk_event_sources`); err != nil {
+		if _, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_filter_logs`); err != nil {
 			return err
 		}
-		_, err := db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name IN ('prompt_filter_logs', 'prompt_policy_incidents', 'prompt_risk_events')`)
+		_, err := db.conn.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name='prompt_filter_logs'`)
 		return err
 	}
 	if db.isMySQL() {
-		for _, table := range []string{"prompt_filter_logs", "prompt_policy_incidents", "prompt_risk_events", "prompt_risk_event_sources"} {
-			if _, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE `+table); err != nil {
-				return err
-			}
+		if _, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_filter_logs`); err != nil {
+			return err
 		}
+		return db.resetMySQLAutoIncrement(ctx, "prompt_filter_logs")
+	}
+	_, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_filter_logs RESTART IDENTITY`)
+	return err
+}
+
+func (db *DB) ClearPromptFilterLogsByReviewStatus(ctx context.Context, reviewed bool) error {
+	if db == nil {
 		return nil
 	}
-	_, err := db.conn.ExecContext(ctx, `TRUNCATE TABLE prompt_filter_logs, prompt_policy_incidents, prompt_risk_events, prompt_risk_event_sources RESTART IDENTITY`)
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_filter_logs WHERE reviewed = $1`, reviewed)
 	return err
 }

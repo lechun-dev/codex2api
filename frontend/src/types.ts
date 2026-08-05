@@ -189,6 +189,9 @@ export interface AccountRow {
   locked?: boolean
   credit_enabled?: boolean
   credit_skip_usage_window?: boolean
+  // using_credits 与 status 并列：用量窗口已打满但积分顶着，status 仍是 active
+  // （确实可调度），这个标记只用于在状态徽章旁并列一个「使用积分」徽章。
+  using_credits?: boolean
   // 图片配额信息
   image_quota_remaining?: number
   image_quota_total?: number
@@ -234,9 +237,17 @@ export interface InviteResult {
   ok: boolean
   status_code: number
   request_id?: string
-  referral_key: string
+  program_id: string
+  entrypoint: string
   emails: string[]
   invites?: InviteItem[]
+  // upstream_message 是上游 detail 里的原因（如「此人已收到推荐邀请」），
+  // failed_emails 是被拒的收件人。收件人级被拒与账号资格无关，别报成「账号无资格」。
+  upstream_message?: string
+  failed_emails?: string[]
+  // challenged 为真表示被 Cloudflare 挑战拦下，不是上游的业务结论。
+  // 此时 status_code（通常 403）不能解读成「无资格」，应提示重试。
+  challenged?: boolean
   upstream?: unknown
   upstream_raw?: string
 }
@@ -244,6 +255,85 @@ export interface InviteResult {
 export interface InviteResponse {
   ok: boolean
   result: InviteResult
+}
+
+// InviteGrant 是一条奖励条目（邀请人 / 受邀人各一条）。
+export interface InviteGrant {
+  recipient?: string
+  grant_type?: string
+  amount?: number
+  reward_id?: string
+}
+
+// InviteTimeFrameRule 是一条配额规则。capacity_type 区分两种独立上限：
+// send 是发送次数、reward 是能拿到奖励的次数（后者通常远小于前者）。
+export interface InviteTimeFrameRule {
+  invites_sent: number
+  invites_total: number
+  time_frame?: string
+  type?: string
+  capacity_type?: string
+}
+
+// InviteEligibility 是 GET /api/accounts/:id/invite/eligibility 的 result。
+// remaining_* 缺失表示上游没给这个字段，与「明确为 0」不同，不要当成配额用尽。
+export interface InviteEligibility {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  should_show: boolean
+  ineligible_reason?: string
+  ineligible_reason_code?: string
+  program_id?: string
+  entrypoint?: string
+  offer_id?: string
+  grants?: InviteGrant[]
+  remaining_send_capacity?: number
+  remaining_reward_capacity?: number
+  title?: string
+  description?: string
+  rules?: string[]
+  time_frame_rules?: InviteTimeFrameRule[]
+  requires_explicit_confirmation?: boolean
+  upstream_message?: string
+  challenged?: boolean
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteEligibilityResponse {
+  ok: boolean
+  result: InviteEligibility
+}
+
+// InviteTrackingItem 是一条已发邀请记录。
+export interface InviteTrackingItem {
+  referral_id?: string
+  email?: string
+  status?: string
+  can_resend?: boolean
+  invite_url?: string
+  resend_available_at?: string
+  grants?: InviteGrant[]
+  created_at?: string
+  expires_at?: string
+}
+
+export interface InviteTracking {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  items: InviteTrackingItem[]
+  cursor?: string
+  upstream_message?: string
+  challenged?: boolean
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteTrackingResponse {
+  ok: boolean
+  result: InviteTracking
 }
 
 export interface RecycleBinAccountRow {
@@ -1259,6 +1349,9 @@ export interface PromptRiskProfile {
   risk_level: PromptRiskLevel
   recommended_actions: string[]
   score_breakdown: PromptRiskScoreBreakdown
+  has_activity: boolean
+  identity_source?: string
+  identity_updated_at?: ISODateString
   latest_at: ISODateString
   event_count: number
   events_10m: number
@@ -1277,6 +1370,30 @@ export interface PromptRiskProfile {
   account_id?: number
   account_name?: string
   trust_policy?: PromptRiskTrustPolicy
+  conversation_lock?: PromptConversationLock
+}
+
+export interface PromptConversationLock {
+  id: number
+  lock_key: string
+  status: 'active' | 'unlocked'
+  platform: string
+  newapi_user_id: string
+  session_fingerprint: string
+  session_hash: string
+  incident_id?: string
+  decision_id: string
+  request_id?: string
+  reason_code: string
+  endpoint?: string
+  model?: string
+  trigger_count: number
+  unlock_count: number
+  locked_at: ISODateString
+  unlocked_at?: ISODateString
+  unlock_reason?: string
+  created_at: ISODateString
+  updated_at: ISODateString
 }
 
 export interface PromptRiskEvent {
@@ -1358,6 +1475,7 @@ export interface PromptReviewTestRequest {
   user_prompt_template: string
   payload_template: string
   confidence_threshold: number
+  moderation_thresholds: Record<string, number>
   timeout_seconds: number
   max_concurrent: number
   max_text_length: number
@@ -1372,6 +1490,12 @@ export interface PromptReviewKeyTestResult {
   flagged: boolean
   confidence: number
   reason?: string
+  highest_category?: string
+  decision_category?: string
+  decision_score?: number
+  decision_threshold?: number
+  category_scores?: Record<string, number>
+  moderation_thresholds?: Record<string, number>
   latency_ms: number
   error?: string
 }
@@ -1384,6 +1508,12 @@ export interface PromptReviewTestResponse {
   confidence: number
   confidence_threshold: number
   reason?: string
+  highest_category?: string
+  decision_category?: string
+  decision_score?: number
+  decision_threshold?: number
+  category_scores?: Record<string, number>
+  moderation_thresholds?: Record<string, number>
   latency_ms: number
   key_count?: number
   results?: PromptReviewKeyTestResult[]
@@ -1872,6 +2002,7 @@ export interface APIKeyAccountStat {
   account_id: number
   account_name: string
   account_email: string
+  account_deleted?: boolean
   groups?: APIKeyAccountGroup[]
   requests: number
   input_tokens: number
@@ -1881,6 +2012,33 @@ export interface APIKeyAccountStat {
   error_count: number
   account_billed: number
   user_billed: number
+}
+
+export interface APIKeyAccountGroupUsage {
+  id: number
+  name: string
+  color: string
+  accounts: number
+  requests: number
+  total_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface APIKeyAccountUsageSummary {
+  accounts: number
+  requests: number
+  total_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface APIKeyAccountStatsResponse {
+  items: APIKeyAccountStat[]
+  groups: APIKeyAccountGroupUsage[]
+  summary: APIKeyAccountUsageSummary
+  /** Active accounts use current memberships; deleted accounts use their last retained membership. */
+  membership_basis: 'current_and_deleted_last_membership'
 }
 
 export interface UsageLog {

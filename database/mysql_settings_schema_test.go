@@ -279,6 +279,47 @@ func TestMySQL56UpstreamC5007B6MigrationScript(t *testing.T) {
 	}
 }
 
+func TestMySQL56Upstream0173444MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_upstream_0173444.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 upstream migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"CREATE TABLE IF NOT EXISTS prompt_conversation_locks",
+		"CREATE TABLE IF NOT EXISTS usage_stats_rollup",
+		"CREATE TABLE IF NOT EXISTS usage_stats_rollup_state",
+		"id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+		"ENGINE=InnoDB DEFAULT CHARSET=utf8",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 upstream migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{
+		"CREATE INDEX IF NOT EXISTS",
+		"ADD COLUMN IF NOT EXISTS",
+		"BIGSERIAL",
+		"TIMESTAMPTZ",
+		"BOOLEAN",
+		"ON CONFLICT",
+		"RETURNING",
+		"TEXT NOT NULL DEFAULT",
+		"MEDIUMTEXT NOT NULL DEFAULT",
+		"ROW_NUMBER(",
+		"AS MATERIALIZED",
+	} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in upstream migration", incompatible)
+		}
+	}
+	for _, destructive := range []string{"ALTER TABLE", "DROP TABLE", "DELETE FROM", "TRUNCATE TABLE"} {
+		if strings.Contains(strings.ToUpper(script), destructive) {
+			t.Fatalf("unexpected destructive statement %q in create-only migration", destructive)
+		}
+	}
+}
+
 func TestMySQLPromptFilterLogsSchemaIncludesAuditFields(t *testing.T) {
 	ddl := promptFilterLogsMySQLDDL()
 	for _, needle := range []string{

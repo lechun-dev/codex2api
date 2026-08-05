@@ -25,7 +25,7 @@ import type {
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
-  APIKeyAccountStat,
+  APIKeyAccountStatsResponse,
   APIKeyScopeUsageItem,
   APIKeyScopeSummaryItem,
   AccountsResponse,
@@ -46,6 +46,8 @@ import type {
   ImagePromptTemplatePayload,
   ImagePromptTemplatesResponse,
   InviteResponse,
+  InviteEligibilityResponse,
+  InviteTrackingResponse,
   MessageResponse,
   ModelSyncResponse,
   ModelPricingOverride,
@@ -580,14 +582,38 @@ export const api = {
     request<{ message: string; success: number; failed: number }>('/accounts/batch-update', { method: 'POST', body: JSON.stringify(data) }),
   resetAccountStatus: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
+  // usage_refreshed 表示重置后的用量探针是否在响应前跑完；false 时调用方应稍后补刷一次。
   resetCredits: (id: number) =>
-    request<{ message: string; rate_limit_reset_credits?: number }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
+    request<{
+      message: string
+      rate_limit_reset_credits?: number
+      windows_reset?: number
+      usage_refreshed?: boolean
+      status?: string
+    }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
   getResetCredits: (id: number) =>
     request<ResetCreditsDetailResponse>(`/accounts/${id}/reset-credits`),
   getAccountHealthBars: () =>
     request<AccountHealthBarsResponse>('/accounts/health-bars'),
-  sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; referral_key?: string; proxy_url?: string; max_emails?: number }) =>
+  sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; program_id?: string; entrypoint?: string; proxy_url?: string; max_emails?: number }) =>
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
+  getInviteEligibility: (id: number, params?: { program_id?: string; entrypoint?: string; proxy_url?: string }) => {
+    const search = new URLSearchParams()
+    if (params?.program_id) search.set('program_id', params.program_id)
+    if (params?.entrypoint) search.set('entrypoint', params.entrypoint)
+    if (params?.proxy_url) search.set('proxy_url', params.proxy_url)
+    const qs = search.toString()
+    return request<InviteEligibilityResponse>(`/accounts/${id}/invite/eligibility${qs ? `?${qs}` : ''}`)
+  },
+  getInviteTracking: (id: number, params?: { program_id?: string; period?: string; limit?: number; proxy_url?: string }) => {
+    const search = new URLSearchParams()
+    if (params?.program_id) search.set('program_id', params.program_id)
+    if (params?.period) search.set('period', params.period)
+    if (typeof params?.limit === 'number') search.set('limit', String(params.limit))
+    if (params?.proxy_url) search.set('proxy_url', params.proxy_url)
+    const qs = search.toString()
+    return request<InviteTrackingResponse>(`/accounts/${id}/invite/tracking${qs ? `?${qs}` : ''}`)
+  },
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   batchDeleteAccounts: (ids: number[]) =>
@@ -684,30 +710,41 @@ export const api = {
     const search = buildOpsErrorSearchParams(params)
     return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
-  getUsageStats: (params: { start?: string; end?: string; channel?: string } = {}) => {
+  getUsageStats: (params: {
+    start?: string
+    end?: string
+    channel?: string
+    detail?: 'summary'
+    signal?: AbortSignal
+  } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
     if (params.channel) searchParams.set('channel', params.channel)
+    if (params.detail) searchParams.set('detail', params.detail)
     const qs = searchParams.toString()
-    return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
+    return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats', {
+      signal: params.signal,
+    })
   },
-  getAPIKeyTokenStats: (params: { start?: string; end?: string } = {}) => {
+  getAPIKeyTokenStats: (params: { start?: string; end?: string; signal?: AbortSignal } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
     const qs = searchParams.toString()
     return request<{ items: APIKeyTokenStat[] }>(
       qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
+      { signal: params.signal },
     )
   },
-  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string } = {}) => {
+  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string; signal?: AbortSignal } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
     const qs = searchParams.toString()
-    return request<{ items: APIKeyAccountStat[] }>(
+    return request<APIKeyAccountStatsResponse>(
       qs ? `/usage/api-keys/${id}/accounts?${qs}` : `/usage/api-keys/${id}/accounts`,
+      { signal: params.signal },
     )
   },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
@@ -738,13 +775,21 @@ export const api = {
     if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getChartData: (params: { start: string; end: string; bucketMinutes: number; channel?: string }) => {
+  getChartData: (params: {
+    start: string
+    end: string
+    bucketMinutes: number
+    channel?: string
+    signal?: AbortSignal
+  }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
     if (params.channel) searchParams.set('channel', params.channel)
-    return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
+    return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`, {
+      signal: params.signal,
+    })
   },
   getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
     const sp = new URLSearchParams()
@@ -853,7 +898,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string; reviewed?: boolean } = 100) => {
+  getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string; reviewed?: boolean; reviewResult?: string } = 100) => {
     const search = new URLSearchParams()
     if (typeof params === 'number') {
       search.set('limit', String(params))
@@ -868,11 +913,16 @@ export const api = {
       if (params.apiKeyId) search.set('api_key_id', params.apiKeyId)
       if (params.q) search.set('q', params.q)
       if (typeof params.reviewed === 'boolean') search.set('reviewed', String(params.reviewed))
+      if (params.reviewResult) search.set('review_result', params.reviewResult)
     }
     return request<PromptFilterLogsResponse>(`/prompt-filter/logs?${search.toString()}`)
   },
-  clearPromptFilterLogs: () =>
-    request<MessageResponse>('/prompt-filter/logs', { method: 'DELETE' }),
+  clearPromptFilterLogs: (params: { reviewed?: boolean } = {}) => {
+    const search = new URLSearchParams()
+    if (typeof params.reviewed === 'boolean') search.set('reviewed', String(params.reviewed))
+    const suffix = search.size > 0 ? `?${search.toString()}` : ''
+    return request<MessageResponse>(`/prompt-filter/logs${suffix}`, { method: 'DELETE' })
+  },
   matchPromptFilterLog: (params: { at: string; endpoint?: string; apiKeyId?: number; source?: string }) => {
     const search = new URLSearchParams()
     search.set('at', params.at)
@@ -898,6 +948,8 @@ export const api = {
 	},
 	getPromptPolicyIncident: (incidentId: string) =>
 		request<PromptPolicyIncidentDetailResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`),
+	clearPromptPolicyIncidents: () =>
+		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
 	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
@@ -917,6 +969,8 @@ export const api = {
 		request<{ policy: import('./types').PromptRiskTrustPolicy }>(`/prompt-policy/risk-profiles/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectKey)}/trust`, { method: 'PUT', body: JSON.stringify(data) }),
 	revokePromptRiskTrust: (subjectType: string, subjectKey: string) =>
 		request<{ policy: import('./types').PromptRiskTrustPolicy }>(`/prompt-policy/risk-profiles/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectKey)}/trust`, { method: 'DELETE' }),
+	unlockPromptConversation: (lockKey: string, reason = '管理员主动解锁') =>
+		request<{ lock: import('./types').PromptConversationLock }>(`/prompt-policy/conversation-locks/${encodeURIComponent(lockKey)}/unlock`, { method: 'POST', body: JSON.stringify({ reason }) }),
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptReview: (data: PromptReviewTestRequest) =>

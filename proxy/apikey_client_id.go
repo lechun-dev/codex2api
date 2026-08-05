@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/codex2api/database"
@@ -28,12 +29,28 @@ func resolveAPIKeyClientID(c *gin.Context, row *database.APIKeyRow) (clientID st
 }
 
 func deriveAPIKeyClientID(c *gin.Context, row *database.APIKeyRow) string {
-	if c == nil {
-		return ""
-	}
 	key := ""
 	if row != nil {
 		key = strings.TrimSpace(row.Key)
+	}
+	return deriveAPIKeyClientIDWithScope(c, key)
+}
+
+// deriveAPIKeyTrackingClientID uses the immutable database ID as its scope so
+// rotating a key secret does not count every fallback fingerprint a second
+// time. The existing limit-enforcement identity remains unchanged to avoid
+// resetting live Redis windows during deployment.
+func deriveAPIKeyTrackingClientID(c *gin.Context, row *database.APIKeyRow) string {
+	scope := ""
+	if row != nil && row.ID > 0 {
+		scope = strconv.FormatInt(row.ID, 10)
+	}
+	return deriveAPIKeyClientIDWithScope(c, scope)
+}
+
+func deriveAPIKeyClientIDWithScope(c *gin.Context, scope string) string {
+	if c == nil {
+		return ""
 	}
 	headers := requestHeaders(c)
 	originator := normalizeClientFingerprintComponent(headers.Get("Originator"))
@@ -45,12 +62,12 @@ func deriveAPIKeyClientID(c *gin.Context, row *database.APIKeyRow) string {
 	userAgent := normalizeClientFingerprintUserAgent(headers.Get("User-Agent"))
 	networkHint := normalizeClientNetworkHint(c)
 
-	if key == "" && originator == "" && version == "" && packageVersion == "" && runtimeVersion == "" && os == "" && arch == "" && userAgent == "" && networkHint == "" {
+	if scope == "" && originator == "" && version == "" && packageVersion == "" && runtimeVersion == "" && os == "" && arch == "" && userAgent == "" && networkHint == "" {
 		return ""
 	}
 
 	sum := sha256.Sum256([]byte(strings.Join([]string{
-		key,
+		scope,
 		userAgent,
 		version,
 		packageVersion,

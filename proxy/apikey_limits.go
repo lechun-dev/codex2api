@@ -135,6 +135,15 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	if row == nil {
 		return 0, ""
 	}
+	clientID, explicitClientID := resolveAPIKeyClientID(c, row)
+	validClientID := clientID != "" && (!explicitClientID || validAPIKeyClientID(clientID))
+	if validClientID && h != nil && h.db != nil {
+		trackingClientID := clientID
+		if !explicitClientID {
+			trackingClientID = deriveAPIKeyTrackingClientID(c, row)
+		}
+		h.db.RecordAPIKeyClient(row.ID, trackingClientID)
+	}
 	limits := row.Limits
 	if limits.IsZero() {
 		return 0, ""
@@ -159,7 +168,7 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	defer cancel()
 
 	// 2. 客户端数量限制。默认不启用;observe 只记录不阻断,enforce 才拒绝。
-	if status, msg := h.enforceAPIKeyClientLimit(ctx, c, row.ID, limits); status != 0 {
+	if status, msg := h.enforceAPIKeyClientLimit(ctx, row.ID, limits, clientID, explicitClientID); status != 0 {
 		return status, msg
 	}
 
@@ -330,12 +339,11 @@ func checkAPIKeyModel(model string, limits database.APIKeyLimits) string {
 	return ""
 }
 
-func (h *Handler) enforceAPIKeyClientLimit(ctx context.Context, c *gin.Context, apiKeyID int64, limits database.APIKeyLimits) (int, string) {
+func (h *Handler) enforceAPIKeyClientLimit(ctx context.Context, apiKeyID int64, limits database.APIKeyLimits, clientID string, explicit bool) (int, string) {
 	mode := strings.ToLower(strings.TrimSpace(limits.ClientLimitMode))
 	if limits.MaxClients <= 0 || (mode != database.APIKeyClientLimitModeObserve && mode != database.APIKeyClientLimitModeEnforce) {
 		return 0, ""
 	}
-	clientID, explicit := resolveAPIKeyClientID(c, apiKeyRowFromContext(c))
 	if explicit && !validAPIKeyClientID(clientID) {
 		if mode == database.APIKeyClientLimitModeEnforce {
 			return http.StatusBadRequest, "X-Client-Id must be 8-128 characters and contain only letters, numbers, '.', '_', '-' or ':'"

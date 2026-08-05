@@ -651,13 +651,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
 	api.POST("/keys/:id/regenerate", h.RegenerateAPIKey)
+	api.POST("/keys/:id/enabled", h.SetAPIKeyEnabled)
 	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
 	api.POST("/keys/:id/reset-quota", h.ResetAPIKeyQuota)
 	api.GET("/keys/:id/scope-usage", h.GetAPIKeyScopeUsage)
 	api.GET("/keys-scope-summary", h.GetAPIKeysScopeSummary)
 	api.POST("/keys/:id/scope-quota/reset", h.ResetAPIKeyScopeQuota)
-	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/account-groups", h.ListAccountGroups)
 	api.POST("/account-groups", h.CreateAccountGroup)
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
@@ -6498,6 +6498,7 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 
 	// 检查是否有任何 key 配置了窗口 cost limit
 	var need5h, need7d, need30d, needDaily bool
+	clientWindows := make(map[int64]time.Duration, len(keys))
 	for _, k := range keys {
 		if k.Limits.CostLimit5h > 0 {
 			need5h = true
@@ -6511,6 +6512,11 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		if k.Limits.CostLimitDaily > 0 {
 			needDaily = true
 		}
+		window := 30 * 24 * time.Hour
+		if k.Limits.ClientWindowMinutes > 0 {
+			window = time.Duration(k.Limits.ClientWindowMinutes) * time.Minute
+		}
+		clientWindows[k.ID] = window
 	}
 
 	// 按需批量查询窗口用量
@@ -6530,6 +6536,11 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 
 	// 最近使用时间：一次聚合，失败不阻断列表
 	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
+
+	// 批量读取活跃/累计客户端数。写入器最多约 5 秒后落库，这里不主动
+	// 等待写入，避免统计数据库抖动拖慢密钥管理页。
+	// 统计失败不阻断密钥管理页，前端会显示“暂不可用”。
+	clientCountByID, _ := h.db.ListAPIKeyClientCounts(ctx, clientWindows)
 
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
@@ -6556,6 +6567,12 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 				formatted := lastUsed.Format(time.RFC3339)
 				mk.LastUsedAt = &formatted
 			}
+		}
+		if clientCountByID != nil {
+			counts := clientCountByID[k.ID]
+			active, total := counts.Active, counts.Total
+			mk.ActiveClientCount = &active
+			mk.TotalClientCount = &total
 		}
 		maskedKeys = append(maskedKeys, mk)
 	}
@@ -7199,6 +7216,66 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")
+}
+
+type setAPIKeyEnabledReq struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// SetAPIKeyEnabled 启用或禁用 API Key，不删除其配置、用量和统计数据。
+func (h *Handler) SetAPIKeyEnabled(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+
+	var req setAPIKeyEnabledReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil || req.Enabled == nil {
+		writeError(c, http.StatusBadRequest, "enabled 必须是布尔值")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if row.Enabled == *req.Enabled {
+		h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+		if *req.Enabled {
+			writeMessage(c, http.StatusOK, "API Key 已启用")
+		} else {
+			writeMessage(c, http.StatusOK, "API Key 已禁用")
+		}
+		return
+	}
+	if err := h.db.SetAPIKeyEnabled(ctx, id, *req.Enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+
+	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+	event := "API_KEY_DISABLED"
+	message := "API Key 已禁用"
+	if *req.Enabled {
+		event = "API_KEY_ENABLED"
+		message = "API Key 已启用"
+	}
+	security.SecurityAuditLog(event, fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(row.Name), c.ClientIP()))
+	writeMessage(c, http.StatusOK, message)
 }
 
 // ==================== Settings ====================

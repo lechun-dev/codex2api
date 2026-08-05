@@ -197,7 +197,9 @@ func (h *Handler) GetPromptIntelligenceAIProviders(c *gin.Context) {
 	safeKeys := make([]gin.H, 0, len(keys))
 	for _, row := range keys {
 		status := "active"
-		if row.IsExpired(now) {
+		if !row.Enabled {
+			status = "disabled"
+		} else if row.IsExpired(now) {
 			status = "expired"
 		} else if row.IsQuotaExhausted() {
 			status = "quota_exhausted"
@@ -551,7 +553,7 @@ func (h *Handler) callPromptIntelligenceAI(ctx context.Context, request promptIn
 			}
 			return "", promptIntelligenceAICallAttribution{}, err
 		}
-		if row.IsExpired(time.Now()) || row.IsQuotaExhausted() {
+		if !row.Enabled || row.IsExpired(time.Now()) || row.IsQuotaExhausted() {
 			return "", promptIntelligenceAICallAttribution{}, errors.New("选择的网关 API Key 当前不可用")
 		}
 	}

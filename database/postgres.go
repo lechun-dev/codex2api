@@ -224,6 +224,19 @@ type DB struct {
 	sqliteWriteSem               chan struct{}
 	sqliteSingleConn             bool
 
+	// API Key 客户端统计按 (key ID, 客户端哈希) 在内存中合并后异步落库，
+	// 避免每个代理请求同步写数据库。
+	clientSeenMu       sync.Mutex
+	clientSeenFlushMu  sync.Mutex
+	clientSeenPending  map[apiKeyClientIdentity]time.Time
+	clientSeenDeleted  map[int64]struct{}
+	clientSeenNotify   chan struct{}
+	clientSeenStop     chan struct{}
+	clientSeenStopOnce sync.Once
+	clientSeenWg       sync.WaitGroup
+	clientSeenClosing  bool
+	clientSeenDropped  int64
+
 	// 配了 scope 累计额度的 API Key 集合（issue #439 v2）。落库热路径靠它跳过
 	// 绝大多数 Key，60s 刷新一次；管理端保存后会主动失效。
 	scopeQuotaMu        sync.Mutex
@@ -401,6 +414,10 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		driver:               driver,
 		logStop:              make(chan struct{}),
 		logFlushNotify:       make(chan struct{}, 1),
+		clientSeenPending:    make(map[apiKeyClientIdentity]time.Time, apiKeyClientBatchSize),
+		clientSeenDeleted:    make(map[int64]struct{}),
+		clientSeenNotify:     make(chan struct{}, 1),
+		clientSeenStop:       make(chan struct{}),
 		sqliteSingleConn:     sqliteSingleConn,
 		backgroundTaskCtx:    backgroundTaskCtx,
 		backgroundTaskCancel: backgroundTaskCancel,
@@ -437,6 +454,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	}
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
+	}
+	if err := db.ensureAPIKeyClientsTable(ctx); err != nil {
+		return nil, fmt.Errorf("创建 API Key 客户端统计表失败: %w", err)
 	}
 	if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
 		return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
@@ -524,6 +544,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 			log.Printf("回填提示词风险画像失败，将在下次启动继续: %v", err)
 		}
 	})
+	db.startAPIKeyClientFlusher()
 
 	return db, nil
 }
@@ -774,6 +795,7 @@ func applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch 
 
 // Close 关闭数据库连接
 func (db *DB) Close() error {
+	db.stopAPIKeyClientFlusher()
 	if !db.DrainBackgroundTasks(2 * time.Second) {
 		log.Printf("数据库后台任务超过优雅关闭窗口，已取消并等待退出")
 	}
@@ -1140,6 +1162,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		id         SERIAL PRIMARY KEY,
 		name       VARCHAR(255) DEFAULT '',
 		key        VARCHAR(255) NOT NULL UNIQUE,
+		enabled    BOOLEAN NOT NULL DEFAULT TRUE,
 		quota_limit DOUBLE PRECISION DEFAULT 0,
 		quota_used  DOUBLE PRECISION DEFAULT 0,
 		expires_at  TIMESTAMPTZ NULL,
@@ -1148,6 +1171,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS quota_limit DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS quota_used DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
 	CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS total_used DOUBLE PRECISION NOT NULL DEFAULT 0;
@@ -1518,6 +1542,7 @@ type APIKeyRow struct {
 	ID              int64        `json:"id"`
 	Name            string       `json:"name"`
 	Key             string       `json:"key"`
+	Enabled         bool         `json:"enabled"`
 	QuotaLimit      float64      `json:"quota_limit"`
 	QuotaUsed       float64      `json:"quota_used"`
 	TotalUsed       float64      `json:"total_used"`
@@ -1677,7 +1702,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), enabled`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -1709,7 +1734,7 @@ func (db *DB) CountAPIKeys(ctx context.Context) (int, error) {
 
 // GetAPIKeyByValue 通过完整 API Key 查找元数据，用于鉴权热路径的按 key 缓存。
 func (db *DB) GetAPIKeyByValue(ctx context.Context, key string) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE key = $1`, key)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE key = $1 AND enabled = TRUE`, key)
 	if err != nil {
 		return nil, err
 	}
@@ -1718,6 +1743,22 @@ func (db *DB) GetAPIKeyByValue(ctx context.Context, key string) (*APIKeyRow, err
 		return nil, sql.ErrNoRows
 	}
 	return scanAPIKeyRow(rows)
+}
+
+// SetAPIKeyEnabled 启用或禁用 API Key，保留额度、用量及关联统计。
+func (db *DB) SetAPIKeyEnabled(ctx context.Context, id int64, enabled bool) error {
+	result, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET enabled = $1 WHERE id = $2`, enabled, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // InsertAPIKey 插入新 API 密钥
@@ -2827,6 +2868,12 @@ func normalizeGrokConfig(raw string) string {
 
 // DeleteAPIKey 删除 API 密钥
 func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
+	// Serialize deletion with client-stat flushes. Otherwise a flush that has
+	// already detached its in-memory snapshot could recreate rows after the
+	// transaction deletes them.
+	db.clientSeenFlushMu.Lock()
+	defer db.clientSeenFlushMu.Unlock()
+
 	err := db.withSQLiteWriteLock(ctx, func() error {
 		tx, err := db.conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -2834,6 +2881,9 @@ func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
 		}
 		defer tx.Rollback()
 		if _, err := tx.ExecContext(ctx, `DELETE FROM prompt_filter_newapi_bindings WHERE api_key_id = $1`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM api_key_clients WHERE api_key_id = $1`, id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM api_keys WHERE id = $1`, id); err != nil {
@@ -2848,6 +2898,7 @@ func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
 	if err != nil {
 		return err
 	}
+	db.discardPendingAPIKeyClients(id)
 	db.InvalidateScopeQuotaKeyCache()
 	return nil
 }

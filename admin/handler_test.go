@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -721,6 +722,159 @@ func TestRegenerateAPIKeyReturnsNotFound(t *testing.T) {
 	handler.RegenerateAPIKey(ginCtx)
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+}
+
+func TestSetAPIKeyEnabledDisablesAndReEnablesWithoutDeleting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New error = %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-toggle-12345678901234567890"
+	id, err := db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:            "Client A",
+		Key:             key,
+		QuotaLimit:      2.5,
+		QuotaUsed:       1.25,
+		AllowedGroupIDs: []int64{3, 7},
+		Limits:          database.APIKeyLimits{RPM: 10, MaxClients: 2},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions() error = %v", err)
+	}
+	before, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(before) error = %v", err)
+	}
+
+	tc := cache.NewMemory(4)
+	defer tc.Close()
+	handler := &Handler{db: db, cache: tc}
+	setEnabled := func(enabled bool) *httptest.ResponseRecorder {
+		t.Helper()
+		if err := tc.SetRuntime(ctx, adminAPIKeyCacheNamespace, key, json.RawMessage(`{"id":1}`), time.Minute); err != nil {
+			t.Fatalf("seed key cache: %v", err)
+		}
+		if err := tc.SetRuntime(ctx, adminAPIKeyCountNamespace, "all", json.RawMessage(`1`), time.Minute); err != nil {
+			t.Fatalf("seed count cache: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+		ginCtx.Request = httptest.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("/api/admin/keys/%d/enabled", id),
+			strings.NewReader(fmt.Sprintf(`{"enabled":%t}`, enabled)),
+		)
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.SetAPIKeyEnabled(ginCtx)
+		return recorder
+	}
+
+	if recorder := setEnabled(false); recorder.Code != http.StatusOK {
+		t.Fatalf("disable status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if _, err := db.GetAPIKeyByValue(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("disabled key lookup error = %v, want sql.ErrNoRows", err)
+	}
+	disabled, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(disabled) error = %v", err)
+	}
+	wantDisabled := *before
+	wantDisabled.Enabled = false
+	if !reflect.DeepEqual(disabled, &wantDisabled) {
+		t.Fatalf("disabled row = %#v, want %#v", disabled, &wantDisabled)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCacheNamespace, key); err != nil || ok {
+		t.Fatalf("key cache after disable = (ok=%v, err=%v), want miss", ok, err)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCountNamespace, "all"); err != nil || ok {
+		t.Fatalf("count cache after disable = (ok=%v, err=%v), want miss", ok, err)
+	}
+
+	if recorder := setEnabled(true); recorder.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	restored, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue(enabled) error = %v", err)
+	}
+	if !reflect.DeepEqual(restored, before) {
+		t.Fatalf("re-enabled row = %#v, want %#v", restored, before)
+	}
+}
+
+func TestListAPIKeysIncludesActiveAndTotalClientCounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New error = %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	trackedID, err := db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name: "Tracked",
+		Key:  "sk-test-tracked-clients-1234567890",
+		Limits: database.APIKeyLimits{
+			MaxClients:          3,
+			ClientWindowMinutes: 60,
+			ClientLimitMode:     database.APIKeyClientLimitModeObserve,
+		},
+	})
+	if err != nil {
+		t.Fatalf("insert tracked API key error = %v", err)
+	}
+	untrackedID, err := db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name: "Untracked",
+		Key:  "sk-test-untracked-clients-1234567890",
+	})
+	if err != nil {
+		t.Fatalf("insert untracked API key error = %v", err)
+	}
+
+	for _, clientID := range []string{"client-a", "client-b", "client-a"} {
+		if ok := db.RecordAPIKeyClient(trackedID, clientID); !ok {
+			t.Fatalf("RecordAPIKeyClient(%q) = false", clientID)
+		}
+	}
+	if ok := db.RecordAPIKeyClient(untrackedID, "client-c"); !ok {
+		t.Fatal("RecordAPIKeyClient for unlimited key = false")
+	}
+	if err := db.FlushAPIKeyClients(ctx); err != nil {
+		t.Fatalf("FlushAPIKeyClients error = %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/keys", nil)
+	handler.ListAPIKeys(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload apiKeysResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response error = %v", err)
+	}
+	rowsByID := make(map[int64]*MaskedAPIKeyRow, len(payload.Keys))
+	for _, row := range payload.Keys {
+		rowsByID[row.ID] = row
+	}
+	if row := rowsByID[trackedID]; row == nil || row.ActiveClientCount == nil || *row.ActiveClientCount != 2 || row.TotalClientCount == nil || *row.TotalClientCount != 2 {
+		t.Fatalf("tracked row = %#v, want active_client_count=2 and total_client_count=2", row)
+	}
+	if row := rowsByID[untrackedID]; row == nil || row.ActiveClientCount == nil || *row.ActiveClientCount != 1 || row.TotalClientCount == nil || *row.TotalClientCount != 1 {
+		t.Fatalf("unlimited row = %#v, want active_client_count=1 and total_client_count=1", row)
 	}
 }
 

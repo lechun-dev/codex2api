@@ -804,8 +804,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  deleteAPIKey: (id: number) =>
-    request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
+  setAPIKeyEnabled: (id: number, enabled: boolean) =>
+    request<MessageResponse>(`/keys/${id}/enabled`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
   regenerateAPIKey: (id: number) =>
     request<RegenerateAPIKeyResponse>(`/keys/${id}/regenerate`, { method: 'POST' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>

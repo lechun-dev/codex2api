@@ -101,6 +101,83 @@ func TestSQLiteRegenerateAPIKeyRejectsMissingID(t *testing.T) {
 	}
 }
 
+func TestSQLiteSetAPIKeyEnabledPreservesKeyAndMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) error = %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-toggle-key-12345678901234567890"
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name:            "Client A",
+		Key:             key,
+		QuotaLimit:      12.5,
+		QuotaUsed:       3.25,
+		ExpiresAt:       sql.NullTime{Time: time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second), Valid: true},
+		AllowedGroupIDs: []int64{3, 7},
+		Limits:          APIKeyLimits{RPM: 20, MaxConcurrency: 3},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions() error = %v", err)
+	}
+	before, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(before) error = %v", err)
+	}
+	if !before.Enabled {
+		t.Fatal("new key Enabled = false, want true")
+	}
+
+	if err := db.SetAPIKeyEnabled(ctx, id, false); err != nil {
+		t.Fatalf("SetAPIKeyEnabled(false) error = %v", err)
+	}
+	if _, err := db.GetAPIKeyByValue(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("disabled key lookup error = %v, want sql.ErrNoRows", err)
+	}
+	after, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID(disabled) error = %v", err)
+	}
+	want := *before
+	want.Enabled = false
+	if !reflect.DeepEqual(after, &want) {
+		t.Fatalf("disabled row = %#v, want %#v", after, &want)
+	}
+	rows, err := db.ListAPIKeys(ctx)
+	if err != nil || len(rows) != 1 || rows[0].ID != id || rows[0].Enabled {
+		t.Fatalf("ListAPIKeys() = (%#v, %v), want one disabled row", rows, err)
+	}
+	count, err := db.CountAPIKeys(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("CountAPIKeys() = (%d, %v), want (1, nil)", count, err)
+	}
+	if _, err := db.FirstAPIKey(ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("FirstAPIKey() error = %v, want sql.ErrNoRows", err)
+	}
+
+	if err := db.SetAPIKeyEnabled(ctx, id, true); err != nil {
+		t.Fatalf("SetAPIKeyEnabled(true) error = %v", err)
+	}
+	if row, err := db.GetAPIKeyByValue(ctx, key); err != nil || row.ID != id || !row.Enabled {
+		t.Fatalf("re-enabled key lookup = (%#v, %v), want enabled id=%d", row, err, id)
+	}
+}
+
+func TestSQLiteSetAPIKeyEnabledRejectsMissingID(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) error = %v", err)
+	}
+	defer db.Close()
+
+	if err := db.SetAPIKeyEnabled(context.Background(), 999, false); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("SetAPIKeyEnabled() error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestChartAggregationUsesEpochBucketsForDailyRange(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "chart-daily.db"))
 	if err != nil {
@@ -799,7 +876,7 @@ func TestSQLiteMigratesLegacyAPIKeysColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAPIKeyByValue legacy 返回错误: %v", err)
 	}
-	if row.Name != "legacy" || row.QuotaLimit != 0 || row.QuotaUsed != 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) != 0 {
+	if row.Name != "legacy" || !row.Enabled || row.QuotaLimit != 0 || row.QuotaUsed != 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) != 0 {
 		t.Fatalf("legacy row = %#v, want migrated defaults", row)
 	}
 }

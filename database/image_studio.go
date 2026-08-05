@@ -682,7 +682,7 @@ func (db *DB) GetAPIKeyByID(ctx context.Context, id int64) (*APIKeyRow, error) {
 }
 
 func (db *DB) FirstAPIKey(ctx context.Context) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys ORDER BY id LIMIT 1`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE enabled = TRUE ORDER BY id LIMIT 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -698,7 +698,7 @@ func scanAPIKeyRow(scanner interface {
 }) (*APIKeyRow, error) {
 	row := &APIKeyRow{}
 	var createdAtRaw, expiresAtRaw, lastResetAtRaw, allowedGroupsRaw, limitsRaw interface{}
-	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw); err != nil {
+	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw, &row.Enabled); err != nil {
 		return nil, err
 	}
 	createdAt, err := parseDBTimeValue(createdAtRaw)

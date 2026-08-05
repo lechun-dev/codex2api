@@ -2287,16 +2287,19 @@ export interface APIKeyRow {
   name: string
   key: string
   raw_key: string
+  enabled: boolean
   quota_limit: number
   quota_used: number
   total_used: number
   reset_count: number
   last_reset_at?: ISODateString | null
   expires_at?: ISODateString | null
-  status?: 'active' | 'expired' | 'quota_exhausted'
+  status?: 'active' | 'disabled' | 'expired' | 'quota_exhausted'
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
+  active_client_count?: number
+  total_client_count?: number
   last_used_at?: ISODateString | null
   created_at: ISODateString
 }

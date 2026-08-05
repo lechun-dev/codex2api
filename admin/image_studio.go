@@ -1439,6 +1439,9 @@ func (h *Handler) resolveImageJobAPIKey(ctx context.Context, id int64) (*databas
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("API Key 不存在")
 		}
+		if err == nil && !key.Enabled {
+			return nil, fmt.Errorf("API Key 已禁用")
+		}
 		return key, err
 	}
 	key, err := h.db.FirstAPIKey(ctx)

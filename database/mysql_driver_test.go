@@ -242,6 +242,19 @@ func TestRewriteSQLForMySQLAPIKeyRegeneration(t *testing.T) {
 	assertNoMySQL56IncompatibleSQL(t, updateQuery)
 }
 
+func TestRewriteSQLForMySQLAPIKeyEnabledQueries(t *testing.T) {
+	selectQuery := rewriteSQLForMySQL(`SELECT ` + apiKeySelectColumns + ` FROM api_keys WHERE key = $1 AND enabled = TRUE`)
+	if !strings.Contains(selectQuery, "WHERE `key` = ? AND enabled = TRUE") {
+		t.Fatalf("rewritten select = %q", selectQuery)
+	}
+	updateQuery := rewriteSQLForMySQL(`UPDATE api_keys SET enabled = $1 WHERE id = $2`)
+	if updateQuery != "UPDATE api_keys SET enabled = ? WHERE id = ?" {
+		t.Fatalf("rewritten update = %q", updateQuery)
+	}
+	assertNoMySQL56IncompatibleSQL(t, selectQuery)
+	assertNoMySQL56IncompatibleSQL(t, updateQuery)
+}
+
 func TestRewriteSQLForMySQLAPIKeyDDLDoesNotRewritePrimaryKey(t *testing.T) {
 	got := rewriteSQLForMySQL("CREATE TABLE api_keys (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(255) NOT NULL UNIQUE)")
 	want := "CREATE TABLE api_keys (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, `key` VARCHAR(255) NOT NULL UNIQUE)"

@@ -4370,6 +4370,32 @@ func TestResolveAPIKeyDistinguishesDBFailureFrom404(t *testing.T) {
 	}
 }
 
+func TestDisabledAPIKeyStillKeepsAuthenticationRequired(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAPIKey(ctx, "disabled", "sk-disabled-123")
+	if err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	if err := db.SetAPIKeyEnabled(ctx, id, false); err != nil {
+		t.Fatalf("SetAPIKeyEnabled: %v", err)
+	}
+
+	h := &Handler{db: db, configKeys: map[string]bool{}}
+	if !h.hasAnyKeys() {
+		t.Fatal("hasAnyKeys() = false with a disabled key; authentication must remain required")
+	}
+	row, ok, resolveErr := h.resolveAPIKey("sk-disabled-123")
+	if ok || resolveErr != nil || row != nil {
+		t.Fatalf("disabled key resolved as row=%v ok=%v err=%v, want (nil,false,nil)", row, ok, resolveErr)
+	}
+}
+
 // body-signal compact:中转账号池收到带 compaction_trigger 的流式 /responses
 // 请求时，必须保留 /responses 的 SSE 协议；compact 专用模型映射只能改写模型，
 // 不能把请求改道到返回一次性 JSON 的 /responses/compact（issue #361）。

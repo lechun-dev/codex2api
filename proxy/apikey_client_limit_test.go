@@ -1,15 +1,53 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
+
+func TestAPIKeyClientTrackingIncludesKeysWithoutClientLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "clients.db"))
+	if err != nil {
+		t.Fatalf("database.New error = %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "unlimited", "sk-test-unlimited-client-tracking-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey error = %v", err)
+	}
+	row := &database.APIKeyRow{ID: keyID, Key: "sk-test-unlimited-client-tracking-1234567890"}
+	handler := &Handler{db: db}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	for _, clientID := range []string{"client-one", "client-one", "client-two"} {
+		request := testAPIKeyLimitContext(row, clientID)
+		if status, msg := handler.enforceAPIKeyLimits(request, ""); status != 0 || msg != "" {
+			t.Fatalf("client %q status=%d msg=%q, want allow", clientID, status, msg)
+		}
+	}
+	if err := db.FlushAPIKeyClients(ctx); err != nil {
+		t.Fatalf("FlushAPIKeyClients error = %v", err)
+	}
+	counts, err := db.ListAPIKeyClientCounts(ctx, map[int64]time.Duration{keyID: time.Hour})
+	if err != nil {
+		t.Fatalf("ListAPIKeyClientCounts error = %v", err)
+	}
+	if got := counts[keyID]; got.Active != 2 || got.Total != 2 {
+		t.Fatalf("counts = %#v, want active=2 total=2", got)
+	}
+}
 
 func TestAPIKeyClientLimitEnforceRejectsNewClientOverLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -181,6 +219,27 @@ func TestDeriveAPIKeyClientIDUsesNetworkHintToReduceCollisions(t *testing.T) {
 	}
 	if id1 == id2 {
 		t.Fatalf("different network hints should produce different derived ids: %q", id1)
+	}
+}
+
+func TestDeriveAPIKeyTrackingClientIDSurvivesKeyRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	before := &database.APIKeyRow{ID: 21, Key: "sk-before-rotation-0021"}
+	after := &database.APIKeyRow{ID: 21, Key: "sk-after-rotation-0021"}
+	other := &database.APIKeyRow{ID: 22, Key: "sk-after-rotation-0021"}
+
+	request := testAPIKeyLimitContextWithFingerprint(before, "", "198.51.100.50:1111", "codex_cli_rs/0.136.0 (Mac OS 15.5.0; arm64)", "MacOS", "arm64", "codex_cli_rs")
+	beforeID := deriveAPIKeyTrackingClientID(request, before)
+	afterID := deriveAPIKeyTrackingClientID(request, after)
+	otherID := deriveAPIKeyTrackingClientID(request, other)
+	if beforeID == "" || afterID == "" || otherID == "" {
+		t.Fatalf("tracking ids should not be empty: %q %q %q", beforeID, afterID, otherID)
+	}
+	if beforeID != afterID {
+		t.Fatalf("key rotation changed tracking identity: %q vs %q", beforeID, afterID)
+	}
+	if beforeID == otherID {
+		t.Fatalf("different API key IDs produced the same tracking identity: %q", beforeID)
 	}
 }
 

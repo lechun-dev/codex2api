@@ -63,7 +63,10 @@ import {
   KeyRound,
   Loader2,
   LockKeyhole,
+  MonitorSmartphone,
   Pencil,
+  Power,
+  PowerOff,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -86,8 +89,8 @@ const WINDOWS_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64-setup.exe.zip
 const MAC_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-arm64.dmg.zip";
 const MAC_INTEL_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64.dmg.zip";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
-type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon";
-type APIKeyStatus = "active" | "expired" | "quota_exhausted";
+type StatusFilter = "all" | "active" | "disabled" | "expired" | "quota_exhausted" | "expiring_soon";
+type APIKeyStatus = "active" | "disabled" | "expired" | "quota_exhausted";
 type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_asc";
 
 const KEY_REVEAL_MS = 30_000;
@@ -270,7 +273,7 @@ export default function APIKeys() {
   const [sortMode, setSortMode] = useState<SortMode>("created_desc");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
+  const [togglingIds, setTogglingIds] = useState<Set<number>>(new Set());
   const [regeneratingIds, setRegeneratingIds] = useState<Set<number>>(
     new Set(),
   );
@@ -419,6 +422,7 @@ export default function APIKeys() {
     const counts = {
       all: keys.length,
       active: 0,
+      disabled: 0,
       expired: 0,
       quota_exhausted: 0,
       expiring_soon: 0,
@@ -427,6 +431,7 @@ export default function APIKeys() {
     for (const keyRow of keys) {
       const status = getAPIKeyStatus(keyRow);
       if (status === "active") counts.active += 1;
+      else if (status === "disabled") counts.disabled += 1;
       else if (status === "expired") counts.expired += 1;
       else counts.quota_exhausted += 1;
 
@@ -484,6 +489,7 @@ export default function APIKeys() {
     const filtered = keys.filter((keyRow) => {
       const status = getAPIKeyStatus(keyRow);
       if (statusFilter === "active" && status !== "active") return false;
+      if (statusFilter === "disabled" && status !== "disabled") return false;
       if (statusFilter === "expired" && status !== "expired") return false;
       if (statusFilter === "quota_exhausted" && status !== "quota_exhausted")
         return false;
@@ -716,42 +722,47 @@ export default function APIKeys() {
     }
   };
 
-  const handleDeleteKey = async (id: number) => {
-    const confirmed = await confirm({
-      title: t("apiKeys.deleteKeyTitle"),
-      description: t("apiKeys.deleteKeyDesc"),
-      confirmText: t("apiKeys.confirmDelete"),
-      tone: "destructive",
-      confirmVariant: "destructive",
-    });
-    if (!confirmed) return;
+  const handleToggleKeyEnabled = async (keyRow: APIKeyRow) => {
+    const nextEnabled = keyRow.enabled === false;
+    if (!nextEnabled) {
+      const confirmed = await confirm({
+        title: t("apiKeys.disableKeyTitle"),
+        description: t("apiKeys.disableKeyDesc"),
+        confirmText: t("apiKeys.confirmDisable"),
+        tone: "destructive",
+        confirmVariant: "destructive",
+      });
+      if (!confirmed) return;
+    }
 
-    setDeletingIds((prev) => new Set(prev).add(id));
+    setTogglingIds((prev) => new Set(prev).add(keyRow.id));
     const previous = keys;
     setData((current) => ({
       ...current,
-      keys: current.keys.filter((item) => item.id !== id),
+      keys: current.keys.map((item) =>
+        item.id === keyRow.id
+          ? {
+              ...item,
+              enabled: nextEnabled,
+              status: nextEnabled ? "active" : "disabled",
+            }
+          : item,
+      ),
     }));
     try {
-      await api.deleteAPIKey(id);
-      showToast(t("apiKeys.keyDeleted"));
-      if (createdKeyId === id) setCreatedKeyId(null);
-      setVisibleKeys((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
+      await api.setAPIKeyEnabled(keyRow.id, nextEnabled);
+      showToast(t(nextEnabled ? "apiKeys.keyEnabled" : "apiKeys.keyDisabled"));
       void reloadSilently();
     } catch (error) {
       setData((current) => ({ ...current, keys: previous }));
       showToast(
-        `${t("apiKeys.deleteFailed")}: ${getErrorMessage(error)}`,
+        `${t(nextEnabled ? "apiKeys.enableFailed" : "apiKeys.disableFailed")}: ${getErrorMessage(error)}`,
         "error",
       );
     } finally {
-      setDeletingIds((prev) => {
+      setTogglingIds((prev) => {
         const next = new Set(prev);
-        next.delete(id);
+        next.delete(keyRow.id);
         return next;
       });
     }
@@ -762,7 +773,7 @@ export default function APIKeys() {
     keyCount: keys.length,
     resettingAll,
     resettingIds,
-    deletingIds,
+    deletingIds: togglingIds,
   });
 
   const handleRegenerateKey = async (keyRow: APIKeyRow) => {
@@ -1343,6 +1354,11 @@ export default function APIKeys() {
                         statusCounts.active,
                       ],
                       [
+                        "disabled",
+                        t("apiKeys.status.disabled"),
+                        statusCounts.disabled,
+                      ],
+                      [
                         "expiring_soon",
                         t("apiKeys.status.expiring_soon"),
                         statusCounts.expiring_soon,
@@ -1495,7 +1511,7 @@ export default function APIKeys() {
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
                           resettingAll ||
-                          deletingIds.has(keyRow.id) ||
+                          togglingIds.has(keyRow.id) ||
                           resettingIds.has(keyRow.id) ||
                           regeneratingIds.has(keyRow.id);
                         const displayKey = isVisible
@@ -1590,6 +1606,13 @@ export default function APIKeys() {
                                   t={t}
                                 />
                               </div>
+                              <div className="flex items-center justify-between gap-2 text-[11px]">
+                                <span className="flex items-center gap-1 font-semibold text-muted-foreground">
+                                  <MonitorSmartphone className="size-3.5" />
+                                  {t("apiKeys.clientCountColumn")}
+                                </span>
+                                <ClientCountDisplay keyRow={keyRow} t={t} />
+                              </div>
                               <div className="rounded-xl border border-border/70 bg-muted/20 px-2.5 py-2">
                                 <div className="flex items-center justify-between gap-2 text-[11px]">
                                   <span className="font-semibold text-muted-foreground">
@@ -1668,18 +1691,20 @@ export default function APIKeys() {
                                 {t("apiKeys.editKey")}
                               </Button>
                               <Button
-                                variant="destructive"
+                                variant={keyRow.enabled === false ? "outline" : "destructive"}
                                 size="sm"
                                 disabled={isBusy}
-                                onClick={() => void handleDeleteKey(keyRow.id)}
+                                onClick={() => void handleToggleKeyEnabled(keyRow)}
                                 className="min-w-[6rem] flex-1"
                               >
-                                {deletingIds.has(keyRow.id) ? (
+                                {togglingIds.has(keyRow.id) ? (
                                   <Loader2 className="size-3.5 animate-spin" />
+                                ) : keyRow.enabled === false ? (
+                                  <Power className="size-3.5" />
                                 ) : (
-                                  <Trash2 className="size-3.5" />
+                                  <PowerOff className="size-3.5" />
                                 )}
-                                {t("common.delete")}
+                                {t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
                               </Button>
                             </div>
                           </div>
@@ -1695,6 +1720,7 @@ export default function APIKeys() {
                             <TableHead>{t("common.name")}</TableHead>
                             <TableHead>{t("apiKeys.keyColumn")}</TableHead>
                             <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
+                            <TableHead>{t("apiKeys.clientCountColumn")}</TableHead>
                             <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
                             <TableHead>{t("apiKeys.lastUsedColumn")}</TableHead>
                             <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
@@ -1709,7 +1735,7 @@ export default function APIKeys() {
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
                               resettingAll ||
-                              deletingIds.has(keyRow.id) ||
+                              togglingIds.has(keyRow.id) ||
                               resettingIds.has(keyRow.id) ||
                               regeneratingIds.has(keyRow.id);
                             const displayKey = isVisible
@@ -1806,6 +1832,9 @@ export default function APIKeys() {
                                     groups={groups}
                                     t={t}
                                   />
+                                </TableCell>
+                                <TableCell className="whitespace-nowrap text-sm">
+                                  <ClientCountDisplay keyRow={keyRow} t={t} />
                                 </TableCell>
                                 <TableCell className="min-w-[160px] text-sm text-muted-foreground">
                                   <div className="space-y-1">
@@ -1906,20 +1935,22 @@ export default function APIKeys() {
                                       {t("apiKeys.editKey")}
                                     </Button>
                                     <Button
-                                      variant="destructive"
+                                      variant={keyRow.enabled === false ? "outline" : "destructive"}
                                       size="sm"
                                       disabled={isBusy}
                                       onClick={() =>
-                                        void handleDeleteKey(keyRow.id)
+                                        void handleToggleKeyEnabled(keyRow)
                                       }
-                                      title={t("common.delete")}
+                                      title={t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
                                     >
-                                      {deletingIds.has(keyRow.id) ? (
+                                      {togglingIds.has(keyRow.id) ? (
                                         <Loader2 className="size-3.5 animate-spin" />
+                                      ) : keyRow.enabled === false ? (
+                                        <Power className="size-3.5" />
                                       ) : (
-                                        <Trash2 className="size-3.5" />
+                                        <PowerOff className="size-3.5" />
                                       )}
-                                      {t("common.delete")}
+                                      {t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
                                     </Button>
                                   </div>
                                 </TableCell>
@@ -3207,6 +3238,9 @@ function toDateTimeLocalValue(value?: string | null) {
 }
 
 function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
+  if (keyRow.enabled === false || keyRow.status === "disabled") {
+    return "disabled";
+  }
   if (keyRow.status === "expired" || keyRow.status === "quota_exhausted") {
     return keyRow.status;
   }
@@ -3295,6 +3329,11 @@ function KeyStatusBadge({
       dot: "bg-[hsl(var(--success))]",
       className:
         "border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]",
+    },
+    disabled: {
+      dot: "bg-[hsl(var(--warning))]",
+      className:
+        "border-transparent bg-[hsl(var(--warning))]/10 text-[hsl(var(--warning))]",
     },
     expired: {
       dot: "bg-muted-foreground",
@@ -3447,6 +3486,42 @@ function formatLastUsed(keyRow: APIKeyRow, t: Translator) {
     return t("apiKeys.neverUsed");
   }
   return formatRelativeTime(keyRow.last_used_at, { variant: "compact" });
+}
+
+function ClientCountDisplay({
+  keyRow,
+  t,
+}: {
+  keyRow: APIKeyRow;
+  t: Translator;
+}) {
+  const maxClients = keyRow.limits?.max_clients ?? 0;
+  if (
+    keyRow.active_client_count === undefined ||
+    keyRow.total_client_count === undefined
+  ) {
+    return (
+      <span className="text-muted-foreground">
+        {t("apiKeys.clientCountUnavailable")}
+      </span>
+    );
+  }
+  const windowMinutes = keyRow.limits?.client_window_minutes || 43_200;
+  return (
+    <span
+      className="font-medium tabular-nums text-foreground"
+      title={t("apiKeys.clientCountHint", { minutes: windowMinutes })}
+    >
+      {t("apiKeys.clientCountSummary", {
+        active: keyRow.active_client_count,
+        total: keyRow.total_client_count,
+        limit:
+          maxClients > 0
+            ? String(maxClients)
+            : t("apiKeys.clientCountUnlimited"),
+      })}
+    </span>
+  );
 }
 
 function formatUSD(value: number) {

@@ -8,6 +8,7 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
+export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
 export interface StatsChannelCounts {
   total: number
@@ -185,6 +186,12 @@ export interface AccountRow {
     reset_at: ISODateString
     remaining_seconds: number
   }>
+  model_cooldown_mode_override?: ModelCooldownMode | null
+  model_cooldown_seconds_override?: number | null
+  model_cooldown_backoff_override?: boolean | null
+  model_cooldown_mode_effective?: ModelCooldownMode
+  model_cooldown_seconds_effective?: number
+  model_cooldown_backoff_effective?: boolean
   enabled?: boolean
   locked?: boolean
   credit_enabled?: boolean
@@ -575,6 +582,7 @@ export interface AccountGroup {
   base_concurrency_override: number | null
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
+  proxy_urls: string[]
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -591,6 +599,7 @@ export interface CreateAccountGroupRequest {
   base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
+  proxy_urls?: string[]
 }
 
 export interface UpdateAccountGroupRequest {
@@ -601,6 +610,7 @@ export interface UpdateAccountGroupRequest {
   base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
+  proxy_urls?: string[]
 }
 
 export interface AccountModelStat {
@@ -985,6 +995,7 @@ export interface SystemSettings {
   utls_shutdown_timeout_minutes: number
   scheduler_mode: string
   affinity_mode?: string
+  session_affinity_spread?: boolean
   grok_affinity_mode?: string
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
@@ -1007,6 +1018,12 @@ export interface SystemSettings {
   response_cache_local_max_entry_bytes: number
   response_cache_reconstruct_max_bytes: number
   readonly response_cache_config_generation: number
+  relay_model_cooldown_mode: ModelCooldownMode
+  relay_model_cooldown_seconds: number
+  relay_model_cooldown_backoff_enabled: boolean
+  oauth_model_cooldown_mode: ModelCooldownMode
+  oauth_model_cooldown_seconds: number
+  oauth_model_cooldown_backoff_enabled: boolean
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
@@ -2306,12 +2323,15 @@ export interface APIKeyRow {
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
 
+export type PromptFilterScope = 'inherit' | 'local_only' | 'off'
+
 export interface PromptFilterNewAPIBinding {
   api_key_id: number
   platform_code: string
   platform_name: string
   enabled: boolean
   require_signed_identity: boolean
+  prompt_filter_scope: PromptFilterScope
   secret_configured: boolean
   secret_masked: string
   previous_secret_active: boolean
@@ -2331,6 +2351,7 @@ export interface CreatePromptFilterNewAPIBindingRequest {
   platform_name: string
   enabled?: boolean
   require_signed_identity?: boolean
+  prompt_filter_scope?: PromptFilterScope
 }
 
 export type UpdatePromptFilterNewAPIBindingRequest = Partial<

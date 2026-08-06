@@ -1153,11 +1153,12 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 			ErrorMessage: "client canceled",
 		},
 		{
-			AccountID:  4,
-			Endpoint:   "/v1/responses",
-			Model:      "gpt-5.4",
-			StatusCode: 200,
-			DurationMs: 90,
+			AccountID:    4,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   200,
+			DurationMs:   90,
+			ViaWebsocket: true,
 		},
 	} {
 		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
@@ -1230,6 +1231,54 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 500 {
 		t.Fatalf("5xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	filter = UsageLogFilter{
+		Start:        now.Add(-1 * time.Hour),
+		End:          now.Add(1 * time.Hour),
+		Page:         1,
+		PageSize:     10,
+		StatusFamily: "2xx",
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 2xx 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 200 {
+		t.Fatalf("2xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	retryOnly := true
+	filter = UsageLogFilter{
+		Start:           now.Add(-1 * time.Hour),
+		End:             now.Add(1 * time.Hour),
+		Page:            1,
+		PageSize:        10,
+		RetryOnly:       &retryOnly,
+		IncludeCanceled: true,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged retry 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].IsRetryAttempt {
+		t.Fatalf("retry page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	websocketOnly := true
+	filter = UsageLogFilter{
+		Start:            now.Add(-1 * time.Hour),
+		End:              now.Add(1 * time.Hour),
+		Page:             1,
+		PageSize:         10,
+		ViaWebsocketOnly: &websocketOnly,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged websocket 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].ViaWebsocket {
+		t.Fatalf("websocket page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
 	}
 }
 
@@ -1351,6 +1400,49 @@ func TestSQLiteModelCooldownPersistence(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 0", len(rows))
+	}
+}
+
+func TestModelCooldownSettingsDefaultsAndUpdate(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	defaults, err := db.GetModelCooldownSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetModelCooldownSettings defaults: %v", err)
+	}
+	if defaults.RelayMode != ModelCooldownModeOff || defaults.RelaySeconds != 2 || defaults.RelayBackoffEnabled {
+		t.Fatalf("relay defaults = %#v", defaults)
+	}
+	if defaults.OAuthMode != ModelCooldownModeAdaptive || defaults.OAuthSeconds != 300 || !defaults.OAuthBackoffEnabled {
+		t.Fatalf("oauth defaults = %#v", defaults)
+	}
+
+	mode := ModelCooldownModeFixed
+	seconds := 7
+	backoff := false
+	updated, err := db.UpdateModelCooldownSettings(ctx, ModelCooldownSettingsUpdate{
+		RelayMode:           &mode,
+		RelaySeconds:        &seconds,
+		RelayBackoffEnabled: &backoff,
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelCooldownSettings: %v", err)
+	}
+	if updated.RelayMode != mode || updated.RelaySeconds != seconds || updated.RelayBackoffEnabled {
+		t.Fatalf("updated relay settings = %#v", updated)
+	}
+	reloaded, err := db.GetModelCooldownSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetModelCooldownSettings reload: %v", err)
+	}
+	if reloaded != updated {
+		t.Fatalf("reloaded = %#v, want %#v", reloaded, updated)
 	}
 }
 

@@ -31,6 +31,14 @@ func TestRewriteSQLForMySQLJSONCasts(t *testing.T) {
 	}
 }
 
+func TestRewriteModelCooldownInsertForMySQL56(t *testing.T) {
+	got := rewriteSQLForMySQL(`INSERT INTO system_settings (id) VALUES (1) ON CONFLICT(id) DO NOTHING`)
+	if !strings.Contains(got, "INSERT IGNORE INTO system_settings") {
+		t.Fatalf("model cooldown insert was not rewritten for MySQL: %s", got)
+	}
+	assertNoMySQL56IncompatibleSQL(t, got)
+}
+
 func TestAccountChannelPredicateUsesMySQL56CompatibleSQL(t *testing.T) {
 	db := &DB{driver: "mysql"}
 	got := db.accountUpstreamTypeIsGrokPredicate()
@@ -331,16 +339,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"grok_config = VALUES(grok_config)",
 		"codex_preflight_sse_passthrough_enabled = VALUES(codex_preflight_sse_passthrough_enabled)",
 		"utls_shutdown_timeout_minutes = VALUES(utls_shutdown_timeout_minutes)",
+		"session_affinity_spread = VALUES(session_affinity_spread)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 105 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 105", got)
+	if got := strings.Count(capture.query, "?"); got != 106 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 106", got)
 	}
-	if len(capture.args) != 105 {
-		t.Fatalf("rewritten settings argument count = %d, want 105", len(capture.args))
+	if len(capture.args) != 106 {
+		t.Fatalf("rewritten settings argument count = %d, want 106", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -427,14 +436,14 @@ func TestCreatePromptFilterNewAPIBindingRewritesForMySQL56(t *testing.T) {
 
 	for _, fragment := range []string{
 		"INSERT INTO prompt_filter_newapi_bindings",
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', NULL, CURRENT_TIMESTAMP)",
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, CURRENT_TIMESTAMP)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten prompt-filter binding query missing %q: %s", fragment, capture.query)
 		}
 	}
 	assertNoMySQL56IncompatibleSQL(t, capture.query)
-	if len(capture.args) != 8 || capture.args[0].Value != int64(17) || capture.args[3].Value != secret {
+	if len(capture.args) != 9 || capture.args[0].Value != int64(17) || capture.args[3].Value != secret {
 		t.Fatalf("rewritten prompt-filter binding args = %#v", capture.args)
 	}
 }

@@ -45,6 +45,13 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "response_cache_local_max_entry_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
 	{table: "system_settings", name: "response_cache_reconstruct_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
 	{table: "system_settings", name: "response_cache_config_generation", def: "BIGINT NOT NULL DEFAULT 1"},
+	{table: "system_settings", name: "session_affinity_spread", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "relay_model_cooldown_mode", def: "VARCHAR(20) NOT NULL DEFAULT 'off'"},
+	{table: "system_settings", name: "relay_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 2"},
+	{table: "system_settings", name: "relay_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 0"},
+	{table: "system_settings", name: "oauth_model_cooldown_mode", def: "VARCHAR(20) NOT NULL DEFAULT 'adaptive'"},
+	{table: "system_settings", name: "oauth_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 300"},
+	{table: "system_settings", name: "oauth_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 1"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -292,6 +299,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "image_quota_total", "INT NULL"},
 		{"accounts", "today_used_count", "INT DEFAULT 0"},
 		{"accounts", "image_quota_reset_at", "DATETIME NULL"},
+		{"account_groups", "proxy_urls", "TEXT NULL"},
 		{"usage_logs", "channel", "VARCHAR(16) DEFAULT ''"},
 		{"usage_logs", "client_ip", "VARCHAR(64) DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INT DEFAULT 0"},
@@ -545,6 +553,7 @@ func accountGroupsMySQLDDL() string {
 		auto_pause_5h_threshold DOUBLE DEFAULT 0,
 		auto_pause_7d_threshold DOUBLE DEFAULT 0,
 		base_concurrency_override INT NULL,
+		proxy_urls TEXT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
@@ -688,6 +697,7 @@ func systemSettingsMySQLDDL() string {
 		smart_pacing_windows VARCHAR(16) DEFAULT '5h,7d',
 		scheduler_mode VARCHAR(20) DEFAULT 'round_robin',
 		affinity_mode VARCHAR(16) DEFAULT 'bounded',
+		session_affinity_spread TINYINT(1) DEFAULT 0,
 		codex_force_websocket TINYINT(1) DEFAULT 0,
 		codex_ws_keepalive_enabled TINYINT(1) DEFAULT 0,
 		codex_ws_keepalive_interval_sec INT DEFAULT 60,
@@ -718,7 +728,13 @@ func systemSettingsMySQLDDL() string {
 		response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
-		response_cache_config_generation BIGINT NOT NULL DEFAULT 1
+		response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
+		relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off',
+		relay_model_cooldown_seconds INT NOT NULL DEFAULT 2,
+		relay_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 0,
+		oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive',
+		oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300,
+		oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

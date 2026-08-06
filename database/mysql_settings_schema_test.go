@@ -61,6 +61,13 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608",
 		"response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864",
 		"response_cache_config_generation BIGINT NOT NULL DEFAULT 1",
+		"session_affinity_spread TINYINT(1) DEFAULT 0",
+		"relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off'",
+		"relay_model_cooldown_seconds INT NOT NULL DEFAULT 2",
+		"relay_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 0",
+		"oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive'",
+		"oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300",
+		"oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -96,9 +103,14 @@ func TestMySQL56V268MigrationScript(t *testing.T) {
 		t.Fatalf("read MySQL 5.6 v2.6.8 migration: %v", err)
 	}
 	script := string(raw)
-	for _, column := range mysql56SystemSettingsColumns[len(mysql56SystemSettingsColumns)-4:] {
-		if !strings.Contains(script, "ADD COLUMN "+column.name+" "+column.def) {
-			t.Fatalf("MySQL 5.6 v2.6.8 migration missing %+v", column)
+	for _, definition := range []string{
+		"response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864",
+		"response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608",
+		"response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864",
+		"response_cache_config_generation BIGINT NOT NULL DEFAULT 1",
+	} {
+		if !strings.Contains(script, "ADD COLUMN "+definition) {
+			t.Fatalf("MySQL 5.6 v2.6.8 migration missing %q", definition)
 		}
 	}
 	for _, incompatible := range []string{"ADD COLUMN IF NOT EXISTS", "BOOLEAN", "ON CONFLICT", "TIMESTAMPTZ"} {
@@ -189,6 +201,7 @@ func TestMySQLPromptFilterNewAPIBindingsSchemaIsMySQL56Compatible(t *testing.T) 
 		"platform_code VARCHAR(32) NOT NULL UNIQUE",
 		"secret TEXT NOT NULL",
 		"require_signed_identity TINYINT(1) NOT NULL DEFAULT 0",
+		"prompt_filter_scope VARCHAR(16) NOT NULL DEFAULT 'inherit'",
 		"previous_secret_expires_at DATETIME NULL",
 		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
 		"ENGINE=InnoDB",
@@ -373,6 +386,36 @@ func TestMySQLAccountGroupSchemaIncludesBaseConcurrencyOverride(t *testing.T) {
 	ddl := accountGroupsMySQLDDL()
 	if !strings.Contains(ddl, "base_concurrency_override INT NULL") {
 		t.Fatalf("MySQL account_groups DDL missing base_concurrency_override: %s", ddl)
+	}
+	if !strings.Contains(ddl, "proxy_urls TEXT NULL") {
+		t.Fatalf("MySQL account_groups DDL missing MySQL 5.6-compatible proxy_urls: %s", ddl)
+	}
+	if strings.Contains(strings.ToUpper(ddl), "PROXY_URLS TEXT DEFAULT") {
+		t.Fatalf("MySQL 5.6-incompatible proxy_urls default leaked into DDL: %s", ddl)
+	}
+}
+
+func TestMySQL56V271MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_v2.7.1.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 v2.7.1 migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"c2a_add_column_if_missing('account_groups', 'proxy_urls', 'TEXT NULL')",
+		"c2a_add_column_if_missing('system_settings', 'session_affinity_spread', 'TINYINT(1) DEFAULT 0')",
+		"c2a_add_column_if_missing('system_settings', 'relay_model_cooldown_mode'",
+		"c2a_add_column_if_missing('system_settings', 'oauth_model_cooldown_mode'",
+		"c2a_add_column_if_missing('prompt_filter_newapi_bindings', 'prompt_filter_scope'",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 v2.7.1 migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{"ADD COLUMN IF NOT EXISTS", "BOOLEAN", "ON CONFLICT", "TIMESTAMPTZ", "TEXT DEFAULT"} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.7.1 migration", incompatible)
+		}
 	}
 }
 

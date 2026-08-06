@@ -1,5 +1,35 @@
 {
-  "common": {"success":"成功","failed":"失敗"},
+  "common": {"success":"成功","failed":"失敗","enabled":"開啟","disabled":"關閉"},
+  "accounts": {
+    "modelCooldownPolicy": "模型冷卻策略",
+    "clearAllModelCooldowns": "清除全部",
+    "modelCooldownEffective": "目前生效：{{mode}} · {{seconds}} 秒 · 退避{{backoff}}",
+    "modelCooldownModeOverride": "帳號覆蓋模式",
+    "modelCooldownInherit": "跟隨系統預設",
+    "saveModelCooldownPolicy": "儲存帳號冷卻策略",
+    "clearModelCooldown": "清除此模型冷卻",
+    "modelCooldownPolicySaved": "帳號模型冷卻策略已儲存",
+    "modelCooldownPolicySaveFailed": "儲存模型冷卻策略失敗：{{error}}",
+    "modelCooldownCleared": "已清除 {{model}} 的模型冷卻",
+    "allModelCooldownsCleared": "已清除 {{count}} 條模型冷卻"
+  },
+  "settings": {
+    "modelCooldownTitle": "模型 429 冷卻策略",
+    "modelCooldownDesc": "分別控制 API 直連上游與 OAuth 帳號池的模型級 429 冷卻。",
+    "relayModelCooldownTitle": "API 計畫 / 直連上游",
+    "relayModelCooldownDesc": "預設關閉持久化模型冷卻，偶發 429 只做換上游重試。",
+    "oauthModelCooldownTitle": "OAuth / 訂閱帳號池",
+    "oauthModelCooldownDesc": "可關閉、固定時長或使用指數退避。",
+    "modelCooldownMode": "冷卻模式",
+    "modelCooldownModeDesc": "關閉、固定或自適應。",
+    "modelCooldownModeOff": "關閉",
+    "modelCooldownModeFixed": "固定",
+    "modelCooldownModeAdaptive": "自適應",
+    "modelCooldownSeconds": "基礎時長",
+    "modelCooldownSecondsDesc": "範圍 1–1800 秒。",
+    "modelCooldownBackoff": "指數退避",
+    "modelCooldownBackoffDesc": "僅自適應模式生效。"
+  },
   "promptFilter": {
     "views": {"profiles":"風險畫像","intelligence":"CY 學習審核"},
     "coverageTitle": "目前防護涵蓋",
@@ -522,6 +552,7 @@
     "terminalBypassModels": "終局二審豁免模型",
     "terminalBypassModelsHint": "以逗號分隔精確的請求模型 ID。僅對這些模型，二審明確通過後可以清除本地終局命中；二審錯誤或判定違規時仍會攔截。",
     "conversationLockEnabled": "上游 CYB 後鎖定目前對話",
+    "cybStrikeEnabled": "允許上游 CYB 計入停用次數",
     "riskSimplifiedDesc": "依使用者、IP 與會話累計週期風險；預設關閉。",
     "outputSimplifiedDesc": "掃描串流輸出中的嚴格高風險訊號；預設關閉。",
     "extensions": {
@@ -608,6 +639,7 @@
     "help": {
       "terminalBypassModels": "僅用於提示詞必然包含違規樣本的專用審計模型。依客戶端請求模型 ID 比對，不依映射後的上游模型比對。",
       "conversationLockEnabled": "僅在上游明確回傳 cyber_policy 且簽名中繼資料含穩定會話指紋時鎖定。已鎖定請求不會重複累計 strike；沒有可靠視窗識別時不會猜測或誤鎖。",
+      "cybStrikeEnabled": "預設關閉。開啟後，只有上游明確回傳 cyber_policy 的決策才會簽為可計次；關閉時仍會稽核、提醒並依設定鎖定對話，但 NewAPI 不會因此累計次數或自動停用帳號。",
       "normalizationPanel": "對常見編碼和壓縮片段進行有界還原；位元組、片段和輪數上限可避免解碼炸彈拖垮服務。",
       "maxDecodedBytes": "單次請求所有還原結果允許占用的最大位元組數，達到上限後停止繼續解碼。",
       "maxEncodedBlocks": "單次請求最多嘗試還原的獨立編碼片段數，限制惡意批量小片段消耗。",

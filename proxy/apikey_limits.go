@@ -136,14 +136,6 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		return 0, ""
 	}
 	clientID, explicitClientID := resolveAPIKeyClientID(c, row)
-	validClientID := clientID != "" && (!explicitClientID || validAPIKeyClientID(clientID))
-	if validClientID && h != nil && h.db != nil {
-		trackingClientID := clientID
-		if !explicitClientID {
-			trackingClientID = deriveAPIKeyTrackingClientID(c, row)
-		}
-		h.db.RecordAPIKeyClient(row.ID, trackingClientID)
-	}
 	limits := row.Limits
 	if limits.IsZero() {
 		return 0, ""

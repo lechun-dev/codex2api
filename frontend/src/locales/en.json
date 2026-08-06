@@ -3575,7 +3575,7 @@
     "clientCountSummary": "Active {{active}} · Total {{total}} · Limit {{limit}}",
     "clientCountUnlimited": "Unlimited",
     "clientCountUnavailable": "Unavailable",
-    "clientCountHint": "Active clients used this key within the last {{minutes}} minutes. Total clients are deduplicated from the time tracking was enabled.",
+    "clientCountHint": "Counts are deduplicated from actual user interactions; background requests such as compaction are excluded. Active clients used this key within the last {{minutes}} minutes, and total clients accumulate from when tracking was enabled. Without X-Client-Id, counts are estimated from client characteristics.",
     "createdLabel": "Created",
     "neverUsed": "Never used",
     "discardEditTitle": "Discard unsaved changes?",

@@ -3575,7 +3575,7 @@
     "clientCountSummary": "活跃 {{active}} · 累计 {{total}} · 上限 {{limit}}",
     "clientCountUnlimited": "不限",
     "clientCountUnavailable": "暂不可用",
-    "clientCountHint": "活跃数为最近 {{minutes}} 分钟内使用过该密钥的客户端；累计数从启用统计功能后持续去重记录。",
+    "clientCountHint": "按实际用户交互去重统计，不计压缩等后台请求。活跃数为最近 {{minutes}} 分钟内使用过该密钥的客户端；累计数从启用统计功能后持续记录。未提供 X-Client-Id 时为基于客户端特征的估算值。",
     "createdLabel": "创建",
     "neverUsed": "从未使用",
     "discardEditTitle": "放弃未保存的修改？",

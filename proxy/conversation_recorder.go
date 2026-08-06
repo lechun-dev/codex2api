@@ -269,11 +269,23 @@ func (r *conversationRecorder) logQueueDrop() {
 }
 
 func (h *Handler) beginConversationTurn(c *gin.Context, requestBody []byte) *conversationTurn {
-	if h == nil || h.convRecorder == nil || c == nil || c.Request == nil {
+	if h == nil || c == nil || c.Request == nil {
 		return nil
 	}
 	row := apiKeyRowFromContext(c)
-	clientID, _ := resolveAPIKeyClientID(c, row)
+	clientID, explicitClientID := resolveAPIKeyClientID(c, row)
+	userMessage := extractCurrentConversationUserMessage(requestBody)
+	if userMessage != "" && row != nil && h.db != nil && clientID != "" &&
+		(!explicitClientID || validAPIKeyClientID(clientID)) {
+		trackingClientID := clientID
+		if !explicitClientID {
+			trackingClientID = deriveAPIKeyTrackingClientID(c, row)
+		}
+		h.db.RecordAPIKeyClient(row.ID, trackingClientID)
+	}
+	if h.convRecorder == nil {
+		return nil
+	}
 	apiKeyName := ""
 	if row != nil {
 		apiKeyName = strings.TrimSpace(row.Name)
@@ -289,7 +301,7 @@ func (h *Handler) beginConversationTurn(c *gin.Context, requestBody []byte) *con
 		model:              strings.TrimSpace(gjson.GetBytes(requestBody, "model").String()),
 		explicitSessionID:  resolveConversationSessionIDFromHeaders(c.Request.Header, requestBody),
 		previousResponseID: normalizeConversationIdentifier(gjson.GetBytes(requestBody, "previous_response_id").String(), 255, "resp"),
-		userMessage:        extractCurrentConversationUserMessage(requestBody),
+		userMessage:        userMessage,
 	}
 	if turn.userMessage != "" {
 		turn.requestID = uuid.NewString()

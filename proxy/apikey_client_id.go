@@ -66,17 +66,14 @@ func deriveAPIKeyClientIDWithScope(c *gin.Context, scope string) string {
 		return ""
 	}
 
-	sum := sha256.Sum256([]byte(strings.Join([]string{
-		scope,
-		userAgent,
-		version,
-		packageVersion,
-		runtimeVersion,
-		os,
-		arch,
-		originator,
-		networkHint,
-	}, "|")))
+	components := []string{scope, userAgent, networkHint}
+	if userAgent == "" {
+		// Stainless and Originator headers are not consistently forwarded by
+		// every Codex request path (notably compaction). Use them only when a
+		// User-Agent is unavailable so one client does not split by endpoint.
+		components = append(components, version, packageVersion, runtimeVersion, os, arch, originator)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(components, "|")))
 	return derivedAPIKeyClientIDPrefix + hex.EncodeToString(sum[:16])
 }
 
@@ -92,7 +89,16 @@ func normalizeClientFingerprintUserAgent(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	return clientFingerprintNumberPattern.ReplaceAllString(raw, "#")
+	raw = clientFingerprintNumberPattern.ReplaceAllString(raw, "#")
+	// Codex Desktop and CLI append launch-surface or terminal metadata after
+	// the platform group. Those suffixes can change between normal responses
+	// and compaction even though the physical client is unchanged.
+	if strings.HasPrefix(raw, "codex desktop/") || strings.HasPrefix(raw, "codex_cli_rs/") {
+		if end := strings.IndexByte(raw, ')'); end >= 0 {
+			return raw[:end+1]
+		}
+	}
+	return raw
 }
 
 func normalizeClientFingerprintComponent(raw string) string {

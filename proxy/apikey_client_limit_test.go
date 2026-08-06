@@ -33,9 +33,7 @@ func TestAPIKeyClientTrackingIncludesKeysWithoutClientLimit(t *testing.T) {
 
 	for _, clientID := range []string{"client-one", "client-one", "client-two"} {
 		request := testAPIKeyLimitContext(row, clientID)
-		if status, msg := handler.enforceAPIKeyLimits(request, ""); status != 0 || msg != "" {
-			t.Fatalf("client %q status=%d msg=%q, want allow", clientID, status, msg)
-		}
+		handler.beginConversationTurn(request, []byte(`{"input":[{"role":"user","content":"hello"}]}`))
 	}
 	if err := db.FlushAPIKeyClients(ctx); err != nil {
 		t.Fatalf("FlushAPIKeyClients error = %v", err)
@@ -46,6 +44,39 @@ func TestAPIKeyClientTrackingIncludesKeysWithoutClientLimit(t *testing.T) {
 	}
 	if got := counts[keyID]; got.Active != 2 || got.Total != 2 {
 		t.Fatalf("counts = %#v, want active=2 total=2", got)
+	}
+}
+
+func TestAPIKeyClientTrackingSkipsRequestsWithoutUserInteraction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "clients.db"))
+	if err != nil {
+		t.Fatalf("database.New error = %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "compact", "sk-test-compact-client-tracking-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey error = %v", err)
+	}
+	row := &database.APIKeyRow{ID: keyID, Key: "sk-test-compact-client-tracking-1234567890"}
+	handler := &Handler{db: db}
+
+	request := testAPIKeyLimitContext(row, "client-one")
+	if status, msg := handler.enforceAPIKeyLimits(request, ""); status != 0 || msg != "" {
+		t.Fatalf("limit check status=%d msg=%q, want allow", status, msg)
+	}
+	handler.beginConversationTurn(request, []byte(`{"input":[{"type":"compaction","encrypted_content":"opaque"}]}`))
+	if err := db.FlushAPIKeyClients(ctx); err != nil {
+		t.Fatalf("FlushAPIKeyClients error = %v", err)
+	}
+	counts, err := db.ListAPIKeyClientCounts(ctx, map[int64]time.Duration{keyID: time.Hour})
+	if err != nil {
+		t.Fatalf("ListAPIKeyClientCounts error = %v", err)
+	}
+	if got := counts[keyID]; got.Active != 0 || got.Total != 0 {
+		t.Fatalf("counts = %#v, want active=0 total=0", got)
 	}
 }
 
@@ -219,6 +250,25 @@ func TestDeriveAPIKeyClientIDUsesNetworkHintToReduceCollisions(t *testing.T) {
 	}
 	if id1 == id2 {
 		t.Fatalf("different network hints should produce different derived ids: %q", id1)
+	}
+}
+
+func TestDeriveAPIKeyClientIDIgnoresOptionalHeaderAndCodexSuffixChanges(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	row := &database.APIKeyRow{ID: 16, Key: "sk-test-client-limit-0016"}
+
+	first := testAPIKeyLimitContextWithFingerprint(row, "", "198.51.100.41:1111", "Codex Desktop/0.146.0 (Windows 10.0.22621; x86_64) unknown (Codex Desktop; 26.721.41059)", "Windows", "x86_64", "codex_cli_rs")
+	first.Request.Header.Set("Version", "0.146.0")
+	first.Request.Header.Set("X-Stainless-Package-Version", "1.2.3")
+	second := testAPIKeyLimitContextWithFingerprint(row, "", "198.51.100.41:2222", "Codex Desktop/0.146.1 (Windows 10.0.22631; x86_64) unknown (codex_chatgpt_ios_remote; 1.2026.167)", "", "", "")
+
+	id1 := deriveAPIKeyClientID(first, row)
+	id2 := deriveAPIKeyClientID(second, row)
+	if id1 == "" || id2 == "" {
+		t.Fatalf("derived ids should not be empty: %q %q", id1, id2)
+	}
+	if id1 != id2 {
+		t.Fatalf("optional headers or Codex suffix split one client: %q vs %q", id1, id2)
 	}
 }
 

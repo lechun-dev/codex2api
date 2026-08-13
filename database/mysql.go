@@ -105,6 +105,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS usage_logs (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			account_id BIGINT DEFAULT 0,
+			credential_generation BIGINT NOT NULL DEFAULT 0,
 			channel VARCHAR(16) DEFAULT '',
 			client_ip VARCHAR(64) DEFAULT '',
 			session_id VARCHAR(255) DEFAULT '',
@@ -300,6 +301,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "today_used_count", "INT DEFAULT 0"},
 		{"accounts", "image_quota_reset_at", "DATETIME NULL"},
 		{"account_groups", "proxy_urls", "TEXT NULL"},
+		{"usage_logs", "credential_generation", "BIGINT NOT NULL DEFAULT 0"},
 		{"usage_logs", "channel", "VARCHAR(16) DEFAULT ''"},
 		{"usage_logs", "client_ip", "VARCHAR(64) DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INT DEFAULT 0"},
@@ -500,6 +502,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "idx_usage_logs_created_at", "CREATE INDEX idx_usage_logs_created_at ON usage_logs(created_at)"},
 		{"usage_logs", "idx_usage_logs_account_id", "CREATE INDEX idx_usage_logs_account_id ON usage_logs(account_id)"},
 		{"usage_logs", "idx_usage_logs_account_created_at", "CREATE INDEX idx_usage_logs_account_created_at ON usage_logs(account_id, created_at)"},
+		{"usage_logs", "idx_usage_logs_account_generation_created_at", "CREATE INDEX idx_usage_logs_account_generation_created_at ON usage_logs(account_id, credential_generation, created_at)"},
 		{"usage_logs", "idx_usage_logs_created_status", "CREATE INDEX idx_usage_logs_created_status ON usage_logs(created_at, status_code)"},
 		{"usage_logs", "idx_usage_logs_account_status", "CREATE INDEX idx_usage_logs_account_status ON usage_logs(account_id, status_code)"},
 		{"usage_logs", "idx_usage_logs_api_key_created_at", "CREATE INDEX idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at)"},

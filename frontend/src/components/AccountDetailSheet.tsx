@@ -9,6 +9,7 @@ import {
   Copy,
   ExternalLink,
   FileJson,
+  Fingerprint,
   FlaskConical,
   Lock,
   Pencil,
@@ -165,6 +166,7 @@ export interface AccountDetailSheetProps {
   healthBuckets?: AccountHealthBucket[];
   sequence?: number;
   usageSlot?: ReactNode;
+  providerSlot?: ReactNode;
   canGoPrev?: boolean;
   canGoNext?: boolean;
   refreshing?: boolean;
@@ -172,6 +174,7 @@ export interface AccountDetailSheetProps {
   onClose: () => void;
   onPrev?: () => void;
   onNext?: () => void;
+  onQuickConfig?: () => void;
   onEdit: () => void;
   onUsage: () => void;
   onTest: () => void;
@@ -197,6 +200,7 @@ export default function AccountDetailSheet({
   healthBuckets,
   sequence,
   usageSlot,
+  providerSlot,
   canGoPrev = false,
   canGoNext = false,
   refreshing = false,
@@ -204,6 +208,7 @@ export default function AccountDetailSheet({
   onClose,
   onPrev,
   onNext,
+  onQuickConfig,
   onEdit,
   onUsage,
   onTest,
@@ -364,10 +369,24 @@ export default function AccountDetailSheet({
                     </span>
                   )}
                 </div>
-                {account.chatgpt_account_id ? (
-                  <SheetDescription className="mt-1 break-all font-mono text-[11px]">
-                    {account.chatgpt_account_id}
-                  </SheetDescription>
+                {account.effective_workspace_id ? (
+                  <div className="mt-1 space-y-0.5">
+                    <SheetDescription className="break-all font-mono text-[11px]">
+                      {account.workspace_id_override
+                        ? `${t("accounts.workspaceRouteBadge")}: `
+                        : ""}
+                      {account.effective_workspace_id}
+                    </SheetDescription>
+                    {account.workspace_id_override &&
+                    account.token_workspace_id &&
+                    account.token_workspace_id !==
+                      account.effective_workspace_id ? (
+                      <SheetDescription className="break-all font-mono text-[10px] text-muted-foreground/70">
+                        {t("accounts.tokenWorkspaceLabel")}:{" "}
+                        {account.token_workspace_id}
+                      </SheetDescription>
+                    ) : null}
+                  </div>
                 ) : isGrok && account.email && account.name && account.email !== account.name ? (
                   <SheetDescription className="mt-1 break-all text-[12px]">
                     {account.email}
@@ -473,6 +492,8 @@ export default function AccountDetailSheet({
                 ) : null}
               </div>
             </Section>
+
+            {providerSlot}
 
             {!isGrok ? <Section
               title={t("accounts.modelCooldownPolicy")}
@@ -811,6 +832,18 @@ export default function AccountDetailSheet({
 
           <SheetFooter>
             <div className="grid grid-cols-2 gap-2">
+              {onQuickConfig ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onQuickConfig}
+                  className="col-span-2 border-primary/40 bg-primary/10 font-bold text-primary hover:bg-primary/20"
+                >
+                  <Fingerprint className="size-4 text-primary" />
+                  <span>指纹与快捷配置</span>
+                </Button>
+              ) : null}
               <Button type="button" variant="default" size="sm" onClick={onEdit}>
                 <Pencil className="size-3.5" />
                 {t("accounts.editScheduler")}

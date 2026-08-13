@@ -345,11 +345,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 106 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 106", got)
+	if got := strings.Count(capture.query, "?"); got != 109 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 109", got)
 	}
-	if len(capture.args) != 106 {
-		t.Fatalf("rewritten settings argument count = %d, want 106", len(capture.args))
+	if len(capture.args) != 109 {
+		t.Fatalf("rewritten settings argument count = %d, want 109", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -370,7 +370,10 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexPreflightSSEPassthroughEnabled,
 		int64(settings.UTLSShutdownTimeoutMinutes),
 		settings.CodexWSWeakNetworkMode,
+		NormalizeCodexFingerprintDefaultMode(settings.CodexFingerprintDefaultMode),
+		settings.CompactViaResponsesEnabled,
 		settings.PreservePromptFilterCustomPatterns,
+		settings.PreservePromptFilterReviewAPIKey,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value
@@ -554,6 +557,8 @@ type mysqlCaptureDriver struct {
 	args         []driver.NamedValue
 	lastInsertID int64
 	queryRow     []driver.Value
+	queryRows    [][]driver.Value
+	queryRowPos  int
 	execCount    int
 }
 
@@ -587,7 +592,12 @@ func (c *mysqlCaptureConn) QueryContext(_ context.Context, query string, args []
 	c.capture.query = query
 	c.capture.queries = append(c.capture.queries, query)
 	c.capture.args = append([]driver.NamedValue(nil), args...)
-	return &mysqlCaptureRows{values: c.capture.queryRow}, nil
+	values := c.capture.queryRow
+	if c.capture.queryRowPos < len(c.capture.queryRows) {
+		values = c.capture.queryRows[c.capture.queryRowPos]
+	}
+	c.capture.queryRowPos++
+	return &mysqlCaptureRows{values: values}, nil
 }
 
 type mysqlCaptureRows struct {

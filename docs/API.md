@@ -35,6 +35,8 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
 
+**Service Tier 语义说明**：请求侧 `fast` / `priority` 会统一以 `priority` 转发上游，其余取值（`auto`/`default`/`flex`/`scale` 等）不转发。用量日志区分三个字段：`requested_service_tier`（客户端请求意图）、`actual_service_tier`（上游回传 Tier，原样取自 `response.completed.response.service_tier`）、`billing_service_tier`（计费采用值，由 Tier 计费策略 `BillingTierPolicy` 决定，默认 `actual`，上游未回传时回退按请求意图计）。注意：在 ChatGPT OAuth / Codex backend 路径上，Fast 由上游服务端路由处理，`service_tier` 不是端到端可校验字段——上游回传 `default` 并不代表 Fast 未生效（openai/codex#14204 官方说明；#494 的交错 A/B 实测在回传 `default` 时仍有约 1.5× 生成吞吐提升）。因此"上游回传 Tier"仅反映上游申报值，不能单独用于判断加速是否生效；`BillingTierPolicy=actual` 下此类请求按标准价计费。
+
 **Base URL:** `http://localhost:8080` (默认端口)
 
 **请求格式:**
@@ -378,6 +380,9 @@ data: [DONE]
       "id": 1,
       "name": "account-1",
       "email": "user@example.com",
+      "token_workspace_id": "personal-workspace-id",
+      "workspace_id_override": "team-workspace-id",
+      "effective_workspace_id": "team-workspace-id",
       "plan_type": "pro",
       "status": "ready",
       "health_tier": "healthy",
@@ -435,6 +440,9 @@ data: [DONE]
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
 | skip_warm_tier             | bool         | 是否跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
+| token_workspace_id         | string       | Token 中识别出的默认工作区 ID                                    |
+| workspace_id_override      | string       | `Chatgpt-Account-Id` 指定的目标工作区；未指定时为空               |
+| effective_workspace_id     | string       | 实际路由工作区；优先使用覆盖值，否则使用 Token 默认工作区         |
 | credit_enabled             | bool         | 是否为信用计费模式账号                                            |
 | credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
 | billed_5h                  | number/null  | 过去 5 小时窗口内的累计计费金额（USD）                            |
@@ -571,7 +579,10 @@ data: [DONE]
 {
   "name": "my-account",
   "refresh_token": "rt_xxxxxxxxxxxx",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -582,6 +593,9 @@ data: [DONE]
 | name          | string | 否   | 账号名称，批量时自动追加序号，默认 `account-{n}`       |
 | refresh_token | string | 是   | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url     | string | 否   | 代理 URL                                               |
+| custom_headers | object | 否   | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一份 RT 可以分别以“默认工作区”和多个 `Chatgpt-Account-Id` 路由加入账号池。额度、冷却、调度和统计按账号记录独立维护；同一登录身份下的相同目标工作区仍会去重。
 
 批量添加（使用换行分隔）:
 
@@ -635,7 +649,10 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 {
   "name": "my-at-account",
   "access_token": "eyJhbGciOiJSUzI1NiIs...",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -646,6 +663,9 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 | name         | string | 否   | 账号名称，批量时自动追加序号，默认 `at-account-{n}`   |
 | access_token | string | 是   | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url    | string | 否   | 代理 URL                                              |
+| custom_headers | object | 否 | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一个 AT 可以按不同目标工作区保存为多条独立路由。对于无法从 AT 解析登录身份的情况，系统至少会按“AT 原文 + 目标工作区”避免同一路由重复写入。
 
 批量添加:
 
@@ -1265,6 +1285,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -1301,6 +1322,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 500,
   "transport_retry_policy": "sticky",
+  "codex_fingerprint_default_mode": "session",
   "response_cache_local_max_bytes": 134217728,
   "response_cache_local_max_entry_bytes": 8388608,
   "response_cache_reconstruct_max_bytes": 134217728
@@ -1308,6 +1330,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 ```
 
 **响应:** 更新后的完整设置对象
+
+`codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
 Responses 上下文缓存字段使用原始字节数：
 
@@ -1370,11 +1394,11 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### DELETE /api/admin/proxies/:id
 
-删除代理。
+删除代理，并清空仍引用该 URL 的账号绑定。提交后立即从当前进程的运行时代理池剔除；若数据库快照重载失败，接口返回 HTTP `500` 和已完成的 `deleted` / `unbound` 数量，但不会把已删除代理重新投入调度。
 
 #### PATCH /api/admin/proxies/:id
 
-更新代理。
+更新代理。禁用会立刻从运行时代理池剔除该 URL，但保留账号上的 `proxy_url` 绑定——这些账号在重新启用前不会改走其它代理，也不会直连。修改 URL 时，仍指向旧 URL 的账号绑定会改写为新 URL。
 
 **请求:**
 
@@ -1387,7 +1411,7 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### POST /api/admin/proxies/batch-delete
 
-批量删除代理。
+批量删除代理，并解绑仍引用这些 URL 的账号。重载失败时的语义与单条删除相同。
 
 **请求:**
 

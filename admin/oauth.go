@@ -305,6 +305,7 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 }
 
 var errDuplicateOAuthIdentity = errors.New("duplicate oauth identity")
+var errDuplicateCredentialWorkspaceRoute = errors.New("duplicate credential workspace route")
 
 func oauthIdentityDuplicateMessage(id int64) string {
 	return fmt.Sprintf("OAuth 账号已存在 (id=%d)，请更新已有账号", id)
@@ -315,10 +316,11 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 		return 0, nil
 	}
 	seed = normalizeTokenCredentialSeed(seed)
-	if seed.email == "" || seed.workspaceID == "" {
+	effectiveWorkspaceID := effectiveWorkspaceIDFromSeed(seed)
+	if seed.email == "" || effectiveWorkspaceID == "" {
 		return 0, nil
 	}
-	id, err := h.db.FindActiveAccountByOAuthIdentity(ctx, seed.email, seed.workspaceID, excludeID)
+	id, err := h.db.FindActiveAccountByOAuthRouteIdentity(ctx, seed.email, effectiveWorkspaceID, excludeID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
@@ -330,8 +332,8 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 
 func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string) (int64, bool, error) {
 	seed = normalizeTokenCredentialSeed(seed)
-	if seed.email == "" || seed.workspaceID == "" {
-		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
+	if seed.email == "" || effectiveWorkspaceIDFromSeed(seed) == "" {
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 		if err != nil {
 			return 0, false, err
 		}
@@ -371,7 +373,7 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 		return duplicateID, true, nil
 	}
 
-	id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
+	id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 	if err != nil {
 		return 0, false, err
 	}
@@ -397,7 +399,7 @@ func (h *Handler) loadInsertedTokenAccount(id int64, proxyURL string, seed token
 	if h == nil || h.store == nil {
 		return
 	}
-	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+	newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
 	h.triggerTokenAccountProbe(id, source)
 }
@@ -508,12 +510,13 @@ func (h *Handler) UpdateOAuthAccountCode(c *gin.Context) {
 	}
 
 	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-		refreshToken: tokenResp.RefreshToken,
-		accessToken:  tokenResp.AccessToken,
-		idToken:      tokenResp.IDToken,
-		expiresIn:    tokenResp.ExpiresIn,
+		refreshToken:  tokenResp.RefreshToken,
+		accessToken:   tokenResp.AccessToken,
+		idToken:       tokenResp.IDToken,
+		expiresIn:     tokenResp.ExpiresIn,
+		customHeaders: row.GetCredentialStringMap("custom_headers"),
 	})
-	if seed.email != "" && seed.workspaceID != "" {
+	if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 		h.mergeDuplicateMu.Lock()
 		defer h.mergeDuplicateMu.Unlock()
 	}
@@ -531,6 +534,14 @@ func (h *Handler) UpdateOAuthAccountCode(c *gin.Context) {
 		}
 		writeError(c, http.StatusInternalServerError, "Token 写入数据库失败: "+err.Error())
 		return
+	}
+	// 与重新导入合并路径(upsertOAuthIdentityAccount)对齐:拿到新凭证后,
+	// 错误/401 态就地清除、交由探针重新判定,而不是让账号一直挂在"异常"
+	// 等一次可能失败的异步探针(issue #493)。限流冷却不在清除范围内。
+	if accountErrorStateNeedsReset(row) {
+		if err := h.db.ClearError(ctx, id); err != nil {
+			log.Printf("重新授权清除账号 %d 错误状态失败: %v", id, err)
+		}
 	}
 
 	if err := h.reloadTokenAccount(ctx, id, "oauth_reauth"); err != nil {

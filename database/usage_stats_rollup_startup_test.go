@@ -39,7 +39,12 @@ func TestUsageStatsRollupStartupContextKeepsValuesButNotSchemaCancellation(t *te
 }
 
 func TestEnsureUsageStatsRollupUsesMySQL56CompatibleStatements(t *testing.T) {
-	capture := &mysqlCaptureDriver{queryRow: []driver.Value{int64(1)}}
+	capture := &mysqlCaptureDriver{
+		queryRows: [][]driver.Value{
+			{int64(1)},
+			{int64(1), int64(2)},
+		},
+	}
 	driverName := fmt.Sprintf("codex2api-mysql-rollup-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
 	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
 
@@ -56,8 +61,8 @@ func TestEnsureUsageStatsRollupUsesMySQL56CompatibleStatements(t *testing.T) {
 	if capture.execCount != 2 {
 		t.Fatalf("rollup schema statement count = %d, want 2 independent statements", capture.execCount)
 	}
-	if len(capture.queries) != 3 {
-		t.Fatalf("captured query count = %d, want 2 DDL statements and 1 state query", len(capture.queries))
+	if len(capture.queries) != 4 {
+		t.Fatalf("captured query count = %d, want 2 DDL statements and 2 MySQL schema/state queries", len(capture.queries))
 	}
 	for _, query := range capture.queries {
 		if strings.Count(strings.ToUpper(query), "CREATE TABLE") > 1 {

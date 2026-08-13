@@ -1950,6 +1950,31 @@ export interface UsageStats {
   api_key_stats: UsageAPIKeyStat[]
 }
 
+export interface UsageDailyTokenRow {
+  date: string
+  requests: number
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  model_tokens: Record<string, number>
+}
+
+export interface UsageDailyTokenTotal {
+  requests: number
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  model_tokens: Record<string, number>
+}
+
+export interface UsageDailyTokenStats {
+  models: string[]
+  rows: UsageDailyTokenRow[]
+  total: UsageDailyTokenTotal
+}
+
 export interface UsageModelStat {
   model: string
   requests: number

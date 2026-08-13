@@ -86,6 +86,7 @@ import type {
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
+  UsageDailyTokenStats,
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
@@ -795,6 +796,25 @@ export const api = {
     if (params.detail) searchParams.set('detail', params.detail)
     const qs = searchParams.toString()
     return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats', {
+      signal: params.signal,
+    })
+  },
+  getDailyTokenUsage: (params: {
+    start?: string
+    end?: string
+    channel?: string
+    model?: string
+    apiKeyId?: string
+    signal?: AbortSignal
+  } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    if (params.channel) searchParams.set('channel', params.channel)
+    if (params.model) searchParams.set('model', params.model)
+    if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
+    const qs = searchParams.toString()
+    return request<UsageDailyTokenStats>(qs ? `/usage/daily-tokens?${qs}` : '/usage/daily-tokens', {
       signal: params.signal,
     })
   },

@@ -16,7 +16,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, APIKeyTokenStat, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
+import type { APIKeyRow, APIKeyTokenStat, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageDailyTokenStats, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
 import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
@@ -1787,6 +1787,126 @@ function ColumnSettingsDropdown({
   )
 }
 
+function DailyTokenUsagePanel({
+  stats,
+  loading,
+  error,
+  modelOptions,
+  apiKeyOptions,
+  model,
+  apiKeyId,
+  onModelChange,
+  onApiKeyChange,
+  showFullUsageNumbers,
+}: {
+  stats: UsageDailyTokenStats | null
+  loading: boolean
+  error: boolean
+  modelOptions: string[]
+  apiKeyOptions: Array<{ label: string; value: string }>
+  model: string
+  apiKeyId: string
+  onModelChange: (value: string) => void
+  onApiKeyChange: (value: string) => void
+  showFullUsageNumbers: boolean
+}) {
+  const { t } = useTranslation()
+  const models = useMemo(() => {
+    const seen = new Set<string>()
+    return [...modelOptions, ...(stats?.models ?? [])].filter((item) => {
+      const value = item.trim()
+      if (!value || seen.has(value)) return false
+      seen.add(value)
+      return true
+    })
+  }, [modelOptions, stats?.models])
+
+  return (
+    <Card>
+      <CardContent className="p-4">
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-foreground">{t('usage.dailyTokenTitle')}</h3>
+            <p className="mt-1 text-xs text-muted-foreground">{t('usage.dailyTokenDesc')}</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={model}
+              onValueChange={onModelChange}
+              options={[
+                { label: t('usage.dailyAllModels'), value: '' },
+                ...models.map((value) => ({ label: value, value })),
+              ]}
+              className="w-44"
+              compact
+              placeholder={t('usage.dailyModelFilter')}
+            />
+            <Select
+              value={apiKeyId}
+              onValueChange={onApiKeyChange}
+              options={apiKeyOptions}
+              className="w-44"
+              compact
+              placeholder={t('usage.dailyApiKeyFilter')}
+            />
+          </div>
+        </div>
+
+        {loading && !stats ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">{t('usage.dailyLoading')}</div>
+        ) : error ? (
+          <div className="py-8 text-center text-sm text-destructive">{t('usage.dailyLoadFailed')}</div>
+        ) : !stats || stats.rows.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">{t('usage.dailyEmpty')}</div>
+        ) : (
+          <div className="overflow-x-auto rounded-md border border-border">
+            <Table className="min-w-max">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="whitespace-nowrap">{t('usage.dailyDate')}</TableHead>
+                  <TableHead className="whitespace-nowrap text-right">{t('usage.dailyRequests')}</TableHead>
+                  {stats.models.map((modelName) => (
+                    <TableHead key={modelName} className="whitespace-nowrap text-right">{modelName}</TableHead>
+                  ))}
+                  <TableHead className="whitespace-nowrap text-right">{t('usage.dailyTotal')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {stats.rows.map((row) => (
+                  <TableRow key={row.date}>
+                    <TableCell className="whitespace-nowrap font-medium">{row.date}</TableCell>
+                    <TableCell className="text-right tabular-nums">{row.requests.toLocaleString()}</TableCell>
+                    {stats.models.map((modelName) => (
+                      <TableCell key={modelName} className="text-right font-mono tabular-nums">
+                        {formatTokens(row.model_tokens[modelName] ?? 0, showFullUsageNumbers)}
+                      </TableCell>
+                    ))}
+                    <TableCell className="text-right font-mono font-semibold tabular-nums">
+                      {formatTokens(row.total_tokens, showFullUsageNumbers)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+                <TableRow className="bg-muted/30 font-semibold">
+                  <TableCell>{t('usage.dailyGrandTotal')}</TableCell>
+                  <TableCell className="text-right tabular-nums">{stats.total.requests.toLocaleString()}</TableCell>
+                  {stats.models.map((modelName) => (
+                    <TableCell key={modelName} className="text-right font-mono tabular-nums">
+                      {formatTokens(stats.total.model_tokens[modelName] ?? 0, showFullUsageNumbers)}
+                    </TableCell>
+                  ))}
+                  <TableCell className="text-right font-mono tabular-nums">
+                    {formatTokens(stats.total.total_tokens, showFullUsageNumbers)}
+                  </TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 export default function Usage() {
   const { t } = useTranslation()
   const { toast, showToast } = useToast()
@@ -1828,6 +1948,11 @@ export default function Usage() {
   const [showAPIKeyUsageModal, setShowAPIKeyUsageModal] = useState(false)
   const [apiKeyTokenStats, setAPIKeyTokenStats] = useState<APIKeyTokenStat[]>([])
   const [apiKeyTokenStatsLoading, setAPIKeyTokenStatsLoading] = useState(false)
+  const [dailyModel, setDailyModel] = useState('')
+  const [dailyApiKeyId, setDailyApiKeyId] = useState('')
+  const [dailyStats, setDailyStats] = useState<UsageDailyTokenStats | null>(null)
+  const [dailyStatsLoading, setDailyStatsLoading] = useState(false)
+  const [dailyStatsError, setDailyStatsError] = useState(false)
   const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
@@ -1886,6 +2011,27 @@ export default function Usage() {
       setAPIKeyTokenStatsLoading(false)
     }
   }, [customRange, showToast, t, timeRange])
+
+  const loadDailyTokenUsage = useCallback(async (silent = false) => {
+    if (!silent) setDailyStatsLoading(true)
+    try {
+      const { start, end } = resolveRangeISO(timeRange, customRange)
+      const response = await api.getDailyTokenUsage({
+        start,
+        end,
+        channel: channel || undefined,
+        model: dailyModel || undefined,
+        apiKeyId: dailyApiKeyId || undefined,
+      })
+      setDailyStats(response)
+      setDailyStatsError(false)
+    } catch {
+      setDailyStats(null)
+      setDailyStatsError(true)
+    } finally {
+      if (!silent) setDailyStatsLoading(false)
+    }
+  }, [channel, customRange, dailyApiKeyId, dailyModel, timeRange])
 
   const buildLogFilterParams = useCallback(() => {
     const { start, end } = resolveRangeISO(timeRange, customRange)
@@ -1989,9 +2135,14 @@ export default function Usage() {
     const timer = window.setInterval(() => {
       void reloadSilently()
       void loadLogs(true)
+      void loadDailyTokenUsage(true)
     }, 30000)
     return () => window.clearInterval(timer)
-  }, [reloadSilently, loadLogs])
+  }, [reloadSilently, loadLogs, loadDailyTokenUsage])
+
+  useEffect(() => {
+    void loadDailyTokenUsage()
+  }, [loadDailyTokenUsage])
 
   useEffect(() => {
     persistUsageVisibleColumns(visibleColumns)
@@ -2129,7 +2280,7 @@ export default function Usage() {
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -2138,7 +2289,7 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
           titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
@@ -2256,6 +2407,19 @@ export default function Usage() {
             </CardContent>
           </Card>
         </div>
+
+        <DailyTokenUsagePanel
+          stats={dailyStats}
+          loading={dailyStatsLoading}
+          error={dailyStatsError}
+          modelOptions={modelFilterOptions}
+          apiKeyOptions={apiKeyOptions}
+          model={dailyModel}
+          apiKeyId={dailyApiKeyId}
+          onModelChange={setDailyModel}
+          onApiKeyChange={setDailyApiKeyId}
+          showFullUsageNumbers={showFullUsageNumbers}
+        />
 
         {showAnalysis && (
           <>

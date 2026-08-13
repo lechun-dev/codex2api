@@ -669,6 +669,19 @@
 	"cyberPolicyReason": "原因",
 	"cyberPolicyMatches": "命中規則與權重",
 	"cyberPolicyState": { "completed": "已完成", "not_run": "未執行", "unavailable": "無法擷取", "legacy_unknown": "歷史未知" },
-	"cyberPolicyOutcome": { "no_hit": "未命中", "audit_hit": "稽核命中", "warn": "警告", "block": "攔截" }
+	"cyberPolicyOutcome": { "no_hit": "未命中", "audit_hit": "稽核命中", "warn": "警告", "block": "攔截" },
+	"dailyTokenTitle": "每日 Token 用量",
+	"dailyTokenDesc": "按天彙總所有請求的 Token，模型會展開為獨立欄位。",
+	"dailyModelFilter": "模型",
+	"dailyApiKeyFilter": "API 金鑰",
+	"dailyAllModels": "全部模型",
+	"dailyAllApiKeys": "全部金鑰",
+	"dailyDate": "日期",
+	"dailyRequests": "請求數",
+	"dailyTotal": "Token 合計",
+	"dailyGrandTotal": "總計",
+	"dailyEmpty": "目前條件下沒有 Token 用量",
+	"dailyLoading": "正在載入每日用量…",
+	"dailyLoadFailed": "每日 Token 用量載入失敗"
   }
 }

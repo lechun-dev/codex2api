@@ -1791,64 +1791,22 @@ function DailyTokenUsagePanel({
   stats,
   loading,
   error,
-  modelOptions,
-  apiKeyOptions,
-  model,
-  apiKeyId,
-  onModelChange,
-  onApiKeyChange,
   showFullUsageNumbers,
 }: {
   stats: UsageDailyTokenStats | null
   loading: boolean
   error: boolean
-  modelOptions: string[]
-  apiKeyOptions: Array<{ label: string; value: string }>
-  model: string
-  apiKeyId: string
-  onModelChange: (value: string) => void
-  onApiKeyChange: (value: string) => void
   showFullUsageNumbers: boolean
 }) {
   const { t } = useTranslation()
-  const models = useMemo(() => {
-    const seen = new Set<string>()
-    return [...modelOptions, ...(stats?.models ?? [])].filter((item) => {
-      const value = item.trim()
-      if (!value || seen.has(value)) return false
-      seen.add(value)
-      return true
-    })
-  }, [modelOptions, stats?.models])
 
   return (
     <Card>
       <CardContent className="p-4">
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div className="mb-4">
           <div>
             <h3 className="text-base font-semibold text-foreground">{t('usage.dailyTokenTitle')}</h3>
             <p className="mt-1 text-xs text-muted-foreground">{t('usage.dailyTokenDesc')}</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Select
-              value={model}
-              onValueChange={onModelChange}
-              options={[
-                { label: t('usage.dailyAllModels'), value: '' },
-                ...models.map((value) => ({ label: value, value })),
-              ]}
-              className="w-44"
-              compact
-              placeholder={t('usage.dailyModelFilter')}
-            />
-            <Select
-              value={apiKeyId}
-              onValueChange={onApiKeyChange}
-              options={apiKeyOptions}
-              className="w-44"
-              compact
-              placeholder={t('usage.dailyApiKeyFilter')}
-            />
           </div>
         </div>
 
@@ -1874,7 +1832,7 @@ function DailyTokenUsagePanel({
               <TableBody>
                 {stats.rows.map((row) => (
                   <TableRow key={row.date}>
-                    <TableCell className="whitespace-nowrap font-medium">{row.date}</TableCell>
+                    <TableCell className="whitespace-nowrap font-medium">{row.date.slice(0, 10)}</TableCell>
                     <TableCell className="text-right tabular-nums">{row.requests.toLocaleString()}</TableCell>
                     {stats.models.map((modelName) => (
                       <TableCell key={modelName} className="text-right font-mono tabular-nums">
@@ -2303,6 +2261,78 @@ export default function Usage() {
           }
         />
 
+        <div className="toolbar-surface flex flex-wrap items-center gap-2 overflow-visible">
+          <span className="mr-1 whitespace-nowrap text-xs font-semibold text-muted-foreground">
+            {t('usage.dailyTokenTitle')}
+          </span>
+          <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border bg-muted/50 p-0.5">
+            {USAGE_TIME_RANGE_OPTIONS.map((key) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => {
+                  setTimeRange(key)
+                  setPage(1)
+                  setShowCustomPopover(false)
+                }}
+                className={`whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ${
+                  timeRange === key
+                    ? 'border border-border bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
+              </button>
+            ))}
+            <button
+              ref={customChipRef}
+              type="button"
+              onClick={() => setShowCustomPopover((v) => !v)}
+              className={`whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ${
+                timeRange === 'custom'
+                  ? 'border border-border bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {timeRange === 'custom' && customRange
+                ? t('usage.customRangeChipApplied')
+                : t('usage.customRange')}
+            </button>
+          </div>
+          {showCustomPopover && (
+            <CustomRangePopover
+              anchorRef={customChipRef}
+              initial={customRange}
+              onCancel={() => setShowCustomPopover(false)}
+              onApply={(range) => {
+                setCustomRange(range)
+                setTimeRange('custom')
+                setPage(1)
+                setShowCustomPopover(false)
+              }}
+            />
+          )}
+          <Select
+            className="w-44 shrink-0"
+            compact
+            value={dailyModel}
+            onValueChange={setDailyModel}
+            placeholder={t('usage.dailyModelFilter')}
+            options={[
+              { label: t('usage.dailyAllModels'), value: '' },
+              ...modelFilterOptions.map((model) => ({ label: model, value: model })),
+            ]}
+          />
+          <Select
+            className="w-52 shrink-0"
+            compact
+            value={dailyApiKeyId}
+            onValueChange={setDailyApiKeyId}
+            placeholder={t('usage.dailyApiKeyFilter')}
+            options={apiKeyOptions}
+          />
+        </div>
+
         <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
         <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
@@ -2412,12 +2442,6 @@ export default function Usage() {
           stats={dailyStats}
           loading={dailyStatsLoading}
           error={dailyStatsError}
-          modelOptions={modelFilterOptions}
-          apiKeyOptions={apiKeyOptions}
-          model={dailyModel}
-          apiKeyId={dailyApiKeyId}
-          onModelChange={setDailyModel}
-          onApiKeyChange={setDailyApiKeyId}
           showFullUsageNumbers={showFullUsageNumbers}
         />
 
@@ -2450,53 +2474,6 @@ export default function Usage() {
             <div className="mb-4 flex items-center justify-between gap-3 overflow-visible max-lg:flex-col max-lg:items-stretch max-lg:overflow-visible">
               <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <h3 className="shrink-0 whitespace-nowrap text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
-                <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border bg-muted/50 p-0.5">
-                  {USAGE_TIME_RANGE_OPTIONS.map((key) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        setTimeRange(key)
-                        setPage(1)
-                        setShowCustomPopover(false)
-                      }}
-                      className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
-                        timeRange === key
-                          ? 'bg-background text-foreground shadow-sm border border-border'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
-                    </button>
-                  ))}
-                  <button
-                    ref={customChipRef}
-                    type="button"
-                    onClick={() => setShowCustomPopover((v) => !v)}
-                    className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
-                      timeRange === 'custom'
-                        ? 'bg-background text-foreground shadow-sm border border-border'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
-                  >
-                    {timeRange === 'custom' && customRange
-                      ? t('usage.customRangeChipApplied')
-                      : t('usage.customRange')}
-                  </button>
-                </div>
-                {showCustomPopover && (
-                  <CustomRangePopover
-                    anchorRef={customChipRef}
-                    initial={customRange}
-                    onCancel={() => setShowCustomPopover(false)}
-                    onApply={(range) => {
-                      setCustomRange(range)
-                      setTimeRange('custom')
-                      setPage(1)
-                      setShowCustomPopover(false)
-                    }}
-                  />
-                )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>

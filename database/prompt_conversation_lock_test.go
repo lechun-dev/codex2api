@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -54,7 +55,7 @@ func TestPromptConversationLockLifecycleAndDecisionReplay(t *testing.T) {
 }
 
 func TestEnsurePromptConversationLocksTableUsesMySQL56DDL(t *testing.T) {
-	capture := &mysqlCaptureDriver{}
+	capture := &mysqlCaptureDriver{queryRows: [][]driver.Value{{int64(0)}, {int64(0)}}}
 	driverName := fmt.Sprintf("codex2api-mysql-lock-schema-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
 	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
 	conn, err := sql.Open(driverName, "")
@@ -67,12 +68,25 @@ func TestEnsurePromptConversationLocksTableUsesMySQL56DDL(t *testing.T) {
 	if err := db.ensurePromptConversationLocksTable(context.Background()); err != nil {
 		t.Fatalf("ensurePromptConversationLocksTable() error = %v", err)
 	}
-	for _, fragment := range []string{"AUTO_INCREMENT", "DATETIME", "ENGINE=InnoDB", "KEY idx_prompt_conversation_locks_status"} {
-		if !strings.Contains(capture.query, fragment) {
-			t.Fatalf("MySQL lock DDL missing %q: %s", fragment, capture.query)
+	if len(capture.queries) < 5 {
+		t.Fatalf("MySQL lock migration executed %d statements, want create, column check/add and index check/add: %#v", len(capture.queries), capture.queries)
+	}
+	ddl := capture.queries[0]
+	for _, fragment := range []string{"AUTO_INCREMENT", "DATETIME", "ENGINE=InnoDB", "identity_kind VARCHAR(24)", "KEY idx_prompt_conversation_locks_status", "platform(64), newapi_user_id(128)"} {
+		if !strings.Contains(ddl, fragment) {
+			t.Fatalf("MySQL lock DDL missing %q: %s", fragment, ddl)
 		}
 	}
-	assertNoMySQL56IncompatibleSQL(t, capture.query)
+	joined := strings.Join(capture.queries, "\n")
+	for _, fragment := range []string{
+		"ALTER TABLE `prompt_conversation_locks` ADD COLUMN `identity_kind` VARCHAR(24) CHARACTER SET ascii NOT NULL DEFAULT 'newapi'",
+		"CREATE INDEX idx_prompt_conversation_locks_user_cooldown ON prompt_conversation_locks(platform(64), newapi_user_id(128), status, locked_at)",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("MySQL legacy lock migration missing %q: %s", fragment, joined)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, joined)
 }
 
 func TestPromptConversationLockExpiresAfterTTL(t *testing.T) {

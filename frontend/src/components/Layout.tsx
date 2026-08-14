@@ -370,9 +370,6 @@ export default function Layout({ children }: PropsWithChildren) {
                         onClick={() => setShowVersionPopover((current) => !current)}
                       >
                         {__APP_VERSION__}
-                        {hasUpdate && (
-                          <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
-                        )}
                       </button>
                       {showVersionPopover && versionPopoverPos && createPortal(
                         <div
@@ -609,9 +606,6 @@ export default function Layout({ children }: PropsWithChildren) {
                 onClick={() => setShowVersionPopover((current) => !current)}
               >
                 {__APP_VERSION__}
-                {hasUpdate && (
-                  <span className="absolute -top-1 -right-1 size-2 rounded-full bg-red-500 shadow-sm ring-2 ring-card animate-pulse" />
-                )}
               </button>
             </div>
             <div className="flex shrink-0 items-center gap-0.5">

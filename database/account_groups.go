@@ -544,7 +544,13 @@ func (db *DB) UpdateAccountProxyURL(ctx context.Context, id int64, proxyURL stri
 		return err
 	}
 	if affected == 0 {
-		return sql.ErrNoRows
+		// MySQL reports changed rows rather than matched rows by default. Saving an
+		// unchanged proxy URL can therefore return zero even though the account
+		// exists, especially when both updates happen within the same second.
+		var exists int
+		if err := db.conn.QueryRowContext(ctx, `SELECT 1 FROM accounts WHERE id = $1`, id).Scan(&exists); err != nil {
+			return err
+		}
 	}
 	return nil
 }

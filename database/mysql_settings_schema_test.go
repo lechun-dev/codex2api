@@ -55,8 +55,10 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_ws_busy_patience_sec INT DEFAULT 2",
 		"codex_ws_weak_network_mode TINYINT(1) DEFAULT 0",
 		"overflow_auto_compact_enabled TINYINT(1) DEFAULT 0",
+		"compact_via_responses_enabled TINYINT(1) DEFAULT 0",
 		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
 		"utls_shutdown_timeout_minutes INT DEFAULT 30",
+		"codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off'",
 		"response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864",
 		"response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608",
 		"response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864",
@@ -393,6 +395,19 @@ func TestMySQLAccountGroupSchemaIncludesBaseConcurrencyOverride(t *testing.T) {
 	if strings.Contains(strings.ToUpper(ddl), "PROXY_URLS TEXT DEFAULT") {
 		t.Fatalf("MySQL 5.6-incompatible proxy_urls default leaked into DDL: %s", ddl)
 	}
+	if !strings.Contains(ddl, "channel VARCHAR(16) NOT NULL DEFAULT 'codex'") {
+		t.Fatalf("MySQL account_groups DDL missing channel required by data migration: %s", ddl)
+	}
+	foundMigrationColumn := false
+	for _, column := range mysql56AccountGroupColumns {
+		if column.table == "account_groups" && column.name == "channel" && column.def == "VARCHAR(16) NOT NULL DEFAULT 'codex'" {
+			foundMigrationColumn = true
+			break
+		}
+	}
+	if !foundMigrationColumn {
+		t.Fatal("MySQL old-database migration missing account_groups.channel")
+	}
 }
 
 func TestMySQL56V271MigrationScript(t *testing.T) {
@@ -426,6 +441,11 @@ func TestMySQL56V277MigrationScript(t *testing.T) {
 	}
 	script := string(raw)
 	for _, required := range []string{
+		"c2a_add_column_if_missing(\n    'account_groups',\n    'channel',\n    'VARCHAR(16) NOT NULL DEFAULT ''codex'''",
+		"c2a_add_column_if_missing(\n    'system_settings',\n    'codex_fingerprint_default_mode',\n    'VARCHAR(20) DEFAULT ''off'''",
+		"c2a_add_column_if_missing(\n    'system_settings',\n    'compact_via_responses_enabled',\n    'TINYINT(1) DEFAULT 0'",
+		"c2a_add_column_if_missing(\n    'prompt_conversation_locks',\n    'identity_kind',",
+		"idx_prompt_conversation_locks_user_cooldown",
 		"c2a_add_column_if_missing(\n    'usage_logs',\n    'credential_generation'",
 		"c2a_add_column_if_missing(\n    'accounts',\n    'credential_family_id'",
 		"CREATE TABLE IF NOT EXISTS grok_account_fact_snapshots",

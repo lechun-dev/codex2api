@@ -234,6 +234,11 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateCredentials account models failed: %v", err)
 	}
+	// The default MySQL driver reports changed rows, so an idempotent update
+	// must not be mistaken for a missing account.
+	if err := db.UpdateAccountProxyURL(ctx, accountID, proxyURL); err != nil {
+		t.Fatalf("UpdateAccountProxyURL unchanged value failed: %v", err)
+	}
 	if err := db.UpdateAccountSchedulerMetadata(ctx, accountID,
 		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 17, Valid: true}},
 		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 19, Valid: true}},

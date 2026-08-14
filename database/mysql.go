@@ -38,9 +38,11 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_ws_busy_overflow_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_ws_busy_patience_sec", def: "INT DEFAULT 2"},
 	{table: "system_settings", name: "overflow_auto_compact_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "compact_via_responses_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_preflight_sse_passthrough_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "utls_shutdown_timeout_minutes", def: "INT DEFAULT 30"},
+	{table: "system_settings", name: "codex_fingerprint_default_mode", def: "VARCHAR(20) DEFAULT 'off'"},
 	{table: "system_settings", name: "response_cache_local_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
 	{table: "system_settings", name: "response_cache_local_max_entry_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
 	{table: "system_settings", name: "response_cache_reconstruct_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
@@ -70,6 +72,10 @@ var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
 	{table: "prompt_filter_logs", name: "newapi_request_id", def: "VARCHAR(255) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "newapi_decision_id", def: "VARCHAR(64) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "session_hash", def: "VARCHAR(64) DEFAULT ''"},
+}
+
+var mysql56AccountGroupColumns = []mysqlColumnDefinition{
+	{table: "account_groups", name: "channel", def: "VARCHAR(16) NOT NULL DEFAULT 'codex'"},
 }
 
 func (db *DB) migrateMySQL(ctx context.Context) error {
@@ -451,6 +457,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"proxies", "test_latency_ms", "INT DEFAULT 0"},
 		{"proxies", "test_status", "VARCHAR(20) NOT NULL DEFAULT 'untested'"},
 	}
+	columns = append(columns, mysql56AccountGroupColumns...)
 	columns = append(columns, mysql56SystemSettingsColumns...)
 	columns = append(columns, mysql56PromptFilterLogColumns...)
 	for _, column := range columns {
@@ -557,6 +564,7 @@ func accountGroupsMySQLDDL() string {
 		auto_pause_7d_threshold DOUBLE DEFAULT 0,
 		base_concurrency_override INT NULL,
 		proxy_urls TEXT NULL,
+		channel VARCHAR(16) NOT NULL DEFAULT 'codex',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
@@ -713,6 +721,7 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_busy_overflow_enabled TINYINT(1) DEFAULT 0,
 		codex_ws_busy_patience_sec INT DEFAULT 2,
 		overflow_auto_compact_enabled TINYINT(1) DEFAULT 0,
+		compact_via_responses_enabled TINYINT(1) DEFAULT 0,
 		codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_thinking_enabled TINYINT(1) DEFAULT 0,
 		codex_continue_max_rounds INT DEFAULT 8,
@@ -728,6 +737,7 @@ func systemSettingsMySQLDDL() string {
 		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
 		auto_reset_credits_before_expiry_min INT DEFAULT 60,
 		utls_shutdown_timeout_minutes INT DEFAULT 30,
+		codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off',
 		response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,

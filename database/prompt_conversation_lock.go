@@ -94,7 +94,7 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 	promptConversationLockSchemaMu.Lock()
 	defer promptConversationLockSchemaMu.Unlock()
 	if db.isMySQL() {
-		_, err := db.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS prompt_conversation_locks (
+		if _, err := db.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS prompt_conversation_locks (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			lock_key VARCHAR(64) CHARACTER SET ascii NOT NULL UNIQUE,
 			status VARCHAR(24) NOT NULL DEFAULT 'active',
@@ -118,9 +118,15 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 			updated_at DATETIME NOT NULL,
 			KEY idx_prompt_conversation_locks_status (status, updated_at),
 			KEY idx_prompt_conversation_locks_session (session_hash, status),
-			KEY idx_prompt_conversation_locks_user_cooldown (platform, newapi_user_id, status, locked_at)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8`)
-		return err
+			KEY idx_prompt_conversation_locks_user_cooldown (platform(64), newapi_user_id(128), status, locked_at)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`); err != nil {
+			return err
+		}
+		// CREATE TABLE IF NOT EXISTS 不会补齐存量表的新列和索引。
+		if err := db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) CHARACTER SET ascii NOT NULL DEFAULT 'newapi'"); err != nil {
+			return err
+		}
+		return db.ensureMySQLIndex(ctx, "prompt_conversation_locks", "idx_prompt_conversation_locks_user_cooldown", "CREATE INDEX idx_prompt_conversation_locks_user_cooldown ON prompt_conversation_locks(platform(64), newapi_user_id(128), status, locked_at)")
 	}
 	idType := "BIGSERIAL PRIMARY KEY"
 	timeType := "TIMESTAMPTZ"
@@ -165,12 +171,6 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 	// 路径,因此默认值保持 newapi,语义与升级前完全一致。
 	if db.isSQLite() {
 		return db.ensureSQLiteColumn(ctx, "prompt_conversation_locks", "identity_kind", "TEXT NOT NULL DEFAULT 'newapi'")
-	}
-	if db.isMySQL() {
-		if err := db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) CHARACTER SET ascii NOT NULL DEFAULT 'newapi'"); err != nil {
-			return err
-		}
-		return db.ensureMySQLIndex(ctx, "prompt_conversation_locks", "idx_prompt_conversation_locks_user_cooldown", "CREATE INDEX idx_prompt_conversation_locks_user_cooldown ON prompt_conversation_locks(platform, newapi_user_id, status, locked_at)")
 	}
 	_, err := db.conn.ExecContext(ctx, `ALTER TABLE prompt_conversation_locks ADD COLUMN IF NOT EXISTS identity_kind VARCHAR(24) NOT NULL DEFAULT 'newapi'`)
 	return err

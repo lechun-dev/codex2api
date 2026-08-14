@@ -1,7 +1,7 @@
 -- codex2api v2.7.7 schema update for MySQL 5.6+.
 -- Select the codex2api database before running this script.
--- The script is idempotent and adds the upstream credential-generation and
--- Grok state schema. It does not modify or delete existing data.
+-- The script is idempotent and adds the upstream account-group channel,
+-- credential-generation, and Grok state schema. It does not delete existing data.
 
 DELIMITER $$
 
@@ -55,6 +55,61 @@ BEGIN
 END$$
 
 DELIMITER ;
+
+CALL c2a_add_column_if_missing(
+    'system_settings',
+    'codex_fingerprint_default_mode',
+    'VARCHAR(20) DEFAULT ''off'''
+);
+CALL c2a_add_column_if_missing(
+    'system_settings',
+    'compact_via_responses_enabled',
+    'TINYINT(1) DEFAULT 0'
+);
+
+CREATE TABLE IF NOT EXISTS prompt_conversation_locks (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    lock_key VARCHAR(64) CHARACTER SET ascii NOT NULL UNIQUE,
+    status VARCHAR(24) NOT NULL DEFAULT 'active',
+    identity_kind VARCHAR(24) CHARACTER SET ascii NOT NULL DEFAULT 'newapi',
+    platform VARCHAR(100) NOT NULL DEFAULT '',
+    newapi_user_id VARCHAR(255) NOT NULL DEFAULT '',
+    session_fingerprint VARCHAR(32) CHARACTER SET ascii NOT NULL DEFAULT '',
+    session_hash VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+    incident_id VARCHAR(64) CHARACTER SET ascii NOT NULL DEFAULT '',
+    decision_id VARCHAR(128) CHARACTER SET ascii NOT NULL DEFAULT '',
+    request_id VARCHAR(255) NOT NULL DEFAULT '',
+    reason_code VARCHAR(100) NOT NULL DEFAULT '',
+    endpoint VARCHAR(255) NOT NULL DEFAULT '',
+    model VARCHAR(128) NOT NULL DEFAULT '',
+    trigger_count BIGINT NOT NULL DEFAULT 1,
+    unlock_count BIGINT NOT NULL DEFAULT 0,
+    locked_at DATETIME NOT NULL,
+    unlocked_at DATETIME NULL,
+    unlock_reason VARCHAR(1000) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    KEY idx_prompt_conversation_locks_status (status, updated_at),
+    KEY idx_prompt_conversation_locks_session (session_hash, status),
+    KEY idx_prompt_conversation_locks_user_cooldown (platform(64), newapi_user_id(128), status, locked_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CALL c2a_add_column_if_missing(
+    'prompt_conversation_locks',
+    'identity_kind',
+    'VARCHAR(24) CHARACTER SET ascii NOT NULL DEFAULT ''newapi'''
+);
+CALL c2a_add_index_if_missing(
+    'prompt_conversation_locks',
+    'idx_prompt_conversation_locks_user_cooldown',
+    '`platform`(64), `newapi_user_id`(128), `status`, `locked_at`'
+);
+
+CALL c2a_add_column_if_missing(
+    'account_groups',
+    'channel',
+    'VARCHAR(16) NOT NULL DEFAULT ''codex'''
+);
 
 CALL c2a_add_column_if_missing(
     'usage_logs',

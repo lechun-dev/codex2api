@@ -497,6 +497,50 @@ func (db *DB) UnlockPromptConversationUserCooldown(ctx context.Context, platform
 		reason = "管理员解除用户安全冷却"
 	}
 	now := time.Now().UTC()
+	if db.isMySQL() {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		rows, err := tx.QueryContext(ctx, `SELECT lock_key FROM prompt_conversation_locks
+			WHERE platform=$1 AND newapi_user_id=$2 AND status='active' FOR UPDATE`, platform, newAPIUserID)
+		if err != nil {
+			return nil, err
+		}
+		keys := make([]string, 0, 4)
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			keys = append(keys, key)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if len(keys) == 0 {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return nil, sql.ErrNoRows
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE prompt_conversation_locks SET
+			status='unlocked', unlock_count=unlock_count+1, unlocked_at=$3,
+			unlock_reason=$4, updated_at=$3
+			WHERE platform=$1 AND newapi_user_id=$2 AND status='active'`, platform, newAPIUserID, now, reason); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return keys, nil
+	}
 	rows, err := db.conn.QueryContext(ctx, `UPDATE prompt_conversation_locks SET
 		status='unlocked', unlock_count=unlock_count+1, unlocked_at=$3,
 		unlock_reason=$4, updated_at=$3

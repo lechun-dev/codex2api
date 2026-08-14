@@ -64,10 +64,7 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 // classifyAccountGroupChannels 把成员清一色是 Grok 账号的存量分组归到 grok 渠道。
 // 混合组保持 codex 且成员不动(只在后续写入时强校验),避免迁移悄悄拆散生产分组。
 func (db *DB) classifyAccountGroupChannels(ctx context.Context, tx *sql.Tx) error {
-	upstreamTypeExpr := `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
-	if db.isSQLite() {
-		upstreamTypeExpr = `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
-	}
+	upstreamTypeExpr := accountGroupUpstreamTypeExpression(db)
 	res, err := tx.ExecContext(ctx, `
 		UPDATE account_groups SET channel = 'grok'
 		WHERE COALESCE(channel, 'codex') <> 'grok' AND id IN (
@@ -85,6 +82,16 @@ func (db *DB) classifyAccountGroupChannels(ctx context.Context, tx *sql.Tx) erro
 		log.Printf("[data_migration] %s: %d 个存量分组归类为 grok 渠道", dataMigrationGroupChannelV1, affected)
 	}
 	return nil
+}
+
+func accountGroupUpstreamTypeExpression(db *DB) string {
+	if db.isSQLite() {
+		return `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
+	}
+	if db.isMySQL() {
+		return `LOWER(COALESCE(CAST(a.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+	}
+	return `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
 }
 
 // backfillUsageLogChannel 给存量 usage_logs 回填 channel：先按现存账号的 platform

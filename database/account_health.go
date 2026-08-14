@@ -36,7 +36,11 @@ func (db *DB) GetAccountsHealthBucketsByIDs(ctx context.Context, ids []int64, no
 
 	windowStart := now.Add(-time.Duration(blockCount) * bucketDuration)
 	ids = positiveUniqueIDs(ids)
-	if !db.isSQLite() {
+	// MySQL 5.6 does not support the PostgreSQL-specific EXTRACT/timestamptz
+	// expression used by getPostgresAccountHealthBuckets. Keep MySQL on the
+	// portable row-bucketing path until a MySQL-specific aggregation query is
+	// introduced.
+	if !db.isSQLite() && !db.isMySQL() {
 		return db.getPostgresAccountHealthBuckets(ctx, ids, windowStart, now, blockCount, bucketDuration)
 	}
 	startArg, endArg := db.timeRangeArgs(windowStart, now)

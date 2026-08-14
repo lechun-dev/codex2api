@@ -220,10 +220,10 @@ func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) e
 	if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id = "+ph, id); err != nil {
 		return err
 	}
-	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
+	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), db.isMySQL(), id); err != nil {
 		return err
 	}
-	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
+	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), db.isMySQL(), APIKeyScopeTypeGroup, id); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
@@ -240,7 +240,7 @@ func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) e
 	return tx.Commit()
 }
 
-func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite bool, groupID int64) error {
+func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite, mysql bool, groupID int64) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(allowed_group_ids, '[]') FROM api_keys`)
 	if err != nil {
 		return err
@@ -275,7 +275,7 @@ func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite b
 	}
 
 	query := `UPDATE api_keys SET allowed_group_ids = $1::jsonb WHERE id = $2`
-	if sqlite {
+	if sqlite || mysql {
 		query = `UPDATE api_keys SET allowed_group_ids = ? WHERE id = ?`
 	}
 	for _, item := range updates {
@@ -289,7 +289,7 @@ func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite b
 // pruneDeletedScopeFromAPIKeyLimits 清理指向已删除分组 / 账号的 scope 维度限额
 // (api_keys.limits.scope_limits)。与 allowed_group_ids 的处理不同,这里即使清空也无副作用:
 // 少一条限额只会让该 Key 恢复不限,不会把它变成能访问更多账号。
-func pruneDeletedScopeFromAPIKeyLimits(ctx context.Context, tx *sql.Tx, sqlite bool, scopeType string, scopeID int64) error {
+func pruneDeletedScopeFromAPIKeyLimits(ctx context.Context, tx *sql.Tx, sqlite, mysql bool, scopeType string, scopeID int64) error {
 	if scopeID <= 0 {
 		return nil
 	}
@@ -326,7 +326,7 @@ func pruneDeletedScopeFromAPIKeyLimits(ctx context.Context, tx *sql.Tx, sqlite b
 	}
 
 	query := `UPDATE api_keys SET limits = $1::jsonb WHERE id = $2`
-	if sqlite {
+	if sqlite || mysql {
 		query = `UPDATE api_keys SET limits = ? WHERE id = ?`
 	}
 	for _, item := range updates {
@@ -517,7 +517,7 @@ func (db *DB) VerifyAccountGroupIDs(ctx context.Context, ids []int64) ([]int64, 
 func (db *DB) UpdateAccountTags(ctx context.Context, id int64, tags []string) error {
 	payload := encodeTagsJSON(tags)
 	query := `UPDATE accounts SET tags = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		query = `UPDATE accounts SET tags = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	}
 	res, err := db.conn.ExecContext(ctx, query, payload, id)

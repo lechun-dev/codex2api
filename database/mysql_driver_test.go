@@ -79,6 +79,40 @@ func TestListActiveByChannelGeneratesMySQL56CompatibleSQL(t *testing.T) {
 	assertNoMySQL56IncompatibleSQL(t, capture.query)
 }
 
+func TestListAccountListProjectionGeneratesMySQL56CompatibleSQL(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	if _, err := db.ListAccountListProjection(context.Background(), UpstreamChannelGrok); err != nil {
+		t.Fatalf("ListAccountListProjection() error = %v", err)
+	}
+	for _, fragment := range []string{
+		"CAST(credentials AS CHAR)",
+		"REGEXP",
+		"FROM accounts",
+		"credentials",
+		"ORDER BY id",
+	} {
+		if !strings.Contains(capture.query, fragment) {
+			t.Fatalf("MySQL account projection query missing %q: %s", fragment, capture.query)
+		}
+	}
+	for _, incompatible := range []string{"JSONB", "JSONB_TO_RECORD", "CROSS JOIN LATERAL", "->>"} {
+		if strings.Contains(strings.ToUpper(capture.query), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL account projection query contains PostgreSQL syntax %q: %s", incompatible, capture.query)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
+}
+
 func TestListAPIKeyAccountStatsGeneratesMySQL56CompatibleSQL(t *testing.T) {
 	capture := &mysqlCaptureDriver{}
 	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
@@ -184,6 +218,66 @@ func TestRewriteSQLForMySQLUpsert(t *testing.T) {
 	`)
 	if !containsAll(got, "ON DUPLICATE KEY UPDATE", "enabled = VALUES(enabled)", "VALUES (?, ?)") {
 		t.Fatalf("unexpected MySQL upsert rewrite: %s", got)
+	}
+}
+
+func TestAccountDailyUsageUpsertUsesMySQL56Syntax(t *testing.T) {
+	capture := &mysqlCaptureDriver{queryRow: []driver.Value{int64(0)}}
+	driverName := fmt.Sprintf("codex2api-mysql-daily-usage-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	err = db.UpsertAccountDailyUsage(context.Background(), AccountDailyUsageInput{
+		AccountID:   7,
+		Day:         "2026-08-14",
+		ClientsJSON: `[{"client_id":"CODEX_CLI"}]`,
+		ModelsJSON:  `[{"model":"gpt-5"}]`,
+	})
+	if err != nil {
+		t.Fatalf("UpsertAccountDailyUsage() error = %v", err)
+	}
+	if !strings.Contains(capture.query, "ON DUPLICATE KEY UPDATE") {
+		t.Fatalf("daily usage upsert was not rewritten: %s", capture.query)
+	}
+	if !strings.Contains(capture.query, "VALUES(credits)") || !strings.Contains(capture.query, "VALUES(total_tokens)") {
+		t.Fatalf("daily usage EXCLUDED references were not rewritten: %s", capture.query)
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.query)
+}
+
+func TestPromptRiskIdentityUpsertUsesMySQL56Syntax(t *testing.T) {
+	capture := &mysqlCaptureDriver{queryRow: []driver.Value{int64(0)}}
+	driverName := fmt.Sprintf("codex2api-mysql-risk-identity-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	err = db.UpsertPromptRiskIdentities(context.Background(), []PromptRiskIdentityInput{{
+		Platform:       "gateway-a",
+		ExternalUserID: "user-42",
+		UserName:       "test-user",
+		Source:         "test",
+	}})
+	if err != nil {
+		t.Fatalf("UpsertPromptRiskIdentities() error = %v", err)
+	}
+	if !strings.Contains(capture.query, "ON DUPLICATE KEY UPDATE") {
+		t.Fatalf("prompt risk identity upsert was not rewritten: %s", capture.query)
+	}
+	if !strings.Contains(capture.query, "VALUES(platform)") || !strings.Contains(capture.query, "VALUES(updated_at)") {
+		t.Fatalf("prompt risk EXCLUDED references were not rewritten: %s", capture.query)
+	}
+	for _, query := range capture.queries {
+		assertNoMySQL56IncompatibleSQL(t, query)
 	}
 }
 

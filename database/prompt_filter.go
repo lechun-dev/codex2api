@@ -695,7 +695,7 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 		defer tx.Rollback()
 		var id int64
 		var createdRaw any
-		if err := tx.QueryRowContext(ctx, `
+		insertSQL := `
 			INSERT INTO prompt_filter_logs (
 				source, endpoint, request_protocol, request_provider, model, action, mode, score, audit_score, threshold_value, policy_profile, reason_code, primary_origin, strike_eligible, matched_patterns, text_preview,
 				match_context, api_key_id, api_key_name, api_key_masked, client_ip, error_code, review_model, review_flagged, review_error,
@@ -704,12 +704,25 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 				newapi_policy_status, newapi_platform, newapi_user_id, newapi_request_id, newapi_decision_id, session_hash
 			)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
-			RETURNING id, created_at
-		`, input.Source, input.Endpoint, input.Protocol, input.Provider, input.Model, input.Action, input.Mode, input.Score, input.AuditScore, input.Threshold,
+		`
+		args := []interface{}{input.Source, input.Endpoint, input.Protocol, input.Provider, input.Model, input.Action, input.Mode, input.Score, input.AuditScore, input.Threshold,
 			input.PolicyProfile, input.ReasonCode, input.PrimaryOrigin, input.StrikeEligible, input.MatchedPatterns, input.TextPreview, input.MatchContext,
 			input.APIKeyID, input.APIKeyName, input.APIKeyMasked, input.ClientIP, input.ErrorCode, input.ReviewModel, input.ReviewFlagged, input.ReviewError,
 			input.Reviewed, input.ReviewConfidence, input.ReviewThreshold, input.ReviewReason, input.ReviewEndpoint, input.ReviewRequestMode, input.ReviewLatencyMS, input.FullText,
-			input.RequestCorrelationID, input.NewAPIPolicyStatus, input.NewAPIPlatform, input.NewAPIUserID, input.NewAPIRequestID, input.NewAPIDecisionID, input.SessionHash).Scan(&id, &createdRaw); err != nil {
+			input.RequestCorrelationID, input.NewAPIPolicyStatus, input.NewAPIPlatform, input.NewAPIUserID, input.NewAPIRequestID, input.NewAPIDecisionID, input.SessionHash}
+		if db.isMySQL() {
+			result, err := tx.ExecContext(ctx, insertSQL, args...)
+			if err != nil {
+				return err
+			}
+			id, err = result.LastInsertId()
+			if err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT created_at FROM prompt_filter_logs WHERE id=$1`, id).Scan(&createdRaw); err != nil {
+				return err
+			}
+		} else if err := tx.QueryRowContext(ctx, insertSQL+` RETURNING id, created_at`, args...).Scan(&id, &createdRaw); err != nil {
 			return err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)

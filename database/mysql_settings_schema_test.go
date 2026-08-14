@@ -419,6 +419,42 @@ func TestMySQL56V271MigrationScript(t *testing.T) {
 	}
 }
 
+func TestMySQL56V277MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_v2.7.7.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 v2.7.7 migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"c2a_add_column_if_missing(\n    'usage_logs',\n    'credential_generation'",
+		"c2a_add_column_if_missing(\n    'accounts',\n    'credential_family_id'",
+		"CREATE TABLE IF NOT EXISTS grok_account_fact_snapshots",
+		"CREATE TABLE IF NOT EXISTS grok_model_catalog_snapshots",
+		"CREATE TABLE IF NOT EXISTS grok_model_catalog_items",
+		"CREATE TABLE IF NOT EXISTS grok_model_capabilities",
+		"CREATE TABLE IF NOT EXISTS grok_credential_identity_claims",
+		"CREATE TABLE IF NOT EXISTS grok_state_migration_progress",
+		"idx_usage_logs_account_generation_created_at",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 v2.7.7 migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{
+		"ADD COLUMN IF NOT EXISTS",
+		"CREATE INDEX IF NOT EXISTS",
+		"BOOLEAN",
+		"ON CONFLICT",
+		"TIMESTAMPTZ",
+		"JSONB",
+		"TEXT DEFAULT",
+	} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.7.7 migration", incompatible)
+		}
+	}
+}
+
 func TestMySQLAPIKeyScopeCountersSchemaIsMySQL56Compatible(t *testing.T) {
 	ddl := apiKeyScopeCountersMySQLDDL()
 	for _, needle := range []string{

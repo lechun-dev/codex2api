@@ -1974,7 +1974,7 @@ func (db *DB) UpdateAPIKeyAllowedGroups(ctx context.Context, id int64, groupIDs 
 		res sql.Result
 		err error
 	)
-	if db.isSQLite() {
+	if db.isSQLite() || db.isMySQL() {
 		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET allowed_group_ids = $1 WHERE id = $2`, payload, id)
 	} else {
 		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET allowed_group_ids = $1::jsonb WHERE id = $2`, payload, id)
@@ -2004,7 +2004,7 @@ func (db *DB) UpdateAPIKeyLimits(ctx context.Context, id int64, limits APIKeyLim
 		res sql.Result
 		err error
 	)
-	if db.isSQLite() {
+	if db.isSQLite() || db.isMySQL() {
 		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET limits = $1 WHERE id = $2`, payload, id)
 	} else {
 		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET limits = $1::jsonb WHERE id = $2`, payload, id)
@@ -2106,7 +2106,7 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	if update.AllowedGroupIDsSet {
 		payload := encodeInt64SliceJSON(update.AllowedGroupIDs)
 		ph := setArg(payload)
-		if db.isSQLite() {
+		if db.isSQLite() || db.isMySQL() {
 			sets = append(sets, "allowed_group_ids = "+ph)
 		} else {
 			sets = append(sets, "allowed_group_ids = "+ph+"::jsonb")
@@ -2115,7 +2115,7 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	if update.LimitsSet {
 		payload := encodeAPIKeyLimits(update.Limits)
 		ph := setArg(payload)
-		if db.isSQLite() {
+		if db.isSQLite() || db.isMySQL() {
 			sets = append(sets, "limits = "+ph)
 		} else {
 			sets = append(sets, "limits = "+ph+"::jsonb")
@@ -2152,6 +2152,34 @@ type APIKeyQuotaResetTarget struct {
 func (db *DB) ResetAPIKeyQuota(ctx context.Context, id int64) (*APIKeyQuotaResetTarget, error) {
 	db.FlushUsageLogs()
 	target := &APIKeyQuotaResetTarget{}
+	if db.isMySQL() {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id, key
+			FROM api_keys
+			WHERE id = $1
+			FOR UPDATE
+		`, id).Scan(&target.ID, &target.Key); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE api_keys
+			SET quota_used = 0,
+				reset_count = COALESCE(reset_count, 0) + 1,
+				last_reset_at = $1
+			WHERE id = $2
+		`, db.timeArg(time.Now()), id); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return target, nil
+	}
 	err := db.conn.QueryRowContext(ctx, `
 		UPDATE api_keys
 		SET quota_used = 0,
@@ -2170,6 +2198,49 @@ func (db *DB) ResetAPIKeyQuota(ctx context.Context, id int64) (*APIKeyQuotaReset
 // API key in one statement and returns the exact affected rows for cache eviction.
 func (db *DB) ResetAllAPIKeyQuotas(ctx context.Context) ([]APIKeyQuotaResetTarget, error) {
 	db.FlushUsageLogs()
+	if db.isMySQL() {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, key
+			FROM api_keys
+			FOR UPDATE
+		`)
+		if err != nil {
+			return nil, err
+		}
+		targets := make([]APIKeyQuotaResetTarget, 0)
+		for rows.Next() {
+			var target APIKeyQuotaResetTarget
+			if err := rows.Scan(&target.ID, &target.Key); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			targets = append(targets, target)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE api_keys
+			SET quota_used = 0,
+				reset_count = COALESCE(reset_count, 0) + 1,
+				last_reset_at = $1
+		`, db.timeArg(time.Now())); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return targets, nil
+	}
 	rows, err := db.conn.QueryContext(ctx, `
 		UPDATE api_keys
 		SET quota_used = 0,
@@ -3643,7 +3714,7 @@ func scanUnboundAccountIDs(rows *sql.Rows) ([]int64, error) {
 	return ids, nil
 }
 
-func unbindAccountsFromProxyURLsTx(ctx context.Context, tx *sql.Tx, sqlite bool, proxyURLs []string) ([]int64, error) {
+func unbindAccountsFromProxyURLsTx(ctx context.Context, tx *sql.Tx, sqlite, mysql bool, proxyURLs []string) ([]int64, error) {
 	if len(proxyURLs) == 0 {
 		return nil, nil
 	}
@@ -3651,12 +3722,42 @@ func unbindAccountsFromProxyURLsTx(ctx context.Context, tx *sql.Tx, sqlite bool,
 	for i, proxyURL := range proxyURLs {
 		args[i] = proxyURL
 	}
+	placeholders := strings.Join(dbPlaceholders(sqlite, 1, len(proxyURLs)), ",")
+	if mysql {
+		selectQuery := fmt.Sprintf(`
+			SELECT id
+			FROM accounts
+			WHERE TRIM(COALESCE(proxy_url, '')) IN (%s)
+			FOR UPDATE`, placeholders)
+		rows, err := tx.QueryContext(ctx, selectQuery, args...)
+		if err != nil {
+			return nil, err
+		}
+		ids, err := scanUnboundAccountIDs(rows)
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		updateQuery := fmt.Sprintf(`
+			UPDATE accounts
+			SET proxy_url = '', updated_at = CURRENT_TIMESTAMP
+			WHERE TRIM(COALESCE(proxy_url, '')) IN (%s)`, placeholders)
+		if _, err := tx.ExecContext(ctx, updateQuery, args...); err != nil {
+			return nil, err
+		}
+		return ids, nil
+	}
 	query := fmt.Sprintf(`
 		UPDATE accounts
 		SET proxy_url = '', updated_at = CURRENT_TIMESTAMP
 		WHERE TRIM(COALESCE(proxy_url, '')) IN (%s)
 		RETURNING id
-	`, strings.Join(dbPlaceholders(sqlite, 1, len(proxyURLs)), ","))
+	`, placeholders)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -3716,36 +3817,48 @@ func (db *DB) RetireProxiesByIDs(ctx context.Context, ids []int64) (ProxyErrorCl
 			return tx.Commit()
 		}
 
-		unboundIDs, err := unbindAccountsFromProxyURLsTx(ctx, tx, db.isSQLite(), proxyURLs)
+		unboundIDs, err := unbindAccountsFromProxyURLsTx(ctx, tx, db.isSQLite(), db.isMySQL(), proxyURLs)
 		if err != nil {
 			return err
 		}
 		result.UnboundAccountIDs = unboundIDs
 		result.Unbound = len(unboundIDs)
 
-		deleteQuery := fmt.Sprintf(
-			`DELETE FROM proxies WHERE id IN (%s) RETURNING id, TRIM(url)`,
-			strings.Join(dbPlaceholders(db.isSQLite(), 1, len(proxyIDs)), ","),
-		)
-		rows, err = tx.QueryContext(ctx, deleteQuery, argsFromInt64s(proxyIDs)...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var proxyID int64
-			var proxyURL string
-			if err := rows.Scan(&proxyID, &proxyURL); err != nil {
-				rows.Close()
+		if db.isMySQL() {
+			deleteQuery := fmt.Sprintf(
+				`DELETE FROM proxies WHERE id IN (%s)`,
+				strings.Join(dbPlaceholders(db.isSQLite(), 1, len(proxyIDs)), ","),
+			)
+			if _, err := tx.ExecContext(ctx, deleteQuery, argsFromInt64s(proxyIDs)...); err != nil {
 				return err
 			}
-			result.Deleted++
-			result.DeletedProxyURLs = append(result.DeletedProxyURLs, proxyURL)
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		if err := rows.Err(); err != nil {
-			return err
+			result.Deleted = len(proxyIDs)
+			result.DeletedProxyURLs = append(result.DeletedProxyURLs, proxyURLs...)
+		} else {
+			deleteQuery := fmt.Sprintf(
+				`DELETE FROM proxies WHERE id IN (%s) RETURNING id, TRIM(url)`,
+				strings.Join(dbPlaceholders(db.isSQLite(), 1, len(proxyIDs)), ","),
+			)
+			rows, err = tx.QueryContext(ctx, deleteQuery, argsFromInt64s(proxyIDs)...)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var proxyID int64
+				var proxyURL string
+				if err := rows.Scan(&proxyID, &proxyURL); err != nil {
+					rows.Close()
+					return err
+				}
+				result.Deleted++
+				result.DeletedProxyURLs = append(result.DeletedProxyURLs, proxyURL)
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	})
@@ -3764,6 +3877,42 @@ func (db *DB) RebindAccountProxyURLs(ctx context.Context, oldURL, newURL string)
 	}
 	var ids []int64
 	err := db.withSQLiteWriteLock(ctx, func() error {
+		if db.isMySQL() {
+			tx, err := db.conn.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+
+			rows, err := tx.QueryContext(ctx, `
+				SELECT id
+				FROM accounts
+				WHERE TRIM(COALESCE(proxy_url, '')) = $1
+				FOR UPDATE
+			`, oldURL)
+			if err != nil {
+				return err
+			}
+			ids, err = scanUnboundAccountIDs(rows)
+			if closeErr := rows.Close(); err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return tx.Commit()
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE accounts
+				SET proxy_url = $1, updated_at = CURRENT_TIMESTAMP
+				WHERE TRIM(COALESCE(proxy_url, '')) = $2
+			`, newURL, oldURL); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}
+
 		rows, err := db.conn.QueryContext(ctx, `
 			UPDATE accounts
 			SET proxy_url = $1, updated_at = CURRENT_TIMESTAMP
@@ -6573,7 +6722,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 		}
 
 		updateQuery := `UPDATE accounts SET credentials = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
-		if !db.isSQLite() {
+		if !db.isSQLite() && !db.isMySQL() {
 			updateQuery = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 		}
 		if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
@@ -6632,7 +6781,11 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 				add("tags", encodeTagsJSON(tags.Values))
 			} else {
 				args = append(args, encodeTagsJSON(tags.Values))
-				sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
+				set := fmt.Sprintf("tags = $%d", len(args))
+				if !db.isMySQL() {
+					set += "::jsonb"
+				}
+				sets = append(sets, set)
 			}
 		}
 		if proxyURL.Set {
@@ -6656,7 +6809,11 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 				add("credentials", credJSON)
 			} else {
 				args = append(args, credJSON)
-				sets = append(sets, fmt.Sprintf("credentials = $%d::jsonb", len(args)))
+				set := fmt.Sprintf("credentials = $%d", len(args))
+				if !db.isMySQL() {
+					set += "::jsonb"
+				}
+				sets = append(sets, set)
 			}
 			if identityChanged {
 				// Keep the credentials document and its identity generation in the
@@ -6832,7 +6989,11 @@ func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []i
 			add("tags", encodeTagsJSON(update.Tags.Values), true)
 		} else {
 			args = append(args, encodeTagsJSON(update.Tags.Values))
-			sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
+			set := fmt.Sprintf("tags = $%d", len(args))
+			if !db.isMySQL() {
+				set += "::jsonb"
+			}
+			sets = append(sets, set)
 			touchUpdatedAt = true
 		}
 	}
@@ -6857,7 +7018,7 @@ func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []i
 func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, current map[int64]map[string]interface{}, updates map[string]interface{}) error {
 	query := `UPDATE accounts SET credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	identityQuery := `UPDATE accounts SET credentials = ?, credential_generation = credential_generation + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		query = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 		identityQuery = `UPDATE accounts SET credentials = $1::jsonb, credential_generation = credential_generation + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	}
@@ -6979,7 +7140,10 @@ func (db *DB) SetAccountTags(ctx context.Context, id int64, tags []string) error
 	if db.isSQLite() {
 		query = `UPDATE accounts SET tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	} else {
-		query = `UPDATE accounts SET tags = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		query = `UPDATE accounts SET tags = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		if !db.isMySQL() {
+			query = `UPDATE accounts SET tags = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		}
 	}
 	_, err := db.conn.ExecContext(ctx, query, encoded, id)
 	return err
@@ -7061,7 +7225,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 		generationUpdate = ", credential_generation = credential_generation + 1"
 	}
 	updateQuery := `UPDATE accounts SET credentials = $1` + generationUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		updateQuery = `UPDATE accounts SET credentials = $1::jsonb` + generationUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	}
 	if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
@@ -7215,7 +7379,7 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	}
 
 	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
 	}
 	res, err := tx.ExecContext(ctx, updateQuery, name, credJSON, proxyURL, id)
@@ -7256,7 +7420,7 @@ func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, crede
 	}
 
 	updateQuery := `UPDATE accounts SET credentials = $1, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		updateQuery = `UPDATE accounts SET credentials = $1::jsonb, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
 	}
 	res, err := tx.ExecContext(ctx, updateQuery, credJSON, proxyURL, id)
@@ -7891,16 +8055,20 @@ func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, works
 	query := `SELECT id, credentials
 		FROM accounts
 		WHERE status <> 'deleted'
-		  AND COALESCE(error_message, '') <> 'deleted'
-		  AND LOWER(TRIM(json_extract(credentials, '$.email'))) = ?`
+		  AND COALESCE(error_message, '') <> 'deleted'`
+	args := []interface{}{}
 	if db.driver == "postgres" {
 		query = `SELECT id, credentials
 			FROM accounts
 			WHERE status <> 'deleted'
 			  AND COALESCE(error_message, '') <> 'deleted'
 			  AND LOWER(BTRIM(COALESCE(credentials->>'email', ''))) = $1`
+		args = append(args, email)
+	} else if db.isSQLite() {
+		query += ` AND LOWER(TRIM(json_extract(credentials, '$.email'))) = ?`
+		args = append(args, email)
 	}
-	rows, err := db.conn.QueryContext(ctx, query, email)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -7948,16 +8116,20 @@ func (db *DB) FindActiveAccountByOAuthRouteIdentity(ctx context.Context, email, 
 	query := `SELECT id, credentials
 		FROM accounts
 		WHERE status <> 'deleted'
-		  AND COALESCE(error_message, '') <> 'deleted'
-		  AND LOWER(TRIM(json_extract(credentials, '$.email'))) = ?`
+		  AND COALESCE(error_message, '') <> 'deleted'`
+	args := []interface{}{}
 	if db.driver == "postgres" {
 		query = `SELECT id, credentials
 			FROM accounts
 			WHERE status <> 'deleted'
 			  AND COALESCE(error_message, '') <> 'deleted'
 			  AND LOWER(BTRIM(COALESCE(credentials->>'email', ''))) = $1`
+		args = append(args, email)
+	} else if db.isSQLite() {
+		query += ` AND LOWER(TRIM(json_extract(credentials, '$.email'))) = ?`
+		args = append(args, email)
 	}
-	rows, err := db.conn.QueryContext(ctx, query, email)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}

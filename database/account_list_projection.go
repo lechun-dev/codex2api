@@ -9,11 +9,29 @@ import (
 )
 
 // ListAccountListProjection returns only non-secret fields needed to build the
-// short-lived admin list snapshot. In particular it never selects or decodes
-// the complete credentials document.
+// short-lived admin list snapshot. PostgreSQL and SQLite project fields in SQL;
+// MySQL 5.6 has no usable JSON functions, so that branch reads the credentials
+// text temporarily and applies the same secret-stripping projection in Go.
 func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]*AccountRow, error) {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	if db.isMySQL() {
+		// MySQL 5.6 has no JSON functions. Read the MEDIUMTEXT credentials only
+		// for this short-lived projection and discard all secret fields below.
+		var query string
+		switch channel {
+		case UpstreamChannelGrok:
+			where += ` AND LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+		case UpstreamChannelCodex:
+			where += ` AND NOT (LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"')`
+		}
+		query = `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
+			COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
+			score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at,
+			COALESCE(credential_generation, 1), COALESCE(credential_family_id, ''), credentials
+			FROM accounts WHERE ` + where + ` ORDER BY id`
+		return db.listAccountListProjectionMySQL(ctx, query)
+	}
 	upstreamExpr := `LOWER(COALESCE(credentials->>'upstream_type', ''))`
 	fromClause := `FROM accounts
 		CROSS JOIN LATERAL jsonb_to_record(accounts.credentials) AS account_public(
@@ -69,6 +87,34 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	return result, rows.Err()
 }
 
+func (db *DB) listAccountListProjectionMySQL(ctx context.Context, query string) ([]*AccountRow, error) {
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号列表投影失败: %w", err)
+	}
+	defer rows.Close()
+	result := make([]*AccountRow, 0)
+	for rows.Next() {
+		row := &AccountRow{}
+		var credentialsRaw, cooldownRaw, tagsRaw, createdRaw, updatedRaw interface{}
+		if err := rows.Scan(
+			&row.ID, &row.Name, &row.Type, &row.ProxyURL, &row.Status, &row.CooldownReason, &cooldownRaw,
+			&row.ErrorMessage, &row.Enabled, &row.Locked, &row.ScoreBiasOverride, &row.BaseConcurrencyOverride,
+			&tagsRaw, &createdRaw, &updatedRaw, &row.CredentialGeneration, &row.CredentialFamilyID,
+			&credentialsRaw,
+		); err != nil {
+			return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
+		}
+		row.Tags = decodeTagsValue(tagsRaw)
+		if err := populateAccountProjectionTimes(row, cooldownRaw, createdRaw, updatedRaw); err != nil {
+			return nil, err
+		}
+		row.Credentials = projectAccountCredentials(decodeCredentials(credentialsRaw))
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
 type accountProjectionScanner interface {
 	Scan(dest ...interface{}) error
 }
@@ -89,40 +135,80 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
 	row.Tags = decodeTagsValue(tagsRaw)
+	if err := populateAccountProjectionTimes(row, cooldownRaw, createdRaw, updatedRaw); err != nil {
+		return nil, err
+	}
+	row.Credentials = projectAccountCredentials(map[string]interface{}{
+		"upstream_type":      upstreamType,
+		"email":              email,
+		"base_url":           baseURL,
+		"plan_type":          planType,
+		"models":             modelsRaw,
+		"api_key":            hasAPIKey,
+		"refresh_token":      hasRefreshToken,
+		"scheduler_priority": schedulerPriority,
+	})
+	return row, nil
+}
+
+func populateAccountProjectionTimes(row *AccountRow, cooldownRaw, createdRaw, updatedRaw interface{}) error {
 	var err error
 	row.CooldownUntil, err = parseDBNullTimeValue(cooldownRaw)
 	if err != nil {
-		return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		return fmt.Errorf("解析 cooldown_until 失败: %w", err)
 	}
 	row.CreatedAt, err = parseDBTimeValue(createdRaw)
 	if err != nil {
-		return nil, fmt.Errorf("解析 created_at 失败: %w", err)
+		return fmt.Errorf("解析 created_at 失败: %w", err)
 	}
 	row.UpdatedAt, err = parseDBTimeValue(updatedRaw)
 	if err != nil {
-		return nil, fmt.Errorf("解析 updated_at 失败: %w", err)
+		return fmt.Errorf("解析 updated_at 失败: %w", err)
 	}
-	row.Credentials = map[string]interface{}{
-		"upstream_type": upstreamType,
-		"email":         email,
-		"base_url":      baseURL,
-		"plan_type":     planType,
+	return nil
+}
+
+func projectAccountCredentials(credentials map[string]interface{}) map[string]interface{} {
+	projected := map[string]interface{}{
+		"upstream_type": projectionStringValue(credentials["upstream_type"]),
+		"email":         projectionStringValue(credentials["email"]),
+		"base_url":      projectionStringValue(credentials["base_url"]),
+		"plan_type":     projectionStringValue(credentials["plan_type"]),
 	}
-	// 调度优先级参与列表排序(issue 截图反馈:排序不生效),投影缺了它会让
-	// 快照全员按 0 打平、退化成 ID 序。以文本取出交给 GetCredentialInt64 解析。
-	if trimmed := strings.TrimSpace(schedulerPriority); trimmed != "" {
-		row.Credentials["scheduler_priority"] = trimmed
+	if models := decodeProjectionStringSlice(credentials["models"]); len(models) > 0 {
+		projected["models"] = models
 	}
-	if models := decodeProjectionStringSlice(modelsRaw); len(models) > 0 {
-		row.Credentials["models"] = models
+	if projectionCredentialConfigured(credentials["api_key"]) {
+		projected["api_key"] = "configured"
 	}
-	if hasAPIKey {
-		row.Credentials["api_key"] = "configured"
+	if projectionCredentialConfigured(credentials["refresh_token"]) {
+		projected["refresh_token"] = "configured"
 	}
-	if hasRefreshToken {
-		row.Credentials["refresh_token"] = "configured"
+	if schedulerPriority := projectionStringValue(credentials["scheduler_priority"]); strings.TrimSpace(schedulerPriority) != "" {
+		projected["scheduler_priority"] = schedulerPriority
 	}
-	return row, nil
+	return projected
+}
+
+func projectionStringValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	if typed, ok := value.(string); ok {
+		return typed
+	}
+	return fmt.Sprint(value)
+}
+
+func projectionCredentialConfigured(value interface{}) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.TrimSpace(typed) != ""
+	default:
+		return value != nil
+	}
 }
 
 func decodeProjectionStringSlice(value interface{}) []string {

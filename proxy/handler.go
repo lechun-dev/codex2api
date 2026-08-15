@@ -510,6 +510,18 @@ func noAvailableAccountError(model string) gin.H {
 }
 
 func usageLogErrorMessage(statusCode int, body []byte) string {
+	return usageLogErrorMessageImpl(statusCode, body, false)
+}
+
+// usageLogFailureMessage 记录网关自产的失败诊断（传输错误、断流原因、重试上下文等）。
+// 与上游任意响应体不同，这些文本由网关代码拼装，脱敏截断后保留原文；否则断流类
+// 错误在用量页只剩裸状态码，根因全靠翻容器日志（issue #524）。仍先尝试 JSON 提取，
+// 因为部分诊断原样包含上游错误帧。
+func usageLogFailureMessage(statusCode int, message string) string {
+	return usageLogErrorMessageImpl(statusCode, []byte(message), true)
+}
+
+func usageLogErrorMessageImpl(statusCode int, body []byte, trustedText bool) string {
 	if statusCode < 400 {
 		return ""
 	}
@@ -560,8 +572,16 @@ func usageLogErrorMessage(statusCode int, body []byte) string {
 	if message == "" {
 		// HTML and plain-text provider pages routinely contain request IDs,
 		// internal routing details or echoed credentials. They are not an API
-		// contract, so persist only the transport status instead of the body.
-		return fmt.Sprintf("HTTP %d", statusCode)
+		// contract, so persist only the transport status instead of the body —
+		// unless the caller marked the text as gateway-generated (trustedText).
+		if !trustedText {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		raw := strings.TrimSpace(string(body))
+		if raw == "" {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		message = raw
 	}
 
 	parts := make([]string, 0, 3)
@@ -834,10 +854,12 @@ func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol Gro
 			}
 		}
 		isVisible := frame.HasData && !frame.Done && grokNativeVisibleEvent(protocol, frame.Data)
-		// Preserve the pre-output retry window. Lifecycle/role-only frames are
-		// buffered until the first visible delta; a failure before then produces
-		// no downstream bytes and the handler may safely select another account.
-		if !visible && !isTerminal && !isVisible {
+		// Hold only the frames that must stay invisible for a silent retry.
+		// Responses used to buffer every non-text frame until the first
+		// output_text.delta (issue #207's anti-pattern); reasoning models then
+		// looked synchronous because thinking/structure never reached the client
+		// (issue #521). Chat/Messages still hold role-only / start frames.
+		if holdGrokNativePreOutput(protocol, frame, visible, isTerminal, isVisible) {
 			if pending.Len()+len(frame.Raw) > grokMaxNativeSSEPendingBytes {
 				frameErr = fmt.Errorf("Grok pre-output SSE exceeds %d bytes", grokMaxNativeSSEPendingBytes)
 				return false
@@ -888,6 +910,26 @@ func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol Gro
 		flusher.Flush()
 	}
 	return usage, outcome, wrote, firstTokenMs
+}
+
+func holdGrokNativePreOutput(protocol GrokProtocol, frame rawGrokSSEFrame, alreadyVisible, isTerminal, isVisible bool) bool {
+	if alreadyVisible || isTerminal || isVisible {
+		return false
+	}
+	if auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolResponses {
+		if !frame.HasData || frame.Done {
+			return false
+		}
+		return isPreContentLifecycleEvent(gjson.GetBytes(frame.Data, "type").String())
+	}
+	return true
+}
+
+// GrokStreamEventIsVisible reports whether a native Grok SSE payload carries
+// model output the client can see. Capability probes reuse this so usage_logs
+// first_token_ms is not left at 0 for otherwise successful streams.
+func GrokStreamEventIsVisible(protocol GrokProtocol, payload []byte) bool {
+	return grokNativeVisibleEvent(protocol, payload)
 }
 
 func grokNativeVisibleEvent(protocol GrokProtocol, payload []byte) bool {
@@ -1127,6 +1169,8 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 			}
 		}
 	}
+	// 过载熔断统计（仅 Codex 渠道，需在渠道固化之后）。
+	h.noteOverloadOutcome(input)
 	_ = h.db.InsertUsageLog(context.Background(), input)
 }
 
@@ -1226,7 +1270,7 @@ func (h *Handler) logContinueThinkingRounds(c *gin.Context, res continueFoldResu
 			// 否则会污染重试统计并与外层 attempt 编号混淆。
 		}
 		if round.ErrMessage != "" {
-			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(round.ErrMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(statusCode, round.ErrMessage)
 			logInput.UpstreamErrorKind = "continue_thinking_error"
 		}
 		if round.Usage != nil {
@@ -3157,7 +3201,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				if outcome.logStatusCode != http.StatusOK {
 					logInput.UpstreamErrorKind = outcome.failureKind
-					logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+					logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 				}
 				h.logUsageForRequest(c, logInput)
 				if outcome.penalize {
@@ -3350,7 +3394,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 					InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 					AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-					ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+					ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 				}, promptPolicyIncidentID)
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
@@ -3429,7 +3473,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AttemptIndex:           attempt + 1,
 			}
 			if outcome.logStatusCode != http.StatusOK {
-				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 				logInput.UpstreamErrorKind = outcome.failureKind
 			}
 			if usage != nil {
@@ -4011,7 +4055,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-				ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -4120,7 +4164,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			AttemptIndex:           attempt + 1,
 		}
 		if logStatusCode != http.StatusOK {
-			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(logStatusCode, outcome.failureMessage)
 			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
@@ -5193,7 +5237,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.UpstreamErrorKind = outcome.failureKind
-				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
 			}
 			h.logUsageForRequest(c, logInput)
 			if outcome.penalize {
@@ -5467,7 +5511,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/chat/completions", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-				ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -5557,7 +5601,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			AttemptIndex:           attempt + 1,
 		}
 		if logStatusCode != http.StatusOK {
-			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(logStatusCode, outcome.failureMessage)
 			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {

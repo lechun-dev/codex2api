@@ -78,6 +78,7 @@ type accountListSummary struct {
 	Total                int `json:"total"`
 	Normal               int `json:"normal"`
 	Active               int `json:"active"`
+	OverloadPaused       int `json:"overload_paused"`
 	RateLimited          int `json:"rate_limited"`
 	RateLimited5h        int `json:"rate_limited_5h"`
 	RateLimited7d        int `json:"rate_limited_7d"`
@@ -301,8 +302,8 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 
 func validateAccountPageFilters(query accountPageQuery) error {
 	validStatuses := map[string]bool{
-		"": true, "all": true, "normal": true, "active": true,
-		"rate_limited": true, "abnormal": true, "banned": true,
+		"": true, "all": true, "normal": true, "active": true, "scheduling": true,
+		"overload_paused": true, "rate_limited": true, "abnormal": true, "banned": true,
 		"error": true, "unsampled": true, "disabled": true, "locked": true,
 	}
 	if !validStatuses[query.Status] {
@@ -719,8 +720,15 @@ func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuer
 			return false
 		}
 	}
-	if query.AuthKind != "" && query.AuthKind != "all" && item.GrokAuthKind != query.AuthKind {
-		return false
+	if query.AuthKind != "" && query.AuthKind != "all" {
+		if channel == database.UpstreamChannelGrok {
+			if item.GrokAuthKind != query.AuthKind {
+				return false
+			}
+		} else if item.OpenAIResponses != (query.AuthKind == auth.GrokAuthKindAPIKey) {
+			// Codex 渠道复用 auth_kind：api_key=Responses API 中转账号，oauth=官方账号（issue #522）
+			return false
+		}
 	}
 	if query.Tag != "" && !containsString(item.Tags, query.Tag) {
 		return false
@@ -772,8 +780,12 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	limited := accountListRateLimited(item)
 	if channel == database.UpstreamChannelGrok {
 		switch status {
-		case "active", "normal":
-			return item.Enabled && !banned && !errorState && !limited
+		case "normal":
+			return accountListNormal(item)
+		case "active", "scheduling":
+			return accountListSchedulable(item)
+		case "overload_paused":
+			return accountListOverloadPaused(item)
 		case "rate_limited":
 			return limited
 		case "disabled":
@@ -786,8 +798,13 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 		return true
 	}
 	switch status {
-	case "normal", "active":
-		return !banned && !errorState && !limited
+	case "normal":
+		// 过载暂停、禁用都归入「正常」；真正可调度的账号走 scheduling/active。
+		return accountListNormal(item)
+	case "active", "scheduling":
+		return accountListSchedulable(item)
+	case "overload_paused":
+		return accountListOverloadPaused(item)
 	case "rate_limited":
 		return !banned && !errorState && limited
 	case "abnormal":
@@ -806,8 +823,34 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	return true
 }
 
+func accountListOverloadPaused(item *accountListSnapshotItem) bool {
+	return strings.EqualFold(item.Status, "overload_paused") ||
+		strings.EqualFold(item.CooldownReason, "overload_paused")
+}
+
+func accountListNormal(item *accountListSnapshotItem) bool {
+	if item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	if !item.Enabled || accountListOverloadPaused(item) {
+		return true
+	}
+	return !accountListRateLimited(item)
+}
+
+func accountListSchedulable(item *accountListSnapshotItem) bool {
+	return item.Enabled &&
+		item.Status != "unauthorized" &&
+		item.Status != "error" &&
+		!accountListRateLimited(item) &&
+		!accountListOverloadPaused(item)
+}
+
 func accountListRateLimited(item *accountListSnapshotItem) bool {
 	if item.UsingCredits || item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	if accountListOverloadPaused(item) {
 		return false
 	}
 	limited := map[string]bool{
@@ -921,6 +964,7 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		banned := item.Status == "unauthorized"
 		errorState := item.Status == "error"
 		limited := accountListRateLimited(item)
+		overloadPaused := accountListOverloadPaused(item)
 		if banned {
 			summary.Banned++
 		}
@@ -929,6 +973,9 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if banned || errorState {
 			summary.Abnormal++
+		}
+		if overloadPaused {
+			summary.OverloadPaused++
 		}
 		if limited {
 			summary.RateLimited++
@@ -941,10 +988,10 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 				summary.RateLimited5h++
 			}
 		}
-		if !banned && !errorState && !limited {
+		if accountListNormal(item) {
 			summary.Normal++
 		}
-		if item.Enabled && !banned && !errorState && !limited {
+		if accountListSchedulable(item) {
 			summary.Active++
 		}
 		if !item.Enabled {
@@ -969,6 +1016,13 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if item.GrokAuthKind == auth.GrokAuthKindAPIKey {
 			summary.APIKey++
+		}
+		if channel == database.UpstreamChannelCodex {
+			if item.OpenAIResponses {
+				summary.APIKey++
+			} else {
+				summary.OAuth++
+			}
 		}
 		if channel == database.UpstreamChannelCodex && accountListSubscriptionPlan(item.PlanType) && !item.Locked {
 			summary.SubscriptionUnlocked++

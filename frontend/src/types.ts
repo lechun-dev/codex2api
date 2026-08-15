@@ -227,6 +227,7 @@ export interface AccountListSummary {
   total: number
   normal: number
   active: number
+  overload_paused: number
   rate_limited: number
   rate_limited_5h: number
   rate_limited_7d: number
@@ -644,6 +645,18 @@ export interface AddGrokAccountRequest {
 }
 
 export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface BatchUpdateGrokModelsRequest {
+  ids: number[]
+  models: string[]
+}
+
+export interface BatchUpdateGrokModelsResponse {
+  message: string
+  success: number
+  failed: number
+  models: string[]
+}
 
 export interface FetchGrokModelsResponse {
   models: string[]
@@ -1333,6 +1346,16 @@ export interface SystemSettings {
   codex_ws_busy_acquire_max_wait_sec: number
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
+  codex_ws_stateless_slots: number
+  // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
+  github_token?: string
+  github_token_configured?: boolean
+  github_proxy_url: string
+  // Codex 过载熔断：窗口内 server_is_overloaded 占比达阈值自动暂停调度
+  codex_overload_pause_enabled: boolean
+  codex_overload_threshold_percent: number
+  codex_overload_pause_minutes: number
+  codex_overload_window_minutes: number
   codex_continue_thinking_enabled: boolean
   overflow_auto_compact_enabled: boolean
   compact_via_responses_enabled: boolean

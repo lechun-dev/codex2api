@@ -54,6 +54,13 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "oauth_model_cooldown_mode", def: "VARCHAR(20) NOT NULL DEFAULT 'adaptive'"},
 	{table: "system_settings", name: "oauth_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 300"},
 	{table: "system_settings", name: "oauth_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 1"},
+	{table: "system_settings", name: "codex_ws_stateless_slots", def: "INT DEFAULT 8"},
+	{table: "system_settings", name: "github_token", def: "TEXT NULL"},
+	{table: "system_settings", name: "github_proxy_url", def: "TEXT NULL"},
+	{table: "system_settings", name: "codex_overload_pause_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_overload_threshold_percent", def: "INT DEFAULT 20"},
+	{table: "system_settings", name: "codex_overload_pause_minutes", def: "INT DEFAULT 30"},
+	{table: "system_settings", name: "codex_overload_window_minutes", def: "INT DEFAULT 5"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -747,7 +754,14 @@ func systemSettingsMySQLDDL() string {
 		relay_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 0,
 		oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive',
 		oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300,
-		oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1
+		oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1,
+		codex_ws_stateless_slots INT DEFAULT 8,
+		github_token TEXT NULL,
+		github_proxy_url TEXT NULL,
+		codex_overload_pause_enabled TINYINT(1) DEFAULT 0,
+		codex_overload_threshold_percent INT DEFAULT 20,
+		codex_overload_pause_minutes INT DEFAULT 30,
+		codex_overload_window_minutes INT DEFAULT 5
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

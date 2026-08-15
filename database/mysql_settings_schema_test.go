@@ -70,6 +70,13 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive'",
 		"oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300",
 		"oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1",
+		"codex_ws_stateless_slots INT DEFAULT 8",
+		"github_token TEXT NULL",
+		"github_proxy_url TEXT NULL",
+		"codex_overload_pause_enabled TINYINT(1) DEFAULT 0",
+		"codex_overload_threshold_percent INT DEFAULT 20",
+		"codex_overload_pause_minutes INT DEFAULT 30",
+		"codex_overload_window_minutes INT DEFAULT 5",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -92,6 +99,8 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"note TEXT DEFAULT",
 		"client_user_agent TEXT DEFAULT",
 		"upstream_user_agent TEXT DEFAULT",
+		"github_token TEXT DEFAULT",
+		"github_proxy_url TEXT DEFAULT",
 	} {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)
@@ -471,6 +480,41 @@ func TestMySQL56V277MigrationScript(t *testing.T) {
 	} {
 		if strings.Contains(strings.ToUpper(script), incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.7.7 migration", incompatible)
+		}
+	}
+}
+
+func TestMySQL56V278MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_v2.7.8.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 v2.7.8 migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"'codex_ws_stateless_slots',\n    'INT DEFAULT 8'",
+		"'github_token',\n    'TEXT NULL'",
+		"'github_proxy_url',\n    'TEXT NULL'",
+		"'codex_overload_pause_enabled',\n    'TINYINT(1) DEFAULT 0'",
+		"'codex_overload_threshold_percent',\n    'INT DEFAULT 20'",
+		"'codex_overload_pause_minutes',\n    'INT DEFAULT 30'",
+		"'codex_overload_window_minutes',\n    'INT DEFAULT 5'",
+		"DROP PROCEDURE IF EXISTS c2a_add_column_if_missing;",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 v2.7.8 migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{
+		"ADD COLUMN IF NOT EXISTS",
+		"CREATE INDEX IF NOT EXISTS",
+		"BOOLEAN",
+		"ON CONFLICT",
+		"TIMESTAMPTZ",
+		"JSONB",
+		"TEXT DEFAULT",
+	} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.7.8 migration", incompatible)
 		}
 	}
 }

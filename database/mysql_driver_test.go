@@ -400,6 +400,13 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		CodexWSBusyAcquireMaxWaitSec:        45,
 		CodexWSBusyOverflowEnabled:          true,
 		CodexWSBusyPatienceSec:              3,
+		CodexWSStatelessSlots:               12,
+		GithubToken:                         "github-token-test",
+		GithubProxyURL:                      "http://127.0.0.1:7890",
+		CodexOverloadPauseEnabled:           true,
+		CodexOverloadThresholdPercent:       35,
+		CodexOverloadPauseMinutes:           45,
+		CodexOverloadWindowMinutes:          10,
 		CodexWSWeakNetworkMode:              true,
 		OverflowAutoCompactEnabled:          true,
 		FirstTokenExcludesWsAcquire:         true,
@@ -427,6 +434,13 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_ws_busy_acquire_max_wait_sec = VALUES(codex_ws_busy_acquire_max_wait_sec)",
 		"codex_ws_busy_overflow_enabled = VALUES(codex_ws_busy_overflow_enabled)",
 		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
+		"codex_ws_stateless_slots = VALUES(codex_ws_stateless_slots)",
+		"github_token = VALUES(github_token)",
+		"github_proxy_url = VALUES(github_proxy_url)",
+		"codex_overload_pause_enabled = VALUES(codex_overload_pause_enabled)",
+		"codex_overload_threshold_percent = VALUES(codex_overload_threshold_percent)",
+		"codex_overload_pause_minutes = VALUES(codex_overload_pause_minutes)",
+		"codex_overload_window_minutes = VALUES(codex_overload_window_minutes)",
 		"codex_ws_weak_network_mode = VALUES(codex_ws_weak_network_mode)",
 		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
@@ -439,11 +453,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 109 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 109", got)
+	if got := strings.Count(capture.query, "?"); got != 116 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 116", got)
 	}
-	if len(capture.args) != 109 {
-		t.Fatalf("rewritten settings argument count = %d, want 109", len(capture.args))
+	if len(capture.args) != 116 {
+		t.Fatalf("rewritten settings argument count = %d, want 116", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.ModelPricingOverrides,
@@ -466,6 +480,13 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexWSWeakNetworkMode,
 		NormalizeCodexFingerprintDefaultMode(settings.CodexFingerprintDefaultMode),
 		settings.CompactViaResponsesEnabled,
+		int64(settings.CodexWSStatelessSlots),
+		settings.GithubToken,
+		settings.GithubProxyURL,
+		settings.CodexOverloadPauseEnabled,
+		int64(settings.CodexOverloadThresholdPercent),
+		int64(settings.CodexOverloadPauseMinutes),
+		int64(settings.CodexOverloadWindowMinutes),
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}

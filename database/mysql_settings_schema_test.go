@@ -77,6 +77,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_overload_threshold_percent INT DEFAULT 20",
 		"codex_overload_pause_minutes INT DEFAULT 30",
 		"codex_overload_window_minutes INT DEFAULT 5",
+		"prompt_filter_review_model VARCHAR(100) DEFAULT 'deepseek-v4-flash'",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -515,6 +516,44 @@ func TestMySQL56V278MigrationScript(t *testing.T) {
 	} {
 		if strings.Contains(strings.ToUpper(script), incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.7.8 migration", incompatible)
+		}
+	}
+}
+
+func TestMySQL56V280MigrationScript(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "docs", "sql", "mysql56_v2.8.0.sql"))
+	if err != nil {
+		t.Fatalf("read MySQL 5.6 v2.8.0 migration: %v", err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		"CREATE PROCEDURE c2a_add_column_if_missing",
+		"'prompt_filter_review_enabled',\n    'TINYINT(1) DEFAULT 0'",
+		"'prompt_filter_review_api_key',\n    'TEXT NULL'",
+		"'prompt_filter_review_base_url',\n    'TEXT NULL'",
+		"'prompt_filter_review_model',\n    'VARCHAR(100) DEFAULT ''deepseek-v4-flash'''",
+		"MODIFY COLUMN prompt_filter_review_model VARCHAR(100) DEFAULT 'deepseek-v4-flash'",
+		"prompt_filter_review_base_url = 'https://api.deepseek.com'",
+		"prompt_filter_review_model = 'deepseek-v4-flash'",
+		"COALESCE(prompt_filter_review_enabled, 0) = 0",
+		"COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest'",
+		"DROP PROCEDURE IF EXISTS c2a_add_column_if_missing;",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("MySQL 5.6 v2.8.0 migration missing %q", required)
+		}
+	}
+	for _, incompatible := range []string{
+		"ADD COLUMN IF NOT EXISTS",
+		"CREATE INDEX IF NOT EXISTS",
+		"BOOLEAN",
+		"ON CONFLICT",
+		"TIMESTAMPTZ",
+		"JSONB",
+		"TEXT DEFAULT",
+	} {
+		if strings.Contains(strings.ToUpper(script), incompatible) {
+			t.Fatalf("MySQL 5.6 incompatible syntax %q in v2.8.0 migration", incompatible)
 		}
 	}
 }

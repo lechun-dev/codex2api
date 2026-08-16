@@ -1373,8 +1373,8 @@ export default function Settings() {
     prompt_filter_review_enabled: false,
     prompt_filter_review_api_key: '',
     prompt_filter_review_api_key_configured: false,
-    prompt_filter_review_base_url: 'https://api.openai.com',
-    prompt_filter_review_model: 'omni-moderation-latest',
+    prompt_filter_review_base_url: 'https://api.deepseek.com',
+    prompt_filter_review_model: 'deepseek-v4-flash',
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
@@ -3383,7 +3383,7 @@ export default function Settings() {
                     <SettingField label={t('settings.pgMaxConns')} description={t('settings.pgMaxConnsRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.pg_max_conns}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, pg_max_conns: value }))}
                       />
@@ -3393,7 +3393,7 @@ export default function Settings() {
                     <SettingField label={t('settings.redisPoolSize')} description={t('settings.redisPoolSizeRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.redis_pool_size}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, redis_pool_size: value }))}
                       />

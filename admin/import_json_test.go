@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -361,7 +363,7 @@ func TestValidateImportFileSize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected oversized file error, got nil")
 	}
-	if got, want := err.Error(), "文件 too-big.txt 大小超过 20MB"; got != want {
+	if got, want := err.Error(), "文件 too-big.txt 大小超过 200MB"; got != want {
 		t.Fatalf("error = %q, want %q", got, want)
 	}
 }
@@ -960,6 +962,102 @@ func TestAddAccountStreamReportsProgressAndProbesAfterRefresh(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("usage probes = %v, want 2 accounts probed", seen)
 		}
+	}
+}
+
+func TestAddAccountSkipRefreshDoesNotWarmup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	var refreshed atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			refreshed.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			t.Fatal("usage probe should not run when skip_refresh is set")
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-skip-1\nrt-skip-2","skip_refresh":true}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if got := refreshed.Load(); got != 0 {
+		t.Fatalf("refresh count = %d, want 0", got)
+	}
+	if store.AccountCount() != 2 {
+		t.Fatalf("runtime accounts = %d, want 2", store.AccountCount())
+	}
+}
+
+func TestAddAccountRTRefreshUsesImportProbeGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 1,
+	})
+	store.SetUsageProbeConcurrency(1)
+	t.Cleanup(store.Stop)
+
+	var current atomic.Int64
+	var maxConcurrent atomic.Int64
+	var finished atomic.Int64
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(context.Context, int64) error {
+			n := current.Add(1)
+			for {
+				prev := maxConcurrent.Load()
+				if n <= prev || maxConcurrent.CompareAndSwap(prev, n) {
+					break
+				}
+			}
+			time.Sleep(80 * time.Millisecond)
+			current.Add(-1)
+			finished.Add(1)
+			return nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	body := bytes.NewBufferString(`{"refresh_token":"rt-gate-1\nrt-gate-2\nrt-gate-3\nrt-gate-4"}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", body)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	deadline := time.After(2 * time.Second)
+	for finished.Load() < 4 {
+		select {
+		case <-deadline:
+			t.Fatalf("finished refreshes = %d, want 4", finished.Load())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Fatalf("max concurrent refreshes = %d, want 1", got)
 	}
 }
 
@@ -1805,5 +1903,92 @@ func TestParseImportJSONTokensAgentIdentityFlatCredentials(t *testing.T) {
 	}
 	if tok.agentPrivateKey != pk {
 		t.Fatal("private key not carried through")
+	}
+}
+
+// 流式解析器必须与全量解析器对所有形态产出完全一致的 tokens——覆盖顶层数组、
+// 单个平铺对象(带 BOM)、sub2api {accounts:[...]}、多余顶层字段、空 accounts。
+func TestParseImportJSONTokensStreamMatchesFullParse(t *testing.T) {
+	cases := map[string]string{
+		"flat-array":      `[{"refresh_token":"rt-1","email":"a@x.com"},{"access_token":"at-2","email":"b@x.com"},{"refresh_token":"","access_token":""}]`,
+		"flat-single":     `{"refresh_token":"rt-flat","email":"flat@x.com"}`,
+		"sub2api":         `{"exported_at":"2026-01-01T00:00:00Z","proxies":[{"proxy_key":"ignored"}],"accounts":[{"name":"P","credentials":{"refresh_token":"rt-p","access_token":"at-p","email":"p@x.com"}},{"credentials":{"access_token":"at-f","email":"f@x.com"}}]}`,
+		"sub2api-empty":   `{"accounts":[{"credentials":{}}],"proxies":[{"proxy_key":"ignored"}]}`,
+		"sub2api-reorder": `{"accounts":[{"credentials":{"refresh_token":"rt-z"}}],"exported_at":"2026-01-01T00:00:00Z"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			full, ferr := parseImportJSONTokens([]byte(body))
+			stream, serr := parseImportJSONTokensStream(bytes.NewReader([]byte(body)))
+			if (ferr == nil) != (serr == nil) {
+				t.Fatalf("error mismatch: full=%v stream=%v", ferr, serr)
+			}
+			if len(full) != len(stream) {
+				t.Fatalf("len mismatch: full=%d stream=%d\nfull=%+v\nstream=%+v", len(full), len(stream), full, stream)
+			}
+			for i := range full {
+				if full[i] != stream[i] {
+					t.Fatalf("token[%d] mismatch:\n full=%+v\n strm=%+v", i, full[i], stream[i])
+				}
+			}
+		})
+	}
+}
+
+// BOM + 流式:json.Decoder 不吃 BOM,parseImportJSONTokensStream 须先剥。
+func TestParseImportJSONTokensStreamHandlesBOM(t *testing.T) {
+	body := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"refresh_token":"rt-bom"}`)...)
+	stream, err := parseImportJSONTokensStream(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("stream parse BOM: %v", err)
+	}
+	if len(stream) != 1 || stream[0].refreshToken != "rt-bom" {
+		t.Fatalf("stream = %+v", stream)
+	}
+}
+
+func TestParseImportJSONTokensStreamRejectsBrokenJSON(t *testing.T) {
+	if _, err := parseImportJSONTokensStream(bytes.NewReader([]byte(`{"accounts":[}`))); err == nil {
+		t.Fatal("expected error for broken json")
+	}
+}
+
+// 导入采样并发闸:同一时刻在途采样任务数不超过闸容量。用一个会阻塞的
+// probe 探测函数占满槽位,断言超出的任务在前面释放前拿不到槽。
+func TestRunImportProbeTaskConcurrencyGate(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	store.SetUsageProbeConcurrency(2)
+	h := &Handler{store: store}
+
+	const n = 6
+	var inFlight int32
+	var maxSeen int32
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		h.runImportProbeTask(func(_ context.Context) {
+			defer wg.Done()
+			cur := atomic.AddInt32(&inFlight, 1)
+			for {
+				old := atomic.LoadInt32(&maxSeen)
+				if cur <= old || atomic.CompareAndSwapInt32(&maxSeen, old, cur) {
+					break
+				}
+			}
+			<-release
+			atomic.AddInt32(&inFlight, -1)
+		})
+	}
+	// 给 goroutine 时间进入信号量;闸容量 2,峰值不应超过 2。
+	time.Sleep(150 * time.Millisecond)
+	if peak := atomic.LoadInt32(&maxSeen); peak > 2 {
+		close(release)
+		t.Fatalf("in-flight peak = %d, want ≤ 2 (gate leaked)", peak)
+	}
+	close(release)
+	wg.Wait()
+	if peak := atomic.LoadInt32(&maxSeen); peak == 0 {
+		t.Fatal("no probe task ran")
 	}
 }

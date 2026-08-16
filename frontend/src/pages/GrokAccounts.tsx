@@ -50,6 +50,11 @@ import type {
   AccountLiveStateResponse,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills from "../components/RequestCountPills";
+import {
+  disabledAccountSurfaceClass,
+  renderDisabledAccountOverlay,
+} from "../components/AccountStateOverlay";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   isAccountGroupFilterEmpty,
@@ -96,6 +101,10 @@ import {
   resolveAccountGrokPlan,
   type GrokPlanFilter,
 } from "../lib/grokPlan";
+import {
+  isLargePoolSortDisabled,
+  resolveDisabledAccountSorts,
+} from "../lib/accountListSort";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
@@ -438,6 +447,7 @@ function GrokAccounts({
   const [totalAccounts, setTotalAccounts] = useState(0);
   const [serverSummary, setServerSummary] = useState<AccountListSummary | null>(null);
   const [statsState, setStatsState] = useState<"ready" | "stale" | "warming">("warming");
+  const [disabledSorts, setDisabledSorts] = useState<string[]>([]);
   const requestAbortRef = useRef<AbortController | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
@@ -610,6 +620,7 @@ function GrokAccounts({
       setTotalAccounts(res.total ?? 0);
       setServerSummary(res.summary ?? null);
       setStatsState(res.stats_state ?? "ready");
+      setDisabledSorts(res.disabled_sorts ?? []);
       if (res.page !== page) setPage(res.page);
       // 选择集只保留仍然存在的账号，避免已删除账号残留在批量选择里。
       setError(null);
@@ -644,6 +655,30 @@ function GrokAccounts({
     setDetailAccountData((current) => current?.id === id ? account : current);
     return account;
   }, []);
+  const refreshAfterAccountRemoval = useCallback((ids: number[]) => {
+    if (ids.length === 0) {
+      void reload({ silent: true });
+      return;
+    }
+    const drop = new Set(ids);
+    let remainingOnPage = 0;
+    setAccounts((current) => {
+      const next = current.filter((account) => !drop.has(account.id));
+      remainingOnPage = next.length;
+      return next;
+    });
+    setTotalAccounts((current) => Math.max(0, current - ids.length));
+    setServerSummary((current) =>
+      current
+        ? { ...current, total: Math.max(0, current.total - ids.length) }
+        : current,
+    );
+    if (remainingOnPage === 0 && page > 1) {
+      setPage(page - 1);
+      return;
+    }
+    void reload({ silent: true });
+  }, [page, reload]);
   const visibleAccountIDs = useMemo(
     () => accounts.map((account) => account.id),
     [accounts],
@@ -679,7 +714,8 @@ function GrokAccounts({
       statsStaleRetriesRef.current = 0;
       return undefined;
     }
-    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const maxStatsRetries = disabledSorts.includes("requests") ? 60 : 5;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
@@ -688,7 +724,7 @@ function GrokAccounts({
     return () => window.clearTimeout(timer);
     // accounts 作为"每次响应都会变化"的信号:连续两次都返回 stale 时
     // statsState 字符串不变,不依赖它定时器就不会被重新拉起。
-  }, [loading, statsState, reload, accounts]);
+  }, [accounts, disabledSorts, loading, reload, statsState]);
 
   // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
   // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
@@ -816,7 +852,16 @@ function GrokAccounts({
     }
   }, [currentPage, detailNavIndex, sortedAccounts, totalPages]);
 
+  const resolvedDisabledSorts = useMemo(
+    () => resolveDisabledAccountSorts(disabledSorts, serverSummary?.total ?? totalAccounts),
+    [disabledSorts, serverSummary?.total, totalAccounts],
+  );
+  const usageSortBlocked = isLargePoolSortDisabled("requests", resolvedDisabledSorts);
   const toggleSort = useCallback((key: GrokSortKey) => {
+    if (isLargePoolSortDisabled(key, resolvedDisabledSorts)) {
+      showToast(t("accounts.largePoolSortDisabled"), "warning");
+      return;
+    }
     setSortKey((current) => {
       if (current === key) {
         setSortDir((dir) => (dir === "desc" ? "asc" : "desc"));
@@ -825,7 +870,9 @@ function GrokAccounts({
       setSortDir(key === "group" || key === "updated" ? "asc" : "desc");
       return key;
     });
-  }, []);
+  }, [resolvedDisabledSorts, showToast, t]);
+  // 禁用窗口(冷启动首轮聚合)只拦截新的排序点击,不清用户已选的排序:
+  // 后端会把被禁用的排序静默降级成默认序,聚合完成后自动按原选择恢复。
 
   useEffect(() => {
     if (detailAccountId == null) return undefined;
@@ -1519,7 +1566,7 @@ function GrokAccounts({
     try {
       await api.deleteAccount(account.id);
       if (detailAccountId === account.id) setDetailAccountId(null);
-      await reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (err) {
       showToast(getErrorMessage(err), "error");
     } finally {
@@ -1786,7 +1833,7 @@ function GrokAccounts({
         }),
       );
       clearSelection();
-      await reload();
+      await reload({ silent: true });
     } catch (err) {
       showToast(
         t("accounts.batchDeleteFailed", { error: getErrorMessage(err) }),
@@ -1809,8 +1856,12 @@ function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokBanned();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-banned?stream=true",
+        undefined,
+        t("grok.cleanBannedProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1830,8 +1881,12 @@ function GrokAccounts({
     if (!confirmed) return;
     setCleaning(true);
     try {
-      const res = await api.cleanGrokError();
-      showToast(t("grok.cleanDone", { count: res.cleaned }));
+      const result = await runStreamingOperation(
+        "/accounts/grok/clean-error?stream=true",
+        undefined,
+        t("grok.cleanErrorProgressTitle"),
+      );
+      showToast(t("grok.cleanDone", { count: result?.deleted ?? result?.success ?? 0 }));
       await reload();
     } catch (err) {
       showToast(getErrorMessage(err), "error");
@@ -1974,14 +2029,10 @@ function GrokAccounts({
             </Button>
           </div>
         ) : null}
-        {loading || statsState !== "ready" ? (
+        {loading || resolvedDisabledSorts.length > 0 ? (
           <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
-            {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-            {loading
-              ? t("common.loading")
-              : statsState === "warming"
-                ? t("accounts.statsWarming")
-                : t("accounts.statsStale")}
+            <Loader2 className="size-3 animate-spin" />
+            {loading ? t("common.loading") : t("accounts.statsWarming")}
           </div>
         ) : null}
         <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
@@ -2171,14 +2222,20 @@ function GrokAccounts({
               <button
                 key={key}
                 type="button"
-                title={hint}
+                title={
+                  key === "requests" && usageSortBlocked
+                    ? t("accounts.largePoolSortDisabled")
+                    : hint
+                }
                 aria-pressed={sortKey === key}
                 onClick={() => toggleSort(key)}
                 className={cn(
                   "inline-flex h-8 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
-                  sortKey === key
-                    ? "border-primary/30 bg-primary/10 text-primary"
-                    : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
+                  key === "requests" && usageSortBlocked
+                    ? "cursor-not-allowed border-border bg-muted/40 text-muted-foreground"
+                    : sortKey === key
+                      ? "border-primary/30 bg-primary/10 text-primary"
+                      : "border-border bg-background text-muted-foreground hover:border-primary/25 hover:bg-accent/50 hover:text-foreground",
                 )}
               >
                 {label}
@@ -2377,7 +2434,17 @@ function GrokAccounts({
                       {t("grok.colStatus")}
                     </TableHead>
                     <TableHead
-                      className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                      className={cn(
+                        "select-none text-[13px] font-semibold transition-colors",
+                        usageSortBlocked
+                          ? "cursor-not-allowed text-muted-foreground"
+                          : "cursor-pointer hover:text-primary",
+                      )}
+                      title={
+                        usageSortBlocked
+                          ? t("accounts.largePoolSortDisabled")
+                          : t("grok.sortRequestsHint")
+                      }
                       onClick={() => toggleSort("requests")}
                     >
                       {t("accounts.requests")}{" "}
@@ -3753,9 +3820,8 @@ function GrokAccountCard({
           ? "border-primary/60 ring-1 ring-primary/30"
           : selected
             ? "border-primary/40 ring-1 ring-primary/20"
-            : disabled
-              ? "border-border/70 opacity-80"
-              : "border-border hover:border-border hover:shadow-md",
+            : "border-border hover:border-border hover:shadow-md",
+        disabledAccountSurfaceClass(account),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -3769,6 +3835,7 @@ function GrokAccountCard({
         onOpenDetail();
       }}
     >
+      {renderDisabledAccountOverlay(account, t)}
       <div className="flex flex-1 flex-col gap-3.5 p-4 sm:p-5">
         {/* Header: identity + status + actions */}
         <div className="flex min-w-0 items-start gap-3">
@@ -3785,10 +3852,7 @@ function GrokAccountCard({
             size={44}
             variant="ring"
             title="Grok"
-            className={cn(
-              "shrink-0 shadow-sm",
-              disabled && "opacity-60 grayscale",
-            )}
+            className="shrink-0 shadow-sm"
           />
 
           <div className="min-w-0 flex-1">
@@ -3870,12 +3934,6 @@ function GrokAccountCard({
             onClick={onEditGroups}
             emptyLabel={t("accounts.groupQuickEdit")}
           />
-          {disabled ? (
-            <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
-              <PowerOff className="mr-0.5 size-2.5" />
-              {t("accounts.disabled")}
-            </span>
-          ) : null}
         </div>
 
         {/* Usage panel */}
@@ -4084,8 +4142,8 @@ function GrokAccountTableRow({
     <TableRow
       className={cn(
         "cursor-pointer",
-        disabled && "opacity-70",
         detailOpen ? "bg-primary/8" : selected && "bg-primary/5",
+        disabledAccountSurfaceClass(account, " relative"),
       )}
       onClick={(event) => {
         const target = event.target as HTMLElement | null;
@@ -4100,6 +4158,7 @@ function GrokAccountTableRow({
       }}
     >
       <TableCell className="w-9">
+        {renderDisabledAccountOverlay(account, t, { compact: true })}
         <input
           type="checkbox"
           className="size-4 cursor-pointer rounded border-border accent-primary"
@@ -4119,7 +4178,7 @@ function GrokAccountTableRow({
             size={32}
             variant="ring"
             title="Grok"
-            className={cn("shrink-0", disabled && "opacity-60 grayscale")}
+            className="shrink-0"
           />
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -4193,24 +4252,7 @@ function GrokAccountTableRow({
         </div>
       </TableCell>
       <TableCell>
-        <div className="space-y-0.5 text-[13px]">
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="font-medium tabular-nums text-[hsl(var(--success))]">
-              {account.success_requests ?? 0}
-            </span>
-            <span className="text-muted-foreground">/</span>
-            <span className="font-medium tabular-nums text-destructive">
-              {account.error_requests ?? 0}
-            </span>
-          </div>
-          {((account.retry_error_requests ?? 0) > 0 ||
-            (account.rate_limit_attempts ?? 0) > 0) && (
-            <div className="whitespace-nowrap text-[11px] text-muted-foreground">
-              retry {account.retry_error_requests ?? 0} · 429{" "}
-              {account.rate_limit_attempts ?? 0}
-            </div>
-          )}
-        </div>
+        <RequestCountPills account={account} compact />
       </TableCell>
       <TableCell className="min-w-[170px]">
         <GrokUsageCell account={account} onRefreshed={onUsageRefreshed} />

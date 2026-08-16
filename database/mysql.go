@@ -414,7 +414,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "prompt_filter_review_enabled", "TINYINT(1) DEFAULT 0"},
 		{"system_settings", "prompt_filter_review_api_key", "TEXT NULL"},
 		{"system_settings", "prompt_filter_review_base_url", "TEXT NULL"},
-		{"system_settings", "prompt_filter_review_model", "VARCHAR(100) DEFAULT 'omni-moderation-latest'"},
+		{"system_settings", "prompt_filter_review_model", "VARCHAR(100) DEFAULT 'deepseek-v4-flash'"},
 		{"system_settings", "prompt_filter_review_timeout_seconds", "INT DEFAULT 10"},
 		{"system_settings", "prompt_filter_review_fail_closed", "TINYINT(1) DEFAULT 1"},
 		{"system_settings", "image_storage_config", "TEXT NULL"},
@@ -479,6 +479,27 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		"0.144.1",
 		"VARCHAR(32) DEFAULT '0.144.1'",
 	); err != nil {
+		return err
+	}
+	if err := db.ensureMySQLColumnDefault(
+		ctx,
+		"system_settings",
+		"prompt_filter_review_model",
+		"deepseek-v4-flash",
+		"VARCHAR(100) DEFAULT 'deepseek-v4-flash'",
+	); err != nil {
+		return err
+	}
+	// Only move untouched, disabled review settings to the new upstream default.
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE system_settings
+		SET prompt_filter_review_base_url = 'https://api.deepseek.com',
+			prompt_filter_review_model = 'deepseek-v4-flash'
+		WHERE COALESCE(prompt_filter_review_api_key, '') = ''
+		  AND COALESCE(prompt_filter_review_enabled, 0) = 0
+		  AND COALESCE(prompt_filter_review_base_url, '') = 'https://api.openai.com'
+		  AND COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest'
+	`); err != nil {
 		return err
 	}
 	if _, err := db.conn.ExecContext(ctx, `
@@ -685,7 +706,7 @@ func systemSettingsMySQLDDL() string {
 		prompt_filter_review_enabled TINYINT(1) DEFAULT 0,
 		prompt_filter_review_api_key TEXT NULL,
 		prompt_filter_review_base_url TEXT NULL,
-		prompt_filter_review_model VARCHAR(100) DEFAULT 'omni-moderation-latest',
+		prompt_filter_review_model VARCHAR(100) DEFAULT 'deepseek-v4-flash',
 		prompt_filter_review_timeout_seconds INT DEFAULT 10,
 		prompt_filter_review_fail_closed TINYINT(1) DEFAULT 1,
 		client_compat_mode VARCHAR(20) DEFAULT 'preserve',

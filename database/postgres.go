@@ -8104,12 +8104,15 @@ func (db *DB) insertAccountRowWithFamily(ctx context.Context, postgresQuery, sql
 			return err
 		}
 		defer tx.Rollback()
-		if db.isSQLite() {
+		// 2026-08-20 coder(lq): MySQL 5.6 cannot use INSERT ... RETURNING, so reuse LastInsertId like SQLite.
+		if db.isSQLite() || db.isMySQL() {
 			query := strings.TrimSpace(sqliteQuery)
-			if _, err = tx.ExecContext(ctx, query, args...); err != nil {
-				return err
+			result, execErr := tx.ExecContext(ctx, query, args...)
+			if execErr != nil {
+				return execErr
 			}
-			if err = tx.QueryRowContext(ctx, "SELECT last_insert_rowid()").Scan(&returnID); err != nil {
+			returnID, err = result.LastInsertId()
+			if err != nil {
 				return err
 			}
 		} else if err = tx.QueryRowContext(ctx, strings.TrimSpace(postgresQuery), args...).Scan(&returnID); err != nil {

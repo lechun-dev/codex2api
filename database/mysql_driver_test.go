@@ -666,6 +666,38 @@ func TestCreateAccountGroupUsesMySQL56InsertPath(t *testing.T) {
 	}
 }
 
+func TestInsertAccountWithCredentialsUsesMySQL56InsertPath(t *testing.T) {
+	capture := &mysqlCaptureDriver{lastInsertID: 88}
+	driverName := fmt.Sprintf("codex2api-mysql-account-insert-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	db := &DB{conn: conn, driver: "mysql"}
+	id, err := db.InsertAccountWithCredentials(context.Background(), "oauth-account", map[string]interface{}{
+		"refresh_token": "rt-test",
+		"email":         "user@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials() error = %v", err)
+	}
+	if id != 88 {
+		t.Fatalf("InsertAccountWithCredentials() id = %d, want 88", id)
+	}
+	for _, query := range capture.queries {
+		if strings.Contains(strings.ToUpper(query), "RETURNING") {
+			t.Fatalf("PostgreSQL RETURNING leaked into MySQL query: %s", query)
+		}
+	}
+	if !strings.Contains(capture.queries[0], "INSERT INTO accounts") {
+		t.Fatalf("unexpected MySQL account insert: %#v", capture.queries)
+	}
+}
+
 type mysqlCaptureDriver struct {
 	query        string
 	queries      []string

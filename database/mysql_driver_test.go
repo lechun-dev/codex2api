@@ -698,15 +698,85 @@ func TestInsertAccountWithCredentialsUsesMySQL56InsertPath(t *testing.T) {
 	}
 }
 
+func TestEnsureMySQLClientFoundRows(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"user:pass@tcp(127.0.0.1:3306)/codex2api", "user:pass@tcp(127.0.0.1:3306)/codex2api?clientFoundRows=true"},
+		{"user:pass@tcp(127.0.0.1:3306)/codex2api?parseTime=true", "user:pass@tcp(127.0.0.1:3306)/codex2api?parseTime=true&clientFoundRows=true"},
+		{"user:pass@tcp(127.0.0.1:3306)/codex2api?clientFoundRows=true", "user:pass@tcp(127.0.0.1:3306)/codex2api?clientFoundRows=true"},
+		{"user:pass@tcp(127.0.0.1:3306)/codex2api?clientfoundrows=false", "user:pass@tcp(127.0.0.1:3306)/codex2api?clientfoundrows=false"},
+	}
+	for _, tc := range cases {
+		if got := ensureMySQLClientFoundRows(tc.in); got != tc.want {
+			t.Fatalf("ensureMySQLClientFoundRows(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestUpdateAPIKeyUsesMySQL56ExecPath(t *testing.T) {
+	t.Run("unchanged values still succeed", func(t *testing.T) {
+		capture := &mysqlCaptureDriver{
+			execRowsAffectedSet: true,
+			execRowsAffected:    0,
+			queryRow:            []driver.Value{int64(1)},
+		}
+		db := newMySQLCaptureDB(t, capture)
+		err := db.UpdateAPIKey(context.Background(), 14, APIKeyUpdate{Name: "李群Grok", NameSet: true})
+		if err != nil {
+			t.Fatalf("UpdateAPIKey() error = %v", err)
+		}
+		if len(capture.queries) != 2 {
+			t.Fatalf("UpdateAPIKey() queries = %#v, want UPDATE then existence check", capture.queries)
+		}
+		assertNoMySQL56IncompatibleSQL(t, capture.queries[0])
+		assertNoMySQL56IncompatibleSQL(t, capture.queries[1])
+		if !strings.Contains(capture.queries[0], "UPDATE api_keys SET") {
+			t.Fatalf("unexpected MySQL API key update: %#v", capture.queries)
+		}
+		if !strings.Contains(capture.queries[1], "SELECT 1 FROM api_keys") {
+			t.Fatalf("missing MySQL API key existence check: %#v", capture.queries)
+		}
+	})
+
+	t.Run("missing key still returns no rows", func(t *testing.T) {
+		capture := &mysqlCaptureDriver{
+			execRowsAffectedSet: true,
+			execRowsAffected:    0,
+		}
+		db := newMySQLCaptureDB(t, capture)
+		err := db.UpdateAPIKey(context.Background(), 99, APIKeyUpdate{Name: "missing", NameSet: true})
+		if err != sql.ErrNoRows {
+			t.Fatalf("UpdateAPIKey() error = %v, want %v", err, sql.ErrNoRows)
+		}
+	})
+}
+
+func newMySQLCaptureDB(t *testing.T, capture *mysqlCaptureDriver) *DB {
+	t.Helper()
+	driverName := fmt.Sprintf("codex2api-mysql-capture-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
+	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
+	conn, err := sql.Open(driverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return &DB{conn: conn, driver: "mysql"}
+}
+
 type mysqlCaptureDriver struct {
-	query        string
-	queries      []string
-	args         []driver.NamedValue
-	lastInsertID int64
-	queryRow     []driver.Value
-	queryRows    [][]driver.Value
-	queryRowPos  int
-	execCount    int
+	query               string
+	queries             []string
+	args                []driver.NamedValue
+	lastInsertID        int64
+	execRowsAffected    int64
+	execRowsAffectedSet bool
+	queryRow            []driver.Value
+	queryRows           [][]driver.Value
+	queryRowPos         int
+	execCount           int
 }
 
 func (d *mysqlCaptureDriver) Open(string) (driver.Conn, error) {
@@ -732,7 +802,11 @@ func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []d
 	c.capture.queries = append(c.capture.queries, query)
 	c.capture.args = append([]driver.NamedValue(nil), args...)
 	c.capture.execCount++
-	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: 1}, nil
+	affected := int64(1)
+	if c.capture.execRowsAffectedSet {
+		affected = c.capture.execRowsAffected
+	}
+	return mysqlCaptureResult{lastInsertID: c.capture.lastInsertID, rowsAffected: affected}, nil
 }
 
 func (c *mysqlCaptureConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {

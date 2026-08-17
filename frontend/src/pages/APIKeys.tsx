@@ -53,7 +53,6 @@ import {
   Copy,
   CalendarClock,
   CircleDollarSign,
-  Download,
   ChevronDown,
   Eye,
   EyeOff,
@@ -83,12 +82,8 @@ import {
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
 type ClientLimitMode = "off" | "observe" | "enforce";
-const DEFAULT_PUBLIC_ORIGIN = "https://codexapi.lechun.cc";
-const WINDOWS_TOOLKIT_PATH = "/downloads/codex-windows-toolkit.zip";
-const MAC_TOOLKIT_PATH = "/downloads/codex-mac-toolkit.zip";
-const WINDOWS_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64-setup.exe.zip";
-const MAC_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-arm64.dmg.zip";
-const MAC_INTEL_INSTALLER_PATH = "/downloads/Codex Toolkit-0.1.0-x64.dmg.zip";
+const CODEX_TOOLKIT_PORTAL_URL =
+  "https://portal.lechun.cc/portal/profile?tab=codextoolkit";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
 type StatusFilter = "all" | "active" | "disabled" | "expired" | "quota_exhausted" | "expiring_soon";
 type APIKeyStatus = "active" | "disabled" | "expired" | "quota_exhausted";
@@ -449,42 +444,13 @@ export default function APIKeys() {
     return counts;
   }, [keys]);
 
-  const publicOrigin = useMemo(() => {
-    if (typeof window === "undefined") return DEFAULT_PUBLIC_ORIGIN;
-    return window.location.origin.replace(/\/$/, "") || DEFAULT_PUBLIC_ORIGIN;
-  }, []);
-  const windowsToolkitURL = useMemo(
-    () => buildPublicURL(WINDOWS_TOOLKIT_PATH, publicOrigin),
-    [publicOrigin],
-  );
-  const macToolkitURL = useMemo(
-    () => buildPublicURL(MAC_TOOLKIT_PATH, publicOrigin),
-    [publicOrigin],
-  );
-  const windowsInstallerURL = useMemo(
-    () => buildPublicURL(WINDOWS_INSTALLER_PATH, publicOrigin),
-    [publicOrigin],
-  );
-  const macInstallerURL = useMemo(
-    () => buildPublicURL(MAC_INSTALLER_PATH, publicOrigin),
-    [publicOrigin],
-  );
-  const macIntelInstallerURL = useMemo(
-    () => buildPublicURL(MAC_INTEL_INSTALLER_PATH, publicOrigin),
-    [publicOrigin],
-  );
   const promptShareText = useMemo(() => {
     if (!promptKey) return "";
     return buildToolkitShareText({
       apiKey: promptKey.raw_key || promptKey.key,
-      windowsToolkitURL,
-      macToolkitURL,
-      windowsInstallerURL,
-      macInstallerURL,
-      macIntelInstallerURL,
       t,
     });
-  }, [macInstallerURL, macIntelInstallerURL, macToolkitURL, promptKey, t, windowsInstallerURL, windowsToolkitURL]);
+  }, [promptKey, t]);
   const filteredKeys = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const now = Date.now();
@@ -1432,36 +1398,6 @@ export default function APIKeys() {
                   >
                     <FileDown className="size-3.5" />
                     {t("apiKeys.exportKeys")}
-                  </Button>
-                  <Button asChild variant="outline" size="sm">
-                    <a href={windowsToolkitURL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.downloadWindowsScript")}
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline" size="sm">
-                    <a href={macToolkitURL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.downloadMacScript")}
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline" size="sm">
-                    <a href={windowsInstallerURL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.downloadWindowsInstaller")}
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline" size="sm">
-                    <a href={macInstallerURL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.downloadMacAppleInstaller")}
-                    </a>
-                  </Button>
-                  <Button asChild variant="outline" size="sm">
-                    <a href={macIntelInstallerURL} download>
-                      <Download className="size-3.5" />
-                      {t("apiKeys.downloadMacIntelInstaller")}
-                    </a>
                   </Button>
                   <Badge variant={keys.length > 0 ? "default" : "secondary"}>
                     {t("apiKeys.keyCount", { count: keys.length })}
@@ -2612,33 +2548,6 @@ export default function APIKeys() {
                 </pre>
               </div>
 
-              <div className="grid gap-2 text-sm sm:grid-cols-2">
-                <DownloadLinkRow
-                  label={t("apiKeys.promptWindowsInstaller")}
-                  url={windowsInstallerURL}
-                  onCopy={handleCopy}
-                />
-                <DownloadLinkRow
-                  label={t("apiKeys.promptMacAppleInstaller")}
-                  url={macInstallerURL}
-                  onCopy={handleCopy}
-                />
-                <DownloadLinkRow
-                  label={t("apiKeys.promptMacIntelInstaller")}
-                  url={macIntelInstallerURL}
-                  onCopy={handleCopy}
-                />
-                <DownloadLinkRow
-                  label={t("apiKeys.promptWindowsToolkit")}
-                  url={windowsToolkitURL}
-                  onCopy={handleCopy}
-                />
-                <DownloadLinkRow
-                  label={t("apiKeys.promptMacToolkit")}
-                  url={macToolkitURL}
-                  onCopy={handleCopy}
-                />
-              </div>
             </div>
           ) : null}
         </Modal>
@@ -2739,81 +2648,20 @@ export default function APIKeys() {
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
 
-function DownloadLinkRow({
-  label,
-  url,
-  onCopy,
-}: {
-  label: string;
-  url: string;
-  onCopy: (text: string) => Promise<void>;
-}) {
-  return (
-    <div className="rounded-lg border border-border bg-muted/20 p-3">
-      <div className="mb-2 text-xs font-semibold text-muted-foreground">
-        {label}
-      </div>
-      <div className="flex min-w-0 items-center gap-2">
-        <a
-          href={url}
-          download
-          className="min-w-0 flex-1 truncate font-mono text-xs text-primary underline-offset-4 hover:underline"
-          title={url}
-        >
-          {url}
-        </a>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          onClick={() => void onCopy(url)}
-          title={label}
-        >
-          <Copy className="size-3.5" />
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function buildPublicURL(path: string, origin: string): string {
-  try {
-    return new URL(path, `${origin.replace(/\/$/, "")}/`).toString();
-  } catch {
-    return `${DEFAULT_PUBLIC_ORIGIN}${path}`;
-  }
-}
-
 function buildToolkitShareText({
   apiKey,
-  windowsToolkitURL,
-  macToolkitURL,
-  windowsInstallerURL,
-  macInstallerURL,
-  macIntelInstallerURL,
   t,
 }: {
   apiKey: string;
-  windowsToolkitURL: string;
-  macToolkitURL: string;
-  windowsInstallerURL: string;
-  macInstallerURL: string;
-  macIntelInstallerURL: string;
   t: Translator;
 }): string {
   return [
     t("apiKeys.promptShareKeyLine", { apiKey }),
     "",
     t("apiKeys.promptShareIntro"),
-    t("apiKeys.promptShareInstallerAdvantage"),
-    t("apiKeys.promptShareRisk"),
+    t("apiKeys.promptShareDownloadURL", { url: CODEX_TOOLKIT_PORTAL_URL }),
     "",
-    t("apiKeys.promptShareWindowsInstaller", { url: windowsInstallerURL }),
-    t("apiKeys.promptShareMacAppleInstaller", { url: macInstallerURL }),
-    t("apiKeys.promptShareMacIntelInstaller", { url: macIntelInstallerURL }),
-    t("apiKeys.promptShareMacQuarantine"),
-    t("apiKeys.promptShareWindowsToolkit", { url: windowsToolkitURL }),
-    t("apiKeys.promptShareMacToolkit", { url: macToolkitURL }),
+    t("apiKeys.promptShareRisk"),
     "",
     t("apiKeys.promptShareTrafficNote"),
   ].join("\n");

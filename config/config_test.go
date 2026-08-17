@@ -176,7 +176,7 @@ func TestLoadAllowsExplicitMySQL(t *testing.T) {
 		t.Fatalf("Database.Port = %d, want %d", got, 3306)
 	}
 	dsn := cfg.Database.DSN()
-	for _, want := range []string{"codex2api:secret@tcp(mysql:3306)/codex2api", "charset=utf8", "parseTime=true", "loc=UTC", "time_zone=%27%2B00%3A00%27"} {
+	for _, want := range []string{"codex2api:secret@tcp(mysql:3306)/codex2api", "charset=utf8", "parseTime=true", "loc=UTC", "time_zone=%27%2B00%3A00%27", "clientFoundRows=true"} {
 		if !strings.Contains(dsn, want) {
 			t.Fatalf("MySQL DSN %q 不包含 %q", dsn, want)
 		}

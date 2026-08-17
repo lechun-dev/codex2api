@@ -407,6 +407,21 @@ func (db *DB) SetMaxOpenConns(n int) {
 	db.conn.SetMaxIdleConns(n / 2)
 }
 
+// 2026-08-17 coder(lq): MySQL 5.6 reports 0 affected rows when UPDATE matches but values stay the same.
+func (db *DB) errIfAPIKeyUpdateMissed(ctx context.Context, id int64, affected int64) error {
+	if affected > 0 {
+		return nil
+	}
+	if db != nil && db.isMySQL() {
+		var exists int
+		if err := db.conn.QueryRowContext(ctx, `SELECT 1 FROM api_keys WHERE id = $1`, id).Scan(&exists); err != nil {
+			return err
+		}
+		return nil
+	}
+	return sql.ErrNoRows
+}
+
 func (db *DB) insertRowID(ctx context.Context, postgresQuery string, sqliteQuery string, args ...interface{}) (int64, error) {
 	if db.isSQLite() || db.isMySQL() {
 		res, err := db.conn.ExecContext(ctx, sqliteQuery, args...)

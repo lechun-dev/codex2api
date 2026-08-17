@@ -495,3 +495,15 @@ func replaceFirstFold(s, old, new string) string {
 	}
 	return s[:idx] + new + s[idx+len(old):]
 }
+
+// 2026-08-17 coder(lq): Force CLIENT_FOUND_ROWS so unchanged UPDATE still reports a match.
+func ensureMySQLClientFoundRows(dsn string) string {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" || strings.Contains(strings.ToLower(dsn), "clientfoundrows=") {
+		return dsn
+	}
+	if strings.Contains(dsn, "?") {
+		return dsn + "&clientFoundRows=true"
+	}
+	return dsn + "?clientFoundRows=true"
+}

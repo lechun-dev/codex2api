@@ -380,6 +380,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		dsn = sqliteConnectDSN(dsn)
 	} else if driver == "mysql" {
 		driverName = mysqlDriverName
+		dsn = ensureMySQLClientFoundRows(dsn)
 	}
 
 	pgSchema := ""
@@ -1941,10 +1942,7 @@ func (db *DB) UpdateAPIKeyName(ctx context.Context, id int64, name string) error
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 // UpdateAPIKeyQuotaLimit updates the quota ceiling. A non-positive value clears the limit.
@@ -1960,10 +1958,7 @@ func (db *DB) UpdateAPIKeyQuotaLimit(ctx context.Context, id int64, quotaLimit f
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 // UpdateAPIKeyExpiresAt updates or clears the key expiration.
@@ -1976,10 +1971,7 @@ func (db *DB) UpdateAPIKeyExpiresAt(ctx context.Context, id int64, expiresAt sql
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 // UpdateAPIKeyAllowedGroups persists the allowed-group scope for an API key.
@@ -2002,10 +1994,7 @@ func (db *DB) UpdateAPIKeyAllowedGroups(ctx context.Context, id int64, groupIDs 
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 func (db *DB) UpdateAPIKeyAllowedGroupIDs(ctx context.Context, id int64, groupIDs []int64) error {
@@ -2032,10 +2021,7 @@ func (db *DB) UpdateAPIKeyLimits(ctx context.Context, id int64, limits APIKeyLim
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 // RegenerateAPIKey replaces only the secret value and returns the previous
@@ -2150,10 +2136,7 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.errIfAPIKeyUpdateMissed(ctx, id, affected)
 }
 
 // APIKeyQuotaResetTarget identifies one row changed by a quota reset. Returning

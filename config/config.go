@@ -67,6 +67,8 @@ func (d *DatabaseConfig) DSN() string {
 		q.Set("timeout", "10s")
 		q.Set("readTimeout", "0s")
 		q.Set("writeTimeout", "0s")
+		// 2026-08-17 coder(lq): MySQL 默认只统计真正改动的行，保存相同密钥值会误报不存在。
+		q.Set("clientFoundRows", "true")
 		return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", d.User, d.Password, host, port, d.DBName, q.Encode())
 	}
 	sslMode := d.SSLMode

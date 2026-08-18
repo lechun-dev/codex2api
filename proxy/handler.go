@@ -61,6 +61,7 @@ type Handler struct {
 	convRecorder *conversationRecorder
 	scopeUsageMu sync.Mutex
 	scopeUsage   *apiKeyScopeUsageTracker
+	liveStore    *liveCallStore
 }
 
 const (
@@ -994,6 +995,7 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 	if db != nil && cfg != nil && cfg.ConversationRecording {
 		handler.convRecorder = newConversationRecorder(db)
 	}
+	handler.liveStore = newLiveCallStore(handler)
 	return handler
 }
 
@@ -1563,9 +1565,8 @@ func requestBodyHasCompactionTrigger(body []byte) bool {
 }
 
 // storeHasAvailableCodexAccount 判断账号池中是否还有可调度的官方（非中转）账号。
-// 注意这是池级判断，不含 API Key 级的账号分组/套餐约束——极端情况下（Key 被限定
-// 只能用中转账号且池中有官方账号）body-signal 请求会等待官方账号而非提升，
-// 该组合目前视为配置矛盾，不做额外处理。
+// 这是池级判断，不含 API Key 级的账号分组/套餐约束。流式 Remote Compact 不再
+// 用它来排除中转账号（issue #540）。
 func (h *Handler) storeHasAvailableCodexAccount() bool {
 	if h == nil || h.store == nil {
 		return false
@@ -2348,6 +2349,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.GET("/models", h.listModelsOrManifest)
 	// Codex CLI web_search = "live" 的 standalone 联网搜索端点 (issue #359)
 	v1.POST("/alpha/search", h.CodexAlphaSearchHandler)
+	v1.POST("/live", h.LiveCreate)
+	v1.GET("/live/:call_id", h.LiveSideband)
 
 	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
 	r.POST("/chat/completions", auth, h.ChatCompletions)
@@ -2367,6 +2370,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/responses/input_tokens", auth, h.ResponsesInputTokens)
 	r.GET("/models", auth, h.listModelsOrManifest)
 	r.POST("/alpha/search", auth, h.CodexAlphaSearchHandler)
+	r.POST("/live", auth, h.LiveCreate)
+	r.GET("/live/:call_id", auth, h.LiveSideband)
 
 	codexDirect := r.Group("/backend-api/codex")
 	codexDirect.Use(auth)
@@ -2374,6 +2379,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	codexDirect.GET("/responses", h.ResponsesWebSocket)
 	codexDirect.GET("/models", h.CodexModelsManifestHandler)
 	codexDirect.POST("/alpha/search", h.CodexAlphaSearchHandler)
+	codexDirect.POST("/realtime/calls", h.LiveCreate)
 	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
 		subpath := strings.TrimSpace(c.Param("subpath"))
 		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
@@ -2382,6 +2388,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		}
 		h.Responses(c)
 	})
+	codexDirect.GET("/:call_id", h.LiveSideband)
 }
 
 // APIKeyAuthMiddleware exposes the standard /v1 API key authentication middleware
@@ -2793,21 +2800,17 @@ func (h *Handler) Responses(c *gin.Context) {
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
 
-	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
-	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
-	// /responses/compact。官方 ChatGPT OAuth 账号的原生上游直接接受该形态，
-	// 透传即正确；中转（OpenAI Responses API）账号的普通 /v1/responses 通常
-	// 不接受，会 400 或返回非压缩响应导致客户端报
-	// "expected exactly one compaction output item"。
-	// 处理：池中还有可用官方账号时，把这类请求钉在官方账号上保持原生透传；
-	// 纯中转池的流式请求也必须继续走 /responses SSE，否则 ResponsesCompact 的
-	// 一次性 JSON 会让客户端在收到 response.completed 前遇到 EOF（issue #361）。
-	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
-	// 中转兼容性。
+	// Native remote compaction v2：较新的 Codex 客户端把会话压缩触发器作为
+	// input item（type=compaction_trigger）嵌进普通 /responses，并带 stream=true。
+	// 这条线就是原生 /responses，不要求 /responses/compact 能力，也不把请求
+	// 钉死在官方 OAuth 账号上——能打普通 /responses 的中转同样可以接
+	// compaction_trigger。旧逻辑在池里还有官方号时 exclude 中转，官方号限流
+	// 或模型白名单对不上就会立刻 503（issue #540）。
+	// 非流式 body-signal 仍提升到 compact 专用链路，兼容只实现
+	// /responses/compact 的中转（issue #361：流式不能走一次性 JSON）。
 	bodySignalCompact := compactionMeta.ProtocolTriggered
-	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount()
-	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
-	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
+	nativeRemoteCompactionV2 := bodySignalCompact && gjson.GetBytes(rawBody, "stream").Bool()
+	if bodySignalCompact && !nativeRemoteCompactionV2 {
 		h.ResponsesCompact(c)
 		return
 	}
@@ -2815,11 +2818,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	var requestModel, mappedModel string
 	var mappingApplied bool
-	if streamingRelayBodySignal {
+	if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	}
+	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -2926,21 +2930,28 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
 	var accountFilter auth.AccountFilter
-	if streamingRelayBodySignal {
+	if nativeRemoteCompactionV2 {
 		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	if pinBodySignalToCodexAccounts && !continuationUnavailable {
-		accountFilter = excludeRelayAccountsFilter(accountFilter)
-	}
 	if continuationUnavailable {
 		accountFilter = relayOnlyAccountFilter(accountFilter)
 	}
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
+	// 来源处理，保持正常调度。
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		sendCompactionProvenanceConflict(c)
+		return
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -2971,7 +2982,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			if continuationUnavailable && !relayContinuationAttempted {
+			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
+				account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			}
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			} else if continuationUnavailable && !relayContinuationAttempted {
 				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
 			} else if turnContinuationPinned {
 				account, stickyProxyURL = h.nextRetryAccountForContinuation(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
@@ -2982,6 +2998,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				return
+			}
+			if compactionAffinity.Known {
+				sendCompactionUpstreamUnavailable(c)
 				return
 			}
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
@@ -3070,7 +3090,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var mappedBody []byte
 			var mappedModel string
 			var accountMappingApplied bool
-			if streamingRelayBodySignal {
+			if nativeRemoteCompactionV2 {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
 			} else {
 				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
@@ -3311,6 +3331,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					streamDiag.markUpstreamFrame()
+					h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
 					conversation.observeResponsesEvent(eventType, parsed)
@@ -3391,6 +3412,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
 					conversation.observeResponsesObject(gjson.ParseBytes(respBody))
+					h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
@@ -3808,6 +3830,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			forward := func(data []byte) bool {
 				streamDiag.markUpstreamFrame()
+				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				downstreamMu.Lock()
 				defer downstreamMu.Unlock()
 				parsed := gjson.ParseBytes(data)
@@ -4009,6 +4032,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 				conversation.observeResponsesEvent(eventType, parsed)
@@ -4264,6 +4288,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
 	// 没有命中映射时，再按兼容规则剥离后缀。
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
+	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -4364,6 +4389,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
+	// 来源处理，保持正常调度。
+	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
+	if compactionAffinityErr != nil {
+		sendCompactionProvenanceConflict(c)
+		return
+	}
+	if compactionAffinity.Known {
+		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -4382,8 +4417,22 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	relayContinuationAttempted := false
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		var account *auth.Account
+		var stickyProxyURL string
+		if attempt == 0 && compactionAffinity.Known {
+			account = h.store.TakePreferredAccountWithFilter(compactionAffinity.PreferredAccountID, apiKeyID, excludeAccounts, accountFilter)
+			if account != nil {
+				stickyProxyURL = account.GetProxyURL()
+			}
+		}
 		if account == nil {
+			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		}
+		if account == nil {
+			if compactionAffinity.Known {
+				sendCompactionUpstreamUnavailable(c)
+				return
+			}
 			if continuationUnavailable && !relayContinuationAttempted {
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
@@ -4400,6 +4449,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
+				if compactionAffinity.Known {
+					sendCompactionUpstreamUnavailable(c)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
@@ -4570,6 +4623,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
 				return
 			}
+			h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
@@ -4784,6 +4838,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
 			return
 		}
+		h.recordCompactionProvenanceFromPayload(context.Background(), account, respBody)
 
 		// body-signal 兼容模式：SSE 内的 response.failed 终态按上游错误处理，
 		// 语义对齐传统 compact 链路的 HTTP 非 200 分支（含 encrypted_content 剥离重试）。
@@ -5845,6 +5900,9 @@ func isCodexModelUnsupportedError(body []byte) bool {
 			continue
 		}
 		if strings.Contains(lower, "model is not supported when using codex") {
+			return true
+		}
+		if strings.Contains(lower, "unknown provider for model") {
 			return true
 		}
 	}

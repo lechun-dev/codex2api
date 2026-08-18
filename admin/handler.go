@@ -86,11 +86,20 @@ type Handler struct {
 	adminSecretEnv            string
 	imageProxy                *proxy.Handler
 
-	// 导入触发的用量采样并发闸：大批量导入时逐个账号入库即触发采样，若不限流
-	// 会瞬间产生成百上千个并发上游请求打爆号池/触发风控。用一个懒初始化的
-	// 信号量把在途导入采样数压到 usage_probe_concurrency，超出的排队。
-	importProbeSemOnce sync.Once
-	importProbeSem     chan struct{}
+	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
+	// 在大文件导入时堆出成千上万个阻塞协程。
+	importProbeQueueMu sync.Mutex
+	importProbeQueue   []func(context.Context)
+	importProbeWorkers int
+	importProbeActive  atomic.Int32
+	importLoadMu       sync.Mutex
+	importLoadTier     importLoadTier
+	importLoadReady    bool
+	importLoadDBWait   int64
+	importLoadChanged  time.Time
+	importLoadBusyTill time.Time
+	importLoadNow      func() time.Time
+	importLoadSnapshot func() importRuntimeLoadSnapshot
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -344,44 +353,266 @@ func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task f
 	})
 }
 
-// importProbeConcurrency 返回导入采样并发闸的容量。取用量探针并行度设置,
-// 兜底 defaultImportProbeConcurrency。
-const defaultImportProbeConcurrency = 16
+type importLoadTier uint8
 
-func (h *Handler) importProbeConcurrency() int {
-	if h != nil && h.store != nil {
-		if n := h.store.GetUsageProbeConcurrency(); n > 0 {
-			return n
-		}
-	}
-	return defaultImportProbeConcurrency
+const (
+	importLoadLow importLoadTier = iota
+	importLoadMedium
+	importLoadHigh
+)
+
+const (
+	maxImportDBConcurrency    = 12
+	maxImportProbeConcurrency = 8
+	importPermitPollInterval  = 25 * time.Millisecond
+	importTierRecoveryDelay   = 5 * time.Second
+	importDBWaitBackoff       = 10 * time.Second
+)
+
+type importRuntimeLoadSnapshot struct {
+	RPM         int64
+	Active      int64
+	DBInUse     int
+	DBMaxOpen   int
+	DBWaitCount int64
 }
 
-// runImportProbeTask 把一个导入采样任务丢到后台执行,但先占用并发闸的一个槽位
-// (排队等待,ctx 取消则放弃),完成后释放。容量在首次调用时按当时的
-// usage_probe_concurrency 固定,避免运行时改设置导致信号量容量抖动。
+type importConcurrencyLimits struct {
+	db    int
+	probe int
+}
+
+func (h *Handler) currentImportRuntimeLoad() importRuntimeLoadSnapshot {
+	if h == nil {
+		return importRuntimeLoadSnapshot{}
+	}
+	if h.importLoadSnapshot != nil {
+		return h.importLoadSnapshot()
+	}
+	var snapshot importRuntimeLoadSnapshot
+	if h.rateLimiter != nil {
+		snapshot.RPM = h.rateLimiter.GetCurrentRPM()
+		snapshot.Active = h.rateLimiter.GetActiveRequests()
+	}
+	if h.db != nil {
+		stats := h.db.Stats()
+		snapshot.DBInUse = stats.InUse
+		snapshot.DBMaxOpen = stats.MaxOpenConnections
+		snapshot.DBWaitCount = stats.WaitCount
+	}
+	return snapshot
+}
+
+func importDBUsagePercent(snapshot importRuntimeLoadSnapshot) int {
+	if snapshot.DBMaxOpen <= 0 || snapshot.DBInUse <= 0 {
+		return 0
+	}
+	return snapshot.DBInUse * 100 / snapshot.DBMaxOpen
+}
+
+// nextImportLoadTier 使用不同的升/降档阈值形成滞回：负载升高立即收紧，
+// 回落则必须越过更低阈值，避免临界 RPM 附近反复增减 worker。
+func nextImportLoadTier(current importLoadTier, initialized bool, snapshot importRuntimeLoadSnapshot, dbWaitIncreased bool) importLoadTier {
+	dbUsage := importDBUsagePercent(snapshot)
+	enterHigh := dbWaitIncreased || snapshot.RPM >= 600 || snapshot.Active >= 64 || dbUsage >= 70
+	enterMedium := snapshot.RPM >= 180 || snapshot.Active >= 16 || dbUsage >= 40
+	if !initialized {
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+
+	switch current {
+	case importLoadHigh:
+		if dbWaitIncreased || snapshot.RPM >= 400 || snapshot.Active >= 32 || dbUsage >= 50 {
+			return importLoadHigh
+		}
+		// 每次最多降一档，让恢复过程保持平滑。
+		return importLoadMedium
+	case importLoadMedium:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if snapshot.RPM < 120 && snapshot.Active < 8 && dbUsage < 25 {
+			return importLoadLow
+		}
+		return importLoadMedium
+	default:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+}
+
+func importLimitsForTier(tier importLoadTier, snapshot importRuntimeLoadSnapshot) importConcurrencyLimits {
+	limits := importConcurrencyLimits{db: maxImportDBConcurrency, probe: maxImportProbeConcurrency}
+	switch tier {
+	case importLoadHigh:
+		limits.db, limits.probe = 4, 4
+	case importLoadMedium:
+		limits.db, limits.probe = 8, 6
+	}
+	// 导入最多使用连接池的约四分之一；SQLite 小连接池也不会被导入独占。
+	if snapshot.DBMaxOpen > 0 {
+		poolShare := snapshot.DBMaxOpen / 4
+		if poolShare < 1 {
+			poolShare = 1
+		}
+		if limits.db > poolShare {
+			limits.db = poolShare
+		}
+	}
+	return limits
+}
+
+func (h *Handler) adaptiveImportLimits() importConcurrencyLimits {
+	if h == nil {
+		return importConcurrencyLimits{db: 4, probe: 4}
+	}
+	snapshot := h.currentImportRuntimeLoad()
+	now := time.Now()
+	if h.importLoadNow != nil {
+		now = h.importLoadNow()
+	}
+	h.importLoadMu.Lock()
+	defer h.importLoadMu.Unlock()
+
+	waitIncreased := h.importLoadReady && snapshot.DBWaitCount > h.importLoadDBWait
+	if waitIncreased {
+		h.importLoadBusyTill = now.Add(importDBWaitBackoff)
+	}
+	if now.Before(h.importLoadBusyTill) {
+		waitIncreased = true
+	}
+	nextTier := nextImportLoadTier(h.importLoadTier, h.importLoadReady, snapshot, waitIncreased)
+	if h.importLoadReady && nextTier < h.importLoadTier && now.Sub(h.importLoadChanged) < importTierRecoveryDelay {
+		nextTier = h.importLoadTier
+	}
+	if !h.importLoadReady || nextTier != h.importLoadTier {
+		h.importLoadChanged = now
+	}
+	h.importLoadTier = nextTier
+	h.importLoadReady = true
+	h.importLoadDBWait = snapshot.DBWaitCount
+	return importLimitsForTier(h.importLoadTier, snapshot)
+}
+
+func (h *Handler) importProbeWorkerCapacity() int {
+	capacity := maxImportProbeConcurrency
+	if h != nil && h.store != nil {
+		if configured := h.store.GetUsageProbeConcurrency(); configured > 0 && configured < capacity {
+			capacity = configured
+		}
+	}
+	return capacity
+}
+
+func (h *Handler) importProbeConcurrency() int {
+	limit := h.adaptiveImportLimits().probe
+	if capacity := h.importProbeWorkerCapacity(); limit > capacity {
+		limit = capacity
+	}
+	return limit
+}
+
+func acquireAdaptivePermit(ctx context.Context, active *atomic.Int32, limit func() int) bool {
+	ticker := time.NewTicker(importPermitPollInterval)
+	defer ticker.Stop()
+	for {
+		maxActive := limit()
+		if maxActive < 1 {
+			maxActive = 1
+		}
+		current := active.Load()
+		if current < int32(maxActive) && active.CompareAndSwap(current, current+1) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// runImportProbeTask 把导入预热放进进程内队列，并按当前导入并发上限启动 worker。
+// 排队任务只占一个函数引用，不会各自创建 goroutine；worker 在队列清空后退出。
 func (h *Handler) runImportProbeTask(fn func(context.Context)) {
 	if h == nil || fn == nil {
 		return
 	}
-	h.importProbeSemOnce.Do(func() {
-		h.importProbeSem = make(chan struct{}, h.importProbeConcurrency())
-	})
-	sem := h.importProbeSem
-	h.importedAccountProbeWg.Add(1)
-	if !h.startDBBackgroundTask(func(ctx context.Context) {
-		defer h.importedAccountProbeWg.Done()
-		if sem != nil {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
+	h.importProbeQueueMu.Lock()
+	h.importProbeQueue = append(h.importProbeQueue, fn)
+	if h.importProbeWorkers >= h.importProbeWorkerCapacity() {
+		h.importProbeQueueMu.Unlock()
+		return
+	}
+	h.importProbeWorkers++
+	h.importProbeQueueMu.Unlock()
+
+	if h.startDBBackgroundTask(h.runImportProbeWorker) {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeWorkers--
+	h.importProbeQueue = nil
+	h.importProbeQueueMu.Unlock()
+}
+
+func (h *Handler) runImportProbeWorker(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			h.importProbeQueueMu.Lock()
+			h.importProbeQueue = nil
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+
+		h.importProbeQueueMu.Lock()
+		if len(h.importProbeQueue) == 0 {
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+		fn := h.importProbeQueue[0]
+		h.importProbeQueue[0] = nil
+		h.importProbeQueue = h.importProbeQueue[1:]
+		h.importProbeQueueMu.Unlock()
+
+		if !acquireAdaptivePermit(ctx, &h.importProbeActive, h.importProbeConcurrency) {
+			continue
 		}
 		fn(ctx)
-	}) {
-		h.importedAccountProbeWg.Done()
+		h.importProbeActive.Add(-1)
+	}
+}
+
+type adaptiveImportDBLimiter struct {
+	handler *Handler
+	active  atomic.Int32
+}
+
+func (l *adaptiveImportDBLimiter) acquire(ctx context.Context) bool {
+	if l == nil || l.handler == nil {
+		return false
+	}
+	return acquireAdaptivePermit(ctx, &l.active, func() int {
+		return l.handler.adaptiveImportLimits().db
+	})
+}
+
+func (l *adaptiveImportDBLimiter) release() {
+	if l != nil {
+		l.active.Add(-1)
 	}
 }
 
@@ -459,7 +690,9 @@ func (h *Handler) refreshImportedAccountWithRetry(ctx context.Context, accountID
 		ctx = context.Background()
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err := h.refreshAccountByID(refreshCtx, accountID)
+	// 导入路径在身份合并后会统一 probe；刷新内部不再先 probe 一次，避免每个
+	// 裸 RT 成功换票后连续打两次 wham/subscription 上游。
+	err := h.refreshAccountByIDWithProbe(refreshCtx, accountID, false)
 	cancel()
 	if err != nil {
 		log.Printf("导入账号 %d 刷新失败(第 %d 次): %v", accountID, attempt+1, err)
@@ -714,6 +947,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
+	store.SetUsageProbeCompletionFunc(handler.invalidateAccountSnapshotCaches)
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
@@ -909,6 +1143,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
 	api.GET("/prompt-filter/review/keys", h.ListPromptReviewAPIKeys)
 	api.DELETE("/prompt-filter/review/keys/:key_id", h.DeletePromptReviewAPIKey)
+	api.GET("/prompt-filter/review/profiles", h.ListPromptReviewProfiles)
+	api.POST("/prompt-filter/review/profiles", h.SavePromptReviewProfile)
+	api.POST("/prompt-filter/review/profiles/:profile_id/activate", h.ActivatePromptReviewProfile)
+	api.DELETE("/prompt-filter/review/profiles/:profile_id", h.DeletePromptReviewProfile)
 	api.POST("/prompt-filter/review/test", h.TestPromptReviewConnection)
 	api.POST("/prompt-filter/review/models", h.ListPromptReviewModels)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
@@ -2920,9 +3158,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
 		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
 	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	// 记录安全审计日志
@@ -3004,7 +3242,6 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
 		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 
 		sendImportEvent(c, importEvent{
@@ -3012,6 +3249,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
 	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
@@ -3118,6 +3356,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	updatedCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
 	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 有效工作区，如 codex_at）
 	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
@@ -3148,7 +3387,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			customHeaders:  customHeaders,
 		})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -3161,6 +3400,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			continue
@@ -3185,18 +3425,15 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
 		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
 		// 身份信息后续由 wham 用量查询补齐。
 		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		// 触发 wham 用量探针：codex_at 的身份此刻未知，探针补齐身份后会回查
-		// 并合并同身份的已有账号（见 probeImportedAccountUsage）。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		pending = append(pending, newAcc)
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 
@@ -3262,6 +3499,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		})
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
 	for i, at := range tokens {
 		name := req.Name
@@ -3273,7 +3511,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -3284,6 +3522,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			progress(i + 1)
@@ -3310,13 +3549,12 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-		// 与非流式路径一致：探针补齐 codex_at 身份后回查合并同身份的已有账号。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		pending = append(pending, newAcc)
 		progress(i + 1)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -4927,7 +5165,25 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var current int64
 	// 本次真正新建的账号，收尾时统一绑分组（命中已有账号的分组不动）。
 	createdIDs := &importedAccountIDs{}
-	sem := make(chan struct{}, 20) // 并发插入上限
+	createdATIDs := &importedAccountIDs{}
+	createdRTIDs := &importedAccountIDs{}
+	type pendingRuntimeAccount struct {
+		account *auth.Account
+		source  string
+	}
+	var pendingMu sync.Mutex
+	pendingRuntime := make([]pendingRuntimeAccount, 0, len(newTokens))
+	addPendingRuntime := func(account *auth.Account, source string) {
+		if account == nil {
+			return
+		}
+		pendingMu.Lock()
+		pendingRuntime = append(pendingRuntime, pendingRuntimeAccount{account: account, source: source})
+		pendingMu.Unlock()
+	}
+	// 写库并发根据近一分钟代理流量与连接池压力动态调整。生产者在启动 goroutine
+	// 前先拿 permit，因此无论目标并发如何变化，都不会堆积等待中的 goroutine。
+	dbLimiter := &adaptiveImportDBLimiter{handler: h}
 	var wg sync.WaitGroup
 
 	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈。
@@ -4949,11 +5205,13 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	)
 
 	for i, t := range newTokens {
-		sem <- struct{}{}
+		if !dbLimiter.acquire(context.Background()) {
+			break
+		}
 		wg.Add(1)
 		go func(idx int, tok importToken) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer dbLimiter.release()
 
 			name := tok.name
 
@@ -4974,7 +5232,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, updated, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
+				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource)
 				upsertCancel()
 				if err != nil {
 					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
@@ -4986,21 +5244,27 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				if updated {
 					// 已有账号只更新凭证，不计入"新增"，分组也保持原样。
 					atomic.AddInt64(&updatedCount, 1)
+					if h.store != nil {
+						if acc := h.store.FindByID(id); acc != nil {
+							h.applyImportedAccountUsageState(acc, importSource)
+							if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
+								h.runImportProbeTask(func(ctx context.Context) {
+									h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
+								})
+							}
+						}
+					}
 				} else {
 					atomic.AddInt64(&successCount, 1)
 					createdIDs.add(id)
+					if importSource == "import_at" {
+						createdATIDs.add(id)
+					} else {
+						createdRTIDs.add(id)
+					}
+					addPendingRuntime(newAcc, importSource)
 				}
 				atomic.AddInt64(&current, 1)
-				if h.store != nil {
-					if acc := h.store.FindByID(id); acc != nil {
-						h.applyImportedAccountUsageState(acc, importSource)
-						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
-							h.runImportProbeTask(func(ctx context.Context) {
-								h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
-							})
-						}
-					}
-				}
 				return
 			}
 
@@ -5023,15 +5287,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdATIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
 				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import_at")
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import_at")
-				}
+				addPendingRuntime(newAcc, "import_at")
 			} else {
 				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
@@ -5051,27 +5311,31 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdRTIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import")
 
 				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import")
-
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import")
-				} else if !h.store.GetLazyMode() {
-					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
-					// 同样走并发闸：RT 刷新也会打上游，大批量导入不限流会一起打爆。
-					h.runImportProbeTask(func(ctx context.Context) {
-						h.refreshImportedAccountAndProbe(ctx, id, "import_refresh")
-					})
-				}
+				addPendingRuntime(newAcc, "import")
 			}
 		}(i, t)
 	}
 
 	wg.Wait()
+	h.db.BatchInsertAccountEventsAsync(createdATIDs.snapshot(), "added", "import_at")
+	h.db.BatchInsertAccountEventsAsync(createdRTIDs.snapshot(), "added", "import")
+	if len(pendingRuntime) > 0 && h.store != nil {
+		accounts := make([]*auth.Account, 0, len(pendingRuntime))
+		for _, pending := range pendingRuntime {
+			accounts = append(accounts, pending.account)
+		}
+		// 一个 Store 锁 + 一个 FastScheduler 锁提交整个批次，避免高 RPM 的 Acquire
+		// 在两个账号之间反复触发全桶排序。
+		h.store.AddAccounts(accounts)
+		for _, pending := range pendingRuntime {
+			h.applyImportedAccountUsageState(pending.account, pending.source)
+			h.scheduleImportedAccountWarmup(pending.account, pending.account.DBID, pending.source)
+		}
+	}
 	close(done)
 	// 等推送 goroutine 真正退出再写收尾事件：gin 的 ResponseWriter 不支持并发写，
 	// 只 close(done) 不等待的话，收尾事件可能和最后一帧进度事件交错，
@@ -5825,6 +6089,10 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	return h.refreshAccountByIDWithProbe(ctx, id, true)
+}
+
+func (h *Handler) refreshAccountByIDWithProbe(ctx context.Context, id int64, probeAfterRefresh bool) error {
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -5840,7 +6108,11 @@ func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
 	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
 	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
 	// （issue #300）
-	if probe := h.usageProbeFunc(); probe != nil && h.store != nil {
+	if probeAfterRefresh {
+		probe := h.usageProbeFunc()
+		if probe == nil || h.store == nil {
+			return nil
+		}
 		if acc := h.store.FindByID(id); acc != nil {
 			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
 			if err := probe(probeCtx, acc); err != nil {
@@ -7843,6 +8115,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		AllowLive:              in.AllowLive,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
 	}
@@ -8240,6 +8513,9 @@ type settingsResponse struct {
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             int    `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
@@ -8392,6 +8668,9 @@ type updateSettingsReq struct {
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             *int     `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           *bool    `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              *string  `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             *string  `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   *string  `json:"grok_oauth_client_id"`
 	MaxRetries                          *int     `json:"max_retries"`
 	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
@@ -8922,8 +9201,8 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
-// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试配置编码成 grok_config JSON 落库。
-func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string) string {
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig) string {
 	mode := strings.TrimSpace(affinityMode)
 	switch mode {
 	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
@@ -8939,12 +9218,16 @@ func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinut
 	if maxRateLimitRetries < 0 {
 		maxRateLimitRetries = 0
 	}
+	followUp = auth.NormalizeGrokFollowUpEffortConfig(followUp)
 	b, err := json.Marshal(map[string]any{
-		"affinity_mode":          mode,
-		"probe_enabled":          probeEnabled,
-		"probe_interval_minutes": probeIntervalMinutes,
-		"max_rate_limit_retries": maxRateLimitRetries,
-		"oauth_client_id":        auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"affinity_mode":            mode,
+		"probe_enabled":            probeEnabled,
+		"probe_interval_minutes":   probeIntervalMinutes,
+		"max_rate_limit_retries":   maxRateLimitRetries,
+		"oauth_client_id":          auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"follow_up_effort_enabled": followUp.Enabled,
+		"follow_up_tool_effort":    followUp.ToolEffort,
+		"follow_up_small_effort":   followUp.SmallEffort,
 	})
 	if err != nil {
 		return `{"affinity_mode":"strict"}`
@@ -9136,6 +9419,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
 		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
 		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
@@ -9949,6 +10235,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: grok_max_rate_limit_retries = %d", h.store.GrokMaxRateLimitRetries())
 	}
 
+	if req.GrokFollowUpEffortEnabled != nil || req.GrokFollowUpToolEffort != nil || req.GrokFollowUpSmallEffort != nil {
+		cfg := h.store.GrokFollowUpEffortConfig()
+		if req.GrokFollowUpEffortEnabled != nil {
+			cfg.Enabled = *req.GrokFollowUpEffortEnabled
+		}
+		if req.GrokFollowUpToolEffort != nil {
+			cfg.ToolEffort = *req.GrokFollowUpToolEffort
+		}
+		if req.GrokFollowUpSmallEffort != nil {
+			cfg.SmallEffort = *req.GrokFollowUpSmallEffort
+		}
+		h.store.SetGrokFollowUpEffortConfig(cfg)
+		proxy.SetGrokFollowUpEffortConfig(h.store.GrokFollowUpEffortConfig())
+		log.Printf("设置已更新: grok_follow_up_effort enabled=%v tool=%s small=%s", cfg.Enabled, cfg.ToolEffort, cfg.SmallEffort)
+	}
+
 	// client_id 会拼进授权 URL 与 token 表单，含空白/控制字符或超长的直接拒绝，
 	// 而不是静默归一化成空——那样用户会以为存上了，实际仍在用默认值。
 	if req.GrokOAuthClientID != nil {
@@ -10494,7 +10796,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageConfig:                  imgConfigJSON,
 		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
-		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID()),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig()),
 		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
@@ -10691,6 +10993,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),

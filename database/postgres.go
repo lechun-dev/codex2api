@@ -1507,6 +1507,19 @@ func (db *DB) migrate(ctx context.Context) error {
 				review_latency_ms BIGINT NULL,
 				full_text        TEXT DEFAULT ''
 			);
+			CREATE TABLE IF NOT EXISTS prompt_review_profiles (
+				id VARCHAR(64) PRIMARY KEY,
+				name VARCHAR(120) NOT NULL,
+				base_url VARCHAR(512) NOT NULL DEFAULT '',
+				model VARCHAR(128) NOT NULL DEFAULT '',
+				request_mode VARCHAR(32) NOT NULL DEFAULT 'moderations',
+				adapter_json TEXT NOT NULL DEFAULT '{}',
+				api_keys TEXT NOT NULL DEFAULT '',
+				timeout_seconds INTEGER NOT NULL DEFAULT 10,
+				active BOOLEAN NOT NULL DEFAULT FALSE,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			);
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_error TEXT DEFAULT '';
@@ -1742,6 +1755,9 @@ type APIKeyLimits struct {
 	// (context_length_exceeded)后，网关把 input 旧轮次摘要压缩并重试一次，
 	// 而不是直接把 400 透传给下游。默认关闭。
 	AutoCompactOnOverflow bool `json:"auto_compact_overflow,omitempty"`
+	// AllowLive 为 true 时，该 Key 可以使用 ChatGPT Live（/v1/live 与
+	// /backend-api/codex/realtime/calls）。默认关闭。
+	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
 	//   - codex:   仅非 Grok 账号（Codex OAuth / OpenAI Responses 中转）
@@ -1807,6 +1823,7 @@ func (l APIKeyLimits) IsZero() bool {
 		len(l.ScopeLimits) == 0 &&
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
+		!l.AllowLive &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
 		l.ResolveUpstreamChannel() == UpstreamChannelAuto
 }

@@ -17,7 +17,7 @@ import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
 import { parseAdvancedConfigDocument, patchAdvancedConfigDocument, readAdvancedConfigPath } from '../types'
-import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterTestResponse, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIdentityUpdateMode, PromptIntelligenceAIAnalysisResponse, PromptIntelligenceAIProvider, PromptIntelligenceCandidate, PromptIntelligenceEvidenceResponse, PromptIntelligenceGatewayKey, PromptIntelligenceRun, PromptPolicyAuditHealth, PromptPolicyIncident, PromptPolicyIncidentDetailResponse, PromptReviewAPIKeyDescriptor, PromptReviewKeyTestResult, PromptReviewTestResponse, PromptRiskProfile, PromptRiskProfileDetailResponse, SystemSettings } from '../types'
+import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterTestResponse, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIdentityUpdateMode, PromptIntelligenceAIAnalysisResponse, PromptIntelligenceAIProvider, PromptIntelligenceCandidate, PromptIntelligenceEvidenceResponse, PromptIntelligenceGatewayKey, PromptIntelligenceRun, PromptPolicyAuditHealth, PromptPolicyIncident, PromptPolicyIncidentDetailResponse, PromptReviewAPIKeyDescriptor, PromptReviewKeyTestResult, PromptReviewProfile, PromptReviewTestResponse, PromptRiskProfile, PromptRiskProfileDetailResponse, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -207,7 +207,7 @@ type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; local_block_message: string; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -298,7 +298,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], local_block_message: '', conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -394,6 +394,9 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       terminal_bypass_models: Array.isArray(enforcement.terminal_bypass_models)
         ? enforcement.terminal_bypass_models.filter((model: unknown): model is string => typeof model === 'string')
         : [...defaultAdvancedProtection.enforcement.terminal_bypass_models],
+      local_block_message: typeof enforcement.local_block_message === 'string'
+        ? enforcement.local_block_message
+        : defaultAdvancedProtection.enforcement.local_block_message,
       conversation_lock_enabled: typeof enforcement.conversation_lock_enabled === 'boolean'
         ? enforcement.conversation_lock_enabled
         : defaultAdvancedProtection.enforcement.conversation_lock_enabled,
@@ -777,6 +780,10 @@ export default function PromptFilter() {
             runTest={runTest}
             advancedConfigError={advancedConfigError}
             settingsSaveRevision={settingsSaveRevision}
+            onSettingsChanged={(settings) => {
+              setForm(normalizePromptFilterForm(settings))
+              setData((current) => ({ ...current, settings }))
+            }}
             onSave={() => void saveSettings()}
           />
         ) : null}
@@ -1187,6 +1194,14 @@ function AdvancedProtectionEditor({
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
             <CompactField label={t('promptFilter.terminalBypassModels')} hint={t('promptFilter.help.terminalBypassModels')}><Input value={terminalBypassModelsText} placeholder="codex-auto-review" onChange={(e) => update('enforcement', { terminal_bypass_models: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalBypassModelsHint')}</p>
+            <CompactField label={t('promptFilter.localBlockMessage')} hint={t('promptFilter.help.localBlockMessage')}>
+              <Textarea
+                rows={3}
+                value={config.enforcement.local_block_message}
+                placeholder={t('promptFilter.localBlockMessagePlaceholder')}
+                onChange={(event) => update('enforcement', { local_block_message: Array.from(event.target.value).slice(0, 2000).join('') })}
+              />
+            </CompactField>
             <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />
             {config.enforcement.conversation_lock_enabled ? <div className="grid gap-3 sm:grid-cols-2">
               <CompactField label={t('promptFilter.conversationLockTTL')} hint={t('promptFilter.help.conversationLockTTL')}><DraftNumberInput min={1} max={720} value={config.enforcement.conversation_lock_ttl_hours} onValueChange={(next) => update('enforcement', { conversation_lock_ttl_hours: next })} /></CompactField>
@@ -2751,6 +2766,7 @@ function OverviewView({
   runTest,
   advancedConfigError,
   settingsSaveRevision,
+  onSettingsChanged,
   onSave,
 }: {
   form: PromptFilterForm
@@ -2772,6 +2788,7 @@ function OverviewView({
   runTest: () => void
   advancedConfigError: string | null
   settingsSaveRevision: number
+  onSettingsChanged: (settings: SystemSettings) => void
   onSave: () => void
 }) {
   const { t } = useTranslation()
@@ -2801,6 +2818,9 @@ function OverviewView({
   const [reviewKeysLoading, setReviewKeysLoading] = useState(false)
   const [reviewKeysRefreshTick, setReviewKeysRefreshTick] = useState(0)
   const [deletingReviewKeyID, setDeletingReviewKeyID] = useState<string | null>(null)
+  const [reviewProfiles, setReviewProfiles] = useState<PromptReviewProfile[]>([])
+  const [reviewProfilesLoading, setReviewProfilesLoading] = useState(false)
+  const [reviewProfileActionID, setReviewProfileActionID] = useState<string | null>(null)
   const { confirm, confirmDialog } = useConfirmDialog()
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [reviewSettingsOpen, setReviewSettingsOpen] = useState(false)
@@ -2935,6 +2955,67 @@ function OverviewView({
       setReviewTesting(false)
     }
   }
+  const refreshReviewProfiles = async () => {
+    setReviewProfilesLoading(true)
+    try {
+      const result = await api.listPromptReviewProfiles()
+      setReviewProfiles(result.profiles ?? [])
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setReviewProfilesLoading(false)
+    }
+  }
+  const saveReviewProfile = async () => {
+    const name = window.prompt(t('promptFilter.reviewProfileNamePrompt'))?.trim()
+    if (!name) return
+    setReviewProfileActionID('new')
+    try {
+      const result = await api.savePromptReviewProfile({
+        name,
+        base_url: form.prompt_filter_review_base_url,
+        model: form.prompt_filter_review_model,
+        request_mode: reviewAdapter.request_mode,
+        api_key: form.prompt_filter_review_api_key?.trim() || undefined,
+        adapter_json: JSON.stringify(reviewAdapter),
+        timeout_seconds: form.prompt_filter_review_timeout_seconds,
+      })
+      setReviewProfiles((current) => [result, ...current.filter((profile) => profile.id !== result.id)])
+      showToast(t('promptFilter.reviewProfileSaved'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileSaveFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
+  const activateReviewProfile = async (profile: PromptReviewProfile) => {
+    setReviewProfileActionID(profile.id)
+    try {
+      await api.activatePromptReviewProfile(profile.id)
+      const settings = await api.getSettings()
+      setForm(normalizePromptFilterForm(settings))
+      onSettingsChanged(settings)
+      await refreshReviewProfiles()
+      showToast(t('promptFilter.reviewProfileActivated'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileActivateFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
+  const deleteReviewProfile = async (profile: PromptReviewProfile) => {
+    if (!window.confirm(t('promptFilter.reviewProfileDeleteConfirm', { name: profile.name }))) return
+    setReviewProfileActionID(profile.id)
+    try {
+      await api.deletePromptReviewProfile(profile.id)
+      setReviewProfiles((current) => current.filter((item) => item.id !== profile.id))
+      showToast(t('promptFilter.reviewProfileDeleted'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileDeleteFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
   useEffect(() => {
     if (!reviewSettingsOpen) return
     let cancelled = false
@@ -2951,6 +3032,9 @@ function OverviewView({
       })
     return () => { cancelled = true }
   }, [reviewSettingsOpen, settingsSaveRevision, reviewKeysRefreshTick, showToast])
+  useEffect(() => {
+    if (reviewSettingsOpen) void refreshReviewProfiles()
+  }, [reviewSettingsOpen])
   const deleteReviewKey = async (keyID: string, masked: string) => {
     const approved = await confirm({
       title: t('promptFilter.reviewKeyDeleteTitle'),
@@ -3231,6 +3315,39 @@ function OverviewView({
                     <Field label={t('promptFilter.reviewTimeout')}>
                       <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
                     </Field>
+                  </div>
+                  <div className="space-y-3 rounded-lg border border-primary/15 bg-primary/[0.04] p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">{t('promptFilter.reviewProfilesTitle')}</div>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewProfilesHint')}</p>
+                      </div>
+                      <Button type="button" variant="outline" size="sm" onClick={() => void saveReviewProfile()} disabled={reviewProfileActionID !== null}>
+                        <Save className="size-4" /> {t('promptFilter.reviewProfileSave')}
+                      </Button>
+                    </div>
+                    {reviewProfilesLoading ? <div className="text-xs text-muted-foreground">{t('common.loading')}</div> : null}
+                    {reviewProfiles.length > 0 ? (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {reviewProfiles.map((profile) => (
+                          <div key={profile.id} className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate text-xs font-semibold">{profile.name}</span>
+                                {profile.active ? <Badge variant="default">{t('promptFilter.reviewProfileActive')}</Badge> : null}
+                              </div>
+                              <div className="mt-1 truncate text-[11px] text-muted-foreground">{profile.base_url} · {profile.model} · {profile.key_count} keys</div>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              {!profile.active ? <Button type="button" size="sm" variant="outline" disabled={reviewProfileActionID !== null} onClick={() => void activateReviewProfile(profile)}>{t('promptFilter.reviewProfileActivate')}</Button> : null}
+                              <Button type="button" size="icon" variant="ghost" className="text-destructive hover:text-destructive" disabled={reviewProfileActionID !== null} onClick={() => void deleteReviewProfile(profile)} aria-label={t('promptFilter.reviewProfileDelete')}>
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : <div className="text-xs text-muted-foreground">{t('promptFilter.reviewProfilesEmpty')}</div>}
                   </div>
                   <Field label={t('promptFilter.reviewApiKey')}>
                     <Textarea

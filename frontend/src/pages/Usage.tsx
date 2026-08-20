@@ -32,7 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, MoreHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, MoreHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw, Check } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -1916,6 +1916,7 @@ export default function Usage() {
   const [customRange, setCustomRange] = useState<CustomRange | null>(getInitialUsageCustomRange)
   const [showCustomPopover, setShowCustomPopover] = useState(false)
   const customChipRef = useRef<HTMLButtonElement>(null)
+  const customChipRefLogs = useRef<HTMLButtonElement>(null)
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -1947,7 +1948,7 @@ export default function Usage() {
   const [apiKeyTokenStats, setAPIKeyTokenStats] = useState<APIKeyTokenStat[]>([])
   const [apiKeyTokenStatsLoading, setAPIKeyTokenStatsLoading] = useState(false)
   const [dailyModel, setDailyModel] = useState('')
-  const [dailyApiKeyId, setDailyApiKeyId] = useState('')
+  const [dailyApiKeyIds, setDailyApiKeyIds] = useState<string[]>([])
   const [dailyStats, setDailyStats] = useState<UsageDailyTokenStats | null>(null)
   const [dailyStatsLoading, setDailyStatsLoading] = useState(false)
   const [dailyStatsError, setDailyStatsError] = useState(false)
@@ -2019,7 +2020,7 @@ export default function Usage() {
         end,
         channel: channel || undefined,
         model: dailyModel || undefined,
-        apiKeyId: dailyApiKeyId || undefined,
+        apiKeyIds: dailyApiKeyIds,
       })
       setDailyStats(response)
       setDailyStatsError(false)
@@ -2029,7 +2030,7 @@ export default function Usage() {
     } finally {
       if (!silent) setDailyStatsLoading(false)
     }
-  }, [channel, customRange, dailyApiKeyId, dailyModel, timeRange])
+  }, [channel, customRange, dailyApiKeyIds, dailyModel, timeRange])
 
   const buildLogFilterParams = useCallback(() => {
     const { start, end } = resolveRangeISO(timeRange, customRange)
@@ -2363,13 +2364,11 @@ export default function Usage() {
               ...modelFilterOptions.map((model) => ({ label: model, value: model })),
             ]}
           />
-          <Select
-            className="w-52 shrink-0"
-            compact
-            value={dailyApiKeyId}
-            onValueChange={setDailyApiKeyId}
-            placeholder={t('usage.dailyApiKeyFilter')}
+          <DailyAPIKeyMultiSelect
             options={apiKeyOptions}
+            selected={dailyApiKeyIds}
+            onChange={setDailyApiKeyIds}
+            placeholder={t('usage.dailyApiKeyFilter')}
           />
         </div>
 
@@ -2538,7 +2537,7 @@ export default function Usage() {
                     )
                   })}
                   <button
-                    ref={customChipRef}
+                    ref={customChipRefLogs}
                     type="button"
                     onClick={() => setShowCustomPopover((v) => !v)}
                     className={cn(
@@ -2555,7 +2554,7 @@ export default function Usage() {
                 </div>
                 {showCustomPopover && (
                   <CustomRangePopover
-                    anchorRef={customChipRef}
+                    anchorRef={customChipRefLogs}
                     initial={customRange}
                     onCancel={() => setShowCustomPopover(false)}
                     onApply={(range) => {
@@ -3263,6 +3262,114 @@ export default function Usage() {
         {confirmDialog}
       </>
     </StateShell>
+  )
+}
+
+// 2026-08-20 coder(lq): Keep the daily usage API-key filter open while selecting multiple keys.
+function DailyAPIKeyMultiSelect({
+  options,
+  selected,
+  onChange,
+  placeholder,
+}: {
+  options: { label: string; value: string }[]
+  selected: string[]
+  onChange: (values: string[]) => void
+  placeholder: string
+}) {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(null)
+  const allValue = ''
+  const selectedLabels = options.filter((option) => selected.includes(option.value)).map((option) => option.label)
+  const label = selected.length === 0
+    ? (options.find((option) => option.value === allValue)?.label ?? placeholder)
+    : selected.length === 1
+      ? selectedLabels[0]
+      : `${selected.length} 个密钥`
+
+  const reposition = useCallback(() => {
+    const trigger = triggerRef.current
+    if (!trigger) return
+    const rect = trigger.getBoundingClientRect()
+    setPosition({ top: rect.bottom + 6, left: Math.max(8, Math.min(window.innerWidth - rect.width - 8, rect.left)), width: rect.width })
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!open) return
+    reposition()
+    const handle = () => reposition()
+    window.addEventListener('resize', handle)
+    window.addEventListener('scroll', handle, true)
+    return () => {
+      window.removeEventListener('resize', handle)
+      window.removeEventListener('scroll', handle, true)
+    }
+  }, [open, reposition])
+
+  useEffect(() => {
+    if (!open) return
+    const handle = (event: PointerEvent) => {
+      const target = event.target as Node | null
+      if (target && (triggerRef.current?.contains(target) || menuRef.current?.contains(target))) return
+      setOpen(false)
+    }
+    document.addEventListener('pointerdown', handle)
+    return () => document.removeEventListener('pointerdown', handle)
+  }, [open])
+
+  const toggle = (value: string) => {
+    if (value === allValue) {
+      onChange([])
+      return
+    }
+    onChange(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value])
+  }
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="flex h-8 w-52 shrink-0 items-center justify-between gap-2 rounded-md border border-input bg-background px-3 text-xs text-foreground shadow-sm hover:bg-accent"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+      >
+        <span className="truncate">{label}</span>
+        <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+      </button>
+      {open && position && createPortal(
+        <div
+          ref={menuRef}
+          role="listbox"
+          aria-multiselectable="true"
+          className="fixed z-[100] max-h-72 overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md"
+          style={{ top: position.top, left: position.left, width: position.width }}
+        >
+          {options.map((option) => {
+            const checked = option.value === allValue ? selected.length === 0 : selected.includes(option.value)
+            return (
+              <button
+                key={option.value || 'all'}
+                type="button"
+                role="option"
+                aria-selected={checked}
+                className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent"
+                onClick={() => toggle(option.value)}
+              >
+                <span className="flex size-4 items-center justify-center rounded-sm border border-input">
+                  {checked && <Check className="size-3" />}
+                </span>
+                <span className="truncate">{option.label}</span>
+              </button>
+            )
+          })}
+        </div>,
+        document.body,
+      )}
+    </>
   )
 }
 

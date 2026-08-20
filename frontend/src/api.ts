@@ -885,6 +885,7 @@ export const api = {
     channel?: string
     model?: string
     apiKeyId?: string
+    apiKeyIds?: string[]
     signal?: AbortSignal
   } = {}) => {
     const searchParams = new URLSearchParams()
@@ -893,6 +894,7 @@ export const api = {
     if (params.channel) searchParams.set('channel', params.channel)
     if (params.model) searchParams.set('model', params.model)
     if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
+    for (const id of params.apiKeyIds ?? []) searchParams.append('api_key_id', id)
     const qs = searchParams.toString()
     return request<UsageDailyTokenStats>(qs ? `/usage/daily-tokens?${qs}` : '/usage/daily-tokens', {
       signal: params.signal,

@@ -6666,11 +6666,25 @@ func (h *Handler) GetDailyTokenUsage(c *gin.Context) {
 		}
 		return &id, nil
 	}
-	apiKeyID, err := parseOptionalID("api_key_id")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
+	apiKeyIDs := make([]int64, 0)
+	for _, value := range c.QueryArray("api_key_id") {
+		id, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if parseErr != nil || id <= 0 {
+			writeError(c, http.StatusBadRequest, "api_key_id 参数必须是正整数")
+			return
+		}
+		duplicate := false
+		for _, existing := range apiKeyIDs {
+			if existing == id {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			apiKeyIDs = append(apiKeyIDs, id)
+		}
 	}
+	sort.Slice(apiKeyIDs, func(i, j int) bool { return apiKeyIDs[i] < apiKeyIDs[j] })
 	accountID, err := parseOptionalID("account_id")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -6679,7 +6693,11 @@ func (h *Handler) GetDailyTokenUsage(c *gin.Context) {
 
 	channel := parseUsageChannel(c)
 	model := strings.TrimSpace(c.Query("model"))
-	cacheKey := fmt.Sprintf("daily:%d:%d:%s:%s:%s:%s", rangeStart.Unix()/30, rangeEnd.Unix()/30, channel, model, optionalIDCacheValue(apiKeyID), optionalIDCacheValue(accountID))
+	apiKeyCache := make([]string, len(apiKeyIDs))
+	for i, id := range apiKeyIDs {
+		apiKeyCache[i] = strconv.FormatInt(id, 10)
+	}
+	cacheKey := fmt.Sprintf("daily:%d:%d:%s:%s:%s:%s", rangeStart.Unix()/30, rangeEnd.Unix()/30, channel, model, strings.Join(apiKeyCache, ","), optionalIDCacheValue(accountID))
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 	var cached database.UsageDailyTokenStats
@@ -6688,7 +6706,7 @@ func (h *Handler) GetDailyTokenUsage(c *gin.Context) {
 		return
 	}
 
-	stats, err := h.db.GetDailyTokenUsage(ctx, rangeStart, rangeEnd, channel, model, apiKeyID, accountID)
+	stats, err := h.db.GetDailyTokenUsage(ctx, rangeStart, rangeEnd, channel, model, apiKeyIDs, accountID)
 	if err != nil {
 		writeInternalError(c, err)
 		return

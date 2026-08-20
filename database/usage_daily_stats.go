@@ -39,7 +39,8 @@ type UsageDailyTokenStats struct {
 // GetDailyTokenUsage aggregates retained usage logs by calendar day and model.
 // The query deliberately uses DATE()/GROUP BY only, which is supported by
 // SQLite, MySQL 5.6 and PostgreSQL without JSON or window-function features.
-func (db *DB) GetDailyTokenUsage(ctx context.Context, rangeStart, rangeEnd time.Time, channel, model string, apiKeyID, accountID *int64) (*UsageDailyTokenStats, error) {
+// 2026-08-20 coder(lq): Support selecting multiple API keys in the usage dashboard.
+func (db *DB) GetDailyTokenUsage(ctx context.Context, rangeStart, rangeEnd time.Time, channel, model string, apiKeyIDs []int64, accountID *int64) (*UsageDailyTokenStats, error) {
 	now := time.Now()
 	if rangeStart.IsZero() {
 		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -58,10 +59,13 @@ func (db *DB) GetDailyTokenUsage(ctx context.Context, rangeStart, rangeEnd time.
 		timeWhere += fmt.Sprintf(" AND (%s = %s OR model = %s)", modelExpr, placeholder, placeholder)
 		args = append(args, model)
 	}
-	if apiKeyID != nil {
-		placeholder := fmt.Sprintf("$%d", len(args)+1)
-		timeWhere += " AND api_key_id = " + placeholder
-		args = append(args, *apiKeyID)
+	if len(apiKeyIDs) > 0 {
+		placeholders := make([]string, 0, len(apiKeyIDs))
+		for _, id := range apiKeyIDs {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)+1))
+			args = append(args, id)
+		}
+		timeWhere += " AND api_key_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
 	if accountID != nil {
 		placeholder := fmt.Sprintf("$%d", len(args)+1)

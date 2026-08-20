@@ -61,7 +61,7 @@ func TestGetDailyTokenUsageSQLiteAggregatesByDayAndModel(t *testing.T) {
 	}
 
 	apiKeyID := int64(7)
-	filtered, err := db.GetDailyTokenUsage(ctx, start, end, UpstreamChannelCodex, "gpt-effective", &apiKeyID, nil)
+	filtered, err := db.GetDailyTokenUsage(ctx, start, end, UpstreamChannelCodex, "gpt-effective", []int64{apiKeyID}, nil)
 	if err != nil {
 		t.Fatalf("GetDailyTokenUsage(filtered): %v", err)
 	}

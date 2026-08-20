@@ -1915,6 +1915,7 @@ export default function Usage() {
   const [timeRange, setTimeRange] = useState<UsageTimeRangeKey>(getInitialUsageRange)
   const [customRange, setCustomRange] = useState<CustomRange | null>(getInitialUsageCustomRange)
   const [showCustomPopover, setShowCustomPopover] = useState(false)
+  const [customPopoverAnchor, setCustomPopoverAnchor] = useState<'daily' | 'logs'>('daily')
   const customChipRef = useRef<HTMLButtonElement>(null)
   const customChipRefLogs = useRef<HTMLButtonElement>(null)
   const [logs, setLogs] = useState<UsageLog[]>([])
@@ -1952,6 +1953,11 @@ export default function Usage() {
   const [dailyStats, setDailyStats] = useState<UsageDailyTokenStats | null>(null)
   const [dailyStatsLoading, setDailyStatsLoading] = useState(false)
   const [dailyStatsError, setDailyStatsError] = useState(false)
+  const statsAbortRef = useRef<AbortController | null>(null)
+  const analysisAbortRef = useRef<AbortController | null>(null)
+  const [analysisStats, setAnalysisStats] = useState<UsageStats | null>(null)
+  const [analysisStatsLoading, setAnalysisStatsLoading] = useState(false)
+  const [analysisStatsError, setAnalysisStatsError] = useState(false)
   const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
@@ -1968,11 +1974,14 @@ export default function Usage() {
     if (searchTimer.current) clearTimeout(searchTimer.current)
   }, [])
 
-  // 仅加载轻量统计（秒级）—— 联动同页 timeRange,与下方请求记录的范围保持一致
+  // 2026-08-20 coder(lq): 首屏只加载汇总，避免长时间范围触发多组全表聚合阻塞页面。
   const loadStats = useCallback(async () => {
+    statsAbortRef.current?.abort()
+    const controller = new AbortController()
+    statsAbortRef.current = controller
     const { start, end } = resolveRangeISO(timeRange, customRange)
     const [stats, settings] = await Promise.all([
-      api.getUsageStats({ start, end, channel: channel || undefined }),
+      api.getUsageStats({ start, end, channel: channel || undefined, detail: 'summary', signal: controller.signal }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     return { stats, settings }
@@ -1985,6 +1994,44 @@ export default function Usage() {
     initialData: { stats: null, settings: null },
     load: loadStats,
   })
+
+  // 2026-08-20 coder(lq): 分析面板单独加载，时间范围切换时取消旧聚合，避免请求叠加。
+  const loadAnalysisStats = useCallback(async () => {
+    analysisAbortRef.current?.abort()
+    if (!showAnalysis) {
+      setAnalysisStats(null)
+      setAnalysisStatsLoading(false)
+      setAnalysisStatsError(false)
+      return
+    }
+
+    const controller = new AbortController()
+    analysisAbortRef.current = controller
+    setAnalysisStats(null)
+    setAnalysisStatsLoading(true)
+    setAnalysisStatsError(false)
+    try {
+      const { start, end } = resolveRangeISO(timeRange, customRange)
+      const response = await api.getUsageStats({
+        start,
+        end,
+        channel: channel || undefined,
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted) {
+        setAnalysisStats(response)
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setAnalysisStatsError(true)
+      }
+      if (err instanceof DOMException && err.name === 'AbortError') return
+    } finally {
+      if (!controller.signal.aborted) {
+        setAnalysisStatsLoading(false)
+      }
+    }
+  }, [channel, customRange, showAnalysis, timeRange])
 
   const loadAPIKeys = useCallback(async () => {
     try {
@@ -2097,6 +2144,10 @@ export default function Usage() {
   }, [loadErrorSummary])
 
   useEffect(() => {
+    void loadAnalysisStats()
+  }, [loadAnalysisStats])
+
+  useEffect(() => {
     void loadAPIKeys()
   }, [loadAPIKeys])
 
@@ -2135,9 +2186,10 @@ export default function Usage() {
       void reloadSilently()
       void loadLogs(true)
       void loadDailyTokenUsage(true)
+      if (showAnalysis) void loadAnalysisStats()
     }, 30000)
     return () => window.clearInterval(timer)
-  }, [reloadSilently, loadLogs, loadDailyTokenUsage])
+  }, [loadAnalysisStats, loadDailyTokenUsage, loadLogs, reloadSilently, showAnalysis])
 
   useEffect(() => {
     void loadDailyTokenUsage()
@@ -2172,7 +2224,7 @@ export default function Usage() {
   const rangeCompletionTokens = stats?.today_completion_tokens ?? 0
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
-  const modelStats = stats?.model_stats ?? []
+  const modelStats = analysisStats?.model_stats ?? []
   // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
   // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
   const modelFilterOptions = useMemo(() => {
@@ -2193,9 +2245,9 @@ export default function Usage() {
     }
     return merged
   }, [modelOptions, grokModelOptions, modelStats, channel])
-  const featureStats = stats?.feature_stats
-  const endpointStats = stats?.endpoint_stats ?? []
-  const apiKeyStats = stats?.api_key_stats ?? []
+  const featureStats = analysisStats?.feature_stats
+  const endpointStats = analysisStats?.endpoint_stats ?? []
+  const apiKeyStats = analysisStats?.api_key_stats ?? []
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
@@ -2279,7 +2331,7 @@ export default function Usage() {
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
+      onRetry={() => { void reload(); void loadAnalysisStats(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -2288,7 +2340,7 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
+          onRefresh={() => { void reload(); void loadAnalysisStats(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
           titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
@@ -2328,7 +2380,10 @@ export default function Usage() {
             <button
               ref={customChipRef}
               type="button"
-              onClick={() => setShowCustomPopover((v) => !v)}
+              onClick={() => {
+                setCustomPopoverAnchor('daily')
+                setShowCustomPopover((v) => !v)
+              }}
               className={`whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ${
                 timeRange === 'custom'
                   ? 'border border-border bg-background text-foreground shadow-sm'
@@ -2342,7 +2397,7 @@ export default function Usage() {
           </div>
           {showCustomPopover && (
             <CustomRangePopover
-              anchorRef={customChipRef}
+              anchorRef={customPopoverAnchor === 'daily' ? customChipRef : customChipRefLogs}
               initial={customRange}
               onCancel={() => setShowCustomPopover(false)}
               onApply={(range) => {
@@ -2488,22 +2543,33 @@ export default function Usage() {
           <>
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2">
               <div className="text-sm font-medium text-foreground">{t('usage.analysisTitle')}</div>
-              <Badge variant="secondary">{analysisRangeLabel}</Badge>
+              <div className="flex items-center gap-2">
+                {analysisStatsLoading ? <span className="text-xs text-muted-foreground">{t('common.loading')}</span> : null}
+                <Badge variant="secondary">{analysisRangeLabel}</Badge>
+              </div>
             </div>
-            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
-              <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
-            </div>
+            {analysisStatsError && !analysisStats ? (
+              <div className="rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {t('common.loadFailed')}
+              </div>
+            ) : analysisStats ? (
+              <>
+                <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                  <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
+                  <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
+                </div>
 
-            <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-              <EndpointStatsPanel stats={endpointStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
-              <APIKeyStatsPanel
-                stats={apiKeyStats}
-                totalRequests={rangeRequests}
-                showFullUsageNumbers={showFullUsageNumbers}
-                onMore={() => setShowAPIKeyUsageModal(true)}
-              />
-            </div>
+                <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
+                  <EndpointStatsPanel stats={endpointStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
+                  <APIKeyStatsPanel
+                    stats={apiKeyStats}
+                    totalRequests={rangeRequests}
+                    showFullUsageNumbers={showFullUsageNumbers}
+                    onMore={() => setShowAPIKeyUsageModal(true)}
+                  />
+                </div>
+              </>
+            ) : null}
           </>
         )}
 
@@ -2539,7 +2605,10 @@ export default function Usage() {
                   <button
                     ref={customChipRefLogs}
                     type="button"
-                    onClick={() => setShowCustomPopover((v) => !v)}
+                    onClick={() => {
+                      setCustomPopoverAnchor('logs')
+                      setShowCustomPopover((v) => !v)
+                    }}
                     className={cn(
                       'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
                       timeRange === 'custom'
@@ -2552,19 +2621,6 @@ export default function Usage() {
                       : t('usage.customRange')}
                   </button>
                 </div>
-                {showCustomPopover && (
-                  <CustomRangePopover
-                    anchorRef={customChipRefLogs}
-                    initial={customRange}
-                    onCancel={() => setShowCustomPopover(false)}
-                    onApply={(range) => {
-                      setCustomRange(range)
-                      setTimeRange('custom')
-                      setPage(1)
-                      setShowCustomPopover(false)
-                    }}
-                  />
-                )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>

@@ -172,8 +172,7 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 	if db.isSQLite() {
 		return db.ensureSQLiteColumn(ctx, "prompt_conversation_locks", "identity_kind", "TEXT NOT NULL DEFAULT 'newapi'")
 	}
-	_, err := db.conn.ExecContext(ctx, `ALTER TABLE prompt_conversation_locks ADD COLUMN IF NOT EXISTS identity_kind VARCHAR(24) NOT NULL DEFAULT 'newapi'`)
-	return err
+	return db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) NOT NULL DEFAULT 'newapi'")
 }
 
 const promptConversationLockSelect = `SELECT id, lock_key, status, identity_kind, platform, newapi_user_id,
@@ -302,12 +301,12 @@ func (db *DB) lockPromptConversationMySQL(ctx context.Context, input PromptConve
 
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `INSERT INTO prompt_conversation_locks (
-		lock_key, status, platform, newapi_user_id, session_fingerprint, session_hash,
+		lock_key, status, identity_kind, platform, newapi_user_id, session_fingerprint, session_hash,
 		incident_id, decision_id, request_id, reason_code, endpoint, model, trigger_count,
 		unlock_count, locked_at, unlocked_at, unlock_reason, created_at, updated_at
-	) VALUES ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,0,$12,NULL,'',$13,$13)
+	) VALUES ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,$13,NULL,'',$14,$14)
 	ON DUPLICATE KEY UPDATE lock_key=VALUES(lock_key)`,
-		input.LockKey, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
+		input.LockKey, input.IdentityKind, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
 		input.IncidentID, input.DecisionID, input.RequestID, input.ReasonCode, input.Endpoint,
 		input.Model, input.LockedAt, now)
 	if err != nil {
@@ -329,13 +328,12 @@ func (db *DB) lockPromptConversationMySQL(ctx context.Context, input PromptConve
 	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE prompt_conversation_locks SET
-		status='active', platform=$2, newapi_user_id=$3, session_fingerprint=$4,
-		session_hash=$5, incident_id=$6, decision_id=$7, request_id=$8,
-		reason_code=$9, endpoint=$10, model=$11, trigger_count=trigger_count+1,
-		locked_at=$12, unlocked_at=NULL, unlock_reason='', updated_at=$13
-		WHERE lock_key=$1`, input.LockKey, input.Platform, input.NewAPIUserID,
-		input.SessionFingerprint, input.SessionHash, input.IncidentID, input.DecisionID,
-		input.RequestID, input.ReasonCode, input.Endpoint, input.Model, input.LockedAt, now)
+		status='active', identity_kind=$2, platform=$3, newapi_user_id=$4, session_fingerprint=$5,
+		session_hash=$6, incident_id=$7, decision_id=$8, request_id=$9,
+		reason_code=$10, endpoint=$11, model=$12, trigger_count=trigger_count+1,
+		locked_at=$13, unlocked_at=NULL, unlock_reason='', updated_at=$14
+		WHERE lock_key=$1`, input.LockKey, input.IdentityKind, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
+		input.IncidentID, input.DecisionID, input.RequestID, input.ReasonCode, input.Endpoint, input.Model, input.LockedAt, now)
 	if err != nil {
 		return nil, false, err
 	}

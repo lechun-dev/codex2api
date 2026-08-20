@@ -165,7 +165,11 @@ func (db *DB) UpdateModelCooldownSettings(ctx context.Context, update ModelCoold
 	}
 	current = NormalizeModelCooldownSettings(current)
 
-	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id) VALUES (1) ON CONFLICT(id) DO NOTHING`); err != nil {
+	insertQuery := `INSERT INTO system_settings (id) VALUES (1) ON CONFLICT(id) DO NOTHING`
+	if db.isMySQL() {
+		insertQuery = `INSERT IGNORE INTO system_settings (id) VALUES (1)`
+	}
+	if _, err := db.conn.ExecContext(ctx, insertQuery); err != nil {
 		return ModelCooldownSettings{}, fmt.Errorf("初始化模型冷却设置失败: %w", err)
 	}
 	_, err = db.conn.ExecContext(ctx, `

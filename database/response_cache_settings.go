@@ -114,10 +114,14 @@ func (db *DB) UpdateResponseCacheSettings(ctx context.Context, update ResponseCa
 		}
 		defer func() { _ = tx.Rollback() }()
 
-		if _, err := tx.ExecContext(ctx, `
+		insertQuery := `
 			INSERT INTO system_settings (id) VALUES (1)
 			ON CONFLICT (id) DO NOTHING
-		`); err != nil {
+		`
+		if db.isMySQL() {
+			insertQuery = `INSERT IGNORE INTO system_settings (id) VALUES (1)`
+		}
+		if _, err := tx.ExecContext(ctx, insertQuery); err != nil {
 			return err
 		}
 

@@ -221,6 +221,46 @@ func TestRewriteSQLForMySQLUpsert(t *testing.T) {
 	}
 }
 
+func TestRewriteSQLForMySQLUpsertDoesNotRewriteLiteralsOrComments(t *testing.T) {
+	got := rewriteSQLForMySQL(`
+		INSERT INTO model_registry (id, enabled)
+		VALUES ($1, $2)
+		-- excluded.comment should remain unchanged
+		ON CONFLICT (id) DO UPDATE SET
+			enabled = excluded.enabled,
+			label = 'excluded.label'
+	`)
+	for _, want := range []string{
+		"enabled = VALUES(enabled)",
+		"-- excluded.comment should remain unchanged",
+		"label = 'excluded.label'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rewritten upsert missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestRewriteSQLForMySQLUpsertKeepsParameterOrder(t *testing.T) {
+	got, order := rewriteSQLForMySQLWithParamOrder(`
+		INSERT INTO model_registry (id, enabled)
+		VALUES ($2, $1)
+		ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled
+	`)
+	if !strings.Contains(got, "VALUES (?, ?)") || !strings.Contains(got, "enabled = VALUES(enabled)") {
+		t.Fatalf("unexpected MySQL upsert rewrite: %s", got)
+	}
+	wantOrder := []int{2, 1}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("parameter order = %v, want %v", order, wantOrder)
+	}
+	for i, want := range wantOrder {
+		if order[i] != want {
+			t.Fatalf("parameter order = %v, want %v", order, wantOrder)
+		}
+	}
+}
+
 func TestAccountDailyUsageUpsertUsesMySQL56Syntax(t *testing.T) {
 	capture := &mysqlCaptureDriver{queryRow: []driver.Value{int64(0)}}
 	driverName := fmt.Sprintf("codex2api-mysql-daily-usage-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))

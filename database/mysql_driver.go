@@ -17,7 +17,6 @@ import (
 
 const mysqlDriverName = "mysql56"
 
-var mysqlExcludedValuePattern = regexp.MustCompile(`(?i)\bexcluded\.([A-Za-z_][A-Za-z0-9_]*)`)
 var mysqlCastAsTextPattern = regexp.MustCompile(`(?i)CAST\(([^()]*)\s+AS\s+TEXT\)`)
 var mysqlDoNothingPattern = regexp.MustCompile(`(?is)\s+ON\s+CONFLICT\s*(?:\([^)]*\))?\s+DO\s+NOTHING(?:\s+RETURNING\s+.+)?\s*$`)
 var mysqlKeywordBeforeKey = map[string]struct{}{
@@ -484,8 +483,130 @@ func rewritePostgresUpsertForMySQL(query string) string {
 		updateStart := idx + updateIdxRel
 		query = query[:idx] + "ON DUPLICATE KEY UPDATE" + query[updateStart+len("do update set"):]
 	}
-	query = mysqlExcludedValuePattern.ReplaceAllString(query, "VALUES($1)")
+	query = rewriteMySQLExcludedValues(query)
 	return query
+}
+
+// 2026-08-20 coder(lq): Rewrite PostgreSQL's EXCLUDED references without touching literals or comments.
+func rewriteMySQLExcludedValues(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		next := byte(0)
+		if i+1 < len(query) {
+			next = query[i+1]
+		}
+
+		if inLineComment {
+			b.WriteByte(ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			b.WriteByte(ch)
+			if ch == '*' && next == '/' {
+				b.WriteByte(next)
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+		if inSingle {
+			b.WriteByte(ch)
+			if ch == '\'' {
+				if next == '\'' || next == '\\' {
+					b.WriteByte(next)
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			b.WriteByte(ch)
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			b.WriteByte(ch)
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch {
+		case ch == '-' && next == '-':
+			b.WriteByte(ch)
+			b.WriteByte(next)
+			i++
+			inLineComment = true
+		case ch == '/' && next == '*':
+			b.WriteByte(ch)
+			b.WriteByte(next)
+			i++
+			inBlockComment = true
+		case ch == '\'':
+			b.WriteByte(ch)
+			inSingle = true
+		case ch == '"':
+			b.WriteByte(ch)
+			inDouble = true
+		case ch == '`':
+			b.WriteByte(ch)
+			inBacktick = true
+		case isSQLIdentifierStart(ch):
+			start := i
+			for i+1 < len(query) && isSQLIdentifierPart(query[i+1]) {
+				i++
+			}
+			if !strings.EqualFold(query[start:i+1], "excluded") {
+				b.WriteString(query[start : i+1])
+				continue
+			}
+
+			j := i + 1
+			for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\r' || query[j] == '\n') {
+				j++
+			}
+			if j >= len(query) || query[j] != '.' {
+				b.WriteString(query[start : i+1])
+				continue
+			}
+			j++
+			for j < len(query) && (query[j] == ' ' || query[j] == '\t' || query[j] == '\r' || query[j] == '\n') {
+				j++
+			}
+			if j >= len(query) || !isSQLIdentifierStart(query[j]) {
+				b.WriteString(query[start : i+1])
+				continue
+			}
+			end := j + 1
+			for end < len(query) && isSQLIdentifierPart(query[end]) {
+				end++
+			}
+			b.WriteString("VALUES(")
+			b.WriteString(query[j:end])
+			b.WriteByte(')')
+			i = end - 1
+		default:
+			b.WriteByte(ch)
+		}
+	}
+	return b.String()
 }
 
 func replaceFirstFold(s, old, new string) string {

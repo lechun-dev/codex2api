@@ -130,7 +130,7 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 	add := func(col string, value interface{}) {
 		args = append(args, value)
 		ph := "?"
-		if !db.isSQLite() {
+		if !db.isSQLite() && !db.isMySQL() {
 			ph = fmt.Sprintf("$%d", len(args))
 		}
 		sets = append(sets, col+" = "+ph)
@@ -174,7 +174,7 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 	sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
 	args = append(args, id)
 	ph := "?"
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		ph = fmt.Sprintf("$%d", len(args))
 	}
 	res, err := db.conn.ExecContext(ctx, "UPDATE account_groups SET "+strings.Join(sets, ", ")+" WHERE id = "+ph, args...)
@@ -361,7 +361,7 @@ func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []
 	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
 		ph := "$1"
 		insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
-		if db.isSQLite() {
+		if db.isSQLite() || db.isMySQL() {
 			ph = "?"
 			insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
 		}

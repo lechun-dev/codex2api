@@ -123,7 +123,7 @@ func (db *DB) UpsertPromptReviewProfile(ctx context.Context, profile PromptRevie
 	if profile.TimeoutSecond <= 0 {
 		profile.TimeoutSecond = 10
 	}
-	_, err := db.conn.ExecContext(ctx, `
+	query := `
 		INSERT INTO prompt_review_profiles
 			(id, name, base_url, model, request_mode, adapter_json, api_keys, timeout_seconds, active, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
@@ -131,7 +131,19 @@ func (db *DB) UpsertPromptReviewProfile(ctx context.Context, profile PromptRevie
 			name=EXCLUDED.name, base_url=EXCLUDED.base_url, model=EXCLUDED.model,
 			request_mode=EXCLUDED.request_mode, adapter_json=EXCLUDED.adapter_json,
 			api_keys=EXCLUDED.api_keys, timeout_seconds=EXCLUDED.timeout_seconds,
-			active=EXCLUDED.active, updated_at=CURRENT_TIMESTAMP`,
+			active=EXCLUDED.active, updated_at=CURRENT_TIMESTAMP`
+	if db.isMySQL() {
+		query = `
+			INSERT INTO prompt_review_profiles
+				(id, name, base_url, model, request_mode, adapter_json, api_keys, timeout_seconds, active, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			ON DUPLICATE KEY UPDATE
+				name=VALUES(name), base_url=VALUES(base_url), model=VALUES(model),
+				request_mode=VALUES(request_mode), adapter_json=VALUES(adapter_json),
+				api_keys=VALUES(api_keys), timeout_seconds=VALUES(timeout_seconds),
+				active=VALUES(active), updated_at=CURRENT_TIMESTAMP`
+	}
+	_, err := db.conn.ExecContext(ctx, query,
 		profile.ID, profile.Name, profile.BaseURL, profile.Model, profile.RequestMode,
 		profile.AdapterJSON, profile.APIKeys, profile.TimeoutSecond, profile.Active)
 	return err

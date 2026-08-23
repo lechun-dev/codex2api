@@ -1428,6 +1428,9 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
               <p className="mb-3 flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
                 ⓘ {t("docs.clientConfig.codexConfigHint")}
               </p>
+              <p className="mb-3 text-xs text-amber-600/90 dark:text-amber-400/90">
+                {t("docs.clientConfig.codexSwitchNote")}
+              </p>
               <div className="space-y-4">
                 <CodeBlock
                   label={codexConfigPath}

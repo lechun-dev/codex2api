@@ -4422,6 +4422,7 @@
     "codexTitle": "Using with Codex CLI",
     "codexDesc": "Add the following configuration files to the Codex CLI config directory to use Codex models through this proxy.",
     "codexConfigHint": "Make sure the following content is at the beginning of config.toml",
+    "codexSwitchNote": "If you switched via cc switch, the active config may live elsewhere and may not appear in this config.toml.",
     "codexNoteUnix": "Make sure the config directory exists. Run mkdir -p ~/.codex to create it.",
     "codexNoteWindows": "Press Win+R, type %userprofile%\\.codex to open the config directory. Create it manually if it doesn't exist.",
     "claudeCodeTitle": "Using with Claude Code",
@@ -4772,6 +4773,7 @@
         "opusModel": "Opus model"
       },
       "codexConfigHint": "Make sure the content below appears at the top of config.toml",
+      "codexSwitchNote": "If you switched via cc switch, the active config may live elsewhere and may not appear in this config.toml.",
       "codexNoteUnix": "Make sure the config directory exists — run mkdir -p ~/.codex if not.",
       "codexNoteWindows": "Press Win+R and enter %userprofile%\\.codex to open the config directory — create it manually if missing.",
       "claudeDesc": "Set environment variables or edit settings.json to make Claude Code use this proxy.",

@@ -212,6 +212,9 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
               active={codexTab}
               onChange={setCodexTab}
             />
+            <p className="mb-3 text-xs text-amber-600 dark:text-amber-400">
+              If you switched via cc switch, the active config may be managed elsewhere and may not appear in this file.
+            </p>
             <div className="space-y-4">
               <CodeBlock label={`${codexDir}/config.toml`} content={codexConfig} />
               <CodeBlock label={`${codexDir}/auth.json`} content={codexAuth} />

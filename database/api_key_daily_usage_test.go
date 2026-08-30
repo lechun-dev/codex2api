@@ -52,6 +52,58 @@ func TestGetAPIKeyUsageSinceAggregatesFromBoundary(t *testing.T) {
 	}
 }
 
+// 2026-08-30 coder(lq): 验证 Key 最近使用时间查询只取最新非 499 记录,且无有效记录的 Key 不进入结果。
+func TestListAPIKeyLastUsedAtUsesLatestNonCancelledRequest(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "last-used.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyWithHistory, err := db.InsertAPIKey(ctx, "history", "sk-last-used-history-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(history) 返回错误: %v", err)
+	}
+	keyOnlyCancelled, err := db.InsertAPIKey(ctx, "cancelled", "sk-last-used-cancelled-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(cancelled) 返回错误: %v", err)
+	}
+	if _, err := db.InsertAPIKey(ctx, "unused", "sk-last-used-unused-1234567890"); err != nil {
+		t.Fatalf("InsertAPIKey(unused) 返回错误: %v", err)
+	}
+
+	oldest := time.Now().UTC().Add(-3 * time.Hour).Truncate(time.Second)
+	latest := oldest.Add(2 * time.Hour)
+	insert := func(apiKeyID int64, statusCode int, at time.Time) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (api_key_id, account_id, endpoint, model, status_code, created_at)
+			VALUES ($1, 1, '/v1/responses', 'gpt-5.4', $2, $3)
+		`, apiKeyID, statusCode, sqliteTimeParam(at)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+	insert(keyWithHistory, 200, oldest)
+	insert(keyWithHistory, 499, latest.Add(time.Minute))
+	insert(keyWithHistory, 201, latest)
+	insert(keyOnlyCancelled, 499, latest.Add(time.Hour))
+
+	got, err := db.ListAPIKeyLastUsedAt(ctx)
+	if err != nil {
+		t.Fatalf("ListAPIKeyLastUsedAt 返回错误: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListAPIKeyLastUsedAt 返回 %d 个 Key, want 1: %#v", len(got), got)
+	}
+	if got[keyWithHistory].Unix() != latest.Unix() {
+		t.Fatalf("last used = %v, want %v", got[keyWithHistory], latest)
+	}
+	if _, ok := got[keyOnlyCancelled]; ok {
+		t.Fatalf("仅有 499 记录的 Key 不应出现在结果中: %#v", got)
+	}
+}
+
 // 自助报表的窗口语义:today 是 fixed 且 reset_at=次日零点;滑动窗口带 decay_at=OldestAt+窗口长度。
 func TestGetAPIKeySelfUsageReportWindowMetadata(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "daily-report.db"))

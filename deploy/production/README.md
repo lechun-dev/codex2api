@@ -13,6 +13,22 @@ sudo ./install.sh --bind 10.0.0.10 --port 8080
 
 脚本创建 `/opt/codex2api`，随机生成数据库密码和 `ADMIN_SECRET`（只写入权限为 600 的 `shared/.env`），拉取固定镜像并运行健康检查。若使用宿主机代理，增加 `--proxy-url socks5://user:pass@host.docker.internal:1080`；WireGuard/OpenVPN 则在宿主机配置默认路由/策略路由，并放行 Docker 网段。
 
+## 由交付方直接部署到客户服务器
+
+拿到客户 SSH 主机、用户和私钥后，在交付工作站执行 `deploy-remote.sh`。该命令会先做
+SSH/权限/Docker 预检，再上传生产包到客户机，远程执行安装并回传 `/health` 结果：
+
+```bash
+./deploy-remote.sh --host customer.example.com --user deploy \
+  --identity ~/.ssh/customer_ed25519 --version v2.8.2
+```
+
+`deploy` 用户需要无交互执行 Docker（加入 `docker` 组）或具备免密 `sudo` 权限。客户机
+尚未安装 Docker 时，明确加 `--bootstrap-docker`（仅支持 apt/dnf/yum，安装前应获客户
+确认）。VPN/WireGuard 仍应在客户宿主机配置；若仅有本机代理，用 `--proxy-url` 注入，
+凭据不会写入交付包。部署命令完成后，交付方还应让客户提供可用账号执行一次真实模型
+请求，作为海外出口验收。
+
 ## 升级与回滚
 
 拿到下一版交付包后，在新包目录执行：

@@ -11,7 +11,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 PACKAGE_DIR="$TMP/codex2api-production-$VERSION"
 mkdir -p "$PACKAGE_DIR"
-cp "$SCRIPT_DIR"/{README.md,.env.example,docker-compose.yml,install.sh,upgrade.sh,rollback.sh,backup.sh,smoke-test.sh} "$PACKAGE_DIR/"
+cp "$SCRIPT_DIR"/{README.md,.env.example,docker-compose.yml,install.sh,upgrade.sh,rollback.sh,backup.sh,smoke-test.sh,deploy-remote.sh} "$PACKAGE_DIR/"
 cp -R "$SCRIPT_DIR/ansible" "$PACKAGE_DIR/ansible"
 chmod +x "$PACKAGE_DIR"/*.sh
 printf 'version=%s\nbuilt_at=%s\nimage=ghcr.io/james-6-23/codex2api:%s\n' "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$VERSION" > "$PACKAGE_DIR/release-manifest"

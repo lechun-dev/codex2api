@@ -1,0 +1,70 @@
+---
+- name: Deploy Codex2API production package
+  hosts: codex2api
+  become: true
+  serial: "{{ rollout_batch | default(1) }}"
+  vars:
+    install_dir: "{{ codex2api_install_dir | default('/opt/codex2api') }}"
+    version: "{{ codex2api_version | mandatory }}"
+    image: "{{ codex2api_image | default('ghcr.io/james-6-23/codex2api:' ~ version) }}"
+    codex_port: "{{ codex2api_port | default(8080) }}"
+    bind_host: "{{ codex2api_bind_host | default('127.0.0.1') }}"
+    admin_secret: "{{ vault_admin_secret | mandatory }}"
+    database_password: "{{ vault_database_password | mandatory }}"
+  tasks:
+    - name: Verify Docker Compose v2 is installed
+      ansible.builtin.command: docker compose version
+      changed_when: false
+
+    - name: Create release and shared directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ install_dir }}/releases/{{ version }}/logs"
+        - "{{ install_dir }}/shared"
+        - "{{ install_dir }}/backups"
+
+    - name: Copy compose manifest
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../docker-compose.yml"
+        dest: "{{ install_dir }}/releases/{{ version }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: Render customer secrets and configuration
+      ansible.builtin.template:
+        src: customer.env.j2
+        dest: "{{ install_dir }}/shared/.env"
+        mode: "0600"
+
+    - name: Point current release at requested version
+      ansible.builtin.file:
+        src: "releases/{{ version }}"
+        dest: "{{ install_dir }}/current"
+        state: link
+        force: true
+
+    - name: Link shared environment into release
+      ansible.builtin.file:
+        src: "{{ install_dir }}/shared/.env"
+        dest: "{{ install_dir }}/releases/{{ version }}/.env"
+        state: link
+        force: true
+
+    - name: Pull the immutable application image
+      ansible.builtin.command:
+        argv: [docker, compose, --project-directory, "{{ install_dir }}/current", --env-file, "{{ install_dir }}/shared/.env", -f, "{{ install_dir }}/current/docker-compose.yml", pull]
+
+    - name: Start or update services
+      ansible.builtin.command:
+        argv: [docker, compose, --project-directory, "{{ install_dir }}/current", --env-file, "{{ install_dir }}/shared/.env", -f, "{{ install_dir }}/current/docker-compose.yml", up, -d]
+
+    - name: Verify service health
+      ansible.builtin.uri:
+        url: "http://{{ bind_host }}:{{ codex_port }}/health"
+        status_code: 200
+        retries: 12
+        delay: 5

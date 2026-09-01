@@ -4,14 +4,20 @@
 
 ## 首次安装
 
-在已安装 Docker Engine + Compose v2 的 Linux 服务器上执行：
+在 Linux 服务器上执行（脚本会检查 Docker CLI、Compose v2 和守护进程状态）：
 
 ```bash
 sudo ./install.sh --version v2.8.2
 sudo ./install.sh --bind 10.0.0.10 --port 8080
 ```
 
-脚本创建 `/opt/codex2api`，随机生成数据库密码和 `ADMIN_SECRET`（只写入权限为 600 的 `shared/.env`），拉取固定镜像并运行健康检查。若使用宿主机代理，增加 `--proxy-url socks5://user:pass@host.docker.internal:1080`；WireGuard/OpenVPN 则在宿主机配置默认路由/策略路由，并放行 Docker 网段。
+Docker 未安装或 Compose 不可用时，脚本会立即给出安装提示；Docker 守护进程未运行时，默认尝试通过 systemd 自动启动（可用 `--no-start-docker` 禁止）。脚本创建 `/opt/codex2api`，随机生成数据库密码和 `ADMIN_SECRET`（只写入权限为 600 的 `shared/.env`），拉取固定镜像并运行健康检查。若使用宿主机代理，增加 `--proxy-url socks5://user:pass@host.docker.internal:1080`；WireGuard/OpenVPN 则在宿主机配置默认路由/策略路由，并放行 Docker 网段。
+
+部署前只做检查、不写入磁盘或启动服务：
+
+```bash
+sudo ./install.sh --version v2.8.2 --dry-run
+```
 
 ## 由交付方直接部署到客户服务器
 

@@ -12,9 +12,24 @@
     admin_secret: "{{ vault_admin_secret | mandatory }}"
     database_password: "{{ vault_database_password | mandatory }}"
   tasks:
+    - name: Verify Docker CLI is installed
+      ansible.builtin.command: docker --version
+      changed_when: false
+
+    - name: Ensure Docker daemon is enabled and running
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
     - name: Verify Docker Compose v2 is installed
       ansible.builtin.command: docker compose version
       changed_when: false
+
+    - name: Verify Docker daemon is responsive
+      ansible.builtin.command: docker info
+      changed_when: false
+      no_log: true
 
     - name: Create release and shared directories
       ansible.builtin.file:

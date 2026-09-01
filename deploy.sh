@@ -272,6 +272,27 @@ preflight() {
     error "未找到 docker compose，请安装 Docker Compose v2+"
   fi
 
+  # CLI 和 Compose 插件存在并不代表 Docker daemon 正在运行；
+  # 在客户服务器上优先尝试通过 systemd 自动启动，避免部署到一半才失败。
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker 守护进程未运行，尝试自动启动..."
+    if command -v systemctl >/dev/null 2>&1; then
+      if [[ "$(id -u)" -eq 0 ]]; then
+        systemctl start docker >/dev/null 2>&1 || true
+      elif command -v sudo >/dev/null 2>&1; then
+        sudo -n systemctl start docker >/dev/null 2>&1 || true
+      fi
+    fi
+
+    local attempt
+    for attempt in {1..10}; do
+      docker info >/dev/null 2>&1 && break
+      sleep 1
+    done
+    docker info >/dev/null 2>&1 || error "Docker 守护进程未启动，请执行 'sudo systemctl start docker' 后重试"
+    success "Docker 守护进程已启动"
+  fi
+
   success "Docker 环境就绪 ($COMPOSE_CMD)"
 }
 

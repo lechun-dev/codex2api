@@ -79,7 +79,21 @@ REMOTE="$USER@$HOST"
 UPLOAD="/tmp/codex2api-deploy-$$.tar.gz"
 
 echo "连接客户服务器 $REMOTE ..."
-ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" "$REMOTE" 'set -eu; command -v tar >/dev/null; if [ "$(id -u)" -ne 0 ]; then command -v sudo >/dev/null; sudo -n true; fi; if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then echo docker-compose-ok; else echo docker-compose-missing; fi'
+ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" "$REMOTE" 'set -eu
+  command -v tar >/dev/null || { echo "客户机缺少 tar" >&2; exit 1; }
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null || { echo "远程用户不是 root 且没有 sudo" >&2; exit 1; }
+    sudo -n true || { echo "远程用户需要免密 sudo（或改用 root）" >&2; exit 1; }
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker CLI: missing"
+  elif ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose: missing"
+  elif ! docker info >/dev/null 2>&1; then
+    echo "Docker daemon: stopped (install.sh will try to start it)"
+  else
+    echo "Docker daemon: running"
+  fi'
 
 if ((BOOTSTRAP_DOCKER)); then
   ssh "${SSH_OPTS[@]}" -p "$SSH_PORT" "$REMOTE" 'set -eu

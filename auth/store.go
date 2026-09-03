@@ -11589,7 +11589,7 @@ func (s *Store) persistAntigravityPermanentRefreshFailure(ctx context.Context, a
 	if s == nil || s.db == nil || row == nil || refreshErr == nil {
 		return refreshErr
 	}
-	applied, err := s.db.MergeAccountCredentialsForGeneration(ctx, row.ID, row.CredentialGeneration, map[string]any{
+	applied, err := s.db.MergeAntigravityStateForGeneration(ctx, row.ID, row.CredentialGeneration, map[string]any{
 		"antigravity_sync_error":                      refreshErr.Error(),
 		antigravityPermanentRefreshErrorCredentialKey: refreshErr.Error(),
 		"antigravity_last_sync_attempt_at":            time.Now().UTC().Format(time.RFC3339),

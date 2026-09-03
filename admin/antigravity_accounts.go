@@ -2034,7 +2034,7 @@ func (h *Handler) persistFailedAntigravitySync(ctx context.Context, row *databas
 	}
 	basicUpdates := antigravityCredentialFailureUpdates(result, syncErr)
 	if !antigravityFailureHasProgress(row, result) {
-		mutated, err := h.db.MergeAccountCredentialsForGeneration(ctx, row.ID, row.CredentialGeneration, basicUpdates)
+		mutated, err := h.db.MergeAntigravityStateForGeneration(ctx, row.ID, row.CredentialGeneration, basicUpdates)
 		if err != nil {
 			return antigravityFailedSyncPersistOutcome{PersistenceFailed: true, Warning: "failed to record Antigravity sync error: " + err.Error()}
 		}
@@ -2062,13 +2062,13 @@ func (h *Handler) persistFailedAntigravitySync(ctx context.Context, row *databas
 			"antigravity_sync_warning":         result.Warning,
 			"antigravity_last_sync_attempt_at": time.Now().UTC().Format(time.RFC3339),
 		}
-		mutated, mergeErr := h.db.MergeAccountCredentialsForGeneration(ctx, row.ID, row.CredentialGeneration, duplicateFailure)
+		mutated, mergeErr := h.db.MergeAntigravityStateForGeneration(ctx, row.ID, row.CredentialGeneration, duplicateFailure)
 		if mergeErr != nil {
 			warning = appendAntigravityWarning(warning, "failed to record Antigravity sync error on source account: "+mergeErr.Error())
 		}
 		return antigravityFailedSyncPersistOutcome{Mutated: mutated, PersistenceFailed: mergeErr != nil, Warning: warning}
 	}
-	applied, persistErr := h.persistAntigravityFailureCredential(ctx, row, familyID, failureUpdates)
+	applied, persistErr := h.persistAntigravityFailureCredential(ctx, row, familyID, failureUpdates, antigravityTrustedSameIdentity(row, result))
 	if persistErr != nil {
 		return antigravityFailedSyncPersistOutcome{PersistenceFailed: true, Warning: "failed to preserve refreshed Antigravity credential: " + persistErr.Error()}
 	}
@@ -2078,9 +2078,13 @@ func (h *Handler) persistFailedAntigravitySync(ctx context.Context, row *databas
 	return antigravityFailedSyncPersistOutcome{Mutated: true, ProgressPersisted: true}
 }
 
-func (h *Handler) persistAntigravityFailureCredential(ctx context.Context, row *database.AccountRow, familyID string, updates map[string]any) (bool, error) {
+func (h *Handler) persistAntigravityFailureCredential(ctx context.Context, row *database.AccountRow, familyID string, updates map[string]any, trustedSameIdentity bool) (bool, error) {
 	if row == nil {
 		return false, sql.ErrNoRows
+	}
+	if trustedSameIdentity {
+		_, applied, err := h.db.UpdateAccountCredentialsCASWithFamily(ctx, row.ID, row.CredentialGeneration, familyID, updates)
+		return applied, err
 	}
 	if familyID == "" || antigravityRowFamilyID(row) != familyID {
 		_, applied, err := h.db.ReplaceAccountCredentialsCAS(ctx, row.ID, row.CredentialGeneration, familyID, updates)
@@ -2100,7 +2104,7 @@ func antigravityFailureCredentialUpdates(row *database.AccountRow, result auth.A
 	trustedSameIdentity := false
 	if profileObserved {
 		familyID = antigravityCredentialFamilyID(result.Credential, result.Profile.ID)
-		trustedSameIdentity = antigravitySnapshotSource(row, result) != nil && antigravityRowHasVerifiedIdentity(row)
+		trustedSameIdentity = antigravityTrustedSameIdentity(row, result)
 	}
 	if trustedSameIdentity {
 		if !result.EntitlementsObserved {
@@ -2135,6 +2139,10 @@ func antigravityFailureCredentialUpdates(row *database.AccountRow, result auth.A
 		updates["expires_at"] = ""
 	}
 	return updates, familyID
+}
+
+func antigravityTrustedSameIdentity(row *database.AccountRow, result auth.AntigravitySyncResult) bool {
+	return antigravityAuthoritativeProfile(result.Profile) && antigravitySnapshotSource(row, result) != nil && antigravityRowHasVerifiedIdentity(row)
 }
 
 func antigravityFailureHasProgress(row *database.AccountRow, result auth.AntigravitySyncResult) bool {

@@ -256,7 +256,7 @@ func (h *Handler) SyncAntigravityAccountState(c *gin.Context) {
 			source = "default"
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
-		applied, mergeErr := h.db.MergeAccountCredentialsForGeneration(ctx, id, row.CredentialGeneration, map[string]any{
+		applied, mergeErr := h.db.MergeAntigravityStateForGeneration(ctx, id, row.CredentialGeneration, map[string]any{
 			"models": models, "antigravity_catalog_source": source,
 			"antigravity_catalog_verified": false, "antigravity_last_sync_attempt_at": now,
 			"antigravity_sync_warning": "API-key catalog is local and was not remotely verified",
@@ -404,7 +404,7 @@ func (h *Handler) ProbeAntigravityAccountCapabilities(c *gin.Context) {
 		writeInternalError(c, marshalErr)
 		return
 	}
-	applied, persistErr := h.db.MergeAccountCredentialsForGeneration(ctx, id, row.CredentialGeneration, map[string]any{
+	applied, persistErr := h.db.MergeAntigravityStateForGeneration(ctx, id, row.CredentialGeneration, map[string]any{
 		"antigravity_capabilities": string(encoded), "antigravity_capability_last_probe_at": observed.ObservedAt.Format(time.RFC3339),
 	})
 	if persistErr != nil {

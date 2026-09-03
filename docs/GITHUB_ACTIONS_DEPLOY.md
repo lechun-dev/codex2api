@@ -2,6 +2,16 @@
 
 仓库包含 `.github/workflows/deploy-ssh.yml`，可在 GitHub Actions 中手动构建并通过 SSH 部署到 Linux 服务器。
 
+## 回滚
+
+在 Actions 中运行 `Deploy SSH`，将 `action` 选择为 `rollback`，并在 `rollback_release` 中填写服务器上已有的 release 目录名，例如 `42-abc1234`。可在服务器执行以下命令查看可回滚版本：
+
+```bash
+find /deploy/codex2api/releases -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V
+```
+
+工作流会先确认目标版本包含 `codex2api` 二进制和共享 `.env`，然后切换 `current`、重启 systemd 服务并执行可选健康检查。回滚不重新编译代码，也不会删除当前或历史 release。
+
 ## GitHub Secrets
 
 在 GitHub 仓库设置中进入 `Settings -> Secrets and variables -> Actions`，新增：

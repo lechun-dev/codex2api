@@ -452,6 +452,9 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		FirstTokenExcludesWsAcquire:         true,
 		CodexPreflightSSEPassthroughEnabled: true,
 		UTLSShutdownTimeoutMinutes:          45,
+		ClaudeConfig:                        `{"base_url":"https://claude.example.test"}`,
+		SchedulerEngine:                     "outbox",
+		CodexRequestCompression:             true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -485,48 +488,36 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"overflow_auto_compact_enabled = VALUES(overflow_auto_compact_enabled)",
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
 		"grok_config = VALUES(grok_config)",
+		"claude_config = VALUES(claude_config)",
 		"codex_preflight_sse_passthrough_enabled = VALUES(codex_preflight_sse_passthrough_enabled)",
 		"utls_shutdown_timeout_minutes = VALUES(utls_shutdown_timeout_minutes)",
 		"session_affinity_spread = VALUES(session_affinity_spread)",
+		"scheduler_engine = VALUES(scheduler_engine)",
+		"codex_request_compression = VALUES(codex_request_compression)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 116 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 116", got)
+	if got := strings.Count(capture.query, "?"); got != 123 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 123", got)
 	}
-	if len(capture.args) != 116 {
-		t.Fatalf("rewritten settings argument count = %d, want 116", len(capture.args))
+	if len(capture.args) != 123 {
+		t.Fatalf("rewritten settings argument count = %d, want 123", len(capture.args))
 	}
 	wantTail := []interface{}{
-		settings.ModelPricingOverrides,
-		settings.ModelPricingSyncURL,
-		settings.IgnoreUsageLimitStatus,
-		settings.AutoResetCreditsEnabled,
-		int64(settings.AutoResetCreditsBeforeExpiryMin),
-		settings.PromptFilterStrictTerminalEnabled,
-		settings.PromptFilterAdvancedConfig,
-		settings.PayloadRules,
-		settings.PublicAccountPortalPageEnabled,
-		settings.CodexWSSizeRouterEnabled,
-		int64(settings.CodexWSBusyAcquireMaxWaitSec),
-		settings.CodexWSBusyOverflowEnabled,
-		int64(settings.CodexWSBusyPatienceSec),
-		settings.OverflowAutoCompactEnabled,
-		settings.FirstTokenExcludesWsAcquire,
-		settings.CodexPreflightSSEPassthroughEnabled,
-		int64(settings.UTLSShutdownTimeoutMinutes),
-		settings.CodexWSWeakNetworkMode,
-		NormalizeCodexFingerprintDefaultMode(settings.CodexFingerprintDefaultMode),
-		settings.CompactViaResponsesEnabled,
-		int64(settings.CodexWSStatelessSlots),
 		settings.GithubToken,
 		settings.GithubProxyURL,
 		settings.CodexOverloadPauseEnabled,
 		int64(settings.CodexOverloadThresholdPercent),
 		int64(settings.CodexOverloadPauseMinutes),
 		int64(settings.CodexOverloadWindowMinutes),
+		settings.SessionSlotBufferEnabled,
+		int64(NormalizeSessionSlotBufferSeconds(settings.SessionSlotBufferSeconds)),
+		NormalizeModelsListReadMaxBytes(settings.ModelsListReadMaxBytes),
+		settings.AutoActivate5hWindowEnabled,
+		settings.SchedulerEngine,
+		settings.CodexRequestCompression,
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}

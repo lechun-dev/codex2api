@@ -287,7 +287,8 @@ func TestPromptRiskProfilesSurviveIncidentClear(t *testing.T) {
 func TestPromptRiskProfilesUseStableTieBreakerAcrossPages(t *testing.T) {
 	db := newPromptPolicySQLiteTestDB(t)
 	ctx := context.Background()
-	createdAt := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	// 2026-09-02 coder(lq): Keep the tie-breaker fixture inside the rolling 30-day window.
+	createdAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	for index := 0; index < 6; index++ {
 		userID := fmt.Sprintf("stable-user-%d", index)
 		subjectKey := PromptRiskNewAPIUserSubjectKey("gateway-a", userID)
@@ -295,7 +296,7 @@ func TestPromptRiskProfilesUseStableTieBreakerAcrossPages(t *testing.T) {
 			created_at, source_type, source_id, subject_type, subject_key, subject_display, platform,
 			is_person, identity_confidence, event_kind, request_risk_score, evidence_confidence, action
 		) VALUES ($1,'prompt_filter',$2,'newapi_user',$3,$4,'gateway-a',true,100,'local_warn',45,100,'warn')`,
-			createdAt, fmt.Sprintf("stable-source-%d", index), subjectKey, userID); err != nil {
+			sqliteTimeParam(createdAt), fmt.Sprintf("stable-source-%d", index), subjectKey, userID); err != nil {
 			t.Fatalf("insert stable profile: %v", err)
 		}
 	}
@@ -313,6 +314,44 @@ func TestPromptRiskProfilesUseStableTieBreakerAcrossPages(t *testing.T) {
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unstable page order got=%#v want=%#v", got, want)
+	}
+}
+
+func TestPromptRiskProfilesFilterUpstreamCYAndActivityState(t *testing.T) {
+	db := newPromptPolicySQLiteTestDB(t)
+	ctx := context.Background()
+	if err := db.UpsertPromptRiskIdentities(ctx, []PromptRiskIdentityInput{{
+		Platform: "gateway-a", ExternalUserID: "identity-only", UserName: "identity-only-user", Source: "test",
+	}}); err != nil {
+		t.Fatalf("UpsertPromptRiskIdentities: %v", err)
+	}
+	now := time.Now().UTC()
+	for _, item := range []struct {
+		sourceID, subjectKey, kind string
+		score                      int
+	}{
+		{"cy-profile", "cy-user", "upstream_cy_policy", 80},
+		{"local-profile", "local-user", "local_warn", 20},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO prompt_risk_events (
+			created_at, source_type, source_id, subject_type, subject_key, subject_display,
+			identity_confidence, event_kind, request_risk_score, evidence_confidence, action
+		) VALUES ($1,'prompt_policy_incident',$2,'newapi_user',$3,$3,100,$4,100,100,'warn')`,
+			now, item.sourceID, item.subjectKey, item.kind, item.score); err != nil {
+			t.Fatalf("insert profile %s: %v", item.sourceID, err)
+		}
+	}
+	cyOnly, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{Page: 1, PageSize: 20, UpstreamCYOnly: true})
+	if err != nil || total != 1 || len(cyOnly) != 1 || cyOnly[0].SubjectKey != "cy-user" {
+		t.Fatalf("CY-only profiles total=%d items=%#v err=%v", total, cyOnly, err)
+	}
+	active, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{Page: 1, PageSize: 20, ActivityState: "active"})
+	if err != nil || total != 2 || len(active) != 2 {
+		t.Fatalf("active profiles total=%d items=%#v err=%v", total, active, err)
+	}
+	identityOnly, total, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{Page: 1, PageSize: 20, ActivityState: "identity_only"})
+	if err != nil || total != 1 || len(identityOnly) != 1 || identityOnly[0].NewAPIUserID != "identity-only" {
+		t.Fatalf("identity-only profiles total=%d items=%#v err=%v", total, identityOnly, err)
 	}
 }
 
@@ -361,6 +400,20 @@ func TestPromptRiskProfilesPrioritizeAndFilterActiveConversationLocksBeforePagin
 	})
 	if err != nil || lockedTotal != 1 || len(lockedOnly) != 1 || lockedOnly[0].SubjectKey != lockedSession {
 		t.Fatalf("locked-only profiles total=%d items=%#v err=%v", lockedTotal, lockedOnly, err)
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM prompt_risk_events WHERE subject_type=$1 AND subject_key=$2`, PromptRiskSubjectSession, lockedSession); err != nil {
+		t.Fatalf("clear locked session risk history: %v", err)
+	}
+	lockOnlyProfile, lockOnlyTotal, err := db.ListPromptRiskProfiles(ctx, PromptRiskProfileQuery{
+		Page: 1, PageSize: 20, SubjectType: PromptRiskSubjectSession, ActiveLocksOnly: true,
+		ConversationLockTTL: 168 * time.Hour, UserCyberCooldownTTL: 30 * time.Minute,
+	})
+	if err != nil || lockOnlyTotal != 1 || len(lockOnlyProfile) != 1 {
+		t.Fatalf("lock-only profile total=%d items=%#v err=%v", lockOnlyTotal, lockOnlyProfile, err)
+	}
+	if lockOnlyProfile[0].SubjectKey != lockedSession || lockOnlyProfile[0].HasActivity || lockOnlyProfile[0].APIKeyID != 9 || lockOnlyProfile[0].RiskLevel != PromptRiskLevelLow {
+		t.Fatalf("lock-only profile metadata=%#v", lockOnlyProfile[0])
 	}
 }
 

@@ -132,6 +132,8 @@ type PromptRiskProfileQuery struct {
 	AccountID             int64
 	MinScore              int
 	Query                 string
+	UpstreamCYOnly        bool
+	ActivityState         string
 	PrioritizeActiveLocks bool
 	ActiveLocksOnly       bool
 	ConversationLockTTL   time.Duration
@@ -214,6 +216,11 @@ type promptRiskAggregate struct {
 	WeightedLocal      int64
 	WeightedUpstream   int64
 	WeightedUnverified int64
+}
+
+type promptRiskActiveRestriction struct {
+	LockedAt time.Time
+	Lock     *PromptConversationLock
 }
 
 func parsePromptRiskTimeValue(value any) (time.Time, error) {
@@ -1020,51 +1027,139 @@ func applyPromptRiskIdentityToEvent(event *PromptRiskEvent, identity promptRiskI
 // restricted by a live conversation lock or user cooldown. It is intentionally
 // read-only: stale rows remain historical evidence and are excluded by the
 // configured TTL instead of being updated while the admin list is loading.
-func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversationTTL, userCooldownTTL time.Duration) (map[string]time.Time, error) {
-	result := make(map[string]time.Time)
+func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversationTTL, userCooldownTTL time.Duration) (map[string]promptRiskActiveRestriction, error) {
+	result := make(map[string]promptRiskActiveRestriction)
 	if db == nil {
 		return result, nil
 	}
 	// The lock table is created once during database startup. Do not run DDL
 	// from this read path: repeated CREATE/ALTER checks on a busy SQLite instance
 	// can contend with OAuth and usage-log writers even when the schema is stable.
-	rows, err := db.conn.QueryContext(ctx, `SELECT session_hash, platform, newapi_user_id, reason_code, locked_at
-		FROM prompt_conversation_locks WHERE status='active'`)
+	rows, err := db.conn.QueryContext(ctx, promptConversationLockSelect+` WHERE status='active'`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	now := time.Now().UTC()
 	for rows.Next() {
-		var sessionHash, platform, userID, reasonCode string
-		var lockedRaw any
-		if err := rows.Scan(&sessionHash, &platform, &userID, &reasonCode, &lockedRaw); err != nil {
-			return nil, err
-		}
-		lockedAt, err := parsePromptRiskTimeValue(lockedRaw)
+		lock, err := scanPromptConversationLock(rows)
 		if err != nil {
 			return nil, err
 		}
-		if sessionHash = strings.ToLower(strings.TrimSpace(sessionHash)); sessionHash != "" &&
-			(conversationTTL <= 0 || lockedAt.After(now.Add(-conversationTTL))) {
+		if sessionHash := strings.ToLower(strings.TrimSpace(lock.SessionHash)); sessionHash != "" &&
+			(conversationTTL <= 0 || lock.LockedAt.After(now.Add(-conversationTTL))) {
 			key := PromptRiskSubjectSession + "\x00" + sessionHash
-			if current, ok := result[key]; !ok || lockedAt.After(current) {
-				result[key] = lockedAt
+			if current, ok := result[key]; !ok || lock.LockedAt.After(current.LockedAt) {
+				result[key] = promptRiskActiveRestriction{LockedAt: lock.LockedAt, Lock: lock}
 			}
 		}
 		// Only a real upstream CYB expands to user scope. Local deterministic
 		// blocks remain attached to the exact session to avoid implicating every
 		// conversation of a shared user.
-		if reasonCode == "upstream_cyber_policy" && (userCooldownTTL <= 0 || lockedAt.After(now.Add(-userCooldownTTL))) {
-			if subjectKey := PromptRiskNewAPIUserSubjectKey(platform, userID); subjectKey != "" {
+		if lock.ReasonCode == "upstream_cyber_policy" && (userCooldownTTL <= 0 || lock.LockedAt.After(now.Add(-userCooldownTTL))) {
+			if subjectKey := PromptRiskNewAPIUserSubjectKey(lock.Platform, lock.NewAPIUserID); subjectKey != "" {
 				key := PromptRiskSubjectNewAPIUser + "\x00" + subjectKey
-				if current, ok := result[key]; !ok || lockedAt.After(current) {
-					result[key] = lockedAt
+				if current, ok := result[key]; !ok || lock.LockedAt.After(current.LockedAt) {
+					result[key] = promptRiskActiveRestriction{LockedAt: lock.LockedAt, Lock: lock}
 				}
 			}
 		}
 	}
 	return result, rows.Err()
+}
+
+func promptRiskAppendLockOnlyAggregates(aggregates []promptRiskAggregate, restrictions map[string]promptRiskActiveRestriction, query PromptRiskProfileQuery) []promptRiskAggregate {
+	if len(restrictions) == 0 {
+		return aggregates
+	}
+	existing := make(map[string]struct{}, len(aggregates))
+	for i := range aggregates {
+		existing[aggregates[i].Profile.SubjectType+"\x00"+aggregates[i].Profile.SubjectKey] = struct{}{}
+	}
+	for key, restriction := range restrictions {
+		if _, ok := existing[key]; ok || restriction.Lock == nil {
+			continue
+		}
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		profile := promptRiskProfileFromActiveRestriction(parts[0], parts[1], restriction)
+		if !promptRiskLockOnlyProfileMatchesQuery(profile, query) {
+			continue
+		}
+		aggregates = append(aggregates, promptRiskAggregate{Profile: profile})
+		existing[key] = struct{}{}
+	}
+	return aggregates
+}
+
+func promptRiskProfileFromActiveRestriction(subjectType, subjectKey string, restriction promptRiskActiveRestriction) PromptRiskProfile {
+	lockCopy := *restriction.Lock
+	lockCopy.RestrictionScope = PromptConversationRestrictionScopeConversation
+	if subjectType == PromptRiskSubjectNewAPIUser {
+		lockCopy.RestrictionScope = PromptConversationRestrictionScopeUserCooldown
+	}
+	display := subjectKey
+	if subjectType == PromptRiskSubjectSession && len(subjectKey) >= 8 {
+		display = "session-" + subjectKey[:8]
+	}
+	profile := PromptRiskProfile{
+		SubjectType: subjectType, SubjectKey: subjectKey, SubjectDisplay: display, Platform: restriction.Lock.Platform,
+		IsPerson: subjectType == PromptRiskSubjectNewAPIUser, IdentityConfidence: 100,
+		RiskLevel: PromptRiskLevelLow, RecommendedActions: []string{"observe"},
+		HasActivity: false, LatestAt: restriction.Lock.LockedAt,
+		APIKeyID:         promptRiskAPIKeyIDFromLock(*restriction.Lock),
+		ConversationLock: &lockCopy,
+		ScoreBreakdown:   PromptRiskScoreBreakdown{IdentityConfidence: 100},
+	}
+	if subjectType == PromptRiskSubjectNewAPIUser {
+		profile.NewAPIUserID = restriction.Lock.NewAPIUserID
+	}
+	return profile
+}
+
+func promptRiskAPIKeyIDFromLock(lock PromptConversationLock) int64 {
+	const prefix = "apikey:"
+	if !strings.HasPrefix(lock.NewAPIUserID, prefix) {
+		return 0
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(lock.NewAPIUserID, prefix)), 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+func promptRiskLockOnlyProfileMatchesQuery(profile PromptRiskProfile, query PromptRiskProfileQuery) bool {
+	if value := strings.TrimSpace(query.SubjectType); value != "" && value != "all" && profile.SubjectType != value {
+		return false
+	}
+	if value := strings.TrimSpace(query.SubjectKey); value != "" && profile.SubjectKey != value {
+		return false
+	}
+	if value := strings.TrimSpace(query.Platform); value != "" && profile.Platform != value {
+		return false
+	}
+	if query.APIKeyID > 0 && profile.APIKeyID != query.APIKeyID {
+		return false
+	}
+	if query.AccountID > 0 || query.UpstreamCYOnly || query.MinScore > 0 {
+		return false
+	}
+	if level := strings.TrimSpace(query.RiskLevel); level != "" && level != "all" && profile.RiskLevel != level {
+		return false
+	}
+	if q := strings.ToLower(strings.TrimSpace(query.Query)); q != "" {
+		haystack := strings.ToLower(strings.Join([]string{
+			profile.SubjectType, profile.SubjectKey, profile.SubjectDisplay, profile.Platform,
+			profile.NewAPIUserID, profile.APIKeyName, profile.APIKeyMasked,
+		}, "\x00"))
+		if !strings.Contains(haystack, q) {
+			return false
+		}
+	}
+	return true
 }
 
 func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfileQuery) ([]*PromptRiskProfile, int, error) {
@@ -1100,6 +1195,9 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 	if query.AccountID > 0 {
 		args = append(args, query.AccountID)
 		clauses = append(clauses, fmt.Sprintf("account_id=$%d", len(args)))
+	}
+	if query.UpstreamCYOnly {
+		clauses = append(clauses, "event_kind LIKE 'upstream_cy_%'")
 	}
 	if value := strings.TrimSpace(query.Query); value != "" {
 		args = append(args, "%"+strings.ToLower(value)+"%")
@@ -1213,8 +1311,12 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		}
 	}
 	filtered := aggregates[:0]
+	activityState := strings.ToLower(strings.TrimSpace(query.ActivityState))
 	for i := range aggregates {
 		finalizePromptRiskAggregate(&aggregates[i])
+		if activityState == "identity_only" && aggregates[i].Profile.HasActivity {
+			continue
+		}
 		if query.MinScore > 0 && aggregates[i].Profile.RiskScore < query.MinScore {
 			continue
 		}
@@ -1239,7 +1341,8 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 	}
 	includeIdentityDirectory := query.APIKeyID == 0 && query.AccountID == 0 &&
 		(strings.TrimSpace(query.SubjectType) == "" || strings.TrimSpace(query.SubjectType) == "all" || strings.TrimSpace(query.SubjectType) == PromptRiskSubjectNewAPIUser) &&
-		query.MinScore == 0 && (strings.TrimSpace(query.RiskLevel) == "" || strings.TrimSpace(query.RiskLevel) == "all" || strings.TrimSpace(query.RiskLevel) == PromptRiskLevelLow)
+		query.MinScore == 0 && !query.UpstreamCYOnly && activityState != "active" &&
+		(strings.TrimSpace(query.RiskLevel) == "" || strings.TrimSpace(query.RiskLevel) == "all" || strings.TrimSpace(query.RiskLevel) == PromptRiskLevelLow)
 	if includeIdentityDirectory {
 		directory, listErr := db.listPromptRiskIdentities(ctx)
 		if listErr != nil {
@@ -1279,18 +1382,44 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 			aggregates = append(aggregates, promptRiskAggregate{Profile: profile})
 		}
 	}
-	activeRestrictions := map[string]time.Time{}
+	activeRestrictions := map[string]promptRiskActiveRestriction{}
 	if query.PrioritizeActiveLocks || query.ActiveLocksOnly {
 		activeRestrictions, err = db.promptRiskActiveRestrictionSubjects(ctx, query.ConversationLockTTL, query.UserCyberCooldownTTL)
 		if err != nil {
 			return nil, 0, err
 		}
 	}
+	for i := range aggregates {
+		profileKey := aggregates[i].Profile.SubjectType + "\x00" + aggregates[i].Profile.SubjectKey
+		restriction, active := activeRestrictions[profileKey]
+		if !active || restriction.Lock == nil {
+			continue
+		}
+		lockCopy := *restriction.Lock
+		lockCopy.RestrictionScope = PromptConversationRestrictionScopeConversation
+		if aggregates[i].Profile.SubjectType == PromptRiskSubjectNewAPIUser {
+			lockCopy.RestrictionScope = PromptConversationRestrictionScopeUserCooldown
+		}
+		aggregates[i].Profile.ConversationLock = &lockCopy
+		if aggregates[i].Profile.APIKeyID == 0 {
+			aggregates[i].Profile.APIKeyID = promptRiskAPIKeyIDFromLock(lockCopy)
+		}
+	}
+	aggregates = promptRiskAppendLockOnlyAggregates(aggregates, activeRestrictions, query)
 	if query.ActiveLocksOnly {
 		filtered := aggregates[:0]
 		for i := range aggregates {
 			profileKey := aggregates[i].Profile.SubjectType + "\x00" + aggregates[i].Profile.SubjectKey
 			if _, active := activeRestrictions[profileKey]; active {
+				filtered = append(filtered, aggregates[i])
+			}
+		}
+		aggregates = filtered
+	}
+	if activityState == "active" || activityState == "identity_only" {
+		filtered := aggregates[:0]
+		for i := range aggregates {
+			if (activityState == "active") == aggregates[i].Profile.HasActivity {
 				filtered = append(filtered, aggregates[i])
 			}
 		}
@@ -1304,8 +1433,8 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 		if leftLocked != rightLocked {
 			return leftLocked
 		}
-		if leftLocked && !leftLockedAt.Equal(rightLockedAt) {
-			return leftLockedAt.After(rightLockedAt)
+		if leftLocked && !leftLockedAt.LockedAt.Equal(rightLockedAt.LockedAt) {
+			return leftLockedAt.LockedAt.After(rightLockedAt.LockedAt)
 		}
 		if aggregates[i].Profile.RiskScore == aggregates[j].Profile.RiskScore {
 			if aggregates[i].Profile.LatestAt.Equal(aggregates[j].Profile.LatestAt) {

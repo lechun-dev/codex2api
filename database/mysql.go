@@ -24,6 +24,8 @@ const (
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "grok_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "claude_config", def: "TEXT NULL"},
+	// 2026-09-03 coder(lq): Keep the Antigravity OAuth JSON setting available in existing MySQL 5.6 schemas.
+	{table: "system_settings", name: "antigravity_oauth_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "payload_rules", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "prompt_filter_strict_terminal_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "prompt_filter_advanced_config", def: "MEDIUMTEXT NULL"},
@@ -723,6 +725,7 @@ func systemSettingsMySQLDDL() string {
 		proxy_pool_enabled TINYINT(1) DEFAULT 0,
 		fast_scheduler_enabled TINYINT(1) DEFAULT 0,
 		claude_config TEXT NULL,
+		antigravity_oauth_config TEXT NULL,
 		max_retries INT DEFAULT 2,
 		max_rate_limit_retries INT DEFAULT 1,
 		reasoning_effort_models TEXT NULL,

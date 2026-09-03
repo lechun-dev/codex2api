@@ -84,6 +84,12 @@ func (db *DB) ensureOfficialPricingSyncConfig(ctx context.Context) error {
 	if _, err := db.conn.ExecContext(ctx, ddl); err != nil {
 		return err
 	}
+	if db.isMySQL() {
+		// 2026-09-03 coder(lq): CREATE TABLE does not alter an existing MySQL table, so add the Claude source flag explicitly for older schemas.
+		if err := db.ensureMySQLColumn(ctx, "official_pricing_sync_config", "include_claude", "TINYINT(1) NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
+	}
 	_, err := db.conn.ExecContext(ctx, seed)
 	if err == nil {
 		officialPricingConfigReady[db] = true

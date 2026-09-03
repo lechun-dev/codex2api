@@ -79,6 +79,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_overload_window_minutes INT DEFAULT 5",
 		"prompt_filter_review_model VARCHAR(100) DEFAULT 'deepseek-v4-flash'",
 		"claude_config TEXT NULL",
+		"antigravity_oauth_config TEXT NULL",
 		"scheduler_engine TEXT NULL",
 		"codex_request_compression TINYINT(1) DEFAULT 1",
 	} {

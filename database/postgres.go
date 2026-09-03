@@ -484,6 +484,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
+	if err := db.ensureOfficialPricingSyncConfig(ctx); err != nil {
+		return nil, fmt.Errorf("初始化官方价格同步配置失败: %w", err)
+	}
 	if err := db.ensureAPIKeyClientsTable(ctx); err != nil {
 		return nil, fmt.Errorf("创建 API Key 客户端统计表失败: %w", err)
 	}

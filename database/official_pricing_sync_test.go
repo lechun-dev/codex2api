@@ -15,6 +15,16 @@ func TestOfficialPricingSyncConfigLifecycleSQLite(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx := context.Background()
 
+	var includeClaude bool
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT include_claude FROM official_pricing_sync_config WHERE singleton_id = 1
+	`).Scan(&includeClaude); err != nil {
+		t.Fatalf("startup should initialize official pricing sync config: %v", err)
+	}
+	if !includeClaude {
+		t.Fatal("startup should enable Claude pricing sync by default")
+	}
+
 	initial, err := db.GetOfficialPricingSyncConfig(ctx)
 	if err != nil {
 		t.Fatalf("Get initial config: %v", err)

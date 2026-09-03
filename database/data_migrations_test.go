@@ -43,3 +43,34 @@ func TestDataMigrationInsertSQLPostgresStyleDefault(t *testing.T) {
 		t.Fatalf("default migration insert should preserve positional placeholder: %s", query)
 	}
 }
+
+func TestAccountGroupUpstreamTypeExpressionMySQL56Compatible(t *testing.T) {
+	db := &DB{driver: "mysql"}
+	query := accountGroupUpstreamTypeExpression(db)
+
+	if !strings.Contains(query, "CAST(a.credentials AS CHAR)") {
+		t.Fatalf("MySQL group expression should read MEDIUMTEXT credentials: %s", query)
+	}
+	if !strings.Contains(query, "THEN 'grok'") || !strings.Contains(query, "ELSE ''") {
+		t.Fatalf("MySQL group expression should return a provider string: %s", query)
+	}
+	for _, incompatible := range []string{"->>", "JSON_EXTRACT", "ON CONFLICT", "RETURNING"} {
+		if strings.Contains(strings.ToUpper(query), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 group expression contains incompatible syntax %q: %s", incompatible, query)
+		}
+	}
+}
+
+func TestClaudeBackfillProviderExpressionMySQL56Compatible(t *testing.T) {
+	db := &DB{driver: "mysql"}
+	query := `SELECT id FROM accounts a WHERE ` + claudeBackfillProviderExpression(db) + ` = 'claude'`
+
+	if !strings.Contains(query, `CAST(a.credentials AS CHAR)`) || !strings.Contains(query, `THEN 'claude'`) {
+		t.Fatalf("MySQL Claude expression should inspect text credentials and return claude: %s", query)
+	}
+	for _, incompatible := range []string{"->>", "JSON_EXTRACT", "ON CONFLICT", "RETURNING"} {
+		if strings.Contains(strings.ToUpper(query), strings.ToUpper(incompatible)) {
+			t.Fatalf("MySQL 5.6 Claude expression contains incompatible syntax %q: %s", incompatible, query)
+		}
+	}
+}

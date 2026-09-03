@@ -210,6 +210,7 @@ func (db *DB) installSchedulerOutboxTriggers(ctx context.Context) error {
 }
 
 func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
+	// 2026-09-03 coder(lq): MySQL 5.6 permits only one trigger per table/event/timing; keep account routing and Grok maintenance in one trigger each.
 	statements := []string{
 		`DROP TRIGGER IF EXISTS scheduler_outbox_accounts_insert`,
 		`DROP TRIGGER IF EXISTS scheduler_outbox_accounts_update`,
@@ -235,6 +236,14 @@ func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
 		`CREATE TRIGGER scheduler_outbox_accounts_insert AFTER INSERT ON accounts FOR EACH ROW
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('account',NEW.id,'created');
+			IF LOWER(COALESCE(CAST(NEW.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'
+				AND NEW.status<>'deleted'
+				AND COALESCE(NEW.error_message,'')<>'deleted'
+				AND COALESCE(NEW.enabled,1)<>0 THEN
+				INSERT INTO maintenance_jobs(entity_id,job_kind,due_at,updated_at)
+				VALUES(NEW.id,'grok_freshness',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+				ON DUPLICATE KEY UPDATE due_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP;
+			END IF;
 		END`,
 		`CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE ON accounts FOR EACH ROW
 		BEGIN
@@ -256,10 +265,28 @@ func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
 				OR NOT (OLD.credential_generation <=> NEW.credential_generation) THEN
 				INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('account',NEW.id,'updated');
 			END IF;
+			IF NOT (OLD.credential_generation <=> NEW.credential_generation)
+				OR NOT (OLD.credentials <=> NEW.credentials)
+				OR NOT (OLD.status <=> NEW.status)
+				OR NOT (OLD.error_message <=> NEW.error_message)
+				OR NOT (OLD.enabled <=> NEW.enabled)
+				OR NOT (OLD.deleted_at <=> NEW.deleted_at) THEN
+				IF LOWER(COALESCE(CAST(NEW.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'
+					AND NEW.status<>'deleted'
+					AND COALESCE(NEW.error_message,'')<>'deleted'
+					AND COALESCE(NEW.enabled,1)<>0 THEN
+					INSERT INTO maintenance_jobs(entity_id,job_kind,due_at,updated_at)
+					VALUES(NEW.id,'grok_freshness',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+					ON DUPLICATE KEY UPDATE due_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP;
+				ELSE
+					DELETE FROM maintenance_jobs WHERE entity_id=NEW.id AND job_kind='grok_freshness';
+				END IF;
+			END IF;
 		END`,
 		`CREATE TRIGGER scheduler_outbox_accounts_delete AFTER DELETE ON accounts FOR EACH ROW
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('account',OLD.id,'deleted');
+			DELETE FROM maintenance_jobs WHERE entity_id=OLD.id AND job_kind='grok_freshness';
 		END`,
 		`CREATE TRIGGER scheduler_outbox_api_keys_insert AFTER INSERT ON api_keys FOR EACH ROW
 		BEGIN
@@ -328,41 +355,6 @@ func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
 		`CREATE TRIGGER scheduler_outbox_settings_update AFTER UPDATE ON system_settings FOR EACH ROW
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('settings',NEW.id,'updated');
-		END`,
-		`CREATE TRIGGER grok_maintenance_accounts_insert AFTER INSERT ON accounts FOR EACH ROW
-		BEGIN
-			IF LOWER(COALESCE(CAST(NEW.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'
-				AND NEW.status<>'deleted'
-				AND COALESCE(NEW.error_message,'')<>'deleted'
-				AND COALESCE(NEW.enabled,1)<>0 THEN
-				INSERT INTO maintenance_jobs(entity_id,job_kind,due_at,updated_at)
-				VALUES(NEW.id,'grok_freshness',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
-				ON DUPLICATE KEY UPDATE due_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP;
-			END IF;
-		END`,
-		`CREATE TRIGGER grok_maintenance_accounts_update AFTER UPDATE ON accounts FOR EACH ROW
-		BEGIN
-			IF NOT (OLD.credential_generation <=> NEW.credential_generation)
-				OR NOT (OLD.credentials <=> NEW.credentials)
-				OR NOT (OLD.status <=> NEW.status)
-				OR NOT (OLD.error_message <=> NEW.error_message)
-				OR NOT (OLD.enabled <=> NEW.enabled)
-				OR NOT (OLD.deleted_at <=> NEW.deleted_at) THEN
-				IF LOWER(COALESCE(CAST(NEW.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'
-					AND NEW.status<>'deleted'
-					AND COALESCE(NEW.error_message,'')<>'deleted'
-					AND COALESCE(NEW.enabled,1)<>0 THEN
-					INSERT INTO maintenance_jobs(entity_id,job_kind,due_at,updated_at)
-					VALUES(NEW.id,'grok_freshness',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
-					ON DUPLICATE KEY UPDATE due_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP;
-				ELSE
-					DELETE FROM maintenance_jobs WHERE entity_id=NEW.id AND job_kind='grok_freshness';
-				END IF;
-			END IF;
-		END`,
-		`CREATE TRIGGER grok_maintenance_accounts_delete AFTER DELETE ON accounts FOR EACH ROW
-		BEGIN
-			DELETE FROM maintenance_jobs WHERE entity_id=OLD.id AND job_kind='grok_freshness';
 		END`,
 	}
 	for _, stmt := range statements {

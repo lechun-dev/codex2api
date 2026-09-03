@@ -47,6 +47,8 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "response_cache_local_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
 	{table: "system_settings", name: "response_cache_local_max_entry_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
 	{table: "system_settings", name: "response_cache_reconstruct_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
+	// 2026-09-03 lq: Ensure the response cache write policy is added to existing MySQL 5.6 schemas before settings are read.
+	{table: "system_settings", name: "response_cache_write_policy", def: "VARCHAR(20) NOT NULL DEFAULT 'always'"},
 	{table: "system_settings", name: "response_cache_config_generation", def: "BIGINT NOT NULL DEFAULT 1"},
 	{table: "system_settings", name: "continuous_retry_policy", def: "TEXT NULL"},
 	{table: "system_settings", name: "session_slot_buffer_enabled", def: "TINYINT(1) DEFAULT 0"},
@@ -806,6 +808,7 @@ func systemSettingsMySQLDDL() string {
 		response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+		response_cache_write_policy VARCHAR(20) NOT NULL DEFAULT 'always',
 		response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
 		continuous_retry_policy TEXT NULL,
 		session_slot_buffer_enabled TINYINT(1) DEFAULT 0,

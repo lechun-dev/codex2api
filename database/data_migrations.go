@@ -95,7 +95,27 @@ func accountGroupUpstreamTypeExpression(db *DB) string {
 		return `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
 	}
 	if db.isMySQL() {
-		return `LOWER(COALESCE(CAST(a.credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+		return `CASE
+			WHEN LOWER(COALESCE(CAST(a.credentials AS CHAR), '')) REGEXP
+				'"upstream_type"[[:space:]]*:[[:space:]]*"grok"'
+			THEN 'grok'
+			ELSE ''
+		END`
+	}
+	return `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
+}
+
+func claudeBackfillProviderExpression(db *DB) string {
+	if db.isSQLite() {
+		return `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
+	}
+	if db.isMySQL() {
+		return `CASE
+			WHEN LOWER(COALESCE(CAST(a.credentials AS CHAR), '')) REGEXP
+				'"upstream_type"[[:space:]]*:[[:space:]]*"claude"'
+			THEN 'claude'
+			ELSE ''
+		END`
 	}
 	return `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
 }
@@ -144,10 +164,7 @@ func (db *DB) backfillUsageLogChannel(ctx context.Context, tx *sql.Tx) error {
 // legacy zero). Pure/mixed groups are left untouched; only groups whose active
 // members are all Claude accounts are promoted from the legacy Codex channel.
 func (db *DB) backfillClaudeProviderData(ctx context.Context, tx *sql.Tx) error {
-	upstreamTypeExpr := `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
-	if db.isSQLite() {
-		upstreamTypeExpr = `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
-	}
+	upstreamTypeExpr := claudeBackfillProviderExpression(db)
 	// Do not update usage_logs with a correlated account subquery. On a large
 	// history that shape forces a full usage_logs scan (and a repeated accounts
 	// scan) while the migration holds the startup write transaction. Resolve the

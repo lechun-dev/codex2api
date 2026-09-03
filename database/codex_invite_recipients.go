@@ -166,6 +166,30 @@ func codexInviteRecipientDDL(sqlite bool) []string {
 	}
 }
 
+// 2026-09-03 coder(lq): MySQL 5.6 does not support PostgreSQL TEXT defaults, CHECK constraints, or CREATE INDEX IF NOT EXISTS.
+func codexInviteRecipientMySQLDDL() []string {
+	return []string{`CREATE TABLE IF NOT EXISTS codex_invite_recipients (
+		email_key VARCHAR(191) PRIMARY KEY,
+		email TEXT NOT NULL,
+		sender_account_id BIGINT NOT NULL DEFAULT 0,
+		program_id VARCHAR(191) NOT NULL DEFAULT '',
+		entrypoint VARCHAR(191) NOT NULL DEFAULT '',
+		state VARCHAR(20) NOT NULL,
+		reservation_id VARCHAR(191) NOT NULL DEFAULT '',
+		request_id VARCHAR(191) NOT NULL DEFAULT '',
+		referral_id VARCHAR(191) NOT NULL DEFAULT '',
+		invite_url TEXT NOT NULL,
+		upstream_status INT NOT NULL DEFAULT 0,
+		upstream_recipient_status VARCHAR(191) NOT NULL DEFAULT '',
+		invited_at DATETIME NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE INDEX idx_codex_invite_recipients_state ON codex_invite_recipients(state, updated_at)`,
+		`CREATE INDEX idx_codex_invite_recipients_reservation ON codex_invite_recipients(reservation_id)`,
+	}
+}
+
 func (db *DB) ensureCodexInviteRecipientTable(ctx context.Context) error {
 	if db == nil || db.conn == nil {
 		return fmt.Errorf("数据库不可用")
@@ -175,9 +199,22 @@ func (db *DB) ensureCodexInviteRecipientTable(ctx context.Context) error {
 	if codexInviteRecipientReady[db] {
 		return nil
 	}
-	for _, statement := range codexInviteRecipientDDL(db.isSQLite()) {
-		if _, err := db.conn.ExecContext(ctx, statement); err != nil {
+	if db.isMySQL() {
+		statements := codexInviteRecipientMySQLDDL()
+		if _, err := db.conn.ExecContext(ctx, statements[0]); err != nil {
 			return err
+		}
+		if err := db.ensureMySQLIndex(ctx, "codex_invite_recipients", "idx_codex_invite_recipients_state", statements[1]); err != nil {
+			return err
+		}
+		if err := db.ensureMySQLIndex(ctx, "codex_invite_recipients", "idx_codex_invite_recipients_reservation", statements[2]); err != nil {
+			return err
+		}
+	} else {
+		for _, statement := range codexInviteRecipientDDL(db.isSQLite()) {
+			if _, err := db.conn.ExecContext(ctx, statement); err != nil {
+				return err
+			}
 		}
 	}
 	codexInviteRecipientReady[db] = true

@@ -27,6 +27,10 @@ const usageStatsRollupInitTimeout = 5 * time.Minute
 
 const grokStateBackfillInitTimeout = 5 * time.Minute
 
+const databasePingTimeout = 10 * time.Second
+
+const databaseSchemaStartupTimeout = 5 * time.Minute
+
 // AccountRow 数据库中的账号行
 type AccountRow struct {
 	ID                      int64
@@ -410,14 +414,30 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		conn.SetConnMaxIdleTime(30 * time.Minute) // 增加空闲连接最大闲置时间
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	initialized := false
+	var backgroundTaskCancel context.CancelFunc
+	defer func() {
+		if initialized {
+			return
+		}
+		if backgroundTaskCancel != nil {
+			backgroundTaskCancel()
+		}
+		_ = conn.Close()
+	}()
 
-	if err := conn.PingContext(ctx); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), databasePingTimeout)
+	err = conn.PingContext(pingCtx)
+	pingCancel()
+	if err != nil {
 		return nil, fmt.Errorf("数据库连接测试失败: %w", err)
 	}
 
-	backgroundTaskCtx, backgroundTaskCancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), databaseSchemaStartupTimeout)
+	defer cancel()
+
+	backgroundTaskCtx, taskCancel := context.WithCancel(context.Background())
+	backgroundTaskCancel = taskCancel
 	db := &DB{
 		conn:                 conn,
 		driver:               driver,
@@ -475,7 +495,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	}
 	// The detached Grok backfill may legitimately consume minutes. Do not reuse
 	// the original ten-second startup context for the remaining small schemas.
-	postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), databaseSchemaStartupTimeout)
 	defer postGrokCancel()
 	ctx = postGrokCtx
 	if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
@@ -573,6 +593,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		})
 	}
 
+	initialized = true
 	return db, nil
 }
 
@@ -699,7 +720,7 @@ func grokStateStartupContext(parent context.Context) (context.Context, context.C
 }
 
 func (db *DB) ensureUsageStatsRollup(ctx context.Context) error {
-	for _, statement := range []string{`CREATE TABLE IF NOT EXISTS usage_stats_rollup (
+	statements := []string{`CREATE TABLE IF NOT EXISTS usage_stats_rollup (
 		channel VARCHAR(32) PRIMARY KEY,
 		total_requests BIGINT NOT NULL DEFAULT 0,
 		total_tokens BIGINT NOT NULL DEFAULT 0,
@@ -716,7 +737,28 @@ func (db *DB) ensureUsageStatsRollup(ctx context.Context) error {
 		initialized INTEGER NOT NULL DEFAULT 0,
 		last_log_id BIGINT NOT NULL DEFAULT 0,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	)`} {
+	)`}
+	if db.isMySQL() {
+		statements = []string{`CREATE TABLE IF NOT EXISTS usage_stats_rollup (
+			channel VARCHAR(32) NOT NULL PRIMARY KEY,
+			total_requests BIGINT NOT NULL DEFAULT 0,
+			total_tokens BIGINT NOT NULL DEFAULT 0,
+			prompt_tokens BIGINT NOT NULL DEFAULT 0,
+			completion_tokens BIGINT NOT NULL DEFAULT 0,
+			cached_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_hit_requests BIGINT NOT NULL DEFAULT 0,
+			first_token_ms_sum DOUBLE NOT NULL DEFAULT 0,
+			first_token_samples BIGINT NOT NULL DEFAULT 0,
+			account_billed DOUBLE NOT NULL DEFAULT 0,
+			user_billed DOUBLE NOT NULL DEFAULT 0
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`, `CREATE TABLE IF NOT EXISTS usage_stats_rollup_state (
+			id INT NOT NULL PRIMARY KEY,
+			initialized INT NOT NULL DEFAULT 0,
+			last_log_id BIGINT NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`}
+	}
+	for _, statement := range statements {
 		if _, err := db.conn.ExecContext(ctx, statement); err != nil {
 			return err
 		}
@@ -787,10 +829,17 @@ func (db *DB) rebuildUsageStatsRollup(ctx context.Context) error {
 		AND TRIM(COALESCE(channel, '')) <> '' GROUP BY TRIM(COALESCE(channel, ''))`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_stats_rollup_state (id, initialized, last_log_id, aggregation_version, updated_at)
+	stateQuery := `INSERT INTO usage_stats_rollup_state (id, initialized, last_log_id, aggregation_version, updated_at)
 		VALUES (1, 1, COALESCE((SELECT MAX(id) FROM usage_logs), 0), 2, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET initialized=1, last_log_id=excluded.last_log_id,
-			aggregation_version=excluded.aggregation_version, updated_at=CURRENT_TIMESTAMP`); err != nil {
+			aggregation_version=excluded.aggregation_version, updated_at=CURRENT_TIMESTAMP`
+	if db.isMySQL() {
+		stateQuery = `INSERT INTO usage_stats_rollup_state (id, initialized, last_log_id, aggregation_version, updated_at)
+			VALUES (1, 1, COALESCE((SELECT MAX(id) FROM usage_logs), 0), 2, CURRENT_TIMESTAMP)
+			ON DUPLICATE KEY UPDATE initialized=VALUES(initialized), last_log_id=VALUES(last_log_id),
+				aggregation_version=VALUES(aggregation_version), updated_at=CURRENT_TIMESTAMP`
+	}
+	if _, err := tx.ExecContext(ctx, stateQuery); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -827,7 +876,8 @@ func (db *DB) loadUsageStatsRollup(ctx context.Context, channel string) (usageSt
 	return result, err
 }
 
-func applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
+// 2026-09-03 coder(lq): Keep rollup writes explicit for MySQL 5.6 instead of relying on PostgreSQL upsert rewriting.
+func (db *DB) applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
 	if execer == nil || len(batch) == 0 {
 		return nil
 	}
@@ -863,7 +913,7 @@ func applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch 
 		}
 	}
 	for channel, item := range rollups {
-		if _, err := execer.ExecContext(ctx, `INSERT INTO usage_stats_rollup (
+		query := `INSERT INTO usage_stats_rollup (
 			channel, total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens,
 			cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -877,7 +927,25 @@ func applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch 
 			first_token_ms_sum=usage_stats_rollup.first_token_ms_sum+excluded.first_token_ms_sum,
 			first_token_samples=usage_stats_rollup.first_token_samples+excluded.first_token_samples,
 			account_billed=usage_stats_rollup.account_billed+excluded.account_billed,
-			user_billed=usage_stats_rollup.user_billed+excluded.user_billed`, channel, item.TotalRequests,
+			user_billed=usage_stats_rollup.user_billed+excluded.user_billed`
+		if db != nil && db.isMySQL() {
+			query = `INSERT INTO usage_stats_rollup (
+				channel, total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens,
+				cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			ON DUPLICATE KEY UPDATE
+				total_requests=usage_stats_rollup.total_requests+VALUES(total_requests),
+				total_tokens=usage_stats_rollup.total_tokens+VALUES(total_tokens),
+				prompt_tokens=usage_stats_rollup.prompt_tokens+VALUES(prompt_tokens),
+				completion_tokens=usage_stats_rollup.completion_tokens+VALUES(completion_tokens),
+				cached_tokens=usage_stats_rollup.cached_tokens+VALUES(cached_tokens),
+				cache_hit_requests=usage_stats_rollup.cache_hit_requests+VALUES(cache_hit_requests),
+				first_token_ms_sum=usage_stats_rollup.first_token_ms_sum+VALUES(first_token_ms_sum),
+				first_token_samples=usage_stats_rollup.first_token_samples+VALUES(first_token_samples),
+				account_billed=usage_stats_rollup.account_billed+VALUES(account_billed),
+				user_billed=usage_stats_rollup.user_billed+VALUES(user_billed)`
+		}
+		if _, err := execer.ExecContext(ctx, query, channel, item.TotalRequests,
 			item.TotalTokens, item.PromptTokens, item.CompletionTokens, item.CachedTokens, item.CacheHitRequests,
 			item.FirstTokenMsSum, item.FirstTokenSamples, item.TotalAccountBilled, item.TotalUserBilled); err != nil {
 			return err
@@ -4763,7 +4831,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
 		return fmt.Errorf("更新 API Key 额度用量: %w", err)
 	}
-	if err := applyUsageStatsRollupWithExec(ctx, tx, logsToStore); err != nil {
+	if err := db.applyUsageStatsRollupWithExec(ctx, tx, logsToStore); err != nil {
 		return fmt.Errorf("更新用量累计汇总: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -4810,7 +4878,7 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
 		return err
 	}
-	if err := applyUsageStatsRollupWithExec(ctx, tx, logsToStore); err != nil {
+	if err := db.applyUsageStatsRollupWithExec(ctx, tx, logsToStore); err != nil {
 		return fmt.Errorf("更新用量累计汇总: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -261,6 +261,61 @@ func TestRewriteSQLForMySQLUpsertKeepsParameterOrder(t *testing.T) {
 	}
 }
 
+func TestRewriteSQLForMySQLDoNothingHandlesSemicolonAndText(t *testing.T) {
+	got := rewriteSQLForMySQL(`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING;`)
+	if !strings.Contains(got, "INSERT IGNORE INTO proxies") {
+		t.Fatalf("DO NOTHING with semicolon was not rewritten: %s", got)
+	}
+	if strings.Contains(strings.ToUpper(got), "ON CONFLICT") {
+		t.Fatalf("PostgreSQL ON CONFLICT leaked into rewritten query: %s", got)
+	}
+
+	literal := rewriteSQLForMySQL(`INSERT INTO proxies (url) VALUES ('on conflict do nothing')`)
+	if literal != `INSERT INTO proxies (url) VALUES ('on conflict do nothing')` {
+		t.Fatalf("upsert keywords in a literal changed the query: %s", literal)
+	}
+
+	comment := rewriteSQLForMySQL("-- on conflict do nothing\nINSERT INTO proxies (url) VALUES ('http://example.test')")
+	if comment != "-- on conflict do nothing\nINSERT INTO proxies (url) VALUES ('http://example.test')" {
+		t.Fatalf("upsert keywords in a comment changed the query: %s", comment)
+	}
+
+	withFollowingStatement := rewriteSQLForMySQL(`INSERT INTO proxies (url) VALUES ($1) ON CONFLICT(url) DO NOTHING RETURNING id; SELECT 'on conflict do nothing'`)
+	if !strings.Contains(withFollowingStatement, "INSERT IGNORE INTO proxies") {
+		t.Fatalf("DO NOTHING RETURNING was not rewritten: %s", withFollowingStatement)
+	}
+	if !strings.Contains(withFollowingStatement, "; SELECT 'on conflict do nothing'") {
+		t.Fatalf("following SQL statement was removed: %s", withFollowingStatement)
+	}
+	if strings.Contains(strings.ToUpper(withFollowingStatement), "RETURNING") {
+		t.Fatalf("MySQL RETURNING clause was not removed: %s", withFollowingStatement)
+	}
+}
+
+func TestMySQLRewriteAppliesInsideSQLTransaction(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	db := newMySQLCaptureDB(t, capture)
+
+	tx, err := db.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(context.Background(), `INSERT INTO model_registry (id, enabled) VALUES ($2, $1) ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled`, true, 7); err != nil {
+		t.Fatalf("transaction ExecContext() error = %v", err)
+	}
+	if !strings.Contains(capture.query, "ON DUPLICATE KEY UPDATE") {
+		t.Fatalf("transaction query was not rewritten: %s", capture.query)
+	}
+	if len(capture.args) != 2 || capture.args[0].Value != int64(7) || capture.args[1].Value != true {
+		t.Fatalf("transaction arguments were not reordered: %#v", capture.args)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+}
+
 func TestAccountDailyUsageUpsertUsesMySQL56Syntax(t *testing.T) {
 	capture := &mysqlCaptureDriver{queryRow: []driver.Value{int64(0)}}
 	driverName := fmt.Sprintf("codex2api-mysql-daily-usage-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))

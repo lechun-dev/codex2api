@@ -18,7 +18,6 @@ import (
 const mysqlDriverName = "mysql56"
 
 var mysqlCastAsTextPattern = regexp.MustCompile(`(?i)CAST\(([^()]*)\s+AS\s+TEXT\)`)
-var mysqlDoNothingPattern = regexp.MustCompile(`(?is)\s+ON\s+CONFLICT\s*(?:\([^)]*\))?\s+DO\s+NOTHING(?:\s+RETURNING\s+.+)?\s*$`)
 var mysqlKeywordBeforeKey = map[string]struct{}{
 	"duplicate": {},
 	"foreign":   {},
@@ -460,31 +459,247 @@ func isSQLIdentifierPart(ch byte) bool {
 	return isSQLIdentifierStart(ch) || (ch >= '0' && ch <= '9')
 }
 
+// 2026-09-03 coder(lq): Identify upsert keywords outside literals/comments and across statement boundaries so MySQL migration SQL is not corrupted by text values.
 func rewritePostgresUpsertForMySQL(query string) string {
-	lower := strings.ToLower(query)
-	if !strings.Contains(lower, "on conflict") {
+	tokens := scanMySQLSQLTokens(query)
+	onConflict := findMySQLSQLTokenSequence(tokens, 0, "on", "conflict")
+	if onConflict < 0 {
 		return query
 	}
-	if strings.Contains(lower, "do nothing") {
-		query = mysqlDoNothingPattern.ReplaceAllString(query, "")
-		return replaceFirstFold(query, "insert into", "INSERT IGNORE INTO")
-	}
-	for {
-		lower = strings.ToLower(query)
-		idx := strings.Index(lower, "on conflict")
-		if idx < 0 {
-			break
+
+	if doNothing := findMySQLSQLTokenSequence(tokens, onConflict+2, "do", "nothing"); doNothing >= 0 {
+		end := tokens[doNothing+1].end
+		if returning := findMySQLSQLToken(tokens, doNothing+2, "returning"); returning >= 0 {
+			// MySQL has no RETURNING clause. The MySQL call sites that need the
+			// inserted ID use LastInsertId instead of relying on this fallback.
+			statementEnd := findMySQLSQLStatementEnd(query, tokens[returning].end)
+			suffix := query[statementEnd:]
+			prefix := query[:tokens[onConflict].start]
+			if strings.TrimSpace(suffix) == "" {
+				prefix = strings.TrimRight(prefix, " \t\r\n")
+				suffix = ""
+			}
+			query = prefix + suffix
+		} else {
+			suffix := query[end:]
+			prefix := query[:tokens[onConflict].start]
+			if strings.TrimSpace(suffix) == "" {
+				prefix = strings.TrimRight(prefix, " \t\r\n")
+				suffix = ""
+			}
+			query = prefix + suffix
 		}
-		after := lower[idx:]
-		updateIdxRel := strings.Index(after, "do update set")
-		if updateIdxRel < 0 {
-			break
-		}
-		updateStart := idx + updateIdxRel
-		query = query[:idx] + "ON DUPLICATE KEY UPDATE" + query[updateStart+len("do update set"):]
+		return replaceFirstMySQLInsert(query)
 	}
-	query = rewriteMySQLExcludedValues(query)
+
+	if doUpdate := findMySQLSQLTokenSequence(tokens, onConflict+2, "do", "update", "set"); doUpdate >= 0 {
+		setEnd := tokens[doUpdate+2].end
+		query = query[:tokens[onConflict].start] + "ON DUPLICATE KEY UPDATE" + query[setEnd:]
+		return rewriteMySQLExcludedValues(query)
+	}
+
 	return query
+}
+
+type mysqlSQLToken struct {
+	value      string
+	start, end int
+	statement  int
+}
+
+func scanMySQLSQLTokens(query string) []mysqlSQLToken {
+	tokens := make([]mysqlSQLToken, 0)
+	statement := 0
+	for i := 0; i < len(query); {
+		ch := query[i]
+		next := byte(0)
+		if i+1 < len(query) {
+			next = query[i+1]
+		}
+		switch {
+		case ch == '\'' || ch == '"' || ch == '`':
+			quote := ch
+			i++
+			for i < len(query) {
+				if query[i] == '\\' && i+1 < len(query) {
+					i += 2
+					continue
+				}
+				if query[i] == quote {
+					if i+1 < len(query) && query[i+1] == quote {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case ch == '-' && next == '-':
+			i += 2
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+		case ch == '#':
+			i++
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+		case ch == '/' && next == '*':
+			i += 2
+			for i+1 < len(query) && !(query[i] == '*' && query[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(query) {
+				i += 2
+			}
+		case isSQLIdentifierStart(ch):
+			start := i
+			for i+1 < len(query) && isSQLIdentifierPart(query[i+1]) {
+				i++
+			}
+			tokens = append(tokens, mysqlSQLToken{value: strings.ToLower(query[start : i+1]), start: start, end: i + 1, statement: statement})
+			i++
+		default:
+			if ch == ';' {
+				statement++
+			}
+			i++
+		}
+	}
+	return tokens
+}
+
+func findMySQLSQLToken(tokens []mysqlSQLToken, start int, value string) int {
+	if start >= len(tokens) {
+		return -1
+	}
+	statement := tokens[start].statement
+	for i := start; i < len(tokens); i++ {
+		if tokens[i].statement != statement {
+			return -1
+		}
+		if tokens[i].value == value {
+			return i
+		}
+	}
+	return -1
+}
+
+func findMySQLSQLTokenSequence(tokens []mysqlSQLToken, start int, values ...string) int {
+	if len(values) == 0 {
+		return -1
+	}
+	for i := start; i+len(values) <= len(tokens); i++ {
+		statement := tokens[i].statement
+		match := true
+		for j, value := range values {
+			if tokens[i+j].statement != statement || tokens[i+j].value != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func findMySQLSQLStatementEnd(query string, start int) int {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	inLineComment := false
+	inBlockComment := false
+	for i := start; i < len(query); i++ {
+		ch := query[i]
+		next := byte(0)
+		if i+1 < len(query) {
+			next = query[i+1]
+		}
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && next == '/' {
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\\' && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == '\'' {
+				if next == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(query) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				if next == '"' {
+					i++
+					continue
+				}
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if next == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch {
+		case ch == '-' && next == '-':
+			i++
+			inLineComment = true
+		case ch == '#':
+			inLineComment = true
+		case ch == '/' && next == '*':
+			i++
+			inBlockComment = true
+		case ch == '\'':
+			inSingle = true
+		case ch == '"':
+			inDouble = true
+		case ch == '`':
+			inBacktick = true
+		case ch == ';':
+			return i
+		}
+	}
+	return len(query)
+}
+
+func replaceFirstMySQLInsert(query string) string {
+	tokens := scanMySQLSQLTokens(query)
+	insert := findMySQLSQLTokenSequence(tokens, 0, "insert", "into")
+	if insert < 0 {
+		return query
+	}
+	return query[:tokens[insert].start] + "INSERT IGNORE INTO" + query[tokens[insert+1].end:]
 }
 
 // 2026-08-20 coder(lq): Rewrite PostgreSQL's EXCLUDED references without touching literals or comments.
@@ -607,14 +822,6 @@ func rewriteMySQLExcludedValues(query string) string {
 		}
 	}
 	return b.String()
-}
-
-func replaceFirstFold(s, old, new string) string {
-	idx := strings.Index(strings.ToLower(s), strings.ToLower(old))
-	if idx < 0 {
-		return s
-	}
-	return s[:idx] + new + s[idx+len(old):]
 }
 
 // 2026-08-17 coder(lq): Force CLIENT_FOUND_ROWS so unchanged UPDATE still reports a match.

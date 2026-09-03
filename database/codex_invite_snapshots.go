@@ -79,7 +79,20 @@ func (db *DB) ensureCodexInviteSnapshotTable(ctx context.Context) error {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (account_id, snapshot_kind, scope)
 	)`
-	if db.isSQLite() {
+	if db.isMySQL() {
+		ddl = `CREATE TABLE IF NOT EXISTS codex_invite_snapshots (
+			account_id BIGINT NOT NULL,
+			snapshot_kind VARCHAR(20) NOT NULL,
+			scope VARCHAR(191) NOT NULL DEFAULT '',
+			credential_generation BIGINT NOT NULL DEFAULT 1,
+			http_status INT NOT NULL DEFAULT 0,
+			payload_json MEDIUMTEXT NOT NULL,
+			observed_at DATETIME NOT NULL,
+			expires_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (account_id, snapshot_kind, scope)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+	} else if db.isSQLite() {
 		ddl = `CREATE TABLE IF NOT EXISTS codex_invite_snapshots (
 			account_id INTEGER NOT NULL,
 			snapshot_kind TEXT NOT NULL,
@@ -96,7 +109,12 @@ func (db *DB) ensureCodexInviteSnapshotTable(ctx context.Context) error {
 	if _, err := db.conn.ExecContext(ctx, ddl); err != nil {
 		return err
 	}
-	if _, err := db.conn.ExecContext(ctx,
+	if db.isMySQL() {
+		if err := db.ensureMySQLIndex(ctx, "codex_invite_snapshots", "idx_codex_invite_snapshots_expires",
+			`CREATE INDEX idx_codex_invite_snapshots_expires ON codex_invite_snapshots(expires_at)`); err != nil {
+			return err
+		}
+	} else if _, err := db.conn.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_codex_invite_snapshots_expires ON codex_invite_snapshots(expires_at)`); err != nil {
 		return err
 	}
@@ -171,8 +189,20 @@ func (db *DB) UpsertCodexInviteSnapshot(ctx context.Context, snap *CodexInviteSn
 		payload_json=excluded.payload_json,observed_at=excluded.observed_at,
 		expires_at=excluded.expires_at,updated_at=CURRENT_TIMESTAMP
 		WHERE codex_invite_snapshots.credential_generation <= excluded.credential_generation`
-	if !db.isSQLite() {
+	if !db.isSQLite() && !db.isMySQL() {
 		query = strings.Replace(query, "$6,$7", "$6::jsonb,$7", 1)
+	}
+	if db.isMySQL() {
+		query = `INSERT INTO codex_invite_snapshots
+			(account_id,snapshot_kind,scope,credential_generation,http_status,payload_json,observed_at,expires_at,updated_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP)
+			ON DUPLICATE KEY UPDATE
+			credential_generation=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), VALUES(credential_generation), codex_invite_snapshots.credential_generation),
+			http_status=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), VALUES(http_status), codex_invite_snapshots.http_status),
+			payload_json=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), VALUES(payload_json), codex_invite_snapshots.payload_json),
+			observed_at=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), VALUES(observed_at), codex_invite_snapshots.observed_at),
+			expires_at=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), VALUES(expires_at), codex_invite_snapshots.expires_at),
+			updated_at=IF(codex_invite_snapshots.credential_generation <= VALUES(credential_generation), CURRENT_TIMESTAMP, codex_invite_snapshots.updated_at)`
 	}
 
 	_, err := db.conn.ExecContext(ctx, query,

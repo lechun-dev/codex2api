@@ -2923,6 +2923,32 @@ export interface UsageStats {
   api_key_stats: UsageAPIKeyStat[]
 }
 
+// 2026-09-03 coder(lq): Keep the daily token response aligned with the admin usage endpoint.
+export interface UsageDailyTokenRow {
+  date: string
+  requests: number
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  model_tokens: Record<string, number>
+}
+
+export interface UsageDailyTokenTotal {
+  requests: number
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  model_tokens: Record<string, number>
+}
+
+export interface UsageDailyTokenStats {
+  models: string[]
+  rows: UsageDailyTokenRow[]
+  total: UsageDailyTokenTotal
+}
+
 export interface UsageModelStat {
   model: string
   requests: number
@@ -3508,6 +3534,13 @@ export interface CreateAPIKeyResponse {
   quota_used: number
   expires_at?: ISODateString | null
   allowed_group_ids?: number[]
+}
+
+// 2026-09-03 coder(lq): Preserve the one-time response shape used by API key rotation.
+export interface RegenerateAPIKeyResponse {
+  id: number
+  key: string
+  name: string
 }
 
 export interface ImagePromptTemplate {

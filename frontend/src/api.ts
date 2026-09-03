@@ -1159,6 +1159,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  deleteAPIKey: (id: number) =>
+    request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   setAPIKeyEnabled: (id: number, enabled: boolean) =>
     request<MessageResponse>(`/keys/${id}/enabled`, {
       method: 'POST',

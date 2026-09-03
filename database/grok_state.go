@@ -757,7 +757,7 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 			}
 		}
 
-		encoded, marshalErr := json.Marshal(merged)
+		encoded, marshalErr := marshalCredentialsForStorage(merged)
 		if marshalErr != nil {
 			return marshalErr
 		}
@@ -920,20 +920,29 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 			return beginErr
 		}
 		defer tx.Rollback()
-		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		query := `SELECT credentials, credential_generation, COALESCE(credential_family_id,'') FROM accounts WHERE id=$1 AND status <> 'deleted'`
 		if !db.isSQLite() {
 			query += ` FOR UPDATE`
 		}
 		var raw any
 		var current int64
-		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current); scanErr != nil {
+		var familyID string
+		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current, &familyID); scanErr != nil {
 			return scanErr
 		}
 		if current != expectedGeneration {
 			newGeneration = current
 			return nil
 		}
-		encoded, marshalErr := json.Marshal(mergeCredentialMaps(decodeCredentials(raw), updates))
+		existing := decodeCredentials(raw)
+		if strings.TrimSpace(familyID) == "" {
+			familyID = credentialFamilyCandidate(existing)
+		}
+		merged := mergeCredentialMaps(existing, updates)
+		if strings.TrimSpace(familyID) != "" {
+			merged["credential_family_id"] = strings.TrimSpace(familyID)
+		}
+		encoded, marshalErr := marshalCredentialsForStorage(merged)
 		if marshalErr != nil {
 			return marshalErr
 		}
@@ -969,6 +978,74 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 				expectedGeneration+1, accountID, expectedGeneration); carryErr != nil {
 				return carryErr
 			}
+		}
+		applied = true
+		newGeneration = expectedGeneration + 1
+		return tx.Commit()
+	})
+	return
+}
+
+// ReplaceAccountCredentialsCAS replaces the durable credential document for a
+// generation-fenced reauthorization. Unlike token refresh, this intentionally
+// drops old observed provider facts/catalog data by moving to a new canonical
+// credential family.
+func (db *DB) ReplaceAccountCredentialsCAS(ctx context.Context, accountID, expectedGeneration int64, familyID string, updates map[string]any) (newGeneration int64, applied bool, err error) {
+	if db == nil || db.conn == nil || accountID <= 0 || expectedGeneration <= 0 || len(updates) == 0 {
+		return 0, false, nil
+	}
+	err = db.withSQLiteWriteLock(ctx, func() error {
+		tx, beginErr := db.conn.BeginTx(ctx, nil)
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.Rollback()
+
+		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		if !db.isSQLite() {
+			query += ` FOR UPDATE`
+		}
+		var raw any
+		var current int64
+		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current); scanErr != nil {
+			return scanErr
+		}
+		if current != expectedGeneration {
+			newGeneration = current
+			return nil
+		}
+
+		replacement := make(map[string]any, len(updates)+1)
+		for key, value := range updates {
+			replacement[key] = value
+		}
+		familyID = strings.TrimSpace(familyID)
+		if familyID == "" {
+			familyID = credentialFamilyCandidate(replacement)
+		}
+		if familyID == "" {
+			familyID = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+		replacement["credential_family_id"] = familyID
+		encoded, marshalErr := json.Marshal(replacement)
+		if marshalErr != nil {
+			return marshalErr
+		}
+
+		updateQuery := `UPDATE accounts SET credentials=$1, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND credential_generation=$4`
+		if !db.isSQLite() && !db.isMySQL() {
+			updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$3 AND credential_generation=$4`
+		}
+		res, execErr := tx.ExecContext(ctx, updateQuery, encoded, familyID, accountID, expectedGeneration)
+		if execErr != nil {
+			return execErr
+		}
+		rows, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if rows == 0 {
+			return nil
 		}
 		applied = true
 		newGeneration = expectedGeneration + 1

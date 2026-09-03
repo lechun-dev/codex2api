@@ -78,6 +78,10 @@ func TestResponsesContinuationUnavailableWaitsForRelayRouting(t *testing.T) {
 		if recorder.Code != http.StatusOK || gjson.GetBytes(seenBody, "previous_response_id").String() != "resp_missing" {
 			t.Fatalf("compaction fallback status=%d upstream=%s response=%s", recorder.Code, seenBody, recorder.Body.String())
 		}
+		input := gjson.GetBytes(seenBody, "input").Array()
+		if len(input) == 0 || input[len(input)-1].Get("type").String() != "compaction_trigger" {
+			t.Fatalf("compaction trigger must be the final upstream input item: %s", seenBody)
+		}
 	})
 }
 
@@ -356,7 +360,7 @@ func newContinuationRelayStore(upstreamURL string) *auth.Store {
 func newContinuationRelayUpstream(t *testing.T, compact bool, seenBody *[]byte) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*seenBody, _ = io.ReadAll(r.Body)
+		*seenBody = readUpstreamRequestBody(r)
 		if compact {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"id":"resp_compact","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)

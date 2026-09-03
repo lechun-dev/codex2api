@@ -128,7 +128,7 @@ func (db *DB) UpsertAccountDailyUsage(ctx context.Context, input AccountDailyUsa
 	if models == "" {
 		models = "[]"
 	}
-	_, err := db.conn.ExecContext(ctx, `INSERT INTO account_daily_usage (
+	query := `INSERT INTO account_daily_usage (
 		account_id, day, credits, users, threads, turns,
 		uncached_input_tokens, cached_input_tokens, output_tokens, total_tokens,
 		settled, clients_json, models_json, synced_at
@@ -139,7 +139,22 @@ func (db *DB) UpsertAccountDailyUsage(ctx context.Context, input AccountDailyUsa
 		cached_input_tokens=EXCLUDED.cached_input_tokens, output_tokens=EXCLUDED.output_tokens,
 		total_tokens=EXCLUDED.total_tokens, settled=EXCLUDED.settled,
 		clients_json=EXCLUDED.clients_json, models_json=EXCLUDED.models_json,
-		synced_at=EXCLUDED.synced_at`,
+		synced_at=EXCLUDED.synced_at`
+	if db.isMySQL() {
+		query = `INSERT INTO account_daily_usage (
+			account_id, day, credits, users, threads, turns,
+			uncached_input_tokens, cached_input_tokens, output_tokens, total_tokens,
+			settled, clients_json, models_json, synced_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			credits=VALUES(credits), users=VALUES(users), threads=VALUES(threads),
+			turns=VALUES(turns), uncached_input_tokens=VALUES(uncached_input_tokens),
+			cached_input_tokens=VALUES(cached_input_tokens), output_tokens=VALUES(output_tokens),
+			total_tokens=VALUES(total_tokens), settled=VALUES(settled),
+			clients_json=VALUES(clients_json), models_json=VALUES(models_json),
+			synced_at=VALUES(synced_at)`
+	}
+	_, err := db.conn.ExecContext(ctx, query,
 		input.AccountID, day, input.Credits, input.Users, input.Threads, input.Turns,
 		input.UncachedInputTokens, input.CachedInputTokens, input.OutputTokens, input.TotalTokens,
 		input.Settled, clients, models, time.Now().UTC(),

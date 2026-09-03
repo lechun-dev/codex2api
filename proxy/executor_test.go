@@ -50,6 +50,28 @@ func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	}
 }
 
+func TestReadSSEStreamWithEventPreservesEventName(t *testing.T) {
+	input := strings.NewReader("event: error\n" +
+		"data: {\"error\":{\"status_code\":403,\"code\":\"forbidden\"}}\n\n")
+
+	var gotEvent string
+	var gotData string
+	err := ReadSSEStreamWithEvent(input, func(event string, data []byte) bool {
+		gotEvent = event
+		gotData = string(data)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStreamWithEvent returned error: %v", err)
+	}
+	if gotEvent != "error" {
+		t.Fatalf("event = %q, want error", gotEvent)
+	}
+	if gotData != `{"error":{"status_code":403,"code":"forbidden"}}` {
+		t.Fatalf("data = %q", gotData)
+	}
+}
+
 func TestReadSSEStreamPreservesEventsAcrossReadBoundaries(t *testing.T) {
 	const eventCount = 2048
 
@@ -251,6 +273,38 @@ func TestClassifyResponseFailedOutcomeContextLengthExceeded(t *testing.T) {
 	}
 }
 
+// 中转上游把超窗回成 code:null / type:"upstream_error"，只有 message 说明了真实
+// 原因。仅匹配 code/type 会落进 default 500，把号池挨个试一遍并惩罚每个健康账号。
+func TestClassifyResponseFailedOutcomeContextLengthExceededMessageOnly(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"nested null code": []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":null,"type":"upstream_error","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}`),
+		"top-level error":  []byte(`{"type":"error","error":{"type":"upstream_error","message":"Your input exceeds the context window of this model."}}`),
+		"status details":   []byte(`{"type":"response.failed","response":{"status":"failed","status_details":{"error":{"message":"maximum context length exceeded"}}}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			outcome := classifyResponseFailedOutcome(payload)
+			if outcome.logStatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusBadRequest)
+			}
+			if outcome.penalize {
+				t.Fatal("context window overflow must not penalize the account")
+			}
+			if shouldTransparentRetryStream(outcome, 0, 2, false, nil, nil) {
+				t.Fatal("context window overflow must not trigger transparent account-rotation retry")
+			}
+		})
+	}
+}
+
+// 回显的请求内容不得改变判定：只有固定的 error 字段是权威的。
+func TestClassifyResponseFailedOutcomeIgnoresEchoedContextWindowText(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","type":"upstream_error","message":"boom"},"echo":"my prompt explains that input exceeds the context window"}}`)
+
+	if got := classifyResponseFailedOutcome(payload).logStatusCode; got != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", got, http.StatusInternalServerError)
+	}
+}
+
 func TestClassifyResponseFailedOutcomeDeterministicClientErrors(t *testing.T) {
 	for _, code := range []string{"context_window_exceeded", "string_above_max_length", "model_not_found", "unsupported_parameter"} {
 		payload := []byte(`{"type":"response.failed","response":{"error":{"code":"` + code + `","message":"boom"}}}`)
@@ -260,6 +314,22 @@ func TestClassifyResponseFailedOutcomeDeterministicClientErrors(t *testing.T) {
 		}
 		if outcome.penalize {
 			t.Errorf("code %s: deterministic client error must not penalize", code)
+		}
+	}
+}
+
+func TestClassifyResponseFailedOutcomeAnthropicAuthAndPermissionErrors(t *testing.T) {
+	for _, tc := range []struct {
+		typ  string
+		want int
+	}{
+		{typ: "authentication_error", want: http.StatusUnauthorized},
+		{typ: "invalid_token", want: http.StatusUnauthorized},
+		{typ: "permission_error", want: http.StatusForbidden},
+	} {
+		payload := []byte(`{"type":"error","error":{"type":"` + tc.typ + `","message":"failure"}}`)
+		if got := classifyResponseFailedOutcome(payload).logStatusCode; got != tc.want {
+			t.Errorf("error type %s: status = %d, want %d", tc.typ, got, tc.want)
 		}
 	}
 }
@@ -350,8 +420,19 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	if got := req.Header.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("Authorization = %q", got)
 	}
-	if got := req.Header.Get("Session_id"); got != "cache-key-1" {
-		t.Fatalf("Session_id = %q", got)
+	// 真实客户端发 session-id / thread-id（连字符），不发下划线写法，也不发
+	// Conversation_id。单线程会话里 thread-id 与 session-id 同值。
+	if got := req.Header.Get("Session-Id"); got != "cache-key-1" {
+		t.Fatalf("Session-Id = %q", got)
+	}
+	if got := req.Header.Get("Thread-Id"); got != "cache-key-1" {
+		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "cache-key-1" {
+		t.Fatalf("X-Client-Request-Id = %q, want 等于 thread id", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty（下划线写法不属于真实形态）", got)
 	}
 	if got := req.Header.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty", got)
@@ -595,6 +676,68 @@ func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
 	}
 	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
 		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
+	}
+}
+
+func TestExecuteRequestWebsocketSendsCompactionTriggerLast(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+
+	var seenBody []byte
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		seenBody = append([]byte(nil), requestBody...)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "session-1", "", "sk-local", nil, http.Header{}, true)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final websocket body must end with compaction_trigger: %s", seenBody)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestSendsCompactionTriggerLast(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody = readUpstreamRequestBody(r)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final relay body must end with compaction_trigger: %s", seenBody)
 	}
 }
 
@@ -934,7 +1077,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		results <- result{
 			path:    r.URL.Path,
@@ -1011,7 +1154,7 @@ func TestExecuteOpenAIResponsesRequestLearnsCodexClientMetadataRequirement(t *te
 	requestCount := 0
 	installationIDs := make([]string, 0, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		installationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
 
@@ -1093,7 +1236,7 @@ func TestExecuteOpenAIResponsesRequestHonorsCodexClientMetadataMode(t *testing.T
 			requestCount := 0
 			installationID := ""
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, _ := io.ReadAll(r.Body)
+				body := readUpstreamRequestBody(r)
 				_ = r.Body.Close()
 				gotInstallationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
 				mu.Lock()
@@ -1151,7 +1294,7 @@ func TestExecuteOpenAIResponsesRequestPreservesClientInstallationIDWithoutLearni
 	var mu sync.Mutex
 	installationIDs := make([]string, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body := readUpstreamRequestBody(r)
 		_ = r.Body.Close()
 		installationID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String()
 		mu.Lock()
@@ -1400,7 +1543,9 @@ func TestLocalAffinityPreservesExplicitAndAPIKeyUpstreamSeeds(t *testing.T) {
 		headers := http.Header{"Authorization": []string{"Bearer shared-key"}}
 		headers.Set("X-Codex2API-Affinity-Key", "user-a")
 		identity := resolveRequestSessionIdentity(headers, []byte(`{}`))
-		wantSeed := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:shared-key")).String()
+		// 与 deterministicPromptCacheKey 共享种子与派生：两处算出不同值，会让同一个
+		// API Key 在 HTTP 与 WS 路径上得到两个互不相干的上游身份。
+		wantSeed := DeriveStableSessionUUIDv7("codex2api:prompt-cache:shared-key")
 		if identity.upstreamSeed != wantSeed || identity.explicitUpstreamID != "" {
 			t.Fatalf("API-key upstream fallback changed: seed=%q explicit=%q want=%q", identity.upstreamSeed, identity.explicitUpstreamID, wantSeed)
 		}
@@ -1594,5 +1739,45 @@ func TestResolveUpstreamSessionID(t *testing.T) {
 		if want := IsolateCodexSessionID(7, "sess-xyz"); got != want {
 			t.Fatalf("explicit session mode=%s: got %q, want %q", mode, got, want)
 		}
+	}
+}
+
+// HTTP 出站收口必须兜底剥离 WS 事件信封的顶层 type，即使上层 prepare 被绕过
+// （native WS ingress 的 1009 降级 / 生图强制 HTTP / Agent Identity 强制 HTTP
+// 都会带信封 body 走到这里）；嵌套 type 不受影响 (issue #548)。
+func TestExecuteRequestHTTPStripsTopLevelEnvelopeType(t *testing.T) {
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	bodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readUpstreamRequestBody(r)
+		bodyCh <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, raw, "", "", "sk-local", nil, http.Header{}, false)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-bodyCh:
+		if gjson.GetBytes(got, "type").Exists() {
+			t.Fatalf("top-level type should be stripped before HTTP upstream: %s", got)
+		}
+		if it := gjson.GetBytes(got, "input.0.type").String(); it != "message" {
+			t.Fatalf("nested input type = %q, want message; body=%s", it, got)
+		}
+		if ct := gjson.GetBytes(got, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("nested content type = %q, want input_text; body=%s", ct, got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream request")
 	}
 }

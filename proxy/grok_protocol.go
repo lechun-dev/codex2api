@@ -685,6 +685,7 @@ type chatToResponsesReader struct {
 	queue       bytes.Buffer
 	responseID  string
 	model       string
+	createdAt   int64
 	created     bool
 	terminal    bool
 	output      []chatResponseOutputRef
@@ -723,7 +724,18 @@ type chatResponseTool struct {
 }
 
 func newChatToResponsesReader(source io.ReadCloser, model string) io.ReadCloser {
-	return &chatToResponsesReader{source: source, reader: bufio.NewReader(source), responseID: "resp_" + uuid.NewString(), model: model, tools: make(map[int]*chatResponseTool)}
+	return &chatToResponsesReader{
+		source: source, reader: bufio.NewReader(source),
+		responseID: "resp_" + uuid.NewString(), model: model, createdAt: time.Now().Unix(),
+		tools: make(map[int]*chatResponseTool),
+	}
+}
+
+func (r *chatToResponsesReader) response(status string) map[string]any {
+	return map[string]any{
+		"id": r.responseID, "object": "response", "created_at": r.createdAt,
+		"status": status, "model": r.model,
+	}
 }
 
 func (r *chatToResponsesReader) ensureReasoningOutput() {
@@ -753,7 +765,7 @@ func (r *chatToResponsesReader) ensureToolOutput(index int) *chatResponseTool {
 }
 
 func (r *chatToResponsesReader) enqueueToolProgress(tool *chatResponseTool) {
-	if tool == nil || tool.id == "" {
+	if tool == nil || tool.id == "" || tool.name == "" {
 		return
 	}
 	if !tool.itemAdded {
@@ -769,12 +781,36 @@ func (r *chatToResponsesReader) enqueueToolProgress(tool *chatResponseTool) {
 	r.queue.Write(responseEvent("response.function_call_arguments.delta", map[string]any{"output_index": tool.outputIndex, "item_id": tool.id, "call_id": tool.id, "delta": delta}))
 }
 
+func chatResponseToolItem(tool *chatResponseTool, status string) map[string]any {
+	return map[string]any{
+		"id": tool.id, "type": "function_call", "call_id": tool.id,
+		"name": tool.name, "arguments": tool.arguments.String(), "status": status,
+	}
+}
+
+func (r *chatToResponsesReader) enqueueToolCompletion(tool *chatResponseTool) map[string]any {
+	if tool.id == "" {
+		tool.id = "call_" + uuid.NewString()
+	}
+	if tool.name == "" {
+		return chatResponseToolItem(tool, "incomplete")
+	}
+	r.enqueueToolProgress(tool)
+	item := chatResponseToolItem(tool, "completed")
+	r.queue.Write(responseEvent("response.function_call_arguments.done", map[string]any{
+		"output_index": tool.outputIndex, "item_id": tool.id, "call_id": tool.id,
+		"arguments": tool.arguments.String(),
+	}))
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{"output_index": tool.outputIndex, "item": item}))
+	return item
+}
+
 func (r *chatToResponsesReader) enqueueCreated() {
 	if r.created {
 		return
 	}
 	r.created = true
-	r.queue.Write(responseEvent("response.created", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "in_progress", "model": r.model}}))
+	r.queue.Write(responseEvent("response.created", map[string]any{"response": r.response("in_progress")}))
 }
 
 func chatFinishReasonStatus(reason string) string {
@@ -806,7 +842,9 @@ func (r *chatToResponsesReader) translate(data []byte) {
 		if message == "" {
 			message = "upstream Chat Completions stream failed"
 		}
-		r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "failed", "model": r.model, "error": map[string]any{"code": code, "message": message}}}))
+		response := r.response("failed")
+		response["error"] = map[string]any{"code": code, "message": message}
+		r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 		r.terminal = true
 		return
 	}
@@ -910,13 +948,19 @@ func (r *chatToResponsesReader) emitChatTerminal(status string) {
 			if tool == nil {
 				continue
 			}
+			if status == "completed" {
+				output = append(output, r.enqueueToolCompletion(tool))
+				continue
+			}
 			if tool.id == "" {
 				tool.id = "call_" + uuid.NewString()
 			}
-			output = append(output, map[string]any{"id": tool.id, "type": "function_call", "call_id": tool.id, "name": tool.name, "arguments": tool.arguments.String(), "status": "completed"})
+			output = append(output, chatResponseToolItem(tool, "incomplete"))
 		}
 	}
-	response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
+	response := r.response(status)
+	response["output"] = output
+	response["usage"] = usage
 	if status == "completed" || status == "incomplete" {
 		if status == "incomplete" {
 			response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
@@ -968,7 +1012,9 @@ func (r *chatToResponsesReader) Read(p []byte) (int, error) {
 					break
 				}
 				r.enqueueCreated()
-				r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "status": "failed", "model": r.model, "error": map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}}}))
+				response := r.response("failed")
+				response["error"] = map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}
+				r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 				r.terminal = true
 				break
 			}
@@ -997,28 +1043,54 @@ type messagesToResponsesReader struct {
 	queue      bytes.Buffer
 	responseID string
 	model      string
+	createdAt  int64
 	created    bool
 	terminal   bool
 	blocks     map[int]*messagesResponseBlock
-	output     []int
+	output     []*messagesResponseBlock
+	message    *messagesResponseBlock
 	usage      map[string]int64
 	stopReason string
 	stopSeen   bool
 }
 
 type messagesResponseBlock struct {
-	blockType   string
-	id          string
-	name        string
-	text        strings.Builder
-	reasoning   strings.Builder
-	signature   strings.Builder
-	arguments   strings.Builder
-	outputIndex int
+	blockType          string
+	id                 string
+	name               string
+	text               strings.Builder
+	reasoning          strings.Builder
+	signature          strings.Builder
+	arguments          strings.Builder
+	outputIndex        int
+	contentIndex       int
+	owner              *messagesResponseBlock
+	textParts          []*messagesResponseBlock
+	itemAdded          bool
+	itemDone           bool
+	partAdded          bool
+	partDone           bool
+	summaryPartAdded   bool
+	summaryPartDone    bool
+	blockStopped       bool
+	argumentsFromStart bool
+	argumentsDeltaSeen bool
+	emittedArguments   int
 }
 
 func newMessagesToResponsesReader(source io.ReadCloser, model string) io.ReadCloser {
-	return &messagesToResponsesReader{source: source, reader: bufio.NewReader(source), responseID: "resp_" + uuid.NewString(), model: model, blocks: make(map[int]*messagesResponseBlock), usage: make(map[string]int64)}
+	return &messagesToResponsesReader{
+		source: source, reader: bufio.NewReader(source),
+		responseID: "resp_" + uuid.NewString(), model: model, createdAt: time.Now().Unix(),
+		blocks: make(map[int]*messagesResponseBlock), usage: make(map[string]int64),
+	}
+}
+
+func (r *messagesToResponsesReader) response(status string) map[string]any {
+	return map[string]any{
+		"id": r.responseID, "object": "response", "created_at": r.createdAt,
+		"status": status, "model": r.model,
+	}
 }
 
 func (r *messagesToResponsesReader) ensureBlock(index int, blockType string) *messagesResponseBlock {
@@ -1028,10 +1100,303 @@ func (r *messagesToResponsesReader) ensureBlock(index int, blockType string) *me
 		}
 		return block
 	}
-	block := &messagesResponseBlock{blockType: blockType, outputIndex: len(r.output)}
+	block := &messagesResponseBlock{blockType: blockType}
 	r.blocks[index] = block
-	r.output = append(r.output, index)
+	switch blockType {
+	case "text":
+		owner := r.message
+		if owner != nil && len(owner.textParts) > 0 && !owner.textParts[len(owner.textParts)-1].blockStopped {
+			// A second start without a stop is malformed. Do not manufacture done
+			// events for the abandoned item: keep it in the terminal output, but
+			// start a fresh message lifecycle for the new block.
+			r.message = nil
+			owner = nil
+		}
+		if owner == nil || owner.itemDone {
+			owner = &messagesResponseBlock{
+				blockType:   "message",
+				id:          "msg_" + uuid.NewString(),
+				outputIndex: len(r.output),
+			}
+			r.output = append(r.output, owner)
+			r.message = owner
+		}
+		block.owner = owner
+		block.outputIndex = owner.outputIndex
+		block.contentIndex = len(owner.textParts)
+		owner.textParts = append(owner.textParts, block)
+	case "thinking", "redacted_thinking":
+		r.enqueueMessageDone(false)
+		block.id = "rs_" + uuid.NewString()
+		block.outputIndex = len(r.output)
+		r.output = append(r.output, block)
+	case "tool_use":
+		r.enqueueMessageDone(false)
+		block.outputIndex = len(r.output)
+		r.output = append(r.output, block)
+	}
 	return block
+}
+
+func messagesResponseOutputItem(block *messagesResponseBlock, status string) map[string]any {
+	if block == nil {
+		return nil
+	}
+	switch block.blockType {
+	case "message":
+		content := make([]any, 0, len(block.textParts))
+		for _, part := range block.textParts {
+			content = append(content, map[string]any{
+				"type": "output_text", "text": part.text.String(), "annotations": []any{},
+			})
+		}
+		return map[string]any{
+			"id": block.id, "type": "message", "role": "assistant",
+			"status": status, "content": content,
+		}
+	case "thinking", "redacted_thinking":
+		summary := []any{}
+		if block.reasoning.Len() > 0 {
+			summary = append(summary, map[string]any{"type": "summary_text", "text": block.reasoning.String()})
+		}
+		item := map[string]any{
+			"id": block.id, "type": "reasoning", "summary": summary, "status": status,
+		}
+		if block.signature.Len() > 0 {
+			item["encrypted_content"] = block.signature.String()
+		}
+		return item
+	case "tool_use":
+		return messagesResponseToolItem(block, status)
+	default:
+		return nil
+	}
+}
+
+func (r *messagesToResponsesReader) enqueueBlockAdded(block *messagesResponseBlock) {
+	if block == nil {
+		return
+	}
+	if block.blockType == "text" {
+		owner := block.owner
+		if owner == nil {
+			return
+		}
+		if !owner.itemAdded {
+			r.queue.Write(responseEvent("response.output_item.added", map[string]any{
+				"output_index": owner.outputIndex,
+				"item": map[string]any{
+					"id": owner.id, "type": "message", "role": "assistant",
+					"status": "in_progress", "content": []any{},
+				},
+			}))
+			owner.itemAdded = true
+		}
+		if !block.partAdded {
+			r.queue.Write(responseEvent("response.content_part.added", map[string]any{
+				"item_id": owner.id, "output_index": owner.outputIndex, "content_index": block.contentIndex,
+				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			}))
+			block.partAdded = true
+		}
+		return
+	}
+	if block.itemAdded {
+		return
+	}
+	if block.id == "" {
+		if block.blockType == "tool_use" {
+			block.id = "call_" + uuid.NewString()
+		} else {
+			block.id = "rs_" + uuid.NewString()
+		}
+	}
+	item := messagesResponseOutputItem(block, "in_progress")
+	if block.blockType == "tool_use" {
+		item["arguments"] = ""
+	}
+	r.queue.Write(responseEvent("response.output_item.added", map[string]any{
+		"output_index": block.outputIndex, "item": item,
+	}))
+	block.itemAdded = true
+}
+
+func (r *messagesToResponsesReader) enqueueTextDelta(block *messagesResponseBlock, delta string) {
+	if block == nil || delta == "" {
+		return
+	}
+	r.enqueueBlockAdded(block)
+	block.text.WriteString(delta)
+	owner := block.owner
+	r.queue.Write(responseEvent("response.output_text.delta", map[string]any{
+		"item_id": owner.id, "output_index": owner.outputIndex, "content_index": block.contentIndex,
+		"delta": delta, "response_id": r.responseID,
+	}))
+}
+
+func (r *messagesToResponsesReader) enqueueTextPartDone(block *messagesResponseBlock) {
+	if block == nil || block.partDone {
+		return
+	}
+	r.enqueueBlockAdded(block)
+	owner := block.owner
+	text := block.text.String()
+	r.queue.Write(responseEvent("response.output_text.done", map[string]any{
+		"item_id": owner.id, "output_index": owner.outputIndex, "content_index": block.contentIndex,
+		"text": text,
+	}))
+	r.queue.Write(responseEvent("response.content_part.done", map[string]any{
+		"item_id": owner.id, "output_index": owner.outputIndex, "content_index": block.contentIndex,
+		"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+	}))
+	block.partDone = true
+}
+
+func (r *messagesToResponsesReader) enqueueMessageCompletion(message *messagesResponseBlock, force bool) {
+	if message == nil || message.itemDone {
+		return
+	}
+	if !force {
+		for _, part := range message.textParts {
+			if !part.blockStopped {
+				return
+			}
+		}
+	}
+	for _, part := range message.textParts {
+		r.enqueueTextPartDone(part)
+	}
+	if !message.itemAdded {
+		return
+	}
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{
+		"output_index": message.outputIndex, "item": messagesResponseOutputItem(message, "completed"),
+	}))
+	message.itemDone = true
+}
+
+func (r *messagesToResponsesReader) enqueueMessageDone(force bool) {
+	message := r.message
+	r.message = nil
+	r.enqueueMessageCompletion(message, force)
+}
+
+func messagesResponseToolItem(block *messagesResponseBlock, status string) map[string]any {
+	arguments := block.arguments.String()
+	if arguments == "" {
+		arguments = "{}"
+	}
+	return map[string]any{
+		"id": block.id, "type": "function_call", "call_id": block.id,
+		"name": block.name, "arguments": arguments, "status": status,
+	}
+}
+
+func (r *messagesToResponsesReader) enqueueToolAdded(block *messagesResponseBlock) {
+	if block == nil {
+		return
+	}
+	r.enqueueBlockAdded(block)
+	arguments := block.arguments.String()
+	if (block.argumentsFromStart && !block.argumentsDeltaSeen) || block.emittedArguments >= len(arguments) {
+		return
+	}
+	delta := arguments[block.emittedArguments:]
+	block.emittedArguments = len(arguments)
+	r.queue.Write(responseEvent("response.function_call_arguments.delta", map[string]any{
+		"output_index": block.outputIndex, "item_id": block.id, "call_id": block.id, "delta": delta,
+	}))
+}
+
+func (r *messagesToResponsesReader) enqueueToolCompletion(block *messagesResponseBlock) map[string]any {
+	if block == nil {
+		return nil
+	}
+	if block.itemDone {
+		return messagesResponseToolItem(block, "completed")
+	}
+	r.enqueueToolAdded(block)
+	if block.argumentsFromStart && !block.argumentsDeltaSeen {
+		// A start-only input has no later delta to carry it. Emit it immediately
+		// before done so stream accumulators and the terminal object agree.
+		block.argumentsFromStart = false
+		r.enqueueToolAdded(block)
+	}
+	arguments := messagesResponseToolItem(block, "completed")["arguments"].(string)
+	if !json.Valid([]byte(arguments)) {
+		// A content_block_stop can still follow a max_tokens cut in the middle
+		// of tool JSON. Never announce a partial call as completed.
+		return messagesResponseToolItem(block, "incomplete")
+	}
+	item := messagesResponseToolItem(block, "completed")
+	r.queue.Write(responseEvent("response.function_call_arguments.done", map[string]any{
+		"output_index": block.outputIndex, "item_id": block.id, "call_id": block.id,
+		"arguments": item["arguments"],
+	}))
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{"output_index": block.outputIndex, "item": item}))
+	block.itemDone = true
+	return item
+}
+
+func (r *messagesToResponsesReader) enqueueReasoningCompletion(block *messagesResponseBlock) map[string]any {
+	if block == nil {
+		return nil
+	}
+	if block.itemDone {
+		return messagesResponseOutputItem(block, "completed")
+	}
+	r.enqueueBlockAdded(block)
+	if block.reasoning.Len() > 0 {
+		r.enqueueReasoningSummaryPart(block)
+		text := block.reasoning.String()
+		r.queue.Write(responseEvent("response.reasoning_summary_text.done", map[string]any{
+			"item_id": block.id, "output_index": block.outputIndex, "summary_index": 0,
+			"text": text,
+		}))
+		if !block.summaryPartDone {
+			r.queue.Write(responseEvent("response.reasoning_summary_part.done", map[string]any{
+				"item_id": block.id, "output_index": block.outputIndex, "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": text},
+			}))
+			block.summaryPartDone = true
+		}
+	}
+	if block.signature.Len() > 0 {
+		r.queue.Write(responseEvent("response.reasoning.encrypted_content.done", map[string]any{
+			"item_id": block.id, "output_index": block.outputIndex,
+			"encrypted_content": block.signature.String(),
+		}))
+	}
+	item := messagesResponseOutputItem(block, "completed")
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{
+		"output_index": block.outputIndex, "item": item,
+	}))
+	block.itemDone = true
+	return item
+}
+
+func (r *messagesToResponsesReader) enqueueReasoningSummaryPart(block *messagesResponseBlock) {
+	if block == nil || block.summaryPartAdded {
+		return
+	}
+	r.enqueueBlockAdded(block)
+	r.queue.Write(responseEvent("response.reasoning_summary_part.added", map[string]any{
+		"item_id": block.id, "output_index": block.outputIndex, "summary_index": 0,
+		"part": map[string]any{"type": "summary_text", "text": ""},
+	}))
+	block.summaryPartAdded = true
+}
+
+func (r *messagesToResponsesReader) enqueueReasoningDelta(block *messagesResponseBlock, delta string) {
+	if block == nil || delta == "" {
+		return
+	}
+	r.enqueueReasoningSummaryPart(block)
+	block.reasoning.WriteString(delta)
+	r.queue.Write(responseEvent("response.reasoning_summary_text.delta", map[string]any{
+		"item_id": block.id, "output_index": block.outputIndex, "summary_index": 0,
+		"delta": delta, "response_id": r.responseID,
+	}))
 }
 
 func (r *messagesToResponsesReader) translate(data []byte) {
@@ -1048,20 +1413,45 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 		}
 		r.usage["input_tokens"] = event.Get("message.usage.input_tokens").Int()
 		r.usage["cached_tokens"] = event.Get("message.usage.cache_read_input_tokens").Int()
-		r.queue.Write(responseEvent("response.created", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "in_progress", "model": r.model}}))
+		r.queue.Write(responseEvent("response.created", map[string]any{"response": r.response("in_progress")}))
 	case "content_block_start":
 		index := int(event.Get("index").Int())
 		blockType := event.Get("content_block.type").String()
 		block := r.ensureBlock(index, blockType)
-		if block.id == "" {
-			block.id = event.Get("content_block.id").String()
-		}
-		if block.name == "" {
-			block.name = event.Get("content_block.name").String()
-		}
-		if blockType == "tool_use" {
-			id := block.id
-			r.queue.Write(responseEvent("response.output_item.added", map[string]any{"output_index": block.outputIndex, "item": map[string]any{"id": id, "type": "function_call", "call_id": id, "name": block.name, "arguments": "", "status": "in_progress"}}))
+		switch blockType {
+		case "text":
+			r.enqueueBlockAdded(block)
+			r.enqueueTextDelta(block, event.Get("content_block.text").String())
+		case "thinking", "redacted_thinking":
+			r.enqueueBlockAdded(block)
+			r.enqueueReasoningDelta(block, event.Get("content_block.thinking").String())
+			signature := event.Get("content_block.signature").String()
+			if signature == "" {
+				signature = event.Get("content_block.data").String()
+			}
+			if signature != "" {
+				block.signature.WriteString(signature)
+				r.queue.Write(responseEvent("response.reasoning.encrypted_content.delta", map[string]any{
+					"item_id": block.id, "output_index": block.outputIndex,
+					"delta": signature, "response_id": r.responseID,
+				}))
+			}
+		case "tool_use":
+			if block.id == "" {
+				block.id = event.Get("content_block.id").String()
+			}
+			if block.name == "" {
+				block.name = event.Get("content_block.name").String()
+			}
+			input := event.Get("content_block.input")
+			if input.Exists() && input.Raw != "null" && block.arguments.Len() == 0 {
+				raw := strings.TrimSpace(input.Raw)
+				if raw != "" {
+					block.arguments.WriteString(raw)
+					block.argumentsFromStart = true
+				}
+			}
+			r.enqueueToolAdded(block)
 		}
 	case "content_block_delta":
 		index := int(event.Get("index").Int())
@@ -1078,20 +1468,53 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 		block := r.ensureBlock(index, blockType)
 		switch deltaType {
 		case "text_delta":
-			block.text.WriteString(event.Get("delta.text").String())
-			r.queue.Write(responseEvent("response.output_text.delta", map[string]any{"delta": event.Get("delta.text").String(), "response_id": r.responseID}))
+			r.enqueueTextDelta(block, event.Get("delta.text").String())
 		case "thinking_delta":
-			block.reasoning.WriteString(event.Get("delta.thinking").String())
-			r.queue.Write(responseEvent("response.reasoning_summary_text.delta", map[string]any{"delta": event.Get("delta.thinking").String(), "response_id": r.responseID}))
+			delta := event.Get("delta.thinking").String()
+			r.enqueueReasoningDelta(block, delta)
 		case "signature_delta":
 			signature := event.Get("delta.signature").String()
+			if signature == "" {
+				return
+			}
+			r.enqueueBlockAdded(block)
 			block.signature.WriteString(signature)
-			r.queue.Write(responseEvent("response.reasoning.encrypted_content.delta", map[string]any{"delta": signature, "response_id": r.responseID}))
+			r.queue.Write(responseEvent("response.reasoning.encrypted_content.delta", map[string]any{
+				"item_id": block.id, "output_index": block.outputIndex,
+				"delta": signature, "response_id": r.responseID,
+			}))
 		case "input_json_delta":
-			id := block.id
 			partialJSON := event.Get("delta.partial_json").String()
+			if partialJSON == "" {
+				return
+			}
+			if !block.argumentsDeltaSeen {
+				block.argumentsDeltaSeen = true
+			}
+			if block.argumentsFromStart {
+				// In streaming Messages the start input is provisional (usually {}).
+				// Once input_json_delta appears, that delta sequence is authoritative.
+				block.arguments.Reset()
+				block.emittedArguments = 0
+				block.argumentsFromStart = false
+			}
 			block.arguments.WriteString(partialJSON)
-			r.queue.Write(responseEvent("response.function_call_arguments.delta", map[string]any{"output_index": block.outputIndex, "item_id": id, "call_id": id, "delta": partialJSON}))
+			r.enqueueToolAdded(block)
+		}
+	case "content_block_stop":
+		index := int(event.Get("index").Int())
+		block := r.blocks[index]
+		if block == nil || block.blockStopped {
+			return
+		}
+		block.blockStopped = true
+		switch block.blockType {
+		case "text":
+			r.enqueueTextPartDone(block)
+		case "thinking", "redacted_thinking":
+			r.enqueueReasoningCompletion(block)
+		case "tool_use":
+			r.enqueueToolCompletion(block)
 		}
 	case "message_delta":
 		r.usage["output_tokens"] = event.Get("usage.output_tokens").Int()
@@ -1115,42 +1538,57 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 		if stop == "max_tokens" || stop == "model_context_window_exceeded" {
 			status = "incomplete"
 		}
+		if status == "completed" {
+			for _, block := range r.output {
+				if block == nil || block.itemDone {
+					continue
+				}
+				switch block.blockType {
+				case "message":
+					r.enqueueMessageCompletion(block, true)
+				case "thinking", "redacted_thinking":
+					r.enqueueReasoningCompletion(block)
+				case "tool_use":
+					r.enqueueToolCompletion(block)
+				}
+			}
+		} else {
+			for _, block := range r.output {
+				if block != nil && block.blockType == "message" {
+					r.enqueueMessageCompletion(block, false)
+				}
+			}
+		}
 		usage := map[string]any{"input_tokens": r.usage["input_tokens"], "output_tokens": r.usage["output_tokens"], "total_tokens": r.usage["input_tokens"] + r.usage["output_tokens"], "input_tokens_details": map[string]any{"cached_tokens": r.usage["cached_tokens"]}}
 		output := make([]any, 0, len(r.output))
-		for _, index := range r.output {
-			block := r.blocks[index]
+		for _, block := range r.output {
 			if block == nil {
 				continue
 			}
-			switch block.blockType {
-			case "thinking", "redacted_thinking":
-				if block.reasoning.Len() == 0 && block.signature.Len() == 0 {
-					continue
-				}
-				reasoningItem := map[string]any{"id": "rs_" + uuid.NewString(), "type": "reasoning", "summary": []any{}, "status": "completed"}
-				if block.reasoning.Len() > 0 {
-					reasoningItem["summary"] = []any{map[string]any{"type": "summary_text", "text": block.reasoning.String()}}
-				}
-				if block.signature.Len() > 0 {
-					reasoningItem["encrypted_content"] = block.signature.String()
-				}
-				output = append(output, reasoningItem)
-			case "text":
-				if block.text.Len() > 0 {
-					output = append(output, map[string]any{"id": "msg_" + uuid.NewString(), "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": block.text.String(), "annotations": []any{}}}})
-				}
-			case "tool_use":
-				output = append(output, map[string]any{"id": block.id, "type": "function_call", "call_id": block.id, "name": block.name, "arguments": block.arguments.String(), "status": "completed"})
+			itemStatus := "incomplete"
+			if block.itemDone {
+				itemStatus = "completed"
+			}
+			if item := messagesResponseOutputItem(block, itemStatus); item != nil {
+				output = append(output, item)
 			}
 		}
-		response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
+		response := r.response(status)
+		response["output"] = output
+		response["usage"] = usage
 		if status == "incomplete" {
 			response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 		}
-		r.queue.Write(responseEvent("response.completed", map[string]any{"response": response}))
+		terminalType := "response.completed"
+		if status == "incomplete" {
+			terminalType = "response.incomplete"
+		}
+		r.queue.Write(responseEvent(terminalType, map[string]any{"response": response}))
 		r.terminal = true
 	case "error":
-		r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "object": "response", "status": "failed", "model": r.model, "error": map[string]any{"code": event.Get("error.type").String(), "message": event.Get("error.message").String()}}}))
+		response := r.response("failed")
+		response["error"] = map[string]any{"code": event.Get("error.type").String(), "message": event.Get("error.message").String()}
+		r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 		r.terminal = true
 	}
 }
@@ -1160,7 +1598,9 @@ func (r *messagesToResponsesReader) Read(p []byte) (int, error) {
 		data, err := readSSEDataLine(r.reader)
 		if err != nil {
 			if err == io.EOF && !r.terminal {
-				r.queue.Write(responseEvent("response.failed", map[string]any{"response": map[string]any{"id": r.responseID, "status": "failed", "model": r.model, "error": map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}}}))
+				response := r.response("failed")
+				response["error"] = map[string]any{"code": ErrorCodeUpstreamStreamBreak, "message": "upstream stream interrupted before completion"}
+				r.queue.Write(responseEvent("response.failed", map[string]any{"response": response}))
 				r.terminal = true
 				break
 			}
@@ -1302,11 +1742,7 @@ func canonicalGrokResponsesBody(inbound GrokProtocol, inboundBody, responsesBody
 	return body, err
 }
 
-func prepareGrokProtocolBody(protocol, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
-	canonical, err := canonicalGrokResponsesBody(inbound, inboundBody, responsesBody)
-	if err != nil {
-		return nil, err
-	}
+func convertCanonicalGrokResponsesBody(protocol GrokProtocol, canonical []byte) ([]byte, error) {
 	switch protocol {
 	case GrokProtocolChatCompletions:
 		return convertResponsesToChatRequest(canonical)
@@ -1330,7 +1766,7 @@ func rewriteGrokProtocolModel(body []byte, model string) ([]byte, error) {
 	return sjson.SetBytes(body, "model", model)
 }
 
-func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
+func prepareRoutedGrokProtocolRequest(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) (grokPreflightResult, error) {
 	inbound = auth.NormalizeGrokProtocol(string(inbound))
 	// A same-protocol route receives the original downstream object even when
 	// it was selected from catalog apiBackend rather than a fresh capability
@@ -1340,10 +1776,24 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 	// ExecuteGrokProtocolRequest.
 	if route.Protocol == inbound && inbound != "" && len(inboundBody) > 0 {
 		body, err := rewriteGrokProtocolModel(inboundBody, route.Model)
-		if err != nil || route.Native {
+		if err != nil {
+			return grokPreflightResult{}, err
+		}
+		if route.Native {
 			// 仅 native 路由按线格式直通返回(forwardGrokNativeResponse),
 			// 可以完整保留 stream=false。
-			return body, err
+			//
+			// 但直通的是"传输形态",不是"请求内容":Codex 专有工具形态
+			// (custom / namespace / tool_search / additional_tools)与被丢弃的
+			// 顶层字段仍必须经 preflight 降级,否则原样发给 Grok 会 400。
+			// 统一跑 preflight 还让同一会话在 native 与非 native 之间切换时
+			// 请求体形态保持一致,不打断上游的静态前缀缓存。
+			// 实测 preflight 成本 0.06~1.9ms(6KB~544KB 请求体),相对 Grok
+			// 秒级首字可忽略。
+			if route.Protocol == GrokProtocolResponses {
+				return prepareGrokUpstreamBody(body), nil
+			}
+			return grokPreflightResult{Body: body, TurnIndex: 1, Model: gjson.GetBytes(body, "model").String()}, nil
 		}
 		// 非 native 的同协议路由不会直通:响应必须经 adaptGrokProtocolResponse
 		// 投影成规范 Responses SSE 再交给下游翻译器,而该投影只处理 SSE。
@@ -1352,7 +1802,7 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 		if !grokProtocolBodyStream(body) {
 			forced, forceErr := sjson.SetBytes(body, "stream", true)
 			if forceErr != nil {
-				return nil, forceErr
+				return grokPreflightResult{}, forceErr
 			}
 			if route.Protocol == GrokProtocolChatCompletions {
 				// Chat 的 usage 只随 include_usage 的独立 chunk 下发。
@@ -1362,9 +1812,34 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 			}
 			body = forced
 		}
-		return body, nil
+		if route.Protocol == GrokProtocolResponses {
+			return prepareGrokUpstreamBody(body), nil
+		}
+		return grokPreflightResult{Body: clampGrokReasoningEffort(body), TurnIndex: 1, Model: gjson.GetBytes(body, "model").String()}, nil
 	}
-	return prepareGrokProtocolBody(route.Protocol, inbound, inboundBody, responsesBody)
+
+	canonical, err := canonicalGrokResponsesBody(inbound, inboundBody, responsesBody)
+	if err != nil {
+		return grokPreflightResult{}, err
+	}
+	// Codex-only Responses tools and history must be lowered while the request
+	// still has canonical Responses semantics. Converting first rejects those
+	// variants and loses the request-local aliases needed to restore tool calls.
+	preflight := prepareGrokUpstreamBody(canonical)
+	converted, err := convertCanonicalGrokResponsesBody(route.Protocol, preflight.Body)
+	if err != nil {
+		return grokPreflightResult{}, err
+	}
+	if route.Protocol != GrokProtocolResponses {
+		converted = clampGrokReasoningEffort(converted)
+	}
+	preflight.Body = converted
+	return preflight, nil
+}
+
+func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
+	preflight, err := prepareRoutedGrokProtocolRequest(route, inbound, inboundBody, responsesBody)
+	return preflight.Body, err
 }
 
 func validGrokClientVersion(value string) bool {
@@ -1419,7 +1894,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 		model = strings.TrimSpace(gjson.GetBytes(inboundBody, "model").String())
 	}
 	route := ResolveGrokUpstreamRoute(account, model, inbound, time.Now())
-	body, err := prepareRoutedGrokProtocolBody(route, inbound, inboundBody, responsesBody)
+	preflight, err := prepareRoutedGrokProtocolRequest(route, inbound, inboundBody, responsesBody)
 	if err != nil {
 		return nil, ErrBadRequest("Grok protocol conversion failed: " + err.Error())
 	}
@@ -1433,14 +1908,6 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	account.Mu().RUnlock()
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
-	}
-	preflight := prepareGrokUpstreamBody(body)
-	if route.Protocol != GrokProtocolResponses || (route.Native && route.Protocol == auth.NormalizeGrokProtocol(string(inbound))) {
-		// Responses-specific history preflight cannot be applied after conversion.
-		preflight = grokPreflightResult{Body: body, TurnIndex: 1, Model: model}
-		if !route.Native {
-			preflight.Body = clampGrokReasoningEffort(body)
-		}
 	}
 	logGrokPrefixFingerprint(preflight.Body, preflight.TurnIndex, preflight.Model)
 	send := func(payload []byte, clientVersion string) (*http.Response, error) {
@@ -1515,15 +1982,17 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	recordGrokUpstreamObservationsAtOrigin(account, resp.Header, route.BaseURL)
 	observeGrokNativeProtocolFailure(account, route, inbound, resp)
 	markGrokNativeRoute(resp, route, inbound)
-	if len(preflight.Aliases) > 0 && resp.Body != nil {
-		streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream")
-		resp.Body = newGrokNamespaceReverser(resp.Body, streaming, preflight.Aliases)
-	}
 	// Same-protocol native routes retain the provider wire representation. The
 	// concrete handler streams/copies it directly; converted routes continue to
 	// project through canonical Responses SSE for the existing translators.
 	if !isGrokNativeRouteResponse(resp) {
 		adaptGrokProtocolResponse(resp, route.Protocol, model, grokProtocolBodyStream(preflight.Body))
+	}
+	if len(preflight.Aliases) > 0 && resp.Body != nil {
+		streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream")
+		resp.Body = newGrokNamespaceReverser(resp.Body, streaming, preflight.Aliases)
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
 	}
 	return resp, nil
 }

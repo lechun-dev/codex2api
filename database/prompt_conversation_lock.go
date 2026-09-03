@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	PromptConversationLockStatusActive             = "active"
-	PromptConversationLockStatusUnlocked           = "unlocked"
-	PromptConversationLockCacheNamespace           = "prompt-conversation-lock"
-	PromptConversationRestrictionScopeConversation = "conversation"
-	PromptConversationRestrictionScopeUserCooldown = "user_cooldown"
+	PromptConversationLockStatusActive                  = "active"
+	PromptConversationLockStatusUnlocked                = "unlocked"
+	PromptConversationLockCacheNamespace                = "prompt-conversation-lock"
+	PromptConversationRestrictionScopeConversation      = "conversation"
+	PromptConversationRestrictionScopeUserCooldown      = "user_cooldown"
+	PromptConversationRestrictionScopeFingerprintReplay = "fingerprint_replay"
 	// PromptUserCyberCooldownTTL is retained for source compatibility with
 	// integrations that referenced the old default. Runtime enforcement reads
 	// the configurable prompt-filter setting instead.
@@ -27,8 +28,11 @@ const (
 	//
 	// 当 identity_kind 为 codex_session 时,newapi_user_id 列存放降级主体
 	// (形如 apikey:<id>),platform 列存放固定标识 codex-local。
-	PromptConversationLockIdentityNewAPI       = "newapi"
-	PromptConversationLockIdentityCodexSession = "codex_session"
+	// fingerprint_replay 使用同一张锁表,但只绑定 API Key、客户端 IP 哈希
+	// 和精确 Prompt 指纹,不能解释为人员身份。
+	PromptConversationLockIdentityNewAPI            = "newapi"
+	PromptConversationLockIdentityCodexSession      = "codex_session"
+	PromptConversationLockIdentityFingerprintReplay = "fingerprint_replay"
 )
 
 func normalizePromptConversationLockIdentityKind(kind string) (string, bool) {
@@ -37,6 +41,8 @@ func normalizePromptConversationLockIdentityKind(kind string) (string, bool) {
 		return PromptConversationLockIdentityNewAPI, true
 	case PromptConversationLockIdentityCodexSession:
 		return PromptConversationLockIdentityCodexSession, true
+	case PromptConversationLockIdentityFingerprintReplay:
+		return PromptConversationLockIdentityFingerprintReplay, true
 	default:
 		return "", false
 	}
@@ -172,8 +178,7 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 	if db.isSQLite() {
 		return db.ensureSQLiteColumn(ctx, "prompt_conversation_locks", "identity_kind", "TEXT NOT NULL DEFAULT 'newapi'")
 	}
-	_, err := db.conn.ExecContext(ctx, `ALTER TABLE prompt_conversation_locks ADD COLUMN IF NOT EXISTS identity_kind VARCHAR(24) NOT NULL DEFAULT 'newapi'`)
-	return err
+	return db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) NOT NULL DEFAULT 'newapi'")
 }
 
 const promptConversationLockSelect = `SELECT id, lock_key, status, identity_kind, platform, newapi_user_id,
@@ -231,7 +236,7 @@ func normalizePromptConversationLockInput(input PromptConversationLockInput) (Pr
 		input.SessionFingerprint != "" && len(input.SessionFingerprint) != 32
 	// 降级的 Codex 会话身份必须携带 32 位指纹，防止空标识锁住共享 API Key。
 	// 已验证的 NewAPI 用户级冷却锁有意不绑定会话，因此允许指纹与会话哈希同时为空。
-	if input.IdentityKind == PromptConversationLockIdentityCodexSession {
+	if input.IdentityKind == PromptConversationLockIdentityCodexSession || input.IdentityKind == PromptConversationLockIdentityFingerprintReplay {
 		invalidSessionIdentity = len(input.SessionFingerprint) != 32
 	}
 	if len(input.LockKey) != 64 || input.Platform == "" || input.NewAPIUserID == "" || input.DecisionID == "" || invalidSessionIdentity {
@@ -302,12 +307,12 @@ func (db *DB) lockPromptConversationMySQL(ctx context.Context, input PromptConve
 
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `INSERT INTO prompt_conversation_locks (
-		lock_key, status, platform, newapi_user_id, session_fingerprint, session_hash,
+		lock_key, status, identity_kind, platform, newapi_user_id, session_fingerprint, session_hash,
 		incident_id, decision_id, request_id, reason_code, endpoint, model, trigger_count,
 		unlock_count, locked_at, unlocked_at, unlock_reason, created_at, updated_at
-	) VALUES ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,0,$12,NULL,'',$13,$13)
+	) VALUES ($1,'active',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,$13,NULL,'',$14,$14)
 	ON DUPLICATE KEY UPDATE lock_key=VALUES(lock_key)`,
-		input.LockKey, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
+		input.LockKey, input.IdentityKind, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
 		input.IncidentID, input.DecisionID, input.RequestID, input.ReasonCode, input.Endpoint,
 		input.Model, input.LockedAt, now)
 	if err != nil {
@@ -329,13 +334,12 @@ func (db *DB) lockPromptConversationMySQL(ctx context.Context, input PromptConve
 	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE prompt_conversation_locks SET
-		status='active', platform=$2, newapi_user_id=$3, session_fingerprint=$4,
-		session_hash=$5, incident_id=$6, decision_id=$7, request_id=$8,
-		reason_code=$9, endpoint=$10, model=$11, trigger_count=trigger_count+1,
-		locked_at=$12, unlocked_at=NULL, unlock_reason='', updated_at=$13
-		WHERE lock_key=$1`, input.LockKey, input.Platform, input.NewAPIUserID,
-		input.SessionFingerprint, input.SessionHash, input.IncidentID, input.DecisionID,
-		input.RequestID, input.ReasonCode, input.Endpoint, input.Model, input.LockedAt, now)
+		status='active', identity_kind=$2, platform=$3, newapi_user_id=$4, session_fingerprint=$5,
+		session_hash=$6, incident_id=$7, decision_id=$8, request_id=$9,
+		reason_code=$10, endpoint=$11, model=$12, trigger_count=trigger_count+1,
+		locked_at=$13, unlocked_at=NULL, unlock_reason='', updated_at=$14
+		WHERE lock_key=$1`, input.LockKey, input.IdentityKind, input.Platform, input.NewAPIUserID, input.SessionFingerprint, input.SessionHash,
+		input.IncidentID, input.DecisionID, input.RequestID, input.ReasonCode, input.Endpoint, input.Model, input.LockedAt, now)
 	if err != nil {
 		return nil, false, err
 	}
@@ -415,6 +419,28 @@ func (db *DB) GetActivePromptConversationLockBySessionHash(ctx context.Context, 
 		return nil, err
 	}
 	return scanPromptConversationLock(db.conn.QueryRowContext(ctx, promptConversationLockSelect+` WHERE session_hash=$1 AND status='active' ORDER BY updated_at DESC LIMIT 1`, strings.ToLower(strings.TrimSpace(sessionHash))))
+}
+
+// HasActivePromptFingerprintReplayLocks reports whether any fingerprint replay
+// cooldown row is still live within ttl. The relay hot path uses it as a cheap
+// existence gate: deriving a replay fingerprint requires a full request
+// envelope build, which is wasted work while no cooldown exists anywhere.
+func (db *DB) HasActivePromptFingerprintReplayLocks(ctx context.Context, ttl time.Duration) (bool, error) {
+	if err := db.ensurePromptConversationLocksTable(ctx); err != nil {
+		return false, err
+	}
+	args := []any{PromptConversationLockIdentityFingerprintReplay}
+	query := `SELECT 1 FROM prompt_conversation_locks WHERE status='active' AND identity_kind=$1`
+	if ttl > 0 {
+		args = append(args, time.Now().UTC().Add(-ttl))
+		query += ` AND locked_at>$2`
+	}
+	var one int
+	err := db.conn.QueryRowContext(ctx, query+` LIMIT 1`, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (db *DB) GetActivePromptConversationLockBySessionHashWithTTL(ctx context.Context, sessionHash string, ttl time.Duration) (*PromptConversationLock, error) {

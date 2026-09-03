@@ -53,7 +53,7 @@ const CLIENT_TOOLS: ClientTool[] = [
   },
 ]
 
-const FALLBACK_MODELS = ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.3-codex', 'claude-sonnet-4-5-20250514']
+const FALLBACK_MODELS = ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.3-codex', 'claude-sonnet-4-5']
 
 function encodeBase64(text: string): string {
   return btoa(unescape(encodeURIComponent(text)))
@@ -212,6 +212,9 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
               active={codexTab}
               onChange={setCodexTab}
             />
+            <p className="mb-3 text-xs text-amber-600 dark:text-amber-400">
+              If you switched via cc switch, the active config may be managed elsewhere and may not appear in this file.
+            </p>
             <div className="space-y-4">
               <CodeBlock label={`${codexDir}/config.toml`} content={codexConfig} />
               <CodeBlock label={`${codexDir}/auth.json`} content={codexAuth} />
@@ -262,6 +265,7 @@ export default function Guide() {
   const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([])
   const [selectedKey, setSelectedKey] = useState('')
   const [models, setModels] = useState(FALLBACK_MODELS)
+  const [claudeModels, setClaudeModels] = useState<string[]>([])
   const [selectedModel, setSelectedModel] = useState('gpt-5.5')
   const [curlTab, setCurlTab] = useState<'responses' | 'chat' | 'messages'>('responses')
 
@@ -273,8 +277,12 @@ export default function Guide() {
     }).catch(() => {})
 
     api.getModels().then((res) => {
-      const next = (res.models?.length ? res.models : res.items?.map((item) => item.id) ?? [])
-        .filter((model): model is string => Boolean(model))
+      const nextClaude = Array.from(new Set((res.claude_models ?? []).filter((model): model is string => Boolean(model))))
+      setClaudeModels(nextClaude)
+      const next = Array.from(new Set([
+        ...(res.models ?? []),
+        ...(res.items?.map((item) => item.id) ?? []),
+      ].filter((model): model is string => Boolean(model) && !model.toLowerCase().startsWith('claude-'))))
       if (next.length > 0) {
         setModels(next)
         setSelectedModel(next.includes('gpt-5.5') ? 'gpt-5.5' : next[0])
@@ -284,7 +292,22 @@ export default function Guide() {
 
   const activeKey = selectedKey || apiKeys[0]?.key || ''
   const keyForSnippet = activeKey || 'YOUR_API_KEY'
-  const messagesModel = selectedModel.startsWith('claude-') ? selectedModel : 'claude-sonnet-4-5-20250514'
+  const claudeModelOptions = useMemo(
+    () => claudeModels.length > 0 ? claudeModels : ['claude-sonnet-4-5'],
+    [claudeModels],
+  )
+  const codexModelOptions = useMemo(() => {
+    const filtered = models.filter((model) => !model.startsWith('claude-'))
+    return filtered.length > 0 ? filtered : FALLBACK_MODELS.filter((model) => !model.startsWith('claude-'))
+  }, [models])
+  const selectedCurlOptions = curlTab === 'messages' ? claudeModelOptions : codexModelOptions
+  useEffect(() => {
+    if (selectedCurlOptions.includes(selectedModel)) return
+    if (selectedCurlOptions[0]) setSelectedModel(selectedCurlOptions[0])
+  }, [selectedCurlOptions, selectedModel])
+  const messagesModel = selectedModel.startsWith('claude-')
+    ? selectedModel
+    : (claudeModelOptions[0] ?? 'claude-sonnet-4-5')
 
   const curlExamples = {
     responses: `curl -X POST ${baseUrl}/v1/responses \\
@@ -378,7 +401,7 @@ export default function Guide() {
                   <Select
                     value={selectedModel}
                     onValueChange={setSelectedModel}
-                    options={models.map((model) => ({ label: model, value: model }))}
+                    options={selectedCurlOptions.map((model) => ({ label: model, value: model }))}
                   />
                 </div>
               </div>

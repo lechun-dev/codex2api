@@ -544,14 +544,21 @@ func emailFromCredentialsJSON(raw string) string {
 }
 
 // ListAPIKeyLastUsedAt 返回每个 API Key 最近一次请求时间（来自 usage_logs）。
-// 仅包含有调用记录的 key；索引 idx_usage_logs_api_key_created_at 支撑该聚合。
+// 仅包含有调用记录的 key；每个相关子查询都可沿
+// idx_usage_logs_api_key_created_at 从最新记录开始查找，避免聚合全量历史日志。
 func (db *DB) ListAPIKeyLastUsedAt(ctx context.Context) (map[int64]time.Time, error) {
 	query := `
-		SELECT api_key_id, MAX(created_at)
-		FROM usage_logs
-		WHERE api_key_id > 0
-		  AND status_code <> 499
-		GROUP BY api_key_id
+		SELECT k.id,
+		       (
+			       SELECT u.created_at
+			       FROM usage_logs u
+			       WHERE u.api_key_id = k.id
+			         AND u.status_code <> 499
+			       ORDER BY u.created_at DESC
+			       LIMIT 1
+		       ) AS last_used_at
+		FROM api_keys k
+		WHERE k.id > 0
 	`
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {

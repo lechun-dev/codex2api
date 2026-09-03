@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -460,6 +461,72 @@ func (tc *MemoryTokenCache) DeleteRuntime(ctx context.Context, namespace string,
 	delete(tc.runtime, mapKey)
 	tc.mu.Unlock()
 	return nil
+}
+
+func (tc *MemoryTokenCache) ClaimRuntimeOwner(ctx context.Context, namespace, key string, owner []byte, ttl time.Duration) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(owner) == 0 {
+		return nil, nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	var previous []byte
+	if entry, ok := tc.runtime[mapKey]; ok && (entry.expiresAt.IsZero() || now.Before(entry.expiresAt)) {
+		previous = append([]byte(nil), entry.value...)
+	}
+	tc.runtime[mapKey] = memoryRuntimeEntry{
+		value:     append(json.RawMessage(nil), owner...),
+		expiresAt: now.Add(ttl),
+	}
+	return previous, nil
+}
+
+func (tc *MemoryTokenCache) CompareAndRefreshRuntimeOwner(ctx context.Context, namespace, key string, expected []byte, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(expected) == 0 {
+		return false, nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	entry, ok := tc.runtime[mapKey]
+	if !ok || (!entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)) || !bytes.Equal(entry.value, expected) {
+		return false, nil
+	}
+	entry.expiresAt = now.Add(ttl)
+	tc.runtime[mapKey] = entry
+	return true, nil
+}
+
+func (tc *MemoryTokenCache) CompareAndDeleteRuntimeOwner(ctx context.Context, namespace, key string, expected []byte) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(expected) == 0 {
+		return false, nil
+	}
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	entry, ok := tc.runtime[mapKey]
+	if !ok || (!entry.expiresAt.IsZero() && !time.Now().Before(entry.expiresAt)) || !bytes.Equal(entry.value, expected) {
+		return false, nil
+	}
+	delete(tc.runtime, mapKey)
+	return true, nil
 }
 
 func (tc *MemoryTokenCache) TrackAPIKeyClient(ctx context.Context, apiKeyID int64, clientID string, maxClients int, ttl time.Duration) (APIKeyClientLimitResult, error) {

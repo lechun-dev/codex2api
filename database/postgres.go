@@ -18,7 +18,8 @@ import (
 
 	"github.com/codex2api/internal/openaiidentity"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -374,9 +375,8 @@ type usageLogEntry struct {
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
 func New(driver string, dsn string, schema ...string) (*DB, error) {
 	driver = normalizeDriver(driver)
-	driverName := driver
+	driverName := sqlOpenDriverName(driver)
 	if driver == "sqlite" {
-		driverName = "sqlite"
 		dsn = sqliteConnectDSN(dsn)
 	} else if driver == "mysql" {
 		driverName = mysqlDriverName
@@ -452,7 +452,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		// search_path 已通过 DSN 的 options=-c search_path=... 在所有连接启动时设置；
 		// 这里仅做一次幂等的 CREATE SCHEMA + SET 兜底，便于首次部署时自动建好 schema。
 		if pgSchema != "" {
-			quoted := pq.QuoteIdentifier(pgSchema)
+			quoted := quotePostgresIdent(pgSchema)
 			if _, err := conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
 				return nil, fmt.Errorf("创建数据库 schema 失败: %w", err)
 			}
@@ -605,12 +605,12 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 		return nil
 	}
 	if exists && !valid {
-		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+pq.QuoteIdentifier(indexName)); err != nil {
+		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+quotePostgresIdent(indexName)); err != nil {
 			return fmt.Errorf("清理无效索引 %s 失败: %w", indexName, err)
 		}
 	}
 	// CONCURRENTLY 不能在事务块内执行；单条 ExecContext 走 autocommit，满足要求。
-	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+pq.QuoteIdentifier(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+quotePostgresIdent(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
 		return fmt.Errorf("在线创建索引 %s 失败: %w", indexName, err)
 	}
 	log.Printf("usage_logs 代际索引 %s 已就绪", indexName)
@@ -1295,6 +1295,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				site_logo          TEXT DEFAULT '',
 				background_config  TEXT DEFAULT '{}',
 				grok_config        TEXT DEFAULT '{}',
+				claude_config      TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -1341,6 +1342,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS grok_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS claude_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
@@ -1350,6 +1352,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_engine TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_request_compression BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_rate_limit_retries INT DEFAULT 1;
@@ -1368,6 +1372,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_spread BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_slot_buffer_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -1454,6 +1461,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864;
@@ -1778,9 +1786,11 @@ const (
 
 // 上游渠道限定取值。
 const (
-	UpstreamChannelAuto  = ""
-	UpstreamChannelCodex = "codex"
-	UpstreamChannelGrok  = "grok"
+	UpstreamChannelAuto        = ""
+	UpstreamChannelCodex       = "codex"
+	UpstreamChannelGrok        = "grok"
+	UpstreamChannelAntigravity = "antigravity"
+	UpstreamChannelClaude      = "claude"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1790,6 +1800,10 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelCodex
 	case UpstreamChannelGrok:
 		return UpstreamChannelGrok
+	case UpstreamChannelAntigravity:
+		return UpstreamChannelAntigravity
+	case UpstreamChannelClaude:
+		return UpstreamChannelClaude
 	}
 	return UpstreamChannelAuto
 }
@@ -1841,6 +1855,8 @@ type APIKeyInput struct {
 type APIKeyUpdate struct {
 	Name               string
 	NameSet            bool
+	Enabled            bool
+	EnabledSet         bool
 	QuotaLimit         float64
 	QuotaLimitSet      bool
 	ResetQuota         bool
@@ -2103,6 +2119,9 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	if update.NameSet {
 		sets = append(sets, "name = "+setArg(update.Name))
 	}
+	if update.EnabledSet {
+		sets = append(sets, "enabled = "+setArg(update.Enabled))
+	}
 	if update.QuotaLimitSet {
 		quotaLimit := update.QuotaLimit
 		if quotaLimit < 0 {
@@ -2304,6 +2323,7 @@ type SystemSettings struct {
 	SiteLogo                           string
 	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
 	GrokConfig                         string // JSON: {"affinity_mode":"strict"}
+	ClaudeConfig                       string
 	MaxConcurrency                     int
 	GlobalRPM                          int
 	TestModel                          string
@@ -2321,6 +2341,8 @@ type SystemSettings struct {
 	LazyMode                           bool
 	ProxyPoolEnabled                   bool
 	FastSchedulerEnabled               bool
+	SchedulerEngine                    string
+	CodexRequestCompression            bool
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	AllowRemoteMigration               bool
@@ -2437,6 +2459,11 @@ type SystemSettings struct {
 	OAuthModelCooldownMode           string
 	OAuthModelCooldownSeconds        int
 	OAuthModelCooldownBackoffEnabled bool
+	ContinuousRetryPolicy            string
+	SessionSlotBufferEnabled         bool
+	SessionSlotBufferSeconds         int
+	ModelsListReadMaxBytes           int64
+	AutoActivate5hWindowEnabled      bool
 
 	// PreservePromptFilterCustomPatterns is an update-only concurrency guard.
 	// When true, an existing row keeps its current custom-pattern value instead
@@ -2571,9 +2598,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(first_token_timeout_seconds, 0),
 			       COALESCE(NULLIF(TRIM(billing_tier_policy), ''), 'actual'),
 			       COALESCE(image_storage_config, '{}'),
-		       COALESCE(background_config, '{}'),
-		       COALESCE(grok_config, '{}'),
-		       COALESCE(show_full_usage_numbers, false),
+	       COALESCE(background_config, '{}'),
+	       COALESCE(grok_config, '{}'),
+	       COALESCE(claude_config, '{}'),
+	       COALESCE(show_full_usage_numbers, false),
 		       COALESCE(public_key_usage_page_enabled, true),
 		       COALESCE(public_image_studio_page_enabled, true),
 		       COALESCE(public_account_portal_page_enabled, false),
@@ -2621,7 +2649,14 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_overload_pause_enabled, false),
 		       COALESCE(codex_overload_threshold_percent, 20),
 		       COALESCE(codex_overload_pause_minutes, 30),
-		       COALESCE(codex_overload_window_minutes, 5)
+		       COALESCE(codex_overload_window_minutes, 5),
+		       COALESCE(continuous_retry_policy, '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}'),
+		       COALESCE(session_slot_buffer_enabled, false),
+		       COALESCE(session_slot_buffer_seconds, 10),
+		       COALESCE(models_list_read_max_bytes, 8388608),
+	       COALESCE(auto_activate_5h_window_enabled, false)
+	       ,COALESCE(NULLIF(TRIM(scheduler_engine), ''), '')
+	       ,COALESCE(codex_request_compression, true)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2647,6 +2682,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ImageStorageConfig,
 		&s.BackgroundConfig,
 		&s.GrokConfig,
+		&s.ClaudeConfig,
 		&s.ShowFullUsageNumbers,
 		&s.PublicKeyUsagePageEnabled,
 		&s.PublicImageStudioPageEnabled,
@@ -2696,6 +2732,13 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOverloadThresholdPercent,
 		&s.CodexOverloadPauseMinutes,
 		&s.CodexOverloadWindowMinutes,
+		&s.ContinuousRetryPolicy,
+		&s.SessionSlotBufferEnabled,
+		&s.SessionSlotBufferSeconds,
+		&s.ModelsListReadMaxBytes,
+		&s.AutoActivate5hWindowEnabled,
+		&s.SchedulerEngine,
+		&s.CodexRequestCompression,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2718,10 +2761,15 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if strings.TrimSpace(s.PayloadRules) == "" {
 		s.PayloadRules = "{}"
 	}
+	if strings.TrimSpace(s.ContinuousRetryPolicy) == "" {
+		s.ContinuousRetryPolicy = EncodeContinuousRetryPolicy(DefaultContinuousRetryPolicy())
+	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
+	s.SessionSlotBufferSeconds = NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds)
+	s.ModelsListReadMaxBytes = NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes)
 	return s, err
 }
 
@@ -2753,6 +2801,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	if codexUserAgentConfig == "" {
 		codexUserAgentConfig = "{}"
 	}
+	claudeConfig := strings.TrimSpace(s.ClaudeConfig)
+	if claudeConfig == "" {
+		claudeConfig = "{}"
+	}
+	schedulerEngine := strings.TrimSpace(s.SchedulerEngine)
 	payloadRules := strings.TrimSpace(s.PayloadRules)
 	if payloadRules == "" {
 		payloadRules = "{}"
@@ -2784,11 +2837,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				scheduler_mode,
 				affinity_mode,
 				session_affinity_spread,
-				background_config,
-				grok_config,
-				show_full_usage_numbers,
-				public_key_usage_page_enabled,
-				public_image_studio_page_enabled,
+					background_config,
+					grok_config,
+					claude_config,
+					show_full_usage_numbers,
+					public_key_usage_page_enabled,
+					public_image_studio_page_enabled,
 					reasoning_effort_models,
 					codex_force_websocket,
 					codex_ws_keepalive_enabled,
@@ -2836,9 +2890,15 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_enabled,
 					codex_overload_threshold_percent,
 					codex_overload_pause_minutes,
-					codex_overload_window_minutes
+					codex_overload_window_minutes,
+					session_slot_buffer_enabled,
+					session_slot_buffer_seconds,
+					models_list_read_max_bytes,
+					auto_activate_5h_window_enabled,
+					scheduler_engine,
+					codex_request_compression
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2878,10 +2938,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $115 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+					prompt_filter_custom_patterns = CASE WHEN $122 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $116 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+					prompt_filter_review_api_key = CASE WHEN $123 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2903,6 +2963,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				session_affinity_spread = EXCLUDED.session_affinity_spread,
 				background_config = EXCLUDED.background_config,
 				grok_config = EXCLUDED.grok_config,
+				claude_config = EXCLUDED.claude_config,
 				show_full_usage_numbers = EXCLUDED.show_full_usage_numbers,
 				public_key_usage_page_enabled = EXCLUDED.public_key_usage_page_enabled,
 				public_image_studio_page_enabled = EXCLUDED.public_image_studio_page_enabled,
@@ -2950,7 +3011,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_pause_enabled = EXCLUDED.codex_overload_pause_enabled,
 					codex_overload_threshold_percent = EXCLUDED.codex_overload_threshold_percent,
 					codex_overload_pause_minutes = EXCLUDED.codex_overload_pause_minutes,
-					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes
+					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes,
+					session_slot_buffer_enabled = EXCLUDED.session_slot_buffer_enabled,
+					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds,
+					models_list_read_max_bytes = EXCLUDED.models_list_read_max_bytes,
+					auto_activate_5h_window_enabled = EXCLUDED.auto_activate_5h_window_enabled,
+					scheduler_engine = EXCLUDED.scheduler_engine,
+					codex_request_compression = EXCLUDED.codex_request_compression
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2964,7 +3031,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
 		s.ClientCompatMode, s.CodexMinCLIVersion, codexUserAgentConfig, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.SessionAffinitySpread, s.BackgroundConfig, normalizeGrokConfig(s.GrokConfig), s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, s.PublicImageStudioPageEnabled, reasoningEffortModels,
+		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.SessionAffinitySpread, s.BackgroundConfig, normalizeGrokConfig(s.GrokConfig), claudeConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, s.PublicImageStudioPageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
 		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
@@ -2995,6 +3062,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexOverloadThresholdPercent(s.CodexOverloadThresholdPercent),
 		NormalizeCodexOverloadPauseMinutes(s.CodexOverloadPauseMinutes),
 		NormalizeCodexOverloadWindowMinutes(s.CodexOverloadWindowMinutes),
+		s.SessionSlotBufferEnabled,
+		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
+		NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes),
+		s.AutoActivate5hWindowEnabled,
+		schedulerEngine,
+		s.CodexRequestCompression,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -3129,6 +3202,18 @@ func NormalizeCodexOverloadWindowMinutes(minutes int) int {
 		return 120
 	}
 	return minutes
+}
+
+// NormalizeSessionSlotBufferSeconds keeps the session slot release delay within
+// the scheduler's supported 1-60s range; blank/invalid values keep the default.
+func NormalizeSessionSlotBufferSeconds(seconds int) int {
+	if seconds <= 0 {
+		return 10
+	}
+	if seconds > 60 {
+		return 60
+	}
+	return seconds
 }
 
 // NormalizeCodexWSStatelessSlots 把无状态 WS 连接槽位数限制在 1-32，非正值回落默认 8（issue #522）。
@@ -4530,11 +4615,11 @@ func isUsageLogDataError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var pqErr *pq.Error
-	if !errors.As(err, &pqErr) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	switch pqErr.Code.Class() {
+	switch pgErr.Code[:2] {
 	case "22", "23":
 		return true
 	}
@@ -6275,8 +6360,9 @@ type AccountTimeRangeUsage struct {
 
 // AccountModelCount 某个模型在指定窗口内的请求数与成功数。
 type AccountModelCount struct {
-	Requests int64
-	Success  int64
+	Requests        int64
+	Success         int64
+	AvgFirstTokenMs float64
 }
 
 // nonRetryUsageLogPredicate keeps transport retry attempts out of end-user
@@ -6521,16 +6607,23 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return db.ListActiveByChannel(ctx, "")
 }
 
-// accountUpstreamTypeIsGrokPredicate returns a driver-specific predicate.
-func (db *DB) accountUpstreamTypeIsGrokPredicate() string {
+// accountUpstreamTypePredicate returns a driver-specific provider predicate.
+// 2026-09-02 coder(lq): MySQL 5.6 stores credentials as MEDIUMTEXT, so provider
+// routing must use a text regexp instead of unavailable JSON functions.
+func (db *DB) accountUpstreamTypePredicate(upstreamType string) string {
+	upstreamType = strings.ToLower(strings.TrimSpace(upstreamType))
 	if db.isSQLite() {
-		return `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
+		return `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = '` + upstreamType + `'`
 	}
 	if db.isMySQL() {
-		// MySQL 5.6 has no JSON_EXTRACT; credentials is stored as MEDIUMTEXT.
-		return `LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+		return `LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"` + upstreamType + `"'`
 	}
-	return `LOWER(COALESCE(credentials->>'upstream_type', '')) = 'grok'`
+	return `LOWER(COALESCE(credentials->>'upstream_type', '')) = '` + upstreamType + `'`
+}
+
+// accountUpstreamTypeIsGrokPredicate is retained for Grok maintenance queries.
+func (db *DB) accountUpstreamTypeIsGrokPredicate() string {
+	return db.accountUpstreamTypePredicate(UpstreamChannelGrok)
 }
 
 // ListActiveByChannel 返回未删除账号；channel 为空返回全部，
@@ -6541,10 +6634,16 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 	switch channel {
 	case UpstreamChannelGrok:
-		where += ` AND ` + db.accountUpstreamTypeIsGrokPredicate()
+		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelGrok)
+	case UpstreamChannelAntigravity:
+		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity)
+	case UpstreamChannelClaude:
+		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude)
 	case UpstreamChannelCodex:
-		// 非 grok 一律归入 codex 视图（缺省 upstream_type 的历史号也算 codex 侧）。
-		where += ` AND NOT (` + db.accountUpstreamTypeIsGrokPredicate() + `)`
+		// 缺省 upstream_type 的历史号仍归入 Codex 视图。
+		where += ` AND NOT (` + db.accountUpstreamTypePredicate(UpstreamChannelGrok) +
+			` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity) +
+			` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + `)`
 	}
 
 	query := `
@@ -6641,6 +6740,69 @@ func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCool
 		row.UpdatedAt, parseErr = parseDBTimeValue(updatedRaw)
 		if parseErr != nil {
 			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", parseErr)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// ListActiveModelCooldownsForAccount is the indexed single-account variant.
+func (db *DB) ListActiveModelCooldownsForAccount(ctx context.Context, accountID int64) ([]*AccountModelCooldownRow, error) {
+	if accountID <= 0 {
+		return nil, nil
+	}
+	return db.ListActiveModelCooldownsForAccounts(ctx, []int64{accountID})
+}
+
+// ListActiveModelCooldownsForAccounts loads only cooldowns touched by one
+// scheduler-outbox batch.
+// 2026-09-02 coder(lq): MySQL and SQLite use question-mark placeholders;
+// PostgreSQL keeps numbered placeholders.
+func (db *DB) ListActiveModelCooldownsForAccounts(ctx context.Context, accountIDs []int64) ([]*AccountModelCooldownRow, error) {
+	accountIDs = positiveUniqueIDs(accountIDs)
+	if len(accountIDs) == 0 {
+		return nil, nil
+	}
+	args := make([]interface{}, 0, len(accountIDs)+1)
+	placeholders := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		args = append(args, accountID)
+		if db.isSQLite() || db.isMySQL() {
+			placeholders = append(placeholders, "?")
+		} else {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+	}
+	args = append(args, db.timeArg(time.Now()))
+	resetPlaceholder := "?"
+	if !db.isSQLite() && !db.isMySQL() {
+		resetPlaceholder = fmt.Sprintf("$%d", len(args))
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT account_id, model, COALESCE(reason, ''), reset_at, updated_at
+		FROM account_model_cooldowns
+		WHERE account_id IN (`+strings.Join(placeholders, ",")+`) AND reset_at > `+resetPlaceholder+`
+		ORDER BY account_id, model
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("批量查询账号模型冷却失败: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*AccountModelCooldownRow
+	for rows.Next() {
+		row := &AccountModelCooldownRow{}
+		var resetRaw, updatedRaw interface{}
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.Reason, &resetRaw, &updatedRaw); err != nil {
+			return nil, err
+		}
+		row.ResetAt, err = parseDBTimeValue(resetRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 reset_at 失败: %w", err)
+		}
+		row.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析模型冷却 updated_at 失败: %w", err)
 		}
 		result = append(result, row)
 	}
@@ -6848,7 +7010,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 		merged := mergeCredentialMaps(decodeCredentials(currentRaw), map[string]interface{}{
 			"allowed_api_key_ids": normalizePositiveInt64Slice(allowedAPIKeyIDs.Values),
 		})
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := marshalCredentialsForStorage(merged)
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -6933,7 +7095,7 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 			current := decodeCredentials(currentRaw)
 			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
 			identityChanged := grokIdentityCredentialChanged(current, merged)
-			credJSON, err := json.Marshal(merged)
+			credJSON, err := marshalCredentialsForStorage(merged)
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
 			}
@@ -7160,7 +7322,7 @@ func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, cur
 		// generation bump.
 		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
 		identityChanged := grokIdentityCredentialChanged(credentials, merged)
-		credJSON, err := json.Marshal(merged)
+		credJSON, err := marshalCredentialsForStorage(merged)
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
@@ -7347,7 +7509,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7382,7 +7544,13 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 			if !sqliteJSONSetKeySupported(key) {
 				return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
 			}
-			valueJSON, err := json.Marshal(value)
+			valueForStorage := value
+			if _, sensitive := sensitiveCredentialKeys[key]; sensitive {
+				if text, ok := value.(string); ok {
+					valueForStorage = encryptCredentialValue(key, text)
+				}
+			}
+			valueJSON, err := json.Marshal(valueForStorage)
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
 			}
@@ -7432,7 +7600,7 @@ func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id i
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
 	identityChanged := grokIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7517,7 +7685,7 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
 	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7567,7 +7735,7 @@ func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, crede
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	credJSON, err := json.Marshal(merged)
+	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -7976,7 +8144,7 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := marshalCredentialsForStorage(credentials)
 	if err != nil {
 		return 0, err
 	}
@@ -8022,7 +8190,7 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	credentials := map[string]interface{}{
 		"access_token": accessToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := marshalCredentialsForStorage(credentials)
 	if err != nil {
 		return 0, err
 	}
@@ -8039,7 +8207,7 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := marshalCredentialsForStorage(credentials)
 	if err != nil {
 		return 0, err
 	}
@@ -8056,7 +8224,7 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := marshalCredentialsForStorage(credentials)
 	if err != nil {
 		return 0, err
 	}
@@ -8081,7 +8249,7 @@ func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, acc
 	if strings.TrimSpace(accountType) == "" {
 		accountType = "api"
 	}
-	credJSON, err := json.Marshal(credentials)
+	credJSON, err := marshalCredentialsForStorage(credentials)
 	if err != nil {
 		return 0, err
 	}

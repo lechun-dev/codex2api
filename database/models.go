@@ -106,6 +106,21 @@ func (db *DB) UpsertModelRegistryRows(ctx context.Context, models []ModelRegistr
 				last_seen_at = excluded.last_seen_at,
 				updated_at = CURRENT_TIMESTAMP
 		`
+	} else if db.isMySQL() {
+		query = `
+			INSERT INTO model_registry (
+				id, enabled, category, source, pro_only, api_key_auth_available, last_seen_at, updated_at
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			ON DUPLICATE KEY UPDATE
+				enabled = VALUES(enabled),
+				category = VALUES(category),
+				source = VALUES(source),
+				pro_only = VALUES(pro_only),
+				api_key_auth_available = VALUES(api_key_auth_available),
+				last_seen_at = VALUES(last_seen_at),
+				updated_at = CURRENT_TIMESTAMP
+		`
 	}
 
 	for _, model := range models {
@@ -167,6 +182,14 @@ func (db *DB) UpdateModelRegistrySyncState(ctx context.Context, sourceURL string
 			ON CONFLICT(id) DO UPDATE SET
 				source_url = excluded.source_url,
 				last_synced_at = excluded.last_synced_at
+		`
+	} else if db.isMySQL() {
+		query = `
+			INSERT INTO model_registry_sync (id, source_url, last_synced_at)
+			VALUES (1, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				source_url = VALUES(source_url),
+				last_synced_at = VALUES(last_synced_at)
 		`
 	}
 	_, err := db.conn.ExecContext(ctx, query, sourceURL, db.timeArg(syncedAt))

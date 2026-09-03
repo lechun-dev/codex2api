@@ -232,6 +232,86 @@ func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	if settings.CodexMinCLIVersion != "0.144.1" {
 		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.144.1", settings.CodexMinCLIVersion)
 	}
+	if settings.SessionSlotBufferEnabled || settings.SessionSlotBufferSeconds != 10 {
+		t.Fatalf("session slot buffer defaults = enabled:%t seconds:%d, want false/10", settings.SessionSlotBufferEnabled, settings.SessionSlotBufferSeconds)
+	}
+}
+
+func TestSQLiteSessionSlotBufferSettingsRoundtrip(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "session-slot-buffer.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		MaxConcurrency:           2,
+		TestConcurrency:          1,
+		TestModel:                "gpt-5.4",
+		SessionSlotBufferEnabled: true,
+		SessionSlotBufferSeconds: 17,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got == nil || !got.SessionSlotBufferEnabled || got.SessionSlotBufferSeconds != 17 {
+		t.Fatalf("session slot buffer = %#v, want enabled with 17 seconds", got)
+	}
+
+	for _, tc := range []struct {
+		input int
+		want  int
+	}{{0, 10}, {-5, 10}, {61, 60}} {
+		settings.SessionSlotBufferSeconds = tc.input
+		if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+			t.Fatalf("UpdateSystemSettings(seconds=%d): %v", tc.input, err)
+		}
+		got, err := db.GetSystemSettings(ctx)
+		if err != nil {
+			t.Fatalf("GetSystemSettings(seconds=%d): %v", tc.input, err)
+		}
+		if got.SessionSlotBufferSeconds != tc.want {
+			t.Fatalf("seconds input %d normalized to %d, want %d", tc.input, got.SessionSlotBufferSeconds, tc.want)
+		}
+	}
+}
+
+func TestSQLiteModelsListReadLimitRoundTripAndFullUpdatePreservesValue(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "models-list-limit.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const want = int64(16 << 20)
+	if err := db.UpdateModelsListReadMaxBytes(ctx, want); err != nil {
+		t.Fatalf("UpdateModelsListReadMaxBytes: %v", err)
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
+
+	settings.SiteName = "preserve-model-list-limit"
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after full update: %v", err)
+	}
+	if settings.ModelsListReadMaxBytes != want {
+		t.Fatalf("read limit after full update = %d, want %d", settings.ModelsListReadMaxBytes, want)
+	}
 }
 
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
@@ -991,6 +1071,13 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount codex 返回错误: %v", err)
 	}
+	relayID, err := db.InsertAccountWithUpstream(ctx, "relay-one", "openai", "relay", map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"api_key":       "relay-key",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithUpstream relay 返回错误: %v", err)
+	}
 	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
 		"upstream_type": "grok",
 		"refresh_token": "rt-grok",
@@ -1000,13 +1087,22 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)
 	}
+	antigravityID, err := db.InsertAccountWithUpstream(ctx, "antigravity-one", "google", "oauth", map[string]interface{}{
+		"upstream_type": "antigravity",
+		"refresh_token": "rt-antigravity",
+		"access_token":  "at-antigravity",
+		"email":         "antigravity@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithUpstream antigravity 返回错误: %v", err)
+	}
 
 	all, err := db.ListActiveByChannel(ctx, "")
 	if err != nil {
 		t.Fatalf("ListActiveByChannel(\"\") 返回错误: %v", err)
 	}
-	if len(all) != 2 {
-		t.Fatalf("ListActiveByChannel(\"\") len = %d, want 2", len(all))
+	if len(all) != 4 {
+		t.Fatalf("ListActiveByChannel(\"\") len = %d, want 4", len(all))
 	}
 
 	grokRows, err := db.ListActiveByChannel(ctx, UpstreamChannelGrok)
@@ -1021,8 +1117,16 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActiveByChannel(codex) 返回错误: %v", err)
 	}
-	if len(codexRows) != 1 || codexRows[0].ID != codexID {
-		t.Fatalf("ListActiveByChannel(codex) = %+v, want id %d", codexRows, codexID)
+	if len(codexRows) != 2 || codexRows[0].ID != codexID || codexRows[1].ID != relayID {
+		t.Fatalf("ListActiveByChannel(codex) = %+v, want ids %d and %d", codexRows, codexID, relayID)
+	}
+
+	antigravityRows, err := db.ListActiveByChannel(ctx, UpstreamChannelAntigravity)
+	if err != nil {
+		t.Fatalf("ListActiveByChannel(antigravity) 返回错误: %v", err)
+	}
+	if len(antigravityRows) != 1 || antigravityRows[0].ID != antigravityID {
+		t.Fatalf("ListActiveByChannel(antigravity) = %+v, want id %d", antigravityRows, antigravityID)
 	}
 }
 
@@ -1621,6 +1725,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		IgnoreUsageLimitStatus:            true,
 		AutoResetCreditsEnabled:           true,
 		AutoResetCreditsBeforeExpiryMin:   75,
+		AutoActivate5hWindowEnabled:       true,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1652,6 +1757,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.AutoResetCreditsBeforeExpiryMin != 75 {
 		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 75", settings.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !settings.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
@@ -1798,6 +1906,7 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	settings := &SystemSettings{
 		AutoResetCreditsEnabled:         true,
 		AutoResetCreditsBeforeExpiryMin: 90,
+		AutoActivate5hWindowEnabled:     true,
 		ModelPricingOverrides:           `{"old":{"input":1}}`,
 		ModelPricingSyncURL:             "https://old.example/pricing.json",
 	}
@@ -1836,6 +1945,9 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	}
 	if !got.AutoResetCreditsEnabled || got.AutoResetCreditsBeforeExpiryMin != 90 {
 		t.Fatalf("auto reset settings = (%v,%d), want (true,90)", got.AutoResetCreditsEnabled, got.AutoResetCreditsBeforeExpiryMin)
+	}
+	if !got.AutoActivate5hWindowEnabled {
+		t.Fatal("AutoActivate5hWindowEnabled = false, want true")
 	}
 	if got.CodexSyncedCLIVersion != "9.9.9" {
 		t.Fatalf("CodexSyncedCLIVersion = %q, want 9.9.9", got.CodexSyncedCLIVersion)
@@ -3801,21 +3913,21 @@ func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
 
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
-	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode int) {
+	insert := func(accountID int64, createdAt time.Time, model, effective string, retry any, statusCode, firstTokenMs int) {
 		t.Helper()
 		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs
-			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, created_at)
-			VALUES ($1, $2, 10, $3, $4, $5, $6)`, accountID, statusCode, retry, model, effective, sqliteTimeParam(createdAt)); err != nil {
+			(account_id, status_code, total_tokens, is_retry_attempt, model, effective_model, first_token_ms, created_at)
+			VALUES ($1, $2, 10, $3, $4, $5, $6, $7)`, accountID, statusCode, retry, model, effective, firstTokenMs, sqliteTimeParam(createdAt)); err != nil {
 			t.Fatalf("insert usage log: %v", err)
 		}
 	}
-	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200)
-	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429)
-	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200)
-	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200)
-	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499)
-	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200)
-	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200)
+	insert(1, now.Add(-time.Hour), "gpt-5.4", "", 0, 200, 1200)
+	insert(1, now.Add(-50*time.Minute), "gpt-5.4", "", 0, 429, 1800)
+	insert(1, now.Add(-2*time.Hour), "gpt-5.2", "gpt-5.2-codex", 0, 200, 500)
+	insert(1, now.Add(-30*time.Minute), "gpt-5.4", "", 1, 200, 2400)
+	insert(1, now.Add(-20*time.Minute), "gpt-5.4", "", 0, 499, 3000)
+	insert(1, now.Add(-26*time.Hour), "gpt-5.3", "", 0, 200, 700)
+	insert(2, now.Add(-time.Hour), "grok-4", "", 0, 200, 900)
 
 	usage, err := db.GetAccountUsageSinceByIDs(ctx, []int64{1, 2}, now.Add(-5*time.Hour))
 	if err != nil {
@@ -3830,6 +3942,9 @@ func TestGetAccountModelCountsSinceByIDsMatchesTodayUsage(t *testing.T) {
 	}
 	if models[1]["gpt-5.4"].Requests != 2 || models[1]["gpt-5.4"].Success != 1 || models[1]["gpt-5.2-codex"].Requests != 1 || models[1]["gpt-5.2-codex"].Success != 1 || models[1]["gpt-5.3"].Requests != 0 {
 		t.Fatalf("today models account 1 = %#v, want gpt-5.4=2/1 gpt-5.2-codex=1/1", models[1])
+	}
+	if models[1]["gpt-5.4"].AvgFirstTokenMs != 1500 || models[1]["gpt-5.2-codex"].AvgFirstTokenMs != 500 {
+		t.Fatalf("today model first-token averages = %#v, want gpt-5.4=1500 gpt-5.2-codex=500", models[1])
 	}
 	if models[2]["grok-4"].Requests != 1 || models[2]["grok-4"].Success != 1 {
 		t.Fatalf("today models account 2 = %#v, want grok-4=1/1", models[2])
@@ -3997,26 +4112,28 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
-		Source:          "local_filter",
-		Endpoint:        "/v1/messages",
-		Protocol:        "claude",
-		Provider:        "anthropic",
-		Model:           "gpt-5.4",
-		Action:          "allow",
-		Mode:            "block",
-		Score:           70,
-		AuditScore:      100,
-		Threshold:       50,
-		PolicyProfile:   "strict",
-		ReasonCode:      "terminal_policy_match",
-		PrimaryOrigin:   "current_user",
-		StrikeEligible:  true,
-		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
-		TextPreview:     "preview",
-		MatchContext:    "actual trigger excerpt",
-		ReviewModel:     "omni-moderation-latest",
-		ReviewFlagged:   false,
-		ReviewError:     "temporary failure",
+		Source:               "local_filter",
+		Endpoint:             "/v1/messages",
+		Protocol:             "claude",
+		Provider:             "anthropic",
+		Model:                "gpt-5.4",
+		Action:               "allow",
+		Mode:                 "block",
+		Score:                70,
+		AuditScore:           100,
+		Threshold:            50,
+		PolicyProfile:        "strict",
+		ReasonCode:           "terminal_policy_match",
+		PrimaryOrigin:        "current_user",
+		StrikeEligible:       true,
+		MatchedPatterns:      `[{"name":"credential_theft","weight":100}]`,
+		TextPreview:          "preview",
+		MatchContext:         "actual trigger excerpt",
+		ReviewModel:          "omni-moderation-latest",
+		ReviewFlagged:        false,
+		ReviewError:          "temporary failure",
+		RequestCorrelationID: "298ee1bb-ad0f-4e96-8924-d34066def71e",
+		SessionHash:          "cb74e520ed6af73b8a9564cc",
 	}); err != nil {
 		t.Fatalf("InsertPromptFilterLog 返回错误: %v", err)
 	}
@@ -4048,6 +4165,22 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if matchTotal != 1 || len(matched) != 1 || matched[0].MatchContext != "actual trigger excerpt" {
 		t.Fatalf("match context search total=%d logs=%+v", matchTotal, matched)
+	}
+
+	byAuditReference, auditReferenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "298ee1bb-ad0f-4e96-8924-d34066def71e"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(audit reference) 返回错误: %v", err)
+	}
+	if auditReferenceTotal != 1 || len(byAuditReference) != 1 || byAuditReference[0].RequestCorrelationID != "298ee1bb-ad0f-4e96-8924-d34066def71e" {
+		t.Fatalf("audit reference search total=%d logs=%+v", auditReferenceTotal, byAuditReference)
+	}
+
+	bySessionHash, sessionHashTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "cb74e520ed6af73b8a9564cc"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(session hash) 返回错误: %v", err)
+	}
+	if sessionHashTotal != 1 || len(bySessionHash) != 1 || bySessionHash[0].SessionHash != "cb74e520ed6af73b8a9564cc" {
+		t.Fatalf("session hash search total=%d logs=%+v", sessionHashTotal, bySessionHash)
 	}
 
 	nearest, err := db.FindNearestPromptFilterLog(ctx, got.CreatedAt, "local_filter", "/v1/messages", 0, 5)
@@ -4125,6 +4258,23 @@ func TestPromptFilterReviewHistorySeparatesIntelligenceAndNullableScores(t *test
 	}
 	if localTotal != 1 || len(local) != 1 || local[0].Endpoint != "/v1/messages" {
 		t.Fatalf("local logs total=%d logs=%+v", localTotal, local)
+	}
+	allLocal, allLocalTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "local_filter", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(all local logs): %v", err)
+	}
+	if allLocalTotal != 4 || len(allLocal) != 4 {
+		t.Fatalf("all local logs total=%d len=%d, want 4", allLocalTotal, len(allLocal))
+	}
+	var foundReviewedBlock bool
+	for _, log := range allLocal {
+		if log.Action == "block" && log.Reviewed {
+			foundReviewedBlock = true
+			break
+		}
+	}
+	if !foundReviewedBlock {
+		t.Fatalf("all local logs did not include reviewed local block: %+v", allLocal)
 	}
 
 	intelligence, intelligenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "intel_run", ExcludeIntelligence: true})

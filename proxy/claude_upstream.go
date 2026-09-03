@@ -18,9 +18,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +46,29 @@ const (
 // claudeCodeSystemBlockJSON 是注入到 system 数组首位的块(带 ephemeral 缓存标记,
 // 与官方客户端一致)。
 const claudeCodeSystemBlockJSON = `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}`
+
+// claudeCodeSystemBlockNoCacheJSON 是不带 cache_control 的同一声明块。Anthropic 最多
+// 接受 4 个 cache_control 块；客户端已用满时再注入带缓存标记的前言会被整体拒绝。
+const claudeCodeSystemBlockNoCacheJSON = `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}`
+
+// claudeCodeSystemBlock1hJSON 是带 1 小时缓存标记的声明块。Anthropic 不允许 1h 块排在 5m
+// 块之后，客户端请求 1h 缓存时前言必须同样使用 1h。
+const claudeCodeSystemBlock1hJSON = `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"1h"}}`
+
+// claudeMaxCacheControlBlocks 是 Anthropic Messages API 允许的 cache_control 块上限。
+const claudeMaxCacheControlBlocks = 4
+
+// claudeCodeSystemBlockFor 在客户端未用满 cache_control 配额时返回带缓存标记的
+// 声明块，否则返回无标记版本。
+func claudeCodeSystemBlockFor(body []byte) string {
+	if claudeCacheControlBlockCount(body) >= claudeMaxCacheControlBlocks {
+		return claudeCodeSystemBlockNoCacheJSON
+	}
+	if claudeFirstCacheControlTTL(body) == "1h" {
+		return claudeCodeSystemBlock1hJSON
+	}
+	return claudeCodeSystemBlockJSON
+}
 
 // defaultClaudeModelIDs 是未设白名单时对外暴露的当前 Claude 模型集(别名形式,
 // Anthropic 侧会解析到带日期的具体版本)。模型演进时可在此维护,或用账号 Models
@@ -190,6 +213,10 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	}
 	applyClaudeMessagesHeadersWithVersion(req, accessToken, headers, stream, fingerprint, fingerprintMode, decision.RewriteVersion, securityConfig)
 
+	if perr := applyClaudeOutboundVersionAlignment(req, claudeOutboundRequiredVersion(decision, model)); perr != nil {
+		return nil, perr
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
@@ -264,7 +291,7 @@ func applyClaudeMessagesHeaders(req *http.Request, accessToken string, incoming 
 	}
 	// 保底:连指纹都没有(老账号未生成指纹)时,给一个稳定的默认 UA,避免空 UA 破绽。
 	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
-		req.Header.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+		req.Header.Set("User-Agent", "claude-cli/"+auth.EffectiveClaudeCLIVersion()+" (external, cli)")
 	}
 	// Keep Claude on the same request-scoped User-Agent audit path as Codex,
 	// Grok, and WebSocket transports. Record only the final sanitized header
@@ -287,14 +314,79 @@ func applyClaudeMessagesHeadersWithVersion(req *http.Request, accessToken string
 	}
 }
 
-var claudeCLIUserAgentVersionPattern = regexp.MustCompile(`(?i)(\bclaude(?:-cli|-code)|\bclaude\s+code)([/\s:_-]*)(?:v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)`)
-
 func rewriteClaudeCLIUserAgentVersion(userAgent, version string) string {
-	version = strings.TrimSpace(version)
-	if _, ok := auth.ParseClaudeClientVersion("claude-cli/" + version); !ok {
-		return ""
+	return auth.RewriteClaudeCLIUserAgentVersion(userAgent, version)
+}
+
+// claudeOutboundRequiredVersion 取入站门控得出的 required 与模型下限中的较大者。
+// 入站非 CLI 时 decision.RequiredVersion 为空,但 force 指纹可能把出站改成 CLI UA,
+// 此时仍必须遵守模型下限。
+func claudeOutboundRequiredVersion(decision auth.ClaudeClientDecision, model string) string {
+	required := strings.TrimSpace(decision.RequiredVersion)
+	floor := auth.ClaudeModelMinimumVersion(model)
+	if floor == "" {
+		return required
 	}
-	return claudeCLIUserAgentVersionPattern.ReplaceAllString(userAgent, "${1}${2}"+version)
+	if required == "" {
+		return floor
+	}
+	if cmp, err := auth.CompareClaudeClientVersions(floor, required); err == nil && cmp > 0 {
+		return floor
+	}
+	return required
+}
+
+// alignClaudeOutboundUserAgent 保证最终出站 CLI UA 版本不低于 required。
+// 低于时抬到生效版本;生效版本仍不够则返回拒绝消息(调用方本地 426,不发上游)。
+func alignClaudeOutboundUserAgent(outbound, required string) (string, string) {
+	if strings.TrimSpace(required) == "" {
+		return outbound, ""
+	}
+	outVersion, isCLI := auth.ParseClaudeClientVersion(outbound)
+	if !isCLI {
+		return outbound, ""
+	}
+	// outVersion just came from ParseClaudeClientVersion (always a valid
+	// SemVer when isCLI) and required is always either an already-validated
+	// decision.RequiredVersion or a fixed auth.ClaudeModelMinimumVersion
+	// constant, so a compare error here is unreachable in practice.
+	if cmp, err := auth.CompareClaudeClientVersions(outVersion, required); err != nil || cmp >= 0 {
+		return outbound, ""
+	}
+	effective := auth.EffectiveClaudeCLIVersion()
+	// effective always comes from auth.EffectiveClaudeCLIVersion, which only
+	// ever returns the built-in constant or a previously validated synced
+	// version, so this compare error is likewise unreachable in practice.
+	if cmp, err := auth.CompareClaudeClientVersions(effective, required); err != nil || cmp < 0 {
+		return outbound, fmt.Sprintf("Claude Code CLI outbound version %s is below required %s (effective %s); update client_version or wait for CLI version sync", outVersion, required, effective)
+	}
+	rewritten := auth.RewriteClaudeCLIUserAgentVersion(outbound, effective)
+	if rewritten == "" {
+		// RewriteClaudeCLIUserAgentVersion failed even though outbound was
+		// just confirmed to be a CLI UA and effective a valid version; fail
+		// closed instead of silently keeping the stale, too-old outbound UA
+		// this function exists to reject.
+		return outbound, fmt.Sprintf("Claude Code CLI outbound version %s could not be rewritten to %s", outVersion, effective)
+	}
+	return rewritten, ""
+}
+
+// applyClaudeOutboundVersionAlignment aligns req's outbound User-Agent to the
+// required Claude Code CLI version, recording the final UA on the request's
+// upstream User-Agent audit when it changes. Returns a local 426 *Error
+// (never sent upstream) when the effective CLI version still can't satisfy
+// required.
+func applyClaudeOutboundVersionAlignment(req *http.Request, required string) *Error {
+	outbound := req.Header.Get("User-Agent")
+	finalUA, deny := alignClaudeOutboundUserAgent(outbound, required)
+	if deny != "" {
+		return &Error{Code: "claude_client_policy", Message: deny, Type: ErrorTypeInvalidRequest, Retryable: false, HTTPStatus: http.StatusUpgradeRequired}
+	}
+	if finalUA != outbound {
+		req.Header.Set("User-Agent", finalUA)
+		RecordUpstreamUserAgent(req.Context(), finalUA)
+	}
+	return nil
 }
 
 // defaultClaudeIdentityHeader is a deterministic compatibility fallback for
@@ -304,7 +396,7 @@ func rewriteClaudeCLIUserAgentVersion(userAgent, version string) string {
 func defaultClaudeIdentityHeader(name string) string {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "user-agent":
-		return "claude-cli/2.1.220 (external, cli)"
+		return "claude-cli/" + auth.EffectiveClaudeCLIVersion() + " (external, cli)"
 	case "x-app":
 		return "cli"
 	case "x-stainless-lang":
@@ -531,6 +623,17 @@ func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	// 客户端会话文件损坏时会回传空/截断签名的 thinking 块，上游必然 400；
+	// 文档允许省略历史 thinking，发送前直接丢弃。
+	if cleaned, dropped := dropUnsignedClaudeThinkingBlocks(normalized); dropped > 0 {
+		log.Printf("[claude-thinking-signature] 丢弃 %d 个签名为空或截断的 thinking 块", dropped)
+		normalized = cleaned
+	}
+	// 思考常开的模型（Fable / Mythos）拒绝 thinking.type=disabled，直接省略该参数。
+	if cleaned, dropped := dropClaudeDisabledThinking(normalized); dropped {
+		log.Printf("[claude-thinking-signature] 模型 %s 不接受 thinking.type=disabled，已移除该参数", gjson.GetBytes(normalized, "model").String())
+		normalized = cleaned
+	}
 	return injectClaudeCodeSystemPrompt(normalized), nil
 }
 
@@ -583,10 +686,11 @@ func injectClaudeCodeSystemPrompt(body []byte) []byte {
 		return body
 	}
 	system := gjson.GetBytes(body, "system")
+	preambleBlock := claudeCodeSystemBlockFor(body)
 
 	switch {
 	case !system.Exists() || system.Type == gjson.Null:
-		out, err := sjson.SetRawBytes(body, "system", []byte("["+claudeCodeSystemBlockJSON+"]"))
+		out, err := sjson.SetRawBytes(body, "system", []byte("["+preambleBlock+"]"))
 		if err != nil {
 			return body
 		}
@@ -602,7 +706,7 @@ func injectClaudeCodeSystemPrompt(body []byte) []byte {
 		if err != nil {
 			return body
 		}
-		raw := "[" + claudeCodeSystemBlockJSON + "," + string(textBlock) + "]"
+		raw := "[" + preambleBlock + "," + string(textBlock) + "]"
 		out, err := sjson.SetRawBytes(body, "system", []byte(raw))
 		if err != nil {
 			return body
@@ -620,9 +724,9 @@ func injectClaudeCodeSystemPrompt(body []byte) []byte {
 		inner = strings.TrimSuffix(inner, "]")
 		var newArr string
 		if strings.TrimSpace(inner) == "" {
-			newArr = "[" + claudeCodeSystemBlockJSON + "]"
+			newArr = "[" + preambleBlock + "]"
 		} else {
-			newArr = "[" + claudeCodeSystemBlockJSON + "," + inner + "]"
+			newArr = "[" + preambleBlock + "," + inner + "]"
 		}
 		out, err := sjson.SetRawBytes(body, "system", []byte(newArr))
 		if err != nil {
@@ -822,6 +926,15 @@ func HandleClaudeModelBillingRejection(store *auth.Store, account *auth.Account,
 	}
 	// 模型级冷却,原因 credits_required;不做退避升级(固定窗口周期性复探,买 credits 后自然恢复)。
 	store.MarkModelCooldownWithBackoff(account, m, claudeCreditsRequiredCooldown, "credits_required", false)
+	// 套餐不含该模型时把它从账号白名单里移除,调度器此后不再把该模型派给这个账号。
+	// 白名单为空(放行全部)时无法表达排除,只能靠上面的冷却。
+	dropCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if removed, err := store.DropAccountModel(dropCtx, account, m); err != nil {
+		log.Printf("[账号 %d] 移除不支持的模型 %s 失败: %v", account.ID(), m, err)
+	} else if removed {
+		log.Printf("[账号 %d] 上游 credits_required,已把模型 %s 从账号模型白名单移除", account.ID(), m)
+	}
 	return true
 }
 

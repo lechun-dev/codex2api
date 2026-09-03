@@ -38,6 +38,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_synced_cli_version VARCHAR(64) DEFAULT ''",
 		"codex_cli_version_sync_enabled TINYINT(1) DEFAULT 1",
 		"codex_cli_version_sync_interval_hours INT DEFAULT 12",
+		"claude_synced_cli_version VARCHAR(64) DEFAULT ''",
 		"model_pricing_overrides MEDIUMTEXT NULL",
 		"model_pricing_sync_url TEXT NULL",
 		"payload_rules MEDIUMTEXT NULL",

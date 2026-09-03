@@ -23,6 +23,7 @@ const (
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "grok_config", def: "TEXT NULL"},
+	{table: "system_settings", name: "claude_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "payload_rules", def: "MEDIUMTEXT NULL"},
 	{table: "system_settings", name: "prompt_filter_strict_terminal_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "prompt_filter_advanced_config", def: "MEDIUMTEXT NULL"},
@@ -47,6 +48,11 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "response_cache_local_max_entry_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
 	{table: "system_settings", name: "response_cache_reconstruct_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
 	{table: "system_settings", name: "response_cache_config_generation", def: "BIGINT NOT NULL DEFAULT 1"},
+	{table: "system_settings", name: "continuous_retry_policy", def: "TEXT NULL"},
+	{table: "system_settings", name: "session_slot_buffer_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "session_slot_buffer_seconds", def: "INT DEFAULT 10"},
+	{table: "system_settings", name: "models_list_read_max_bytes", def: "BIGINT NOT NULL DEFAULT 8388608"},
+	{table: "system_settings", name: "auto_activate_5h_window_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "session_affinity_spread", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "relay_model_cooldown_mode", def: "VARCHAR(20) NOT NULL DEFAULT 'off'"},
 	{table: "system_settings", name: "relay_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 2"},
@@ -61,6 +67,8 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_overload_threshold_percent", def: "INT DEFAULT 20"},
 	{table: "system_settings", name: "codex_overload_pause_minutes", def: "INT DEFAULT 30"},
 	{table: "system_settings", name: "codex_overload_window_minutes", def: "INT DEFAULT 5"},
+	{table: "system_settings", name: "scheduler_engine", def: "TEXT NULL"},
+	{table: "system_settings", name: "codex_request_compression", def: "TINYINT(1) DEFAULT 1"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -93,6 +101,8 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			platform VARCHAR(50) DEFAULT 'openai',
 			type VARCHAR(50) DEFAULT 'oauth',
 			credentials MEDIUMTEXT NOT NULL,
+			credential_generation BIGINT NOT NULL DEFAULT 1,
+			credential_family_id VARCHAR(255) CHARACTER SET ascii NOT NULL DEFAULT '',
 			proxy_url VARCHAR(500) DEFAULT '',
 			status VARCHAR(50) DEFAULT 'active',
 			cooldown_reason VARCHAR(50) DEFAULT '',
@@ -203,6 +213,24 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (account_id, model)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE TABLE IF NOT EXISTS scheduler_outbox (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			entity_type VARCHAR(32) NOT NULL,
+			entity_id BIGINT NOT NULL DEFAULT 0,
+			event_type VARCHAR(64) NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE TABLE IF NOT EXISTS maintenance_jobs (
+			entity_id BIGINT NOT NULL,
+			job_kind VARCHAR(64) NOT NULL,
+			due_at DATETIME NOT NULL,
+			lease_owner VARCHAR(255) NOT NULL DEFAULT '',
+			lease_until DATETIME NULL,
+			attempts BIGINT NOT NULL DEFAULT 0,
+			last_error VARCHAR(2048) NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (entity_id, job_kind)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		systemSettingsMySQLDDL(),
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id VARCHAR(100) NOT NULL PRIMARY KEY,
@@ -309,6 +337,8 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"accounts", "credit_enabled", "TINYINT(1) DEFAULT 0"},
 		{"accounts", "credit_skip_usage_window", "TINYINT(1) DEFAULT 0"},
 		{"accounts", "skip_warm_tier", "TINYINT(1) DEFAULT 0"},
+		{"accounts", "credential_generation", "BIGINT NOT NULL DEFAULT 1"},
+		{"accounts", "credential_family_id", "VARCHAR(255) CHARACTER SET ascii NOT NULL DEFAULT ''"},
 		{"accounts", "image_quota_remaining", "INT NULL"},
 		{"accounts", "image_quota_total", "INT NULL"},
 		{"accounts", "today_used_count", "INT DEFAULT 0"},
@@ -546,6 +576,8 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"account_group_members", "idx_account_group_members_group", "CREATE INDEX idx_account_group_members_group ON account_group_members(group_id)"},
 		{"account_group_members", "idx_account_group_members_account", "CREATE INDEX idx_account_group_members_account ON account_group_members(account_id)"},
 		{"account_model_cooldowns", "idx_account_model_cooldowns_reset_at", "CREATE INDEX idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at)"},
+		{"scheduler_outbox", "idx_scheduler_outbox_created", "CREATE INDEX idx_scheduler_outbox_created ON scheduler_outbox(created_at, id)"},
+		{"maintenance_jobs", "idx_maintenance_jobs_due", "CREATE INDEX idx_maintenance_jobs_due ON maintenance_jobs(job_kind, due_at, entity_id)"},
 		{"account_events", "idx_account_events_created", "CREATE INDEX idx_account_events_created ON account_events(created_at)"},
 		{"account_events", "idx_account_events_type_created", "CREATE INDEX idx_account_events_type_created ON account_events(event_type, created_at)"},
 		{"image_prompt_templates", "idx_image_prompt_templates_updated", "CREATE INDEX idx_image_prompt_templates_updated ON image_prompt_templates(updated_at)"},
@@ -574,6 +606,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') = 'deleted'
 	`)
 	if err != nil {
+		return err
+	}
+
+	if err := db.installSchedulerOutboxTriggers(ctx); err != nil {
 		return err
 	}
 
@@ -684,6 +720,7 @@ func systemSettingsMySQLDDL() string {
 		lazy_mode TINYINT(1) DEFAULT 0,
 		proxy_pool_enabled TINYINT(1) DEFAULT 0,
 		fast_scheduler_enabled TINYINT(1) DEFAULT 0,
+		claude_config TEXT NULL,
 		max_retries INT DEFAULT 2,
 		max_rate_limit_retries INT DEFAULT 1,
 		reasoning_effort_models TEXT NULL,
@@ -770,6 +807,13 @@ func systemSettingsMySQLDDL() string {
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
+		continuous_retry_policy TEXT NULL,
+		session_slot_buffer_enabled TINYINT(1) DEFAULT 0,
+		session_slot_buffer_seconds INT DEFAULT 10,
+		models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608,
+		auto_activate_5h_window_enabled TINYINT(1) DEFAULT 0,
+		scheduler_engine TEXT NULL,
+		codex_request_compression TINYINT(1) DEFAULT 1,
 		relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off',
 		relay_model_cooldown_seconds INT NOT NULL DEFAULT 2,
 		relay_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 0,

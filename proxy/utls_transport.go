@@ -87,9 +87,13 @@ func (c *utlsConn) reclaimable(now time.Time, grace time.Duration) bool {
 // 使用 utls 模拟 Chrome 浏览器的 TLS 指纹以绕过 TLS 指纹检测
 type utlsRoundTripper struct {
 	mu          sync.Mutex
-	connections map[string]*utlsConn  // HTTP/2 连接池，按 host 索引
-	pending     map[string]*sync.Cond // 防止重复连接创建
-	dialer      xproxy.Dialer         // 底层拨号器（支持代理）
+	connections map[string]*utlsConn              // HTTP/2 连接池，按 host 索引
+	pending     map[string]*utlsPendingConnection // 防止重复连接创建
+	dialer      xproxy.Dialer                     // 底层拨号器（支持代理）
+}
+
+type utlsPendingConnection struct {
+	done chan struct{}
 }
 
 // utlsSessionCache 在所有 uTLS 连接间共享 TLS 会话缓存，让重连走 TLS resumption。
@@ -113,7 +117,7 @@ func NewUTLSTransport(proxyURL string) http.RoundTripper {
 
 	return &utlsRoundTripper{
 		connections: make(map[string]*utlsConn),
-		pending:     make(map[string]*sync.Cond),
+		pending:     make(map[string]*utlsPendingConnection),
 		dialer:      dialer,
 	}
 }
@@ -151,11 +155,18 @@ type httpConnectDialer struct {
 
 // Dial 通过 HTTP CONNECT 隧道连接到目标地址
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
+}
+
+// 2026-09-03 coder(lq): 让代理服务器连接、CONNECT 握手和响应读取都服从请求取消。
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	// 1. 建立到代理服务器的 TCP 连接
-	conn, err := net.DialTimeout("tcp", d.proxyAddr, 10*time.Second)
+	conn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", d.proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理服务器失败: %w", err)
 	}
+	stopCancelWatcher := closeConnOnContextDone(ctx, conn)
+	defer stopCancelWatcher()
 
 	// 2. 发送 CONNECT 请求建立隧道
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
@@ -239,69 +250,154 @@ func buildSOCKS5Dialer(u *url.URL) (xproxy.Dialer, error) {
 }
 
 // getOrCreateConnection 获取或创建 HTTP/2 连接
-// 使用 sync.Cond 防止同一 host 的重复连接创建
+// 使用可等待的 channel 防止同一 host 重复连接创建，同时允许请求上下文取消等待。
 //
 // 返回前会 touch() 命中的连接：该时间戳是 CloseIdleConnections 的保护窗口依据，
 // 防止连接在“已取出、尚未发 stream”的窗口里被当成空闲连接关掉。
-func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*utlsConn, error) {
-	t.mu.Lock()
+func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr string) (*utlsConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		t.mu.Lock()
 
-	// 检查是否已有可用连接
-	if entry, ok := t.connections[host]; ok && entry.conn.CanTakeNewRequest() {
+		// 检查是否已有可用连接
+		if entry, ok := t.connections[host]; ok && entry.conn.CanTakeNewRequest() {
+			entry.touch()
+			t.mu.Unlock()
+			return entry, nil
+		}
+
+		// 检查是否有其他 goroutine 正在创建连接。等待通知时保留请求上下文，
+		// 避免一个已经取消的请求被连接建立超时拖住。
+		if pending, ok := t.pending[host]; ok {
+			done := pending.done
+			t.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		// 标记此 host 正在创建连接
+		pending := &utlsPendingConnection{done: make(chan struct{})}
+		t.pending[host] = pending
+		t.mu.Unlock()
+
+		// 在锁外创建连接
+		h2Conn, err := t.createConnection(ctx, host, addr)
+
+		t.mu.Lock()
+
+		// 移除 pending 标记并唤醒所有等待者；每个等待者会重新检查连接状态。
+		if current, ok := t.pending[host]; ok && current == pending {
+			delete(t.pending, host)
+			close(pending.done)
+		}
+
+		if err != nil || ctx.Err() != nil {
+			if err == nil {
+				err = ctx.Err()
+			}
+			t.mu.Unlock()
+			if h2Conn != nil {
+				_ = h2Conn.Close()
+			}
+			return nil, err
+		}
+
+		// 旧连接已不可用（走到这里说明 CanTakeNewRequest()==false），但可能仍有
+		// 在途 stream（例如已收 GOAWAY 但旧请求未完）。用 graceful shutdown 等它们
+		// 收尾再关，不能直接 Close 掉——否则会把进行中的流式回答直接截断。
+		if oldEntry, ok := t.connections[host]; ok {
+			shutdownUTLSConn(oldEntry.conn)
+		}
+
+		// 存储新连接
+		entry := &utlsConn{conn: h2Conn}
 		entry.touch()
+		t.connections[host] = entry
 		t.mu.Unlock()
 		return entry, nil
 	}
+}
 
-	// 检查是否有其他 goroutine 正在创建连接
-	if cond, ok := t.pending[host]; ok {
-		// 等待其他 goroutine 完成（循环重试，避免虚假唤醒）
-		for {
-			cond.Wait()
-			// 再次检查连接是否可用
-			if entry, ok := t.connections[host]; ok && entry.conn.CanTakeNewRequest() {
-				entry.touch()
-				t.mu.Unlock()
-				return entry, nil
+type utlsContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// 2026-09-03 coder(lq): 兼容只实现旧 Dial 接口的第三方拨号器，并关闭取消后迟到的连接。
+func dialerWithContext(ctx context.Context, dialer xproxy.Dialer, network, address string) (net.Conn, error) {
+	if dialer == nil {
+		return nil, fmt.Errorf("拨号器为空")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if contextDialer, ok := dialer.(utlsContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, address)
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	var stateMu sync.Mutex
+	canceled := false
+	go func() {
+		conn, err := dialer.Dial(network, address)
+		stateMu.Lock()
+		if canceled {
+			stateMu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
 			}
-			// 如果 pending 已移除，说明创建完成（可能失败），跳出循环自己创建
-			if _, still := t.pending[host]; !still {
-				break
-			}
+			return
 		}
+		resultCh <- dialResult{conn: conn, err: err}
+		stateMu.Unlock()
+	}()
+
+	select {
+	case result := <-resultCh:
+		return result.conn, result.err
+	case <-ctx.Done():
+		stateMu.Lock()
+		canceled = true
+		stateMu.Unlock()
+		// 2026-09-03 coder(lq): 处理取消与拨号完成同时发生的竞态，回收无人持有的连接。
+		select {
+		case result := <-resultCh:
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		default:
+		}
+		return nil, ctx.Err()
 	}
+}
 
-	// 标记此 host 正在创建连接
-	cond := sync.NewCond(&t.mu)
-	t.pending[host] = cond
-	t.mu.Unlock()
-
-	// 在锁外创建连接
-	h2Conn, err := t.createConnection(host, addr)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// 移除 pending 标记并唤醒一个等待者（Signal 而非 Broadcast，避免惊群）
-	delete(t.pending, host)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
+func closeConnOnContextDone(ctx context.Context, conn net.Conn) func() {
+	if ctx == nil || conn == nil {
+		return func() {}
 	}
-
-	// 旧连接已不可用（走到这里说明 CanTakeNewRequest()==false），但可能仍有
-	// 在途 stream（例如已收 GOAWAY 但旧请求未完）。用 graceful shutdown 等它们
-	// 收尾再关，不能直接 Close 掉——否则会把进行中的流式回答直接截断。
-	if oldEntry, ok := t.connections[host]; ok {
-		shutdownUTLSConn(oldEntry.conn)
+	stop := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-watcherDone
 	}
-
-	// 存储新连接
-	entry := &utlsConn{conn: h2Conn}
-	entry.touch()
-	t.connections[host] = entry
-	return entry, nil
 }
 
 // shutdownUTLSConn 异步优雅关闭一条连接：先发 GOAWAY 并等在途 stream 收尾，
@@ -324,9 +420,12 @@ func shutdownUTLSConn(conn *http2.ClientConn) {
 
 // createConnection 创建新的 HTTP/2 连接
 // 使用 utls 的 HelloChrome_Auto 模拟 Chrome 浏览器的 TLS 指纹
-func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientConn, error) {
+func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// 1. 建立 TCP 连接（通过代理或直连）
-	conn, err := t.dialer.Dial("tcp", addr)
+	conn, err := dialerWithContext(ctx, t.dialer, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("TCP 连接失败: %w", err)
 	}
@@ -341,7 +440,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	tlsConn := utls.UClient(conn, tlsConfig, utls.HelloChrome_Auto)
 
 	// 设置握手超时
-	handshakeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
@@ -373,6 +472,9 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 
 // RoundTrip 实现 http.RoundTripper 接口
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, fmt.Errorf("无效的 HTTP 请求")
+	}
 	host := req.URL.Host
 	addr := host
 	if !strings.Contains(addr, ":") {
@@ -382,7 +484,7 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	// 获取主机名（不含端口）用于 TLS ServerName
 	hostname := req.URL.Hostname()
 
-	entry, err := t.getOrCreateConnection(hostname, addr)
+	entry, err := t.getOrCreateConnection(req.Context(), hostname, addr)
 	if err != nil {
 		return nil, err
 	}

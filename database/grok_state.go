@@ -757,7 +757,7 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 			}
 		}
 
-		encoded, marshalErr := json.Marshal(merged)
+		encoded, marshalErr := marshalCredentialsForStorage(merged)
 		if marshalErr != nil {
 			return marshalErr
 		}
@@ -914,34 +914,66 @@ func (db *DB) EnsureAccountCredentialFamilyID(ctx context.Context, accountID int
 // belongs to expectedGeneration. A successful write advances the generation;
 // callers must publish tokens to memory/cache only after applied=true.
 func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expectedGeneration int64, updates map[string]any) (newGeneration int64, applied bool, err error) {
+	return db.updateAccountCredentialsCAS(ctx, accountID, expectedGeneration, "", false, updates)
+}
+
+// UpdateAccountCredentialsCASWithFamily merges a refreshed credential and
+// assigns a newly verified canonical family without dropping observed state.
+func (db *DB) UpdateAccountCredentialsCASWithFamily(ctx context.Context, accountID, expectedGeneration int64, familyID string, updates map[string]any) (newGeneration int64, applied bool, err error) {
+	return db.updateAccountCredentialsCAS(ctx, accountID, expectedGeneration, familyID, true, updates)
+}
+
+func (db *DB) updateAccountCredentialsCAS(ctx context.Context, accountID, expectedGeneration int64, familyID string, replaceFamily bool, updates map[string]any) (newGeneration int64, applied bool, err error) {
 	err = db.withSQLiteWriteLock(ctx, func() error {
 		tx, beginErr := db.conn.BeginTx(ctx, nil)
 		if beginErr != nil {
 			return beginErr
 		}
 		defer tx.Rollback()
-		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		query := `SELECT credentials, credential_generation, COALESCE(credential_family_id,'') FROM accounts WHERE id=$1 AND status <> 'deleted'`
 		if !db.isSQLite() {
 			query += ` FOR UPDATE`
 		}
 		var raw any
 		var current int64
-		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current); scanErr != nil {
+		var currentFamilyID string
+		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current, &currentFamilyID); scanErr != nil {
 			return scanErr
 		}
 		if current != expectedGeneration {
 			newGeneration = current
 			return nil
 		}
-		encoded, marshalErr := json.Marshal(mergeCredentialMaps(decodeCredentials(raw), updates))
+		existing := decodeCredentials(raw)
+		if !replaceFamily && strings.TrimSpace(currentFamilyID) == "" {
+			currentFamilyID = credentialFamilyCandidate(existing)
+		}
+		merged := mergeCredentialMaps(existing, updates)
+		familyToPersist := familyID
+		if !replaceFamily {
+			familyToPersist = currentFamilyID
+		}
+		if strings.TrimSpace(familyToPersist) != "" {
+			merged["credential_family_id"] = strings.TrimSpace(familyToPersist)
+		}
+		encoded, marshalErr := marshalCredentialsForStorage(merged)
 		if marshalErr != nil {
 			return marshalErr
 		}
 		updateQuery := `UPDATE accounts SET credentials=$1, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND credential_generation=$3`
-		if !db.isSQLite() && !db.isMySQL() {
-			updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$2 AND credential_generation=$3`
+		args := []any{encoded, accountID, expectedGeneration}
+		if replaceFamily {
+			updateQuery = `UPDATE accounts SET credentials=$1, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND credential_generation=$4`
+			args = []any{encoded, familyID, accountID, expectedGeneration}
 		}
-		res, execErr := tx.ExecContext(ctx, updateQuery, encoded, accountID, expectedGeneration)
+		if !db.isSQLite() && !db.isMySQL() {
+			if replaceFamily {
+				updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$3 AND credential_generation=$4`
+			} else {
+				updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$2 AND credential_generation=$3`
+			}
+		}
+		res, execErr := tx.ExecContext(ctx, updateQuery, args...)
 		if execErr != nil {
 			return execErr
 		}
@@ -977,6 +1009,74 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 	return
 }
 
+// ReplaceAccountCredentialsCAS replaces the durable credential document for a
+// generation-fenced reauthorization. Unlike token refresh, this intentionally
+// drops old observed provider facts/catalog data by moving to a new canonical
+// credential family.
+func (db *DB) ReplaceAccountCredentialsCAS(ctx context.Context, accountID, expectedGeneration int64, familyID string, updates map[string]any) (newGeneration int64, applied bool, err error) {
+	if db == nil || db.conn == nil || accountID <= 0 || expectedGeneration <= 0 || len(updates) == 0 {
+		return 0, false, nil
+	}
+	err = db.withSQLiteWriteLock(ctx, func() error {
+		tx, beginErr := db.conn.BeginTx(ctx, nil)
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.Rollback()
+
+		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		if !db.isSQLite() {
+			query += ` FOR UPDATE`
+		}
+		var raw any
+		var current int64
+		if scanErr := tx.QueryRowContext(ctx, query, accountID).Scan(&raw, &current); scanErr != nil {
+			return scanErr
+		}
+		if current != expectedGeneration {
+			newGeneration = current
+			return nil
+		}
+
+		replacement := make(map[string]any, len(updates)+1)
+		for key, value := range updates {
+			replacement[key] = value
+		}
+		familyID = strings.TrimSpace(familyID)
+		if familyID == "" {
+			familyID = credentialFamilyCandidate(replacement)
+		}
+		if familyID == "" {
+			familyID = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+		replacement["credential_family_id"] = familyID
+		encoded, marshalErr := json.Marshal(replacement)
+		if marshalErr != nil {
+			return marshalErr
+		}
+
+		updateQuery := `UPDATE accounts SET credentials=$1, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND credential_generation=$4`
+		if !db.isSQLite() && !db.isMySQL() {
+			updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$3 AND credential_generation=$4`
+		}
+		res, execErr := tx.ExecContext(ctx, updateQuery, encoded, familyID, accountID, expectedGeneration)
+		if execErr != nil {
+			return execErr
+		}
+		rows, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if rows == 0 {
+			return nil
+		}
+		applied = true
+		newGeneration = expectedGeneration + 1
+		return tx.Commit()
+	})
+	return
+}
+
 // MergeAccountCredentialsForGeneration merges non-identity compatibility
 // fields only while the account still belongs to expectedGeneration. Unlike
 // UpdateAccountCredentialsCAS it deliberately does not advance the generation:
@@ -987,15 +1087,34 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 // callers) so a future refactor cannot accidentally publish token, principal,
 // origin, or rich catalog metadata through this compatibility path.
 func (db *DB) MergeAccountCredentialsForGeneration(ctx context.Context, accountID, expectedGeneration int64, updates map[string]any) (applied bool, err error) {
-	if db == nil || db.conn == nil || accountID <= 0 || expectedGeneration <= 0 || len(updates) == 0 {
-		return false, nil
-	}
 	allowed := map[string]struct{}{
 		"models": {}, "grok_billing_detail": {},
 		"grok_weekly_usage_percent": {}, "grok_weekly_period_end": {},
 		"grok_monthly_usage_percent": {}, "grok_monthly_limit_cents": {},
 		"grok_monthly_used_cents": {}, "grok_monthly_period_end": {},
 		"grok_usage_updated_at": {},
+	}
+	return db.mergeAccountCredentialsForGeneration(ctx, accountID, expectedGeneration, updates, allowed)
+}
+
+// MergeAntigravityStateForGeneration persists only non-secret Antigravity
+// observations while fencing the write by credential generation.
+func (db *DB) MergeAntigravityStateForGeneration(ctx context.Context, accountID, expectedGeneration int64, updates map[string]any) (applied bool, err error) {
+	// 2026-09-03 coder(lq): Keep Antigravity state writes separate from token and identity mutation paths.
+	allowed := map[string]struct{}{
+		"models":                 {},
+		"antigravity_sync_error": {}, "antigravity_sync_warning": {},
+		"antigravity_last_sync_attempt_at":    {},
+		"antigravity_permanent_refresh_error": {},
+		"antigravity_catalog_source":          {}, "antigravity_catalog_verified": {},
+		"antigravity_capabilities": {}, "antigravity_capability_last_probe_at": {},
+	}
+	return db.mergeAccountCredentialsForGeneration(ctx, accountID, expectedGeneration, updates, allowed)
+}
+
+func (db *DB) mergeAccountCredentialsForGeneration(ctx context.Context, accountID, expectedGeneration int64, updates map[string]any, allowed map[string]struct{}) (applied bool, err error) {
+	if db == nil || db.conn == nil || accountID <= 0 || expectedGeneration <= 0 || len(updates) == 0 {
+		return false, nil
 	}
 	filtered := make(map[string]any, len(updates))
 	for key, value := range updates {

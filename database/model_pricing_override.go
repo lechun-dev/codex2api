@@ -23,7 +23,12 @@ type ModelPricingOverride struct {
 	// 标准档（短上下文）
 	Input       float64 `json:"input,omitempty"`
 	CachedInput float64 `json:"cached_input,omitempty"`
-	Output      float64 `json:"output,omitempty"`
+	// Anthropic prompt-cache creation prices are informational today; actual
+	// billing still uses CachedInput (cache read) because usage logs expose
+	// cache reads separately from cache creation only in provider payloads.
+	CacheWrite5m float64 `json:"cache_write_5m,omitempty"`
+	CacheWrite1h float64 `json:"cache_write_1h,omitempty"`
+	Output       float64 `json:"output,omitempty"`
 
 	// priority(fast) 档
 	InputPriority       float64 `json:"input_priority,omitempty"`
@@ -48,7 +53,7 @@ type ModelPricingOverride struct {
 
 // IsEmpty 判断覆盖是否不含任何价格（全 0）。
 func (o ModelPricingOverride) IsEmpty() bool {
-	return o.Input == 0 && o.CachedInput == 0 && o.Output == 0 &&
+	return o.Input == 0 && o.CachedInput == 0 && o.CacheWrite5m == 0 && o.CacheWrite1h == 0 && o.Output == 0 &&
 		o.InputPriority == 0 && o.CachedInputPriority == 0 && o.OutputPriority == 0 &&
 		o.InputLong == 0 && o.CachedInputLong == 0 && o.OutputLong == 0 &&
 		o.InputLongPriority == 0 && o.CachedInputLongPriority == 0 && o.OutputLongPriority == 0 &&
@@ -62,6 +67,12 @@ func (o ModelPricingOverride) applyNonZero(p *ModelPricing) {
 	}
 	if o.CachedInput > 0 {
 		p.CacheReadPricePerMToken = o.CachedInput
+	}
+	if o.CacheWrite5m > 0 {
+		p.CacheWrite5mPricePerMToken = o.CacheWrite5m
+	}
+	if o.CacheWrite1h > 0 {
+		p.CacheWrite1hPricePerMToken = o.CacheWrite1h
 	}
 	if o.Output > 0 {
 		p.OutputPricePerMToken = o.Output
@@ -108,6 +119,8 @@ func ModelPricingOverrideFromPricing(p *ModelPricing, source string) ModelPricin
 		Source:                     source,
 		Input:                      p.InputPricePerMToken,
 		CachedInput:                p.CacheReadPricePerMToken,
+		CacheWrite5m:               p.CacheWrite5mPricePerMToken,
+		CacheWrite1h:               p.CacheWrite1hPricePerMToken,
 		Output:                     p.OutputPricePerMToken,
 		InputPriority:              p.InputPricePerMTokenPriority,
 		CachedInputPriority:        p.CacheReadPricePerMTokenPriority,
@@ -213,6 +226,30 @@ func CanonicalBillingModelKey(model string) string {
 		return strings.ToLower(codexModel)
 	}
 	return strings.ToLower(normalized)
+}
+
+// PricingManagementModelKey returns the key exposed by pricing management.
+// Most model variants share their canonical model's price, but selected
+// internal aliases have an independent override and therefore need their own
+// editable row instead of being deduplicated into the canonical model.
+func PricingManagementModelKey(model string) string {
+	normalized := normalizeBillingModelName(model)
+	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(normalized)
+	if compact == "codex-auto-review" {
+		return compact
+	}
+	return CanonicalBillingModelKey(normalized)
+}
+
+// PricingAliasTarget reports the canonical fallback for an independently
+// managed alias. An empty string means the model is already canonical.
+func PricingAliasTarget(model string) string {
+	managed := PricingManagementModelKey(model)
+	canonical := CanonicalBillingModelKey(model)
+	if managed != canonical {
+		return canonical
+	}
+	return ""
 }
 
 // ModelPricingSourceFor 返回某规范键当前定价来源：custom / synced / default。

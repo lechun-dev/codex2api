@@ -16,14 +16,20 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 	if db.isMySQL() {
-		// MySQL 5.6 has no JSON functions. Read the MEDIUMTEXT credentials only
-		// for this short-lived projection and discard all secret fields below.
+		// 2026-09-02 coder(lq): MySQL 5.6 has no JSON functions. Read MEDIUMTEXT
+		// only for this short-lived projection and discard secret fields below.
 		var query string
 		switch channel {
 		case UpstreamChannelGrok:
-			where += ` AND LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"'`
+			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelGrok)
+		case UpstreamChannelAntigravity:
+			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity)
+		case UpstreamChannelClaude:
+			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude)
 		case UpstreamChannelCodex:
-			where += ` AND NOT (LOWER(COALESCE(CAST(credentials AS CHAR), '')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"grok"')`
+			where += ` AND NOT (` + db.accountUpstreamTypePredicate(UpstreamChannelGrok) +
+				` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity) +
+				` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + `)`
 		}
 		query = `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 			COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
@@ -36,7 +42,11 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	fromClause := `FROM accounts
 		CROSS JOIN LATERAL jsonb_to_record(accounts.credentials) AS account_public(
 			upstream_type text, email text, base_url text, plan_type text,
-			models jsonb, api_key text, refresh_token text, scheduler_priority text
+			models jsonb, api_key text, refresh_token text, scheduler_priority text,
+			avatar_url text, verified_email boolean, project_id text,
+			antigravity_sync_error text, antigravity_sync_warning text,
+			antigravity_permissions text, antigravity_entitlements text, antigravity_quota text,
+			claude_usage_probe_at text, claude_usage_probe_error text
 		)`
 	credentialColumns := `
 		COALESCE(account_public.upstream_type, ''),
@@ -46,7 +56,16 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(account_public.models, '[]'::jsonb)::text,
 		COALESCE(account_public.api_key, '') <> '',
 		COALESCE(account_public.refresh_token, '') <> '',
-		COALESCE(account_public.scheduler_priority, '')`
+		COALESCE(account_public.scheduler_priority, ''),
+		COALESCE(account_public.avatar_url, ''),
+		COALESCE(account_public.verified_email, false),
+		COALESCE(account_public.project_id, ''),
+		COALESCE(account_public.antigravity_sync_error, ''),
+		COALESCE(account_public.antigravity_sync_warning, ''),
+		COALESCE(NULLIF(account_public.antigravity_permissions, ''), account_public.antigravity_entitlements, ''),
+		COALESCE(account_public.antigravity_quota, ''),
+		COALESCE(account_public.claude_usage_probe_at, ''),
+		COALESCE(account_public.claude_usage_probe_error, '')`
 	if db.isSQLite() {
 		upstreamExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 		fromClause = `FROM accounts`
@@ -58,13 +77,26 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			COALESCE(json_extract(credentials, '$.models'), '[]'),
 			CASE WHEN COALESCE(json_extract(credentials, '$.api_key'), '') <> '' THEN 1 ELSE 0 END,
 			CASE WHEN COALESCE(json_extract(credentials, '$.refresh_token'), '') <> '' THEN 1 ELSE 0 END,
-			COALESCE(CAST(json_extract(credentials, '$.scheduler_priority') AS TEXT), '')`
+			COALESCE(CAST(json_extract(credentials, '$.scheduler_priority') AS TEXT), ''),
+			COALESCE(json_extract(credentials, '$.avatar_url'), ''),
+			CASE WHEN COALESCE(json_extract(credentials, '$.verified_email'), 0) <> 0 THEN 1 ELSE 0 END,
+			COALESCE(json_extract(credentials, '$.project_id'), ''),
+			COALESCE(json_extract(credentials, '$.antigravity_sync_error'), ''),
+			COALESCE(json_extract(credentials, '$.antigravity_sync_warning'), ''),
+			COALESCE(NULLIF(json_extract(credentials, '$.antigravity_permissions'), ''), json_extract(credentials, '$.antigravity_entitlements'), '{}'),
+			COALESCE(json_extract(credentials, '$.antigravity_quota'), '{}'),
+			COALESCE(json_extract(credentials, '$.claude_usage_probe_at'), ''),
+			COALESCE(json_extract(credentials, '$.claude_usage_probe_error'), '')`
 	}
 	switch channel {
 	case UpstreamChannelGrok:
 		where += ` AND ` + upstreamExpr + ` = 'grok'`
+	case UpstreamChannelAntigravity:
+		where += ` AND ` + upstreamExpr + ` = 'antigravity'`
+	case UpstreamChannelClaude:
+		where += ` AND ` + upstreamExpr + ` = 'claude'`
 	case UpstreamChannelCodex:
-		where += ` AND ` + upstreamExpr + ` <> 'grok'`
+		where += ` AND ` + upstreamExpr + ` NOT IN ('grok', 'antigravity', 'claude')`
 	}
 	query := `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 		COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
@@ -123,14 +155,20 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	row := &AccountRow{}
 	var cooldownRaw, tagsRaw, createdRaw, updatedRaw interface{}
 	var upstreamType, email, baseURL, planType, schedulerPriority string
+	var avatarURL, projectID string
+	var antigravitySyncError, antigravitySyncWarning, antigravityPermissions, antigravityQuota string
+	var claudeUsageProbeAt, claudeUsageProbeError string
 	var modelsRaw interface{}
-	var hasAPIKey, hasRefreshToken bool
+	var hasAPIKey, hasRefreshToken, verifiedEmail bool
 	if err := scanner.Scan(
 		&row.ID, &row.Name, &row.Type, &row.ProxyURL, &row.Status, &row.CooldownReason, &cooldownRaw,
 		&row.ErrorMessage, &row.Enabled, &row.Locked, &row.ScoreBiasOverride, &row.BaseConcurrencyOverride,
 		&tagsRaw, &createdRaw, &updatedRaw, &row.CredentialGeneration, &row.CredentialFamilyID,
 		&upstreamType, &email, &baseURL, &planType, &modelsRaw,
 		&hasAPIKey, &hasRefreshToken, &schedulerPriority,
+		&avatarURL, &verifiedEmail, &projectID,
+		&antigravitySyncError, &antigravitySyncWarning, &antigravityPermissions, &antigravityQuota,
+		&claudeUsageProbeAt, &claudeUsageProbeError,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
@@ -139,14 +177,23 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		return nil, err
 	}
 	row.Credentials = projectAccountCredentials(map[string]interface{}{
-		"upstream_type":      upstreamType,
-		"email":              email,
-		"base_url":           baseURL,
-		"plan_type":          planType,
-		"models":             modelsRaw,
-		"api_key":            hasAPIKey,
-		"refresh_token":      hasRefreshToken,
-		"scheduler_priority": schedulerPriority,
+		"upstream_type":            upstreamType,
+		"email":                    email,
+		"base_url":                 baseURL,
+		"plan_type":                planType,
+		"models":                   modelsRaw,
+		"api_key":                  hasAPIKey,
+		"refresh_token":            hasRefreshToken,
+		"scheduler_priority":       schedulerPriority,
+		"avatar_url":               avatarURL,
+		"verified_email":           verifiedEmail,
+		"project_id":               projectID,
+		"antigravity_sync_error":   antigravitySyncError,
+		"antigravity_sync_warning": antigravitySyncWarning,
+		"antigravity_permissions":  antigravityPermissions,
+		"antigravity_quota":        antigravityQuota,
+		"claude_usage_probe_at":    claudeUsageProbeAt,
+		"claude_usage_probe_error": claudeUsageProbeError,
 	})
 	return row, nil
 }
@@ -186,6 +233,22 @@ func projectAccountCredentials(credentials map[string]interface{}) map[string]in
 	}
 	if schedulerPriority := projectionStringValue(credentials["scheduler_priority"]); strings.TrimSpace(schedulerPriority) != "" {
 		projected["scheduler_priority"] = schedulerPriority
+	}
+	for _, key := range []string{
+		"avatar_url", "project_id", "antigravity_sync_error", "antigravity_sync_warning",
+		"antigravity_permissions", "antigravity_quota", "claude_usage_probe_at", "claude_usage_probe_error",
+	} {
+		if value := credentials[key]; value != nil && strings.TrimSpace(projectionStringValue(value)) != "" {
+			projected[key] = value
+		}
+	}
+	if _, ok := projected["antigravity_permissions"]; !ok {
+		if value := credentials["antigravity_entitlements"]; value != nil && strings.TrimSpace(projectionStringValue(value)) != "" {
+			projected["antigravity_permissions"] = value
+		}
+	}
+	if verified, ok := credentials["verified_email"].(bool); ok && verified {
+		projected["verified_email"] = true
 	}
 	return projected
 }

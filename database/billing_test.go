@@ -53,7 +53,7 @@ func TestGetModelPricingUsesSub2APIClaudeFamilies(t *testing.T) {
 		{model: "claude-opus-4-7-20260401", wantInput: 5.0, wantOutput: 25.0},
 		{model: "claude-opus-4-20250514", wantInput: 15.0, wantOutput: 75.0},
 		{model: "claude-sonnet-4-5-20250929", wantInput: 3.0, wantOutput: 15.0},
-		{model: "claude-3-5-haiku-20241022", wantInput: 1.0, wantOutput: 5.0},
+		{model: "claude-3-5-haiku-20241022", wantInput: 0.8, wantOutput: 4.0},
 		{model: "claude-unknown-model", wantInput: 3.0, wantOutput: 15.0},
 	}
 
@@ -420,6 +420,26 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 }
 
 // grok-4.6 / grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
+func TestAntigravityGeminiEstimatedPricing(t *testing.T) {
+	tests := []struct {
+		model      string
+		wantInput  float64
+		wantOutput float64
+		wantCache  float64
+	}{
+		{model: "gemini-3-pro-preview", wantInput: 2.0, wantOutput: 12.0, wantCache: 0.2},
+		{model: "gemini-2.5-pro", wantInput: 1.25, wantOutput: 10.0, wantCache: 0.125},
+		{model: "gemini-2.5-flash", wantInput: 0.3, wantOutput: 2.5, wantCache: 0.03},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			got := GetModelPricing(tt.model)
+			assertPricing(t, got, tt.wantInput, tt.wantOutput)
+			assertFloatEqual(t, got.CacheReadPricePerMToken, tt.wantCache)
+		})
+	}
+}
+
 func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
 	assertPricing(t, GetModelPricing("grok-4.6"), 2.0, 6.0)
 	assertFloatEqual(t, GetModelPricing("grok-4.6").CacheReadPricePerMToken, 0.5)
@@ -490,5 +510,20 @@ func TestGrok46OfficialPricingAndLongContextThreshold(t *testing.T) {
 	breakdown := CalculateCostBreakdown(200001, 1000000, 0, "grok-4.6", "")
 	if !breakdown.LongContext || breakdown.LongContextThreshold != 200000 {
 		t.Fatalf("grok-4.6 should enter long pricing above 200K: %+v", breakdown)
+	}
+}
+
+func TestClaudeFablePricingUsesOfficialCacheReadRates(t *testing.T) {
+	fable51 := GetModelPricing("claude-fable-5.1")
+	assertPricing(t, fable51, 10, 50)
+	assertFloatEqual(t, fable51.CacheReadPricePerMToken, 0.25)
+	if fable51.CacheWrite5mPricePerMToken != 12.5 || fable51.CacheWrite1hPricePerMToken != 20 {
+		t.Fatalf("Fable 5.1 cache-write pricing = %+v", fable51)
+	}
+	fable5 := GetModelPricing("claude-fable-5")
+	assertPricing(t, fable5, 10, 50)
+	assertFloatEqual(t, fable5.CacheReadPricePerMToken, 1)
+	if fable5.CacheWrite5mPricePerMToken != 12.5 || fable5.CacheWrite1hPricePerMToken != 20 {
+		t.Fatalf("Fable 5 cache-write pricing = %+v", fable5)
 	}
 }

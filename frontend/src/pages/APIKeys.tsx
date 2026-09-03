@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 import { api } from "../api";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
 import ChipInput from "../components/ChipInput";
@@ -29,6 +30,7 @@ import type {
   APIKeyScopeSummaryItem,
   APIKeyRow,
   APIKeyWindowUsage,
+  PromptFilterNewAPIBinding,
   SystemSettings,
 } from "../types";
 import { canStartAPIKeyBulkReset } from "../lib/apiKeyOperationState";
@@ -51,30 +53,26 @@ import {
 import { cn } from "@/lib/utils";
 import {
   Check,
+  ClipboardCheck,
   Copy,
   CalendarClock,
   CircleDollarSign,
   ChevronDown,
   Eye,
   EyeOff,
-  FileDown,
   ExternalLink,
   ArrowUpDown,
   Gauge,
   KeyRound,
   Loader2,
   LockKeyhole,
-  MonitorSmartphone,
   Pencil,
-  Power,
-  PowerOff,
   Plus,
-  RefreshCw,
+  Power,
   RotateCcw,
   Search,
   ShieldAlert,
   ShieldCheck,
-  Terminal,
   SlidersHorizontal,
   Waypoints,
   Trash2,
@@ -82,12 +80,9 @@ import {
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
-type ClientLimitMode = "off" | "observe" | "enforce";
-const CODEX_TOOLKIT_PORTAL_URL =
-  "https://portal.lechun.cc/portal/profile?tab=codextoolkit";
 type TokenLimitUnit = "token" | "k" | "m" | "b";
-type StatusFilter = "all" | "active" | "disabled" | "expired" | "quota_exhausted" | "expiring_soon";
-type APIKeyStatus = "active" | "disabled" | "expired" | "quota_exhausted";
+type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon" | "disabled";
+type APIKeyStatus = "active" | "expired" | "quota_exhausted" | "disabled";
 type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_asc";
 
 const KEY_REVEAL_MS = 30_000;
@@ -120,9 +115,6 @@ interface LimitsFormState {
   rpm: string;
   rpd: string;
   maxConcurrency: string;
-  maxClients: string;
-  clientWindowMinutes: string;
-  clientLimitMode: ClientLimitMode;
   costLimit5h: string;
   costLimit7d: string;
   costLimit30d: string;
@@ -143,7 +135,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok";
+type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity" | "claude";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -195,6 +187,41 @@ const DEFAULT_GROK_MODEL_OPTIONS = [
   "grok-2",
 ];
 
+const DEFAULT_ANTIGRAVITY_MODEL_OPTIONS = [
+  "gemini-3-pro-preview",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+];
+// Keep this fallback in lockstep with proxy.defaultClaudeModelIDs. The
+// server catalog normally wins; these aliases are only used when no
+// Claude account has populated a catalog yet.
+const DEFAULT_CLAUDE_MODEL_OPTIONS = [
+  "claude-opus-4-5",
+  "claude-sonnet-4-5",
+  "claude-haiku-4-5",
+];
+
+function accountGroupsForUpstreamChannel(
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): AccountGroup[] {
+  return channel === "auto"
+    ? groups
+    : groups.filter((group) => group.channel === channel);
+}
+
+function compatibleGroupIdsForUpstreamChannel(
+  ids: number[],
+  groups: AccountGroup[],
+  channel: UpstreamChannel,
+): number[] {
+  if (channel === "auto") return ids;
+  const compatibleIds = new Set(
+    accountGroupsForUpstreamChannel(groups, channel).map((group) => group.id),
+  );
+  return ids.filter((id) => compatibleIds.has(id));
+}
+
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
   k: 1_000,
@@ -212,9 +239,6 @@ const emptyLimitsForm: LimitsFormState = {
   rpm: "",
   rpd: "",
   maxConcurrency: "",
-  maxClients: "",
-  clientWindowMinutes: "",
-  clientLimitMode: "off",
   costLimit5h: "",
   costLimit7d: "",
   costLimit30d: "",
@@ -262,7 +286,6 @@ export default function APIKeys() {
     id: number;
     name: string;
     key: string;
-    mode: "created" | "regenerated";
   } | null>(null);
   const [createdRevealAck, setCreatedRevealAck] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
@@ -273,10 +296,7 @@ export default function APIKeys() {
   const [sortMode, setSortMode] = useState<SortMode>("created_desc");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [togglingIds, setTogglingIds] = useState<Set<number>>(new Set());
-  const [regeneratingIds, setRegeneratingIds] = useState<Set<number>>(
-    new Set(),
-  );
+  const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   // 编辑抽屉里展示 scope 预算的当前用量（issue #439）；打开时按需拉一次。
   const [scopeUsage, setScopeUsage] = useState<APIKeyScopeUsageItem[]>([]);
@@ -288,7 +308,6 @@ export default function APIKeys() {
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
   const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [promptKey, setPromptKey] = useState<APIKeyRow | null>(null);
   const [resettingAll, setResettingAll] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
   const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
@@ -307,7 +326,7 @@ export default function APIKeys() {
   }, []);
 
   const loadKeys = useCallback(async () => {
-    const [keysResponse, groupsResponse, modelsResponse, settingsResponse] = await Promise.all([
+    const [keysResponse, groupsResponse, modelsResponse, settingsResponse, promptBindingsResponse] = await Promise.all([
       api.getAPIKeys(),
       api.listAccountGroups().catch(() => ({ groups: [] })),
       api
@@ -315,15 +334,21 @@ export default function APIKeys() {
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
         grok_models?: string[];
+        antigravity_models?: string[];
+        claude_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
+      api.getPromptFilterNewAPIBindings().catch(() => ({ bindings: [] as PromptFilterNewAPIBinding[] })),
     ]);
     return {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
       grokModelOptions: modelsResponse.grok_models ?? [],
+      antigravityModelOptions: modelsResponse.antigravity_models ?? [],
+      claudeModelOptions: modelsResponse.claude_models ?? [],
       settings: settingsResponse,
+      promptBindings: promptBindingsResponse.bindings ?? [],
     };
   }, []);
 
@@ -332,20 +357,30 @@ export default function APIKeys() {
     groups: AccountGroup[];
     modelOptions: string[];
     grokModelOptions: string[];
+    antigravityModelOptions: string[];
+    claudeModelOptions: string[];
     settings: SystemSettings | null;
+    promptBindings: PromptFilterNewAPIBinding[];
   }>({
     initialData: {
       keys: [],
       groups: [],
       modelOptions: [],
       grokModelOptions: [],
+      antigravityModelOptions: [],
+      claudeModelOptions: [],
       settings: null,
+      promptBindings: [],
     },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  const promptBindingsByKey = useMemo(
+    () => new Map(data.promptBindings.map((binding) => [binding.api_key_id, binding])),
+    [data.promptBindings],
+  );
 
   // scope 预算概览单独拉：它需要跨 Key 的用量聚合，不该拖慢 Key 列表本身。
   const anyScopeBudget = keys.some(
@@ -375,17 +410,47 @@ export default function APIKeys() {
     data.grokModelOptions.length > 0
       ? data.grokModelOptions
       : DEFAULT_GROK_MODEL_OPTIONS;
+  const antigravityModelOptions =
+    data.antigravityModelOptions.length > 0
+      ? data.antigravityModelOptions
+      : DEFAULT_ANTIGRAVITY_MODEL_OPTIONS;
+  const claudeModelOptions =
+    data.claudeModelOptions.length > 0
+      ? data.claudeModelOptions
+      : DEFAULT_CLAUDE_MODEL_OPTIONS;
   const modelOptionsForChannel = useCallback(
     (channel: UpstreamChannel): string[] => {
       if (channel === "grok") return grokModelOptions;
+      if (channel === "antigravity") return antigravityModelOptions;
       if (channel === "codex") return modelOptions;
+      if (channel === "claude") return claudeModelOptions;
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
-      return [
-        ...modelOptions,
-        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
-      ];
+      const merged = [...modelOptions];
+      for (const candidate of [...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions]) {
+        if (!seen.has(candidate.toLowerCase())) {
+          seen.add(candidate.toLowerCase());
+          merged.push(candidate);
+        }
+      }
+      return merged;
     },
-    [modelOptions, grokModelOptions],
+    [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions],
+  );
+  const createSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        createForm.limits.upstreamChannel,
+      ),
+    [createForm.limits.upstreamChannel, groups],
+  );
+  const editSelectableGroups = useMemo(
+    () =>
+      accountGroupsForUpstreamChannel(
+        groups,
+        editForm.limits.upstreamChannel,
+      ),
+    [editForm.limits.upstreamChannel, groups],
   );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
   const publicImageStudioPageEnabled =
@@ -422,17 +487,17 @@ export default function APIKeys() {
     const counts = {
       all: keys.length,
       active: 0,
-      disabled: 0,
       expired: 0,
       quota_exhausted: 0,
       expiring_soon: 0,
+      disabled: 0,
     };
     const now = Date.now();
     for (const keyRow of keys) {
       const status = getAPIKeyStatus(keyRow);
       if (status === "active") counts.active += 1;
-      else if (status === "disabled") counts.disabled += 1;
       else if (status === "expired") counts.expired += 1;
+      else if (status === "disabled") counts.disabled += 1;
       else counts.quota_exhausted += 1;
 
       if (
@@ -447,23 +512,16 @@ export default function APIKeys() {
     return counts;
   }, [keys]);
 
-  const promptShareText = useMemo(() => {
-    if (!promptKey) return "";
-    return buildToolkitShareText({
-      apiKey: promptKey.raw_key || promptKey.key,
-      t,
-    });
-  }, [promptKey, t]);
   const filteredKeys = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const now = Date.now();
     const filtered = keys.filter((keyRow) => {
       const status = getAPIKeyStatus(keyRow);
       if (statusFilter === "active" && status !== "active") return false;
-      if (statusFilter === "disabled" && status !== "disabled") return false;
       if (statusFilter === "expired" && status !== "expired") return false;
       if (statusFilter === "quota_exhausted" && status !== "quota_exhausted")
         return false;
+      if (statusFilter === "disabled" && status !== "disabled") return false;
       if (statusFilter === "expiring_soon") {
         if (status !== "active" || !keyRow.expires_at) return false;
         const expiresAt = new Date(keyRow.expires_at).getTime();
@@ -545,6 +603,25 @@ export default function APIKeys() {
 
   const updateCreateForm = (patch: Partial<CreateKeyFormState>) => {
     setCreateForm((current) => ({ ...current, ...patch }));
+  };
+
+  const updateCreateUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setCreateForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
   };
 
   const closeCreateDialog = () => {
@@ -673,7 +750,6 @@ export default function APIKeys() {
         id: result.id,
         name: result.name,
         key: result.key,
-        mode: "created",
       });
       setCreatedRevealAck(false);
       setCreateForm(initialCreateForm);
@@ -693,13 +769,57 @@ export default function APIKeys() {
     }
   };
 
-  const handleToggleKeyEnabled = async (keyRow: APIKeyRow) => {
-    const nextEnabled = keyRow.enabled === false;
+  const handleDeleteKey = async (id: number) => {
+    const confirmed = await confirm({
+      title: t("apiKeys.deleteKeyTitle"),
+      description: t("apiKeys.deleteKeyDesc"),
+      confirmText: t("apiKeys.confirmDelete"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setDeletingIds((prev) => new Set(prev).add(id));
+    const previous = keys;
+    setData((current) => ({
+      ...current,
+      keys: current.keys.filter((item) => item.id !== id),
+    }));
+    try {
+      await api.deleteAPIKey(id);
+      showToast(t("apiKeys.keyDeleted"));
+      if (createdKeyId === id) setCreatedKeyId(null);
+      setVisibleKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      void reloadSilently();
+    } catch (error) {
+      setData((current) => ({ ...current, keys: previous }));
+      showToast(
+        `${t("apiKeys.deleteFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setDeletingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
+  const [togglingIds, setTogglingIds] = useState<Set<number>>(new Set());
+
+  const handleToggleEnabled = async (keyRow: APIKeyRow) => {
+    const nextEnabled = getAPIKeyStatus(keyRow) === "disabled";
     if (!nextEnabled) {
       const confirmed = await confirm({
-        title: t("apiKeys.disableKeyTitle"),
-        description: t("apiKeys.disableKeyDesc"),
-        confirmText: t("apiKeys.confirmDisable"),
+        title: t("apiKeys.disableTitle"),
+        description: t("apiKeys.disableDesc"),
+        confirmText: t("apiKeys.disableConfirm"),
         tone: "destructive",
         confirmVariant: "destructive",
       });
@@ -707,27 +827,29 @@ export default function APIKeys() {
     }
 
     setTogglingIds((prev) => new Set(prev).add(keyRow.id));
-    const previous = keys;
-    setData((current) => ({
-      ...current,
-      keys: current.keys.map((item) =>
-        item.id === keyRow.id
-          ? {
-              ...item,
-              enabled: nextEnabled,
-              status: nextEnabled ? "active" : "disabled",
-            }
-          : item,
-      ),
-    }));
     try {
-      await api.setAPIKeyEnabled(keyRow.id, nextEnabled);
-      showToast(t(nextEnabled ? "apiKeys.keyEnabled" : "apiKeys.keyDisabled"));
+      await api.updateAPIKey(keyRow.id, { enabled: nextEnabled });
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.id === keyRow.id
+            ? {
+                ...item,
+                enabled: nextEnabled,
+                status: nextEnabled ? undefined : "disabled",
+              }
+            : item,
+        ),
+      }));
+      showToast(
+        nextEnabled
+          ? t("apiKeys.enableSuccess")
+          : t("apiKeys.disableSuccess"),
+      );
       void reloadSilently();
     } catch (error) {
-      setData((current) => ({ ...current, keys: previous }));
       showToast(
-        `${t(nextEnabled ? "apiKeys.enableFailed" : "apiKeys.disableFailed")}: ${getErrorMessage(error)}`,
+        `${t("apiKeys.toggleFailed")}: ${getErrorMessage(error)}`,
         "error",
       );
     } finally {
@@ -738,67 +860,12 @@ export default function APIKeys() {
       });
     }
   };
-
-  const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
   const canResetAllQuotas = canStartAPIKeyBulkReset({
     keyCount: keys.length,
     resettingAll,
     resettingIds,
-    deletingIds: togglingIds,
+    deletingIds,
   });
-
-  const handleRegenerateKey = async (keyRow: APIKeyRow) => {
-    const confirmed = await confirm({
-      title: t("apiKeys.regenerateTitle"),
-      description: t("apiKeys.regenerateDesc"),
-      confirmText: t("apiKeys.regenerateConfirm"),
-      tone: "destructive",
-      confirmVariant: "destructive",
-    });
-    if (!confirmed) return;
-
-    setRegeneratingIds((prev) => new Set(prev).add(keyRow.id));
-    try {
-      const result = await api.regenerateAPIKey(keyRow.id);
-      setData((current) => ({
-        ...current,
-        keys: current.keys.map((item) =>
-          item.id === keyRow.id
-            ? {
-                ...item,
-                key: maskAPIKey(result.key),
-                raw_key: result.key,
-              }
-            : item,
-        ),
-      }));
-      setVisibleKeys((prev) => {
-        const next = new Set(prev);
-        next.delete(keyRow.id);
-        return next;
-      });
-      setCreatedReveal({
-        id: result.id,
-        name: result.name,
-        key: result.key,
-        mode: "regenerated",
-      });
-      setCreatedRevealAck(false);
-      showToast(t("apiKeys.regenerateSuccess"));
-      void reloadSilently();
-    } catch (error) {
-      showToast(
-        `${t("apiKeys.regenerateFailed")}: ${getErrorMessage(error)}`,
-        "error",
-      );
-    } finally {
-      setRegeneratingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(keyRow.id);
-        return next;
-      });
-    }
-  };
 
   const handleResetQuota = async (keyRow: APIKeyRow) => {
     const confirmed = await confirm({
@@ -900,27 +967,6 @@ export default function APIKeys() {
     }
   };
 
-  const handleExportKeys = () => {
-    if (keys.length === 0) {
-      showToast(t("apiKeys.exportEmpty"), "error");
-      return;
-    }
-    const csv = buildAPIKeysCSV(keys, groups, t);
-    const blob = new Blob([`\uFEFF${csv}`], {
-      type: "text/csv;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    const date = new Date().toISOString().slice(0, 10);
-    link.href = url;
-    link.download = `api-keys-${date}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    showToast(t("apiKeys.exportSuccess"));
-  };
-
   const hideKey = useCallback((id: number) => {
     const existing = revealTimers.current.get(id);
     if (existing) {
@@ -963,25 +1009,12 @@ export default function APIKeys() {
       showToast(t("apiKeys.createdRevealAckRequired"), "error");
       return;
     }
-    if (createdReveal?.mode === "regenerated") {
-      const regeneratedID = createdReveal.id;
-      setData((current) => ({
-        ...current,
-        keys: current.keys.map((item) =>
-          item.id === regeneratedID
-            ? {
-                ...item,
-                raw_key: "",
-              }
-            : item,
-        ),
-      }));
-    }
     setCreatedReveal(null);
     setCreatedRevealAck(false);
   };
 
   const startEditing = (keyRow: APIKeyRow) => {
+    const limits = limitsFromAPIKey(keyRow.limits);
     setEditingKey(keyRow);
     setScopeUsage([]);
     if ((keyRow.limits?.scope_limits?.length ?? 0) > 0) {
@@ -995,19 +1028,22 @@ export default function APIKeys() {
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
-      allowedGroupIds: keyRow.allowed_group_ids ?? [],
-      limits: limitsFromAPIKey(keyRow.limits),
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        keyRow.allowed_group_ids ?? [],
+        groups,
+        limits.upstreamChannel,
+      ),
+      limits: {
+        ...limits,
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          limits.noAffinityGroupIds,
+          groups,
+          limits.upstreamChannel,
+        ),
+      },
     });
     setEditDirty(false);
     setEditTab("basic");
-  };
-
-  const openPromptDialog = (keyRow: APIKeyRow) => {
-    setPromptKey(keyRow);
-  };
-
-  const closePromptDialog = () => {
-    setPromptKey(null);
   };
 
   // 重置某条 scope 的累计额度：累计额度不随时间回落，用完必须手动重置。
@@ -1035,6 +1071,7 @@ export default function APIKeys() {
       showToast(getErrorMessage(err), "error");
     }
   };
+
   const closeEditDialog = async () => {
     if (saving) return;
     if (editDirty) {
@@ -1055,6 +1092,26 @@ export default function APIKeys() {
 
   const updateEditForm = (patch: Partial<EditKeyFormState>) => {
     setEditForm((current) => ({ ...current, ...patch }));
+    setEditDirty(true);
+  };
+
+  const updateEditUpstreamChannel = (upstreamChannel: UpstreamChannel) => {
+    setEditForm((current) => ({
+      ...current,
+      allowedGroupIds: compatibleGroupIdsForUpstreamChannel(
+        current.allowedGroupIds,
+        groups,
+        upstreamChannel,
+      ),
+      limits: {
+		...applyUpstreamChannel(current.limits, upstreamChannel),
+        noAffinityGroupIds: compatibleGroupIdsForUpstreamChannel(
+          current.limits.noAffinityGroupIds,
+          groups,
+          upstreamChannel,
+        ),
+      },
+    }));
     setEditDirty(true);
   };
 
@@ -1313,11 +1370,6 @@ export default function APIKeys() {
                         statusCounts.active,
                       ],
                       [
-                        "disabled",
-                        t("apiKeys.status.disabled"),
-                        statusCounts.disabled,
-                      ],
-                      [
                         "expiring_soon",
                         t("apiKeys.status.expiring_soon"),
                         statusCounts.expiring_soon,
@@ -1331,6 +1383,11 @@ export default function APIKeys() {
                         "quota_exhausted",
                         t("apiKeys.status.quota_exhausted"),
                         statusCounts.quota_exhausted,
+                      ],
+                      [
+                        "disabled",
+                        t("apiKeys.status.disabled"),
+                        statusCounts.disabled,
                       ],
                     ] as const
                   ).map(([key, label, count]) => (
@@ -1391,21 +1448,6 @@ export default function APIKeys() {
                     <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                   ) : null}
                 </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={handleExportKeys}
-                    disabled={keys.length === 0}
-                  >
-                    <FileDown className="size-3.5" />
-                    {t("apiKeys.exportKeys")}
-                  </Button>
-                  <Badge variant={keys.length > 0 ? "default" : "secondary"}>
-                    {t("apiKeys.keyCount", { count: keys.length })}
-                  </Badge>
-                </div>
               </div>
 
               <StateShell
@@ -1449,9 +1491,9 @@ export default function APIKeys() {
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
                           resettingAll ||
-                          togglingIds.has(keyRow.id) ||
+                          deletingIds.has(keyRow.id) ||
                           resettingIds.has(keyRow.id) ||
-                          regeneratingIds.has(keyRow.id);
+                          togglingIds.has(keyRow.id);
                         const displayKey = isVisible
                           ? keyRow.raw_key || keyRow.key
                           : keyRow.key;
@@ -1485,6 +1527,7 @@ export default function APIKeys() {
                                     t={t}
                                   />
                                   <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                   <KeyScopeBudgetBadge
                                     items={scopeSummary[String(keyRow.id)]}
                                     t={t}
@@ -1544,13 +1587,6 @@ export default function APIKeys() {
                                   t={t}
                                 />
                               </div>
-                              <div className="flex items-center justify-between gap-2 text-[11px]">
-                                <span className="flex items-center gap-1 font-semibold text-muted-foreground">
-                                  <MonitorSmartphone className="size-3.5" />
-                                  {t("apiKeys.clientCountColumn")}
-                                </span>
-                                <ClientCountDisplay keyRow={keyRow} t={t} />
-                              </div>
                               <div className="rounded-xl border border-border/70 bg-muted/20 px-2.5 py-2">
                                 <div className="flex items-center justify-between gap-2 text-[11px]">
                                   <span className="font-semibold text-muted-foreground">
@@ -1580,15 +1616,6 @@ export default function APIKeys() {
                               <Button
                                 variant="outline"
                                 size="sm"
-                                onClick={() => openPromptDialog(keyRow)}
-                                className="min-w-[8rem] flex-1"
-                              >
-                                <Terminal className="size-3.5" />
-                                {t("apiKeys.generatePrompt")}
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
                                 disabled={
                                   resettingAll || resettingIds.has(keyRow.id)
                                 }
@@ -1606,17 +1633,17 @@ export default function APIKeys() {
                                 variant="outline"
                                 size="sm"
                                 disabled={isBusy}
-                                onClick={() =>
-                                  void handleRegenerateKey(keyRow)
-                                }
-                                className="min-w-[7rem] flex-1"
+                                onClick={() => void handleToggleEnabled(keyRow)}
+                                className="min-w-[6rem] flex-1"
                               >
-                                {regeneratingIds.has(keyRow.id) ? (
+                                {togglingIds.has(keyRow.id) ? (
                                   <Loader2 className="size-3.5 animate-spin" />
                                 ) : (
-                                  <RefreshCw className="size-3.5" />
+                                  <Power className="size-3.5" />
                                 )}
-                                {t("apiKeys.regenerate")}
+                                {getAPIKeyStatus(keyRow) === "disabled"
+                                  ? t("apiKeys.enable")
+                                  : t("apiKeys.disable")}
                               </Button>
                               <Button
                                 variant="outline"
@@ -1629,20 +1656,18 @@ export default function APIKeys() {
                                 {t("apiKeys.editKey")}
                               </Button>
                               <Button
-                                variant={keyRow.enabled === false ? "outline" : "destructive"}
+                                variant="destructive"
                                 size="sm"
                                 disabled={isBusy}
-                                onClick={() => void handleToggleKeyEnabled(keyRow)}
+                                onClick={() => void handleDeleteKey(keyRow.id)}
                                 className="min-w-[6rem] flex-1"
                               >
-                                {togglingIds.has(keyRow.id) ? (
+                                {deletingIds.has(keyRow.id) ? (
                                   <Loader2 className="size-3.5 animate-spin" />
-                                ) : keyRow.enabled === false ? (
-                                  <Power className="size-3.5" />
                                 ) : (
-                                  <PowerOff className="size-3.5" />
+                                  <Trash2 className="size-3.5" />
                                 )}
-                                {t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
+                                {t("common.delete")}
                               </Button>
                             </div>
                           </div>
@@ -1656,13 +1681,8 @@ export default function APIKeys() {
                         <TableHeader>
                           <TableRow>
                             <TableHead>{t("common.name")}</TableHead>
-                            <TableHead className="w-[220px]">
-                              {t("apiKeys.keyColumn")}
-                            </TableHead>
+                            <TableHead>{t("apiKeys.keyColumn")}</TableHead>
                             <TableHead>{t("apiKeys.allowedGroups")}</TableHead>
-                            <TableHead className="w-[140px]">
-                              {t("apiKeys.clientCountColumn")}
-                            </TableHead>
                             <TableHead>{t("apiKeys.quotaColumn")}</TableHead>
                             <TableHead>{t("apiKeys.lastUsedColumn")}</TableHead>
                             <TableHead>{t("apiKeys.expiresColumn")}</TableHead>
@@ -1677,9 +1697,9 @@ export default function APIKeys() {
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
                               resettingAll ||
-                              togglingIds.has(keyRow.id) ||
+                              deletingIds.has(keyRow.id) ||
                               resettingIds.has(keyRow.id) ||
-                              regeneratingIds.has(keyRow.id);
+                              togglingIds.has(keyRow.id);
                             const displayKey = isVisible
                               ? keyRow.raw_key || keyRow.key
                               : keyRow.key;
@@ -1716,6 +1736,7 @@ export default function APIKeys() {
                                         t={t}
                                       />
                                       <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                       <KeyScopeBudgetBadge
                                         items={scopeSummary[String(keyRow.id)]}
                                         t={t}
@@ -1723,10 +1744,10 @@ export default function APIKeys() {
                                     </div>
                                   </div>
                                 </TableCell>
-                                <TableCell className="w-[220px] max-w-[220px]">
-                                  <div className="flex w-[220px] items-center gap-1">
+                                <TableCell>
+                                  <div className="flex min-w-[240px] items-center gap-1">
                                     <code
-                                      className="min-w-0 flex-1 truncate rounded-md bg-muted/70 px-2 py-1 font-mono text-[12px] tabular-nums text-foreground"
+                                      className="min-w-0 max-w-[360px] truncate rounded-md bg-muted/70 px-2 py-1 font-mono text-[12px] tabular-nums text-foreground"
                                       title={displayKey}
                                     >
                                       {displayKey}
@@ -1758,14 +1779,6 @@ export default function APIKeys() {
                                     >
                                       <Copy className="size-3.5" />
                                     </Button>
-                                    <Button
-                                      variant="ghost"
-                                      size="icon-xs"
-                                      onClick={() => openPromptDialog(keyRow)}
-                                      title={t("apiKeys.generatePrompt")}
-                                    >
-                                      <Terminal className="size-3.5" />
-                                    </Button>
                                   </div>
                                 </TableCell>
                                 <TableCell className="min-w-[160px]">
@@ -1774,9 +1787,6 @@ export default function APIKeys() {
                                     groups={groups}
                                     t={t}
                                   />
-                                </TableCell>
-                                <TableCell className="w-[140px] max-w-[140px] whitespace-normal text-sm leading-5">
-                                  <ClientCountDisplay keyRow={keyRow} t={t} />
                                 </TableCell>
                                 <TableCell className="min-w-[160px] text-sm text-muted-foreground">
                                   <div className="space-y-1">
@@ -1855,16 +1865,22 @@ export default function APIKeys() {
                                       size="sm"
                                       disabled={isBusy}
                                       onClick={() =>
-                                        void handleRegenerateKey(keyRow)
+                                        void handleToggleEnabled(keyRow)
                                       }
-                                      title={t("apiKeys.regenerate")}
+                                      title={
+                                        getAPIKeyStatus(keyRow) === "disabled"
+                                          ? t("apiKeys.enable")
+                                          : t("apiKeys.disable")
+                                      }
                                     >
-                                      {regeneratingIds.has(keyRow.id) ? (
+                                      {togglingIds.has(keyRow.id) ? (
                                         <Loader2 className="size-3.5 animate-spin" />
                                       ) : (
-                                        <RefreshCw className="size-3.5" />
+                                        <Power className="size-3.5" />
                                       )}
-                                      {t("apiKeys.regenerate")}
+                                      {getAPIKeyStatus(keyRow) === "disabled"
+                                        ? t("apiKeys.enable")
+                                        : t("apiKeys.disable")}
                                     </Button>
                                     <Button
                                       variant="outline"
@@ -1877,22 +1893,20 @@ export default function APIKeys() {
                                       {t("apiKeys.editKey")}
                                     </Button>
                                     <Button
-                                      variant={keyRow.enabled === false ? "outline" : "destructive"}
+                                      variant="destructive"
                                       size="sm"
                                       disabled={isBusy}
                                       onClick={() =>
-                                        void handleToggleKeyEnabled(keyRow)
+                                        void handleDeleteKey(keyRow.id)
                                       }
-                                      title={t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
+                                      title={t("common.delete")}
                                     >
-                                      {togglingIds.has(keyRow.id) ? (
+                                      {deletingIds.has(keyRow.id) ? (
                                         <Loader2 className="size-3.5 animate-spin" />
-                                      ) : keyRow.enabled === false ? (
-                                        <Power className="size-3.5" />
                                       ) : (
-                                        <PowerOff className="size-3.5" />
+                                        <Trash2 className="size-3.5" />
                                       )}
-                                      {t(keyRow.enabled === false ? "apiKeys.enable" : "apiKeys.disable")}
+                                      {t("common.delete")}
                                     </Button>
                                   </div>
                                 </TableCell>
@@ -2078,8 +2092,9 @@ export default function APIKeys() {
                         <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
                           {t("apiKeys.publicAccountPortalDesc")}
                         </p>
-                        {publicAccountPortalPageEnabled ? (
-                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {publicAccountPortalPageEnabled ? (
+                            <>
                             <code
                               className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
                               title={accountPortalUrl}
@@ -2103,8 +2118,16 @@ export default function APIKeys() {
                               <ExternalLink className="size-3.5" />
                               {t("apiKeys.publicUsageOpen")}
                             </a>
-                          </div>
-                        ) : null}
+                            </>
+                          ) : null}
+                          <Link
+                            to="/accounts?pending=1"
+                            className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                          >
+                            <ClipboardCheck className="size-3.5" />
+                            {t("apiKeys.publicAccountPortalReview")}
+                          </Link>
+                        </div>
                       </div>
                       <Button
                         variant={
@@ -2214,14 +2237,7 @@ export default function APIKeys() {
             >
               <UpstreamChannelPicker
                 value={createForm.limits.upstreamChannel}
-                onChange={(upstreamChannel) =>
-                  updateCreateForm({
-                    limits: applyUpstreamChannel(
-                      createForm.limits,
-                      upstreamChannel,
-                    ),
-                  })
-                }
+                onChange={updateCreateUpstreamChannel}
               />
             </FormField>
             {createForm.limits.upstreamChannel === "codex" ? (
@@ -2251,9 +2267,6 @@ export default function APIKeys() {
                     updateCreateForm({ quotaLimit: event.target.value })
                   }
                 />
-                <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-                  {t("apiKeys.quotaLimitHelp")}
-                </p>
               </FormField>
               <FormField
                 label={t("apiKeys.expireModeLabel")}
@@ -2288,7 +2301,7 @@ export default function APIKeys() {
               as="div"
             >
               <GroupMultiSelect
-                groups={groups}
+                groups={createSelectableGroups}
                 value={createForm.allowedGroupIds}
                 onChange={(allowedGroupIds) =>
                   updateCreateForm({ allowedGroupIds })
@@ -2409,14 +2422,7 @@ export default function APIKeys() {
                   >
                     <UpstreamChannelPicker
                       value={editForm.limits.upstreamChannel}
-                      onChange={(upstreamChannel) =>
-                        updateEditForm({
-                          limits: applyUpstreamChannel(
-                            editForm.limits,
-                            upstreamChannel,
-                          ),
-                        })
-                      }
+                      onChange={updateEditUpstreamChannel}
                     />
                   </FormField>
                   {editForm.limits.upstreamChannel === "codex" ? (
@@ -2473,7 +2479,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.allowedGroupIds}
                       onChange={(allowedGroupIds) =>
                         updateEditForm({ allowedGroupIds })
@@ -2493,7 +2499,7 @@ export default function APIKeys() {
                     as="div"
                   >
                     <GroupMultiSelect
-                      groups={groups}
+                      groups={editSelectableGroups}
                       value={editForm.limits.noAffinityGroupIds}
                       onChange={(noAffinityGroupIds) =>
                         updateEditForm({
@@ -2528,66 +2534,8 @@ export default function APIKeys() {
         </Modal>
 
         <Modal
-          show={Boolean(promptKey)}
-          title={t("apiKeys.promptTitle")}
-          onClose={closePromptDialog}
-          contentClassName="sm:max-w-[780px]"
-          footer={
-            <>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={closePromptDialog}
-              >
-                {t("common.close")}
-              </Button>
-              <Button
-                type="button"
-                onClick={() => void handleCopy(promptShareText)}
-                disabled={!promptShareText}
-              >
-                <Copy className="size-3.5" />
-                {t("apiKeys.copyUserPrompt")}
-              </Button>
-            </>
-          }
-        >
-          {promptKey ? (
-            <div className="space-y-4">
-              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
-                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                  <Terminal className="size-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-foreground">
-                    {t("apiKeys.promptAdminTitle")}
-                  </div>
-                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {t("apiKeys.promptAdminDesc")}
-                  </p>
-                </div>
-              </div>
-
-              <div className="rounded-lg border border-border bg-background">
-                <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
-                  {t("apiKeys.promptPreviewLabel")}
-                </div>
-                <pre className="max-h-[420px] whitespace-pre-wrap break-words p-3 text-sm leading-relaxed text-foreground">
-                  {promptShareText}
-                </pre>
-              </div>
-
-            </div>
-          ) : null}
-        </Modal>
-
-        <Modal
           show={Boolean(createdReveal)}
-          title={t(
-            createdReveal?.mode === "regenerated"
-              ? "apiKeys.regeneratedRevealTitle"
-              : "apiKeys.createdRevealTitle",
-          )}
+          title={t("apiKeys.createdRevealTitle")}
           onClose={closeCreatedReveal}
           contentClassName="sm:max-w-[560px]"
           footer={
@@ -2624,11 +2572,7 @@ export default function APIKeys() {
                     {t("apiKeys.createdRevealWarnTitle")}
                   </div>
                   <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-                    {t(
-                      createdReveal.mode === "regenerated"
-                        ? "apiKeys.regeneratedRevealWarnDesc"
-                        : "apiKeys.createdRevealWarnDesc",
-                    )}
+                    {t("apiKeys.createdRevealWarnDesc")}
                   </p>
                 </div>
               </div>
@@ -2676,110 +2620,6 @@ export default function APIKeys() {
 }
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
-
-function buildToolkitShareText({
-  apiKey,
-  t,
-}: {
-  apiKey: string;
-  t: Translator;
-}): string {
-  return [
-    t("apiKeys.promptShareKeyLine", { apiKey }),
-    "",
-    t("apiKeys.promptShareIntro"),
-    t("apiKeys.promptShareDownloadURL", { url: CODEX_TOOLKIT_PORTAL_URL }),
-    "",
-    t("apiKeys.promptShareRisk"),
-    "",
-    t("apiKeys.promptShareTrafficNote"),
-  ].join("\n");
-}
-
-function buildAPIKeysCSV(
-  keys: APIKeyRow[],
-  groups: AccountGroup[],
-  t: Translator,
-): string {
-  const headers = [
-    t("common.name"),
-    t("apiKeys.keyColumn"),
-    t("apiKeys.exportStatus"),
-    t("apiKeys.exportQuotaLimitUSD"),
-    t("apiKeys.exportQuotaUsedUSD"),
-    t("apiKeys.expiresColumn"),
-    t("common.createdAt"),
-    t("apiKeys.allowedGroups"),
-    t("apiKeys.exportModelAllow"),
-    t("apiKeys.exportModelDeny"),
-    t("apiKeys.exportRPM"),
-    t("apiKeys.exportRPD"),
-    t("apiKeys.exportClientLimitMode"),
-    t("apiKeys.exportMaxClients"),
-    t("apiKeys.exportClientWindowMinutes"),
-    t("apiKeys.exportCostLimit5h"),
-    t("apiKeys.exportCostLimit7d"),
-    t("apiKeys.exportTokenLimit5h"),
-    t("apiKeys.exportTokenLimit7d"),
-  ];
-  const rows = keys.map((keyRow) => {
-    const limits = keyRow.limits ?? {};
-    return [
-      keyRow.name,
-      keyRow.raw_key || keyRow.key,
-      t(`apiKeys.status.${getAPIKeyStatus(keyRow)}`),
-      keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : t("apiKeys.unlimited"),
-      String(keyRow.quota_used ?? 0),
-      keyRow.expires_at ? formatBeijingTime(keyRow.expires_at) : t("apiKeys.neverExpires"),
-      formatBeijingTime(keyRow.created_at),
-      formatExportGroups(keyRow.allowed_group_ids ?? [], groups, t),
-      (limits.model_allow ?? []).join("; "),
-      (limits.model_deny ?? []).join("; "),
-      formatOptionalNumber(limits.rpm),
-      formatOptionalNumber(limits.rpd),
-      limits.client_limit_mode ? t(`apiKeys.limits.clientModes.${limits.client_limit_mode}`) : "",
-      formatOptionalNumber(limits.max_clients),
-      formatOptionalNumber(limits.client_window_minutes),
-      formatOptionalNumber(limits.cost_limit_5h),
-      formatOptionalNumber(limits.cost_limit_7d),
-      formatOptionalNumber(limits.token_limit_5h),
-      formatOptionalNumber(limits.token_limit_7d),
-    ];
-  });
-  return [headers, ...rows]
-    .map((row) => row.map((value) => csvEscape(String(value ?? ""))).join(","))
-    .join("\n");
-}
-
-function maskAPIKey(key: string) {
-  if (key.length <= 8) return "****";
-  return `${key.slice(0, 4)}****...****${key.slice(-4)}`;
-}
-
-function formatExportGroups(
-  ids: number[],
-  groups: AccountGroup[],
-  t: Translator,
-): string {
-  if (ids.length === 0) return t("apiKeys.allowedGroupsAll");
-  const groupMap = new Map(groups.map((group) => [group.id, group.name]));
-  return ids
-    .map((id) => groupMap.get(id) || `#${id}`)
-    .join("; ");
-}
-
-function formatOptionalNumber(value: number | undefined): string {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? String(value)
-    : "";
-}
-
-function csvEscape(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
 
 function parseQuotaLimit(raw: string, t: Translator): number {
   const quotaLimitText = raw.trim();
@@ -2833,18 +2673,6 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.max_concurrency && limits.max_concurrency > 0
         ? String(limits.max_concurrency)
         : "",
-    maxClients:
-      limits.max_clients && limits.max_clients > 0
-        ? String(limits.max_clients)
-        : "",
-    clientWindowMinutes:
-      limits.client_window_minutes && limits.client_window_minutes > 0
-        ? String(limits.client_window_minutes)
-        : "",
-    clientLimitMode:
-      limits.client_limit_mode === "observe" || limits.client_limit_mode === "enforce"
-        ? limits.client_limit_mode
-        : "off",
     costLimit5h:
       limits.cost_limit_5h && limits.cost_limit_5h > 0
         ? String(limits.cost_limit_5h)
@@ -2872,7 +2700,10 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     allowLive: Boolean(limits.allow_live),
     upstreamChannel:
-      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+      limits.upstream_channel === "codex" ||
+      limits.upstream_channel === "grok" ||
+      limits.upstream_channel === "antigravity"
+      || limits.upstream_channel === "claude"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2927,7 +2758,7 @@ function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
   ].some((value) => Number(value.trim()) > 0);
 }
 
-// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道选择。
 // 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
 function UpstreamChannelPicker({
   value,
@@ -2957,10 +2788,20 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelGrok"),
       icon: <ChannelLogo channel="grok" size={18} />,
     },
+    {
+      key: "antigravity",
+      label: t("apiKeys.limits.upstreamChannelAntigravity"),
+      icon: <ChannelLogo channel="antigravity" size={18} />,
+    },
+    {
+      key: "claude",
+      label: t("apiKeys.limits.upstreamChannelClaude"),
+      icon: <ChannelLogo channel="claude" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-5 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -3076,7 +2917,6 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     const n = Number(s.trim());
     return Number.isInteger(n) && n > 0 ? n : 0;
   };
-  const clientLimitEnabled = form.clientLimitMode !== "off";
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
@@ -3088,9 +2928,6 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
     max_concurrency: intNum(form.maxConcurrency),
-    max_clients: clientLimitEnabled ? intNum(form.maxClients) : 0,
-    client_window_minutes: clientLimitEnabled ? intNum(form.clientWindowMinutes) : 0,
-    client_limit_mode: clientLimitEnabled ? form.clientLimitMode : "off",
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
     cost_limit_30d: num(form.costLimit30d),
@@ -3160,17 +2997,6 @@ function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
   return "active";
 }
 
-function formatQuotaUsage(keyRow: APIKeyRow, t: Translator) {
-  const used = formatUSD(keyRow.quota_used);
-  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
-    return t("apiKeys.quotaUsageUnlimited", { used });
-  }
-  return t("apiKeys.quotaUsedOfLimit", {
-    used,
-    limit: formatUSD(keyRow.quota_limit),
-  });
-}
-
 function resetAPIKeyQuotaUsage(keyRow: APIKeyRow): APIKeyRow {
   return {
     ...keyRow,
@@ -3237,11 +3063,6 @@ function KeyStatusBadge({
       className:
         "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
     },
-    disabled: {
-      dot: "bg-[hsl(var(--warning))]",
-      className:
-        "border-transparent bg-[hsl(var(--warning))]/10 text-[hsl(var(--warning))]",
-    },
     expired: {
       dot: "bg-muted-foreground",
       className: "border-transparent bg-muted text-muted-foreground",
@@ -3249,6 +3070,11 @@ function KeyStatusBadge({
     quota_exhausted: {
       dot: "bg-rose-500 animate-pulse",
       className: "border-rose-500/20 bg-rose-500/10 text-rose-600 dark:text-rose-400",
+    },
+    disabled: {
+      dot: "bg-amber-500",
+      className:
+        "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300",
     },
   }[status];
 
@@ -3327,6 +3153,18 @@ function KeyChannelBadge({
       </Badge>
     );
   }
+  if (channel === "antigravity") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelAntigravity")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="antigravity" size={12} />
+        Antigravity
+      </Badge>
+    );
+  }
   if (channel === "codex") {
     return (
       <Badge
@@ -3336,6 +3174,18 @@ function KeyChannelBadge({
       >
         <ChannelLogo channel="codex" size={12} />
         Codex
+      </Badge>
+    );
+  }
+  if (channel === "claude") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelClaude")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="claude" size={12} />
+        Claude
       </Badge>
     );
   }
@@ -3352,33 +3202,62 @@ function KeyChannelBadge({
   );
 }
 
+// APIKeyPromptPolicyBadge separates the effective Prompt policy from the
+// optional NewAPI identity binding. An unbound key still follows the global
+// Prompt Filter; the badge makes that explicit instead of implying bypass.
+function APIKeyPromptPolicyBadge({
+  binding,
+}: {
+  binding?: PromptFilterNewAPIBinding;
+}) {
+  const { t } = useTranslation();
+  const scope = binding?.prompt_filter_scope ?? "inherit";
+  const scopeLabel =
+    scope === "off"
+      ? t("apiKeys.promptFilterScopeOff")
+      : scope === "local_only"
+        ? t("apiKeys.promptFilterScopeLocal")
+        : t("apiKeys.promptFilterScopeGlobal");
+  const identityLabel = binding
+    ? binding.require_signed_identity
+      ? t("apiKeys.promptFilterIdentityRequired")
+      : t("apiKeys.promptFilterIdentityBound")
+    : t("apiKeys.promptFilterIdentityUnbound");
+  return (
+    <span className="inline-flex max-w-full flex-wrap items-center gap-1">
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-sky-500/10 px-1.5 py-0 text-[10px] font-semibold text-sky-700 dark:text-sky-300",
+          scope === "off" && "bg-rose-500/10 text-rose-700 dark:text-rose-300",
+          scope === "local_only" && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={scopeLabel}
+      >
+        {scopeLabel}
+      </Badge>
+      <Badge
+        variant="outline"
+        className={cn(
+          "max-w-full truncate border-transparent bg-muted/70 px-1.5 py-0 text-[10px] font-medium text-muted-foreground",
+          !binding && "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+        )}
+        title={identityLabel}
+      >
+        {identityLabel}
+      </Badge>
+    </span>
+  );
+}
+
 function formatQuotaLimit(keyRow: APIKeyRow, t: Translator) {
   if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
-    return t("apiKeys.quotaUsageUnlimited", {
-      used: formatUSD(keyRow.quota_used),
-    });
+    return t("apiKeys.unlimited");
   }
   return t("apiKeys.quotaUsedOfLimit", {
     used: formatUSD(keyRow.quota_used),
     limit: formatUSD(keyRow.quota_limit),
   });
-}
-
-function formatQuotaMeta(keyRow: APIKeyRow, t: Translator) {
-  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
-    return t("apiKeys.quotaUnlimitedMeta");
-  }
-  return t("apiKeys.quotaUsedPercent", {
-    percent: getQuotaUsagePercent(keyRow).toFixed(1),
-  });
-}
-
-function getQuotaUsagePercent(keyRow: APIKeyRow) {
-  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) return 0;
-  return Math.min(
-    100,
-    Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100),
-  );
 }
 
 function formatExpiration(keyRow: APIKeyRow, t: Translator) {
@@ -3393,42 +3272,6 @@ function formatLastUsed(keyRow: APIKeyRow, t: Translator) {
     return t("apiKeys.neverUsed");
   }
   return formatRelativeTime(keyRow.last_used_at, { variant: "compact" });
-}
-
-function ClientCountDisplay({
-  keyRow,
-  t,
-}: {
-  keyRow: APIKeyRow;
-  t: Translator;
-}) {
-  const maxClients = keyRow.limits?.max_clients ?? 0;
-  if (
-    keyRow.active_client_count === undefined ||
-    keyRow.total_client_count === undefined
-  ) {
-    return (
-      <span className="text-muted-foreground">
-        {t("apiKeys.clientCountUnavailable")}
-      </span>
-    );
-  }
-  const windowMinutes = keyRow.limits?.client_window_minutes || 43_200;
-  return (
-    <span
-      className="font-medium tabular-nums text-foreground"
-      title={t("apiKeys.clientCountHint", { minutes: windowMinutes })}
-    >
-      {t("apiKeys.clientCountSummary", {
-        active: keyRow.active_client_count,
-        total: keyRow.total_client_count,
-        limit:
-          maxClients > 0
-            ? String(maxClients)
-            : t("apiKeys.clientCountUnlimited"),
-      })}
-    </span>
-  );
 }
 
 function formatUSD(value: number) {
@@ -3643,9 +3486,6 @@ function LimitsEditor({
     value.rpm !== "" ||
     value.rpd !== "" ||
     value.maxConcurrency !== "" ||
-    value.clientLimitMode !== "off" ||
-    value.maxClients !== "" ||
-    value.clientWindowMinutes !== "" ||
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.costLimit30d !== "" ||
@@ -3663,14 +3503,6 @@ function LimitsEditor({
         label: t(`apiKeys.limits.tokenUnits.${unit}`),
         triggerLabel: t(`apiKeys.limits.tokenUnitShort.${unit}`),
         value: unit,
-      })),
-    [t],
-  );
-  const clientLimitModeOptions = useMemo(
-    () =>
-      (["off", "observe", "enforce"] as ClientLimitMode[]).map((mode) => ({
-        label: t(`apiKeys.limits.clientModes.${mode}`),
-        value: mode,
       })),
     [t],
   );
@@ -3737,38 +3569,6 @@ function LimitsEditor({
               {t("apiKeys.limits.planAllowHint")}
             </p>
           </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <div className="space-y-1">
-              <label className="text-[11px] font-medium text-muted-foreground">
-                {t("apiKeys.limits.clientLimitMode")}
-              </label>
-              <Select
-                value={value.clientLimitMode}
-                onValueChange={(clientLimitMode) =>
-                  patch({ clientLimitMode: clientLimitMode as ClientLimitMode })
-                }
-                options={clientLimitModeOptions}
-                compact
-              />
-            </div>
-            <LimitNumberField
-              label={t("apiKeys.limits.maxClients")}
-              value={value.maxClients}
-              onChange={(maxClients) => patch({ maxClients })}
-              suffix={t("apiKeys.limits.clientsSuffix")}
-            />
-            <LimitNumberField
-              label={t("apiKeys.limits.clientWindowMinutes")}
-              value={value.clientWindowMinutes}
-              onChange={(clientWindowMinutes) =>
-                patch({ clientWindowMinutes })
-              }
-              suffix={t("apiKeys.limits.minutesSuffix")}
-            />
-          </div>
-          <p className="text-[10px] text-muted-foreground">
-            {t("apiKeys.limits.clientLimitHint")}
-          </p>
           <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
             <label className="text-xs font-medium text-foreground">
               {t("apiKeys.limits.imageGenerationPolicy")}
@@ -4078,16 +3878,37 @@ const GROK_PLAN_FILTER_OPTIONS = [
   "supergrok_plus",
 ] as const;
 
+// Claude OAuth profiles expose these normalized plan keys. Keep them
+// separate from the Codex/Grok plan allowlist so a Claude-bound API key
+// cannot accidentally be configured with an unrelated plan.
+const CLAUDE_PLAN_FILTER_OPTIONS = [
+  "claude",
+  "free",
+  "pro",
+  "max",
+  "max-5x",
+  "max-20x",
+  "team",
+  "enterprise",
+  "business",
+] as const;
+
 const PLAN_FILTER_OPTIONS = [
   ...CODEX_PLAN_FILTER_OPTIONS,
   ...GROK_PLAN_FILTER_OPTIONS.filter(
     (plan) => !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+  ...CLAUDE_PLAN_FILTER_OPTIONS.filter(
+    (plan) =>
+      !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan) &&
+      !(GROK_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
   ),
 ];
 
 function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
   if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
   if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
+  if (channel === "claude") return CLAUDE_PLAN_FILTER_OPTIONS;
   return PLAN_FILTER_OPTIONS;
 }
 

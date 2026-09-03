@@ -4,19 +4,19 @@ import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
 import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
-import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
 import ChannelLogo from '../components/ChannelLogo'
 import CompactionBadges from '../components/CompactionBadges'
 import ModelLogo from '../components/ModelLogo'
+import Modal from '../components/Modal'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, APIKeyTokenStat, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageDailyTokenStats, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
+import type { APIKeyRow, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
 import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
@@ -32,7 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, MoreHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw, Check } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -755,12 +755,10 @@ function APIKeyStatsPanel({
   stats,
   totalRequests,
   showFullUsageNumbers,
-  onMore,
 }: {
   stats: UsageAPIKeyStat[]
   totalRequests: number
   showFullUsageNumbers: boolean
-  onMore?: () => void
 }) {
   const { t } = useTranslation()
   return (
@@ -780,12 +778,6 @@ function APIKeyStatsPanel({
       limit={3}
       totalRequests={totalRequests}
       showFullUsageNumbers={showFullUsageNumbers}
-      action={stats.length > 0 && onMore ? (
-        <Button variant="ghost" size="sm" onClick={onMore} className="h-8 px-2 text-xs">
-          <MoreHorizontal className="size-3.5" />
-          {t('usage.more')}
-        </Button>
-      ) : null}
     />
   )
 }
@@ -796,7 +788,6 @@ function DistributionPanel({
   description,
   emptyText,
   icon,
-  action,
   items,
   limit = 6,
   totalRequests,
@@ -807,7 +798,6 @@ function DistributionPanel({
   description: string
   emptyText: string
   icon: ReactNode
-  action?: ReactNode
   items: Array<{ key: string; label: string; mono?: boolean; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
@@ -819,7 +809,7 @@ function DistributionPanel({
 
   return (
     <PanelShell>
-      <PanelHeader accent={accent} icon={icon} title={title} description={description} trailing={action} />
+      <PanelHeader accent={accent} icon={icon} title={title} description={description} />
 
       {visibleItems.length === 0 ? (
         <EmptyPanel accent={accent} icon={icon} text={emptyText} />
@@ -866,134 +856,6 @@ function DistributionPanel({
         </div>
       )}
     </PanelShell>
-  )
-}
-
-function APIKeyUsageModal({
-  show,
-  onClose,
-  stats,
-  fallbackStats,
-  loading,
-  showFullUsageNumbers,
-}: {
-  show: boolean
-  onClose: () => void
-  stats: APIKeyTokenStat[]
-  fallbackStats: UsageAPIKeyStat[]
-  loading?: boolean
-  showFullUsageNumbers: boolean
-}) {
-  const { t } = useTranslation()
-  const rows: APIKeyTokenStat[] = (stats.length > 0
-    ? stats
-    : fallbackStats.map((item) => ({
-        api_key_id: item.api_key_id,
-        api_key_name: item.label,
-        api_key_masked: '',
-        label: item.label,
-        requests: item.requests,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-        total_tokens: item.tokens,
-        error_count: item.error_count,
-        user_billed: item.user_billed,
-      }))
-  ).sort((a, b) => (
-    safeNumber(b.total_tokens) - safeNumber(a.total_tokens) ||
-    safeNumber(b.requests) - safeNumber(a.requests) ||
-    (a.label || '').localeCompare(b.label || '')
-  ))
-  const totalRequests = rows.reduce((sum, item) => sum + safeNumber(item.requests), 0)
-
-  return (
-    <Modal
-      show={show}
-      title={t('usage.apiKeyUsageModalTitle')}
-      onClose={onClose}
-      contentClassName="sm:max-w-[980px]"
-      bodyClassName="space-y-4"
-    >
-      <p className="text-sm leading-relaxed text-muted-foreground">
-        {t('usage.apiKeyUsageModalDesc')}
-      </p>
-      {loading ? (
-        <div className="flex min-h-48 items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 text-sm text-muted-foreground">
-          {t('common.loading')}
-        </div>
-      ) : (
-        <div className="data-table-shell max-h-[62vh] overflow-auto">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-14 text-center">{t('usage.rank')}</TableHead>
-                <TableHead>{t('usage.tableApiKey')}</TableHead>
-                <TableHead className="text-right">{t('usage.modelStatsRequests')}</TableHead>
-                <TableHead className="text-right">{t('usage.inputTokens')}</TableHead>
-                <TableHead className="text-right">{t('usage.outputTokens')}</TableHead>
-                <TableHead className="text-right">{t('usage.tableCached')}</TableHead>
-                <TableHead className="text-right">{t('usage.modelStatsTokens')}</TableHead>
-                <TableHead className="text-right">{t('usage.modelStatsErrors')}</TableHead>
-                <TableHead className="text-right">{t('usage.tableCost')}</TableHead>
-                <TableHead className="text-right">{t('usage.share')}</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">
-                    {t('usage.noApiKeyStats')}
-                  </TableCell>
-                </TableRow>
-              ) : rows.map((item, index) => (
-                <TableRow key={`${item.api_key_id}-${item.label}-${index}`}>
-                  <TableCell className="text-center font-geist-mono text-xs text-muted-foreground">
-                    #{index + 1}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex min-w-0 flex-col gap-1">
-                      <span className="max-w-[220px] truncate font-medium text-foreground" title={item.label}>
-                        {formatCompactEmail(item.label) || item.label || t('usage.unknownApiKey')}
-                      </span>
-                      {item.api_key_masked ? (
-                        <Badge variant="secondary" className="w-fit font-geist-mono text-[10px]">
-                          {item.api_key_masked}
-                        </Badge>
-                      ) : null}
-                    </div>
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums">
-                    {formatTokens(item.requests, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-blue-600 dark:text-blue-400">
-                    {formatTokens(item.input_tokens, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-emerald-600 dark:text-emerald-400">
-                    {formatTokens(item.output_tokens, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-cyan-600 dark:text-cyan-400">
-                    {formatTokens(item.cached_tokens, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs font-semibold tabular-nums">
-                    {formatTokens(item.total_tokens, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className={`text-right font-geist-mono text-xs tabular-nums ${item.error_count > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
-                    {formatTokens(item.error_count, showFullUsageNumbers)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-emerald-700 dark:text-emerald-400">
-                    {formatCostCardValue(item.user_billed)}
-                  </TableCell>
-                  <TableCell className="text-right font-geist-mono text-xs tabular-nums text-muted-foreground">
-                    {formatPercent(item.requests, totalRequests)}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-    </Modal>
   )
 }
 
@@ -1827,84 +1689,6 @@ function ColumnSettingsDropdown({
   )
 }
 
-function DailyTokenUsagePanel({
-  stats,
-  loading,
-  error,
-  showFullUsageNumbers,
-}: {
-  stats: UsageDailyTokenStats | null
-  loading: boolean
-  error: boolean
-  showFullUsageNumbers: boolean
-}) {
-  const { t } = useTranslation()
-
-  return (
-    <Card>
-      <CardContent className="p-4">
-        <div className="mb-4">
-          <div>
-            <h3 className="text-base font-semibold text-foreground">{t('usage.dailyTokenTitle')}</h3>
-            <p className="mt-1 text-xs text-muted-foreground">{t('usage.dailyTokenDesc')}</p>
-          </div>
-        </div>
-
-        {loading && !stats ? (
-          <div className="py-8 text-center text-sm text-muted-foreground">{t('usage.dailyLoading')}</div>
-        ) : error ? (
-          <div className="py-8 text-center text-sm text-destructive">{t('usage.dailyLoadFailed')}</div>
-        ) : !stats || stats.rows.length === 0 ? (
-          <div className="py-8 text-center text-sm text-muted-foreground">{t('usage.dailyEmpty')}</div>
-        ) : (
-          <div className="overflow-x-auto rounded-md border border-border">
-            <Table className="min-w-max">
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="whitespace-nowrap">{t('usage.dailyDate')}</TableHead>
-                  <TableHead className="whitespace-nowrap text-right">{t('usage.dailyRequests')}</TableHead>
-                  {stats.models.map((modelName) => (
-                    <TableHead key={modelName} className="whitespace-nowrap text-right">{modelName}</TableHead>
-                  ))}
-                  <TableHead className="whitespace-nowrap text-right">{t('usage.dailyTotal')}</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {stats.rows.map((row) => (
-                  <TableRow key={row.date}>
-                    <TableCell className="whitespace-nowrap font-medium">{row.date.slice(0, 10)}</TableCell>
-                    <TableCell className="text-right tabular-nums">{row.requests.toLocaleString()}</TableCell>
-                    {stats.models.map((modelName) => (
-                      <TableCell key={modelName} className="text-right font-mono tabular-nums">
-                        {formatTokens(row.model_tokens[modelName] ?? 0, showFullUsageNumbers)}
-                      </TableCell>
-                    ))}
-                    <TableCell className="text-right font-mono font-semibold tabular-nums">
-                      {formatTokens(row.total_tokens, showFullUsageNumbers)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-                <TableRow className="bg-muted/30 font-semibold">
-                  <TableCell>{t('usage.dailyGrandTotal')}</TableCell>
-                  <TableCell className="text-right tabular-nums">{stats.total.requests.toLocaleString()}</TableCell>
-                  {stats.models.map((modelName) => (
-                    <TableCell key={modelName} className="text-right font-mono tabular-nums">
-                      {formatTokens(stats.total.model_tokens[modelName] ?? 0, showFullUsageNumbers)}
-                    </TableCell>
-                  ))}
-                  <TableCell className="text-right font-mono tabular-nums">
-                    {formatTokens(stats.total.total_tokens, showFullUsageNumbers)}
-                  </TableCell>
-                </TableRow>
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 export default function Usage() {
   const { t } = useTranslation()
   const { toast, showToast } = useToast()
@@ -1915,9 +1699,7 @@ export default function Usage() {
   const [timeRange, setTimeRange] = useState<UsageTimeRangeKey>(getInitialUsageRange)
   const [customRange, setCustomRange] = useState<CustomRange | null>(getInitialUsageCustomRange)
   const [showCustomPopover, setShowCustomPopover] = useState(false)
-  const [customPopoverAnchor, setCustomPopoverAnchor] = useState<'daily' | 'logs'>('daily')
   const customChipRef = useRef<HTMLButtonElement>(null)
-  const customChipRefLogs = useRef<HTMLButtonElement>(null)
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -1938,6 +1720,7 @@ export default function Usage() {
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
+  const [claudeModelOptions, setClaudeModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1945,19 +1728,6 @@ export default function Usage() {
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
   const [showAnalysis, setShowAnalysis] = useState(getInitialAnalysisVisibility)
-  const [showAPIKeyUsageModal, setShowAPIKeyUsageModal] = useState(false)
-  const [apiKeyTokenStats, setAPIKeyTokenStats] = useState<APIKeyTokenStat[]>([])
-  const [apiKeyTokenStatsLoading, setAPIKeyTokenStatsLoading] = useState(false)
-  const [dailyModel, setDailyModel] = useState('')
-  const [dailyApiKeyIds, setDailyApiKeyIds] = useState<string[]>([])
-  const [dailyStats, setDailyStats] = useState<UsageDailyTokenStats | null>(null)
-  const [dailyStatsLoading, setDailyStatsLoading] = useState(false)
-  const [dailyStatsError, setDailyStatsError] = useState(false)
-  const statsAbortRef = useRef<AbortController | null>(null)
-  const analysisAbortRef = useRef<AbortController | null>(null)
-  const [analysisStats, setAnalysisStats] = useState<UsageStats | null>(null)
-  const [analysisStatsLoading, setAnalysisStatsLoading] = useState(false)
-  const [analysisStatsError, setAnalysisStatsError] = useState(false)
   const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
@@ -1974,14 +1744,11 @@ export default function Usage() {
     if (searchTimer.current) clearTimeout(searchTimer.current)
   }, [])
 
-  // 2026-08-20 coder(lq): 首屏只加载汇总，避免长时间范围触发多组全表聚合阻塞页面。
+  // 仅加载轻量统计（秒级）—— 联动同页 timeRange,与下方请求记录的范围保持一致
   const loadStats = useCallback(async () => {
-    statsAbortRef.current?.abort()
-    const controller = new AbortController()
-    statsAbortRef.current = controller
     const { start, end } = resolveRangeISO(timeRange, customRange)
     const [stats, settings] = await Promise.all([
-      api.getUsageStats({ start, end, channel: channel || undefined, detail: 'summary', signal: controller.signal }),
+      api.getUsageStats({ start, end, channel: channel || undefined }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     return { stats, settings }
@@ -1995,44 +1762,6 @@ export default function Usage() {
     load: loadStats,
   })
 
-  // 2026-08-20 coder(lq): 分析面板单独加载，时间范围切换时取消旧聚合，避免请求叠加。
-  const loadAnalysisStats = useCallback(async () => {
-    analysisAbortRef.current?.abort()
-    if (!showAnalysis) {
-      setAnalysisStats(null)
-      setAnalysisStatsLoading(false)
-      setAnalysisStatsError(false)
-      return
-    }
-
-    const controller = new AbortController()
-    analysisAbortRef.current = controller
-    setAnalysisStats(null)
-    setAnalysisStatsLoading(true)
-    setAnalysisStatsError(false)
-    try {
-      const { start, end } = resolveRangeISO(timeRange, customRange)
-      const response = await api.getUsageStats({
-        start,
-        end,
-        channel: channel || undefined,
-        signal: controller.signal,
-      })
-      if (!controller.signal.aborted) {
-        setAnalysisStats(response)
-      }
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        setAnalysisStatsError(true)
-      }
-      if (err instanceof DOMException && err.name === 'AbortError') return
-    } finally {
-      if (!controller.signal.aborted) {
-        setAnalysisStatsLoading(false)
-      }
-    }
-  }, [channel, customRange, showAnalysis, timeRange])
-
   const loadAPIKeys = useCallback(async () => {
     try {
       const response = await api.getAPIKeys()
@@ -2043,41 +1772,6 @@ export default function Usage() {
       setAPIKeyLoadFailed(true)
     }
   }, [])
-
-  const loadAPIKeyTokenStats = useCallback(async () => {
-    setAPIKeyTokenStatsLoading(true)
-    try {
-      const { start, end } = resolveRangeISO(timeRange, customRange)
-      const response = await api.getAPIKeyTokenStats({ start, end })
-      setAPIKeyTokenStats(response.items ?? [])
-    } catch {
-      setAPIKeyTokenStats([])
-      showToast(t('usage.apiKeyUsageLoadFailed'), 'error')
-    } finally {
-      setAPIKeyTokenStatsLoading(false)
-    }
-  }, [customRange, showToast, t, timeRange])
-
-  const loadDailyTokenUsage = useCallback(async (silent = false) => {
-    if (!silent) setDailyStatsLoading(true)
-    try {
-      const { start, end } = resolveRangeISO(timeRange, customRange)
-      const response = await api.getDailyTokenUsage({
-        start,
-        end,
-        channel: channel || undefined,
-        model: dailyModel || undefined,
-        apiKeyIds: dailyApiKeyIds,
-      })
-      setDailyStats(response)
-      setDailyStatsError(false)
-    } catch {
-      setDailyStats(null)
-      setDailyStatsError(true)
-    } finally {
-      if (!silent) setDailyStatsLoading(false)
-    }
-  }, [channel, customRange, dailyApiKeyIds, dailyModel, timeRange])
 
   const buildLogFilterParams = useCallback(() => {
     const { start, end } = resolveRangeISO(timeRange, customRange)
@@ -2103,8 +1797,8 @@ export default function Usage() {
   }, [timeRange, customRange, searchQuery, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterType, channel, filterStatus, filterErrorKind, filterRetry, filterTransport])
 
   // 服务端分页加载日志
-  const loadLogs = useCallback(async (silent = false) => {
-    if (!silent) setLogsLoading(true)
+  const loadLogs = useCallback(async () => {
+    setLogsLoading(true)
     try {
       const res = await api.getUsageLogsPaged({
         ...buildLogFilterParams(),
@@ -2116,7 +1810,7 @@ export default function Usage() {
     } catch {
       // 静默容错
     } finally {
-      if (!silent) setLogsLoading(false)
+      setLogsLoading(false)
     }
   }, [buildLogFilterParams, page, pageSize])
 
@@ -2144,18 +1838,8 @@ export default function Usage() {
   }, [loadErrorSummary])
 
   useEffect(() => {
-    void loadAnalysisStats()
-  }, [loadAnalysisStats])
-
-  useEffect(() => {
     void loadAPIKeys()
   }, [loadAPIKeys])
-
-  useEffect(() => {
-    if (showAPIKeyUsageModal) {
-      void loadAPIKeyTokenStats()
-    }
-  }, [loadAPIKeyTokenStats, showAPIKeyUsageModal])
 
   useEffect(() => {
     let active = true
@@ -2168,10 +1852,12 @@ export default function Usage() {
           : response.models ?? []
         setModelOptions(models)
         setGrokModelOptions(response.grok_models ?? [])
+        setClaudeModelOptions(response.claude_models ?? [])
       } catch {
         if (active) {
           setModelOptions([])
           setGrokModelOptions([])
+          setClaudeModelOptions([])
         }
       }
     }
@@ -2184,16 +1870,9 @@ export default function Usage() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       void reloadSilently()
-      void loadLogs(true)
-      void loadDailyTokenUsage(true)
-      if (showAnalysis) void loadAnalysisStats()
     }, 30000)
     return () => window.clearInterval(timer)
-  }, [loadAnalysisStats, loadDailyTokenUsage, loadLogs, reloadSilently, showAnalysis])
-
-  useEffect(() => {
-    void loadDailyTokenUsage()
-  }, [loadDailyTokenUsage])
+  }, [reloadSilently])
 
   useEffect(() => {
     persistUsageVisibleColumns(visibleColumns)
@@ -2224,7 +1903,7 @@ export default function Usage() {
   const rangeCompletionTokens = stats?.today_completion_tokens ?? 0
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
-  const modelStats = analysisStats?.model_stats ?? []
+  const modelStats = stats?.model_stats ?? []
   // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
   // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
   const modelFilterOptions = useMemo(() => {
@@ -2234,7 +1913,9 @@ export default function Usage() {
       ? grokModelOptions
       : channel === 'codex'
         ? modelOptions
-        : [...modelOptions, ...grokModelOptions]
+        : channel === 'claude'
+          ? claudeModelOptions
+          : [...modelOptions, ...grokModelOptions, ...claudeModelOptions]
     for (const m of catalog) {
       const key = m.trim()
       if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
@@ -2244,10 +1925,10 @@ export default function Usage() {
       if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
     }
     return merged
-  }, [modelOptions, grokModelOptions, modelStats, channel])
-  const featureStats = analysisStats?.feature_stats
-  const endpointStats = analysisStats?.endpoint_stats ?? []
-  const apiKeyStats = analysisStats?.api_key_stats ?? []
+  }, [modelOptions, grokModelOptions, claudeModelOptions, modelStats, channel])
+  const featureStats = stats?.feature_stats
+  const endpointStats = stats?.endpoint_stats ?? []
+  const apiKeyStats = stats?.api_key_stats ?? []
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
@@ -2285,17 +1966,6 @@ export default function Usage() {
     { value: '429', label: '429', tone: 'text-amber-600 dark:text-amber-300' },
     { value: '499', label: '499', tone: 'text-slate-600 dark:text-slate-300' },
   ]
-  const usageLogMode = settings?.usage_log_mode ?? 'full'
-  const hasStatsButNoLogs = !hasActiveFilters && logsTotal === 0 && rangeRequests > 0
-  const emptyLogsDescription = hasActiveFilters
-    ? t('usage.emptyFilteredDesc')
-    : usageLogMode === 'off'
-      ? t('usage.emptyLogsOffDesc')
-      : usageLogMode === 'errors'
-        ? t('usage.emptyLogsErrorsDesc')
-        : hasStatsButNoLogs
-          ? t('usage.emptyStatsWithoutLogsDesc')
-          : t('usage.emptyDesc')
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -2309,7 +1979,6 @@ export default function Usage() {
   const rangeRequestsLabel = t('usage.rangeRequestsCard', { range: rangeLabel })
   const rangeTokensLabel = t('usage.rangeTokensCard', { range: rangeLabel })
   const rangeCostLabel = t('usage.rangeCostCard', { range: rangeLabel })
-  const analysisRangeLabel = t('usage.analysisRange', { range: rangeLabel })
   const resetLogFilters = () => {
     setSearchInput('')
     setSearchQuery('')
@@ -2331,7 +2000,7 @@ export default function Usage() {
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadAnalysisStats(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
+      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -2340,7 +2009,7 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadAnalysisStats(); void loadLogs(); void loadAPIKeys(); void loadDailyTokenUsage() }}
+          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
           titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
@@ -2353,79 +2022,6 @@ export default function Usage() {
             </Button>
           }
         />
-
-        <div className="toolbar-surface flex flex-wrap items-center gap-2 overflow-visible">
-          <span className="mr-1 whitespace-nowrap text-xs font-semibold text-muted-foreground">
-            {t('usage.dailyTokenTitle')}
-          </span>
-          <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border bg-muted/50 p-0.5">
-            {USAGE_TIME_RANGE_OPTIONS.map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => {
-                  setTimeRange(key)
-                  setPage(1)
-                  setShowCustomPopover(false)
-                }}
-                className={`whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ${
-                  timeRange === key
-                    ? 'border border-border bg-background text-foreground shadow-sm'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
-              </button>
-            ))}
-            <button
-              ref={customChipRef}
-              type="button"
-              onClick={() => {
-                setCustomPopoverAnchor('daily')
-                setShowCustomPopover((v) => !v)
-              }}
-              className={`whitespace-nowrap rounded-lg px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ${
-                timeRange === 'custom'
-                  ? 'border border-border bg-background text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {timeRange === 'custom' && customRange
-                ? t('usage.customRangeChipApplied')
-                : t('usage.customRange')}
-            </button>
-          </div>
-          {showCustomPopover && (
-            <CustomRangePopover
-              anchorRef={customPopoverAnchor === 'daily' ? customChipRef : customChipRefLogs}
-              initial={customRange}
-              onCancel={() => setShowCustomPopover(false)}
-              onApply={(range) => {
-                setCustomRange(range)
-                setTimeRange('custom')
-                setPage(1)
-                setShowCustomPopover(false)
-              }}
-            />
-          )}
-          <Select
-            className="w-44 shrink-0"
-            compact
-            value={dailyModel}
-            onValueChange={setDailyModel}
-            placeholder={t('usage.dailyModelFilter')}
-            options={[
-              { label: t('usage.dailyAllModels'), value: '' },
-              ...modelFilterOptions.map((model) => ({ label: model, value: model })),
-            ]}
-          />
-          <DailyAPIKeyMultiSelect
-            options={apiKeyOptions}
-            selected={dailyApiKeyIds}
-            onChange={setDailyApiKeyIds}
-            placeholder={t('usage.dailyApiKeyFilter')}
-          />
-        </div>
 
         <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
@@ -2532,44 +2128,17 @@ export default function Usage() {
           </Card>
         </div>
 
-        <DailyTokenUsagePanel
-          stats={dailyStats}
-          loading={dailyStatsLoading}
-          error={dailyStatsError}
-          showFullUsageNumbers={showFullUsageNumbers}
-        />
-
         {showAnalysis && (
           <>
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2">
-              <div className="text-sm font-medium text-foreground">{t('usage.analysisTitle')}</div>
-              <div className="flex items-center gap-2">
-                {analysisStatsLoading ? <span className="text-xs text-muted-foreground">{t('common.loading')}</span> : null}
-                <Badge variant="secondary">{analysisRangeLabel}</Badge>
-              </div>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
+              <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
-            {analysisStatsError && !analysisStats ? (
-              <div className="rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-                {t('common.loadFailed')}
-              </div>
-            ) : analysisStats ? (
-              <>
-                <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                  <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
-                  <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
-                </div>
 
-                <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-                  <EndpointStatsPanel stats={endpointStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
-                  <APIKeyStatsPanel
-                    stats={apiKeyStats}
-                    totalRequests={rangeRequests}
-                    showFullUsageNumbers={showFullUsageNumbers}
-                    onMore={() => setShowAPIKeyUsageModal(true)}
-                  />
-                </div>
-              </>
-            ) : null}
+            <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
+              <EndpointStatsPanel stats={endpointStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
+            </div>
           </>
         )}
 
@@ -2603,12 +2172,9 @@ export default function Usage() {
                     )
                   })}
                   <button
-                    ref={customChipRefLogs}
+                    ref={customChipRef}
                     type="button"
-                    onClick={() => {
-                      setCustomPopoverAnchor('logs')
-                      setShowCustomPopover((v) => !v)
-                    }}
+                    onClick={() => setShowCustomPopover((v) => !v)}
                     className={cn(
                       'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
                       timeRange === 'custom'
@@ -2621,6 +2187,19 @@ export default function Usage() {
                       : t('usage.customRange')}
                   </button>
                 </div>
+                {showCustomPopover && (
+                  <CustomRangePopover
+                    anchorRef={customChipRef}
+                    initial={customRange}
+                    onCancel={() => setShowCustomPopover(false)}
+                    onApply={(range) => {
+                      setCustomRange(range)
+                      setTimeRange('custom')
+                      setPage(1)
+                      setShowCustomPopover(false)
+                    }}
+                  />
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
@@ -2918,7 +2497,7 @@ export default function Usage() {
               variant="section"
               isEmpty={logs.length === 0}
               emptyTitle={t('usage.emptyTitle')}
-              emptyDescription={emptyLogsDescription}
+              emptyDescription={hasActiveFilters ? t('usage.emptyFilteredDesc') : t('usage.emptyDesc')}
             >
               {/* Mobile log cards */}
               <TooltipProvider>
@@ -2955,6 +2534,14 @@ export default function Usage() {
                           ) : null}
                           {visibleColumns.model && (
                             <Badge variant="outline" className={usageTableBadgeClass}>
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity' || log.channel === 'claude') && (
+                                <ChannelLogo
+                                  channel={log.channel}
+                                  size={13}
+                                  className="mr-1"
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : log.channel === 'claude' ? 'Claude' : 'Codex'}
+                                />
+                              )}
                               {log.model || '-'}
                             </Badge>
                           )}
@@ -3151,12 +2738,12 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
-                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity' || log.channel === 'claude') && (
                                 <ChannelLogo
                                   channel={log.channel}
                                   size={13}
                                   className="mr-1"
-                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : log.channel === 'claude' ? 'Claude' : 'Codex'}
                                 />
                               )}
                               {log.model || '-'}
@@ -3307,125 +2894,9 @@ export default function Usage() {
         </Card>
         </div>
 
-        <APIKeyUsageModal
-          show={showAPIKeyUsageModal}
-          onClose={() => setShowAPIKeyUsageModal(false)}
-          stats={apiKeyTokenStats}
-          fallbackStats={apiKeyStats}
-          loading={apiKeyTokenStatsLoading}
-          showFullUsageNumbers={showFullUsageNumbers}
-        />
         {confirmDialog}
       </>
     </StateShell>
-  )
-}
-
-// 2026-08-20 coder(lq): Keep the daily usage API-key filter open while selecting multiple keys.
-function DailyAPIKeyMultiSelect({
-  options,
-  selected,
-  onChange,
-  placeholder,
-}: {
-  options: { label: string; value: string }[]
-  selected: string[]
-  onChange: (values: string[]) => void
-  placeholder: string
-}) {
-  const [open, setOpen] = useState(false)
-  const triggerRef = useRef<HTMLButtonElement>(null)
-  const menuRef = useRef<HTMLDivElement>(null)
-  const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(null)
-  const allValue = ''
-  const selectedLabels = options.filter((option) => selected.includes(option.value)).map((option) => option.label)
-  const label = selected.length === 0
-    ? (options.find((option) => option.value === allValue)?.label ?? placeholder)
-    : selected.length === 1
-      ? selectedLabels[0]
-      : `${selected.length} 个密钥`
-
-  const reposition = useCallback(() => {
-    const trigger = triggerRef.current
-    if (!trigger) return
-    const rect = trigger.getBoundingClientRect()
-    setPosition({ top: rect.bottom + 6, left: Math.max(8, Math.min(window.innerWidth - rect.width - 8, rect.left)), width: rect.width })
-  }, [])
-
-  useLayoutEffect(() => {
-    if (!open) return
-    reposition()
-    const handle = () => reposition()
-    window.addEventListener('resize', handle)
-    window.addEventListener('scroll', handle, true)
-    return () => {
-      window.removeEventListener('resize', handle)
-      window.removeEventListener('scroll', handle, true)
-    }
-  }, [open, reposition])
-
-  useEffect(() => {
-    if (!open) return
-    const handle = (event: PointerEvent) => {
-      const target = event.target as Node | null
-      if (target && (triggerRef.current?.contains(target) || menuRef.current?.contains(target))) return
-      setOpen(false)
-    }
-    document.addEventListener('pointerdown', handle)
-    return () => document.removeEventListener('pointerdown', handle)
-  }, [open])
-
-  const toggle = (value: string) => {
-    if (value === allValue) {
-      onChange([])
-      return
-    }
-    onChange(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value])
-  }
-
-  return (
-    <>
-      <button
-        ref={triggerRef}
-        type="button"
-        className="flex h-8 w-52 shrink-0 items-center justify-between gap-2 rounded-md border border-input bg-background px-3 text-xs text-foreground shadow-sm hover:bg-accent"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-      >
-        <span className="truncate">{label}</span>
-        <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-      </button>
-      {open && position && createPortal(
-        <div
-          ref={menuRef}
-          role="listbox"
-          aria-multiselectable="true"
-          className="fixed z-[100] max-h-72 overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md"
-          style={{ top: position.top, left: position.left, width: position.width }}
-        >
-          {options.map((option) => {
-            const checked = option.value === allValue ? selected.length === 0 : selected.includes(option.value)
-            return (
-              <button
-                key={option.value || 'all'}
-                type="button"
-                role="option"
-                aria-selected={checked}
-                className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent"
-                onClick={() => toggle(option.value)}
-              >
-                <span className="flex size-4 items-center justify-center rounded-sm border border-input">
-                  {checked && <Check className="size-3" />}
-                </span>
-                <span className="truncate">{option.label}</span>
-              </button>
-            )
-          })}
-        </div>,
-        document.body,
-      )}
-    </>
   )
 }
 

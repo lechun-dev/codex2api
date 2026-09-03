@@ -78,6 +78,9 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_overload_pause_minutes INT DEFAULT 30",
 		"codex_overload_window_minutes INT DEFAULT 5",
 		"prompt_filter_review_model VARCHAR(100) DEFAULT 'deepseek-v4-flash'",
+		"claude_config TEXT NULL",
+		"scheduler_engine TEXT NULL",
+		"codex_request_compression TINYINT(1) DEFAULT 1",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)
@@ -97,6 +100,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"prompt_filter_advanced_config TEXT DEFAULT",
 		"prompt_filter_advanced_config MEDIUMTEXT DEFAULT",
 		"grok_config TEXT DEFAULT",
+		"claude_config TEXT DEFAULT",
 		"note TEXT DEFAULT",
 		"client_user_agent TEXT DEFAULT",
 		"upstream_user_agent TEXT DEFAULT",
@@ -528,6 +532,9 @@ func TestMySQL56V280MigrationScript(t *testing.T) {
 	script := string(raw)
 	for _, required := range []string{
 		"CREATE PROCEDURE c2a_add_column_if_missing",
+		"'claude_config',\n    'TEXT NULL'",
+		"'scheduler_engine',\n    'TEXT NULL'",
+		"'codex_request_compression',\n    'TINYINT(1) DEFAULT 1'",
 		"'prompt_filter_review_enabled',\n    'TINYINT(1) DEFAULT 0'",
 		"'prompt_filter_review_api_key',\n    'TEXT NULL'",
 		"'prompt_filter_review_base_url',\n    'TEXT NULL'",

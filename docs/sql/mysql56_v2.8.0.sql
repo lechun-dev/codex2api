@@ -33,6 +33,11 @@ DELIMITER ;
 
 CALL c2a_add_column_if_missing(
     'system_settings',
+    'claude_config',
+    'TEXT NULL'
+);
+CALL c2a_add_column_if_missing(
+    'system_settings',
     'prompt_filter_review_enabled',
     'TINYINT(1) DEFAULT 0'
 );
@@ -50,6 +55,16 @@ CALL c2a_add_column_if_missing(
     'system_settings',
     'prompt_filter_review_model',
     'VARCHAR(100) DEFAULT ''deepseek-v4-flash'''
+);
+CALL c2a_add_column_if_missing(
+    'system_settings',
+    'scheduler_engine',
+    'TEXT NULL'
+);
+CALL c2a_add_column_if_missing(
+    'system_settings',
+    'codex_request_compression',
+    'TINYINT(1) DEFAULT 1'
 );
 
 ALTER TABLE system_settings

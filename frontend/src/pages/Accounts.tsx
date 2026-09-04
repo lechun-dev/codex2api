@@ -209,6 +209,7 @@ import AccountGroupFilterSelect, {
 } from "../components/AccountGroupFilterSelect";
 import ChipInput from "../components/ChipInput";
 
+const DEFAULT_LOCAL_PROXY_URL = "http://localhost:7890";
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 
 // 账号导入的体积约束。后端对导入端点放宽到 200MB;单个文件无法再切分,超过
@@ -1957,7 +1958,7 @@ export default function Accounts() {
     session_id: string;
     auth_url: string;
   } | null>(null);
-  const [oauthProxyUrl, setOauthProxyUrl] = useState("");
+  const [oauthProxyUrl, setOauthProxyUrl] = useState(DEFAULT_LOCAL_PROXY_URL);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
   const [oauthName, setOauthName] = useState("");
   const [oauthGenerating, setOauthGenerating] = useState(false);
@@ -3781,6 +3782,7 @@ export default function Accounts() {
       setOauthSession(null);
       setOauthCallbackUrl("");
       setOauthName("");
+      setOauthProxyUrl(DEFAULT_LOCAL_PROXY_URL);
       setAddCustomHeadersText("");
       void reload();
     } catch (error) {
@@ -7474,6 +7476,7 @@ export default function Accounts() {
               setOauthSession(null);
               setOauthCallbackUrl("");
               setOauthName("");
+              setOauthProxyUrl(DEFAULT_LOCAL_PROXY_URL);
               setOpenAIForm({
                 base_url: "https://api.openai.com",
                 api_key: "",
@@ -7515,6 +7518,7 @@ export default function Accounts() {
                     setOauthSession(null);
                     setOauthCallbackUrl("");
                     setOauthName("");
+                    setOauthProxyUrl(DEFAULT_LOCAL_PROXY_URL);
                     setOpenAIForm({
                       base_url: "https://api.openai.com",
                       api_key: "",
@@ -7611,6 +7615,7 @@ export default function Accounts() {
                   setOauthStep("generate");
                   setOauthSession(null);
                   setOauthCallbackUrl("");
+                  setOauthProxyUrl(DEFAULT_LOCAL_PROXY_URL);
                 }}
                 className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "oauth"

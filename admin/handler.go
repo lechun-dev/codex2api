@@ -1170,6 +1170,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/daily-tokens", h.GetDailyTokenUsage)
 	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
@@ -7165,6 +7166,113 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+// GetDailyTokenUsage returns a day-by-day token matrix split into model columns.
+// It reads usage_logs only and supports optional model, API-key and account filters.
+func (h *Handler) GetDailyTokenUsage(c *gin.Context) {
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 2026-09-04 coder(lq): Resolve the default range before building the cache key so the daily view cannot reuse a previous day's zero-time cache entry.
+	now := time.Now()
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
+	if rangeEnd.IsZero() {
+		rangeEnd = now
+	}
+	if !rangeStart.IsZero() && !rangeEnd.IsZero() && rangeEnd.Sub(rangeStart) > 366*24*time.Hour {
+		writeError(c, http.StatusBadRequest, "时间范围不能超过 366 天")
+		return
+	}
+
+	parseOptionalID := func(name string) (*int64, error) {
+		value := strings.TrimSpace(c.Query(name))
+		if value == "" {
+			return nil, nil
+		}
+		id, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || id <= 0 {
+			return nil, fmt.Errorf("%s 参数必须是正整数", name)
+		}
+		return &id, nil
+	}
+	apiKeyIDs, err := parseOptionalPositiveIDs(c.Request.URL.Query()["api_key_id"])
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "api_key_id 参数必须是正整数")
+		return
+	}
+	accountID, err := parseOptionalID("account_id")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	channel := parseUsageChannel(c)
+	model := strings.TrimSpace(c.Query("model"))
+	cacheKey := fmt.Sprintf("daily:%d:%d:%s:%s:%s:%s", rangeStart.Unix()/30, rangeEnd.Unix()/30, channel, model, optionalIDsCacheValue(apiKeyIDs), optionalIDCacheValue(accountID))
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	var cached database.UsageDailyTokenStats
+	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, &cached) {
+		c.JSON(http.StatusOK, &cached)
+		return
+	}
+
+	stats, err := h.db.GetDailyTokenUsage(ctx, rangeStart, rangeEnd, channel, model, apiKeyIDs, accountID)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, cacheKey, stats, adminUsageRangeCacheTTL)
+	c.JSON(http.StatusOK, stats)
+}
+
+func optionalIDCacheValue(id *int64) string {
+	if id == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*id, 10)
+}
+
+// 2026-09-04 coder(lq): Normalize repeated API-key filters so legacy single-key and multi-key requests share one cache entry.
+func parseOptionalPositiveIDs(values []string) ([]int64, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int64]struct{}, len(values))
+	ids := make([]int64, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("id must be a positive integer")
+		}
+		id, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("id must be a positive integer")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+func optionalIDsCacheValue(ids []int64) string {
+	if len(ids) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(parts, ",")
 }
 
 // parseUsageStatsRange 解析 /usage/stats 的可选 start/end query。

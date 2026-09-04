@@ -58,6 +58,7 @@ import {
   CalendarClock,
   CircleDollarSign,
   ChevronDown,
+  FileDown,
   Eye,
   EyeOff,
   ExternalLink,
@@ -74,6 +75,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Terminal,
   Waypoints,
   Trash2,
   XCircle,
@@ -87,6 +89,8 @@ type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_a
 
 const KEY_REVEAL_MS = 30_000;
 const EXPIRING_SOON_MS = 7 * 24 * 60 * 60 * 1000;
+const CODEX_TOOLKIT_PORTAL_URL =
+  "https://portal.lechun.cc/portal/profile?tab=codextoolkit";
 
 interface CreateKeyFormState {
   name: string;
@@ -288,6 +292,7 @@ export default function APIKeys() {
     key: string;
   } | null>(null);
   const [createdRevealAck, setCreatedRevealAck] = useState(false);
+  const [promptKey, setPromptKey] = useState<APIKeyRow | null>(null);
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
   const revealTimers = useRef<Map<number, number>>(new Map());
   const [activeTab, setActiveTab] = useState<"keys" | "token-usage">("keys");
@@ -482,6 +487,16 @@ export default function APIKeys() {
     if (typeof window === "undefined") return "/account-portal";
     return `${window.location.origin}/account-portal`;
   }, []);
+
+  const promptShareText = useMemo(() => {
+    const apiKey = promptKey?.raw_key?.trim();
+    if (!apiKey) return "";
+    return buildToolkitShareText({
+      apiKey,
+      portalURL: CODEX_TOOLKIT_PORTAL_URL,
+      t,
+    });
+  }, [promptKey, t]);
 
   const statusCounts = useMemo(() => {
     const counts = {
@@ -967,6 +982,34 @@ export default function APIKeys() {
     }
   };
 
+  const handleExportKeys = () => {
+    if (keys.length === 0) {
+      showToast(t("apiKeys.exportEmpty"), "error");
+      return;
+    }
+    const csv = buildAPIKeysCSV(keys, groups, t);
+    const blob = new Blob([`\uFEFF${csv}`], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `api-keys-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    showToast(t("apiKeys.exportSuccess"));
+  };
+
+  const openPromptDialog = (keyRow: APIKeyRow) => {
+    setPromptKey(keyRow);
+  };
+
+  const closePromptDialog = () => {
+    setPromptKey(null);
+  };
+
   const hideKey = useCallback((id: number) => {
     const existing = revealTimers.current.get(id);
     if (existing) {
@@ -1444,6 +1487,16 @@ export default function APIKeys() {
                       total: keys.length,
                     })}
                   </Badge>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleExportKeys}
+                    disabled={keys.length === 0}
+                  >
+                    <FileDown className="size-3.5" />
+                    {t("apiKeys.exportKeys")}
+                  </Button>
                   {refreshing ? (
                     <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                   ) : null}
@@ -1576,6 +1629,14 @@ export default function APIKeys() {
                                 title={t("common.copy")}
                               >
                                 <Copy className="size-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                onClick={() => openPromptDialog(keyRow)}
+                                title={t("apiKeys.generatePrompt")}
+                              >
+                                <Terminal className="size-3.5" />
                               </Button>
                             </div>
 
@@ -1778,6 +1839,14 @@ export default function APIKeys() {
                                       title={t("common.copy")}
                                     >
                                       <Copy className="size-3.5" />
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      onClick={() => openPromptDialog(keyRow)}
+                                      title={t("apiKeys.generatePrompt")}
+                                    >
+                                      <Terminal className="size-3.5" />
                                     </Button>
                                   </div>
                                 </TableCell>
@@ -2534,6 +2603,61 @@ export default function APIKeys() {
         </Modal>
 
         <Modal
+          show={Boolean(promptKey)}
+          title={t("apiKeys.promptTitle")}
+          onClose={closePromptDialog}
+          contentClassName="sm:max-w-[780px]"
+          footer={
+            <>
+              <Button type="button" variant="outline" onClick={closePromptDialog}>
+                {t("common.close")}
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleCopy(promptShareText)}
+                disabled={!promptShareText}
+              >
+                <Copy className="size-3.5" />
+                {t("apiKeys.copyUserPrompt")}
+              </Button>
+            </>
+          }
+        >
+          {promptKey ? (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <Terminal className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-foreground">
+                    {t("apiKeys.promptAdminTitle")}
+                  </div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                    {t("apiKeys.promptAdminDesc")}
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-border bg-background">
+                <div className="border-b border-border px-3 py-2 text-xs font-semibold text-muted-foreground">
+                  {t("apiKeys.promptPreviewLabel")}
+                </div>
+                {promptShareText ? (
+                  <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words p-3 text-sm leading-relaxed text-foreground">
+                    {promptShareText}
+                  </pre>
+                ) : (
+                  <div className="p-3 text-sm leading-relaxed text-amber-700 dark:text-amber-300">
+                    {t("apiKeys.promptUnavailable")}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
+        </Modal>
+
+        <Modal
           show={Boolean(createdReveal)}
           title={t("apiKeys.createdRevealTitle")}
           onClose={closeCreatedReveal}
@@ -2620,6 +2744,104 @@ export default function APIKeys() {
 }
 
 type Translator = (key: string, options?: Record<string, unknown>) => string;
+
+function buildToolkitShareText({
+  apiKey,
+  portalURL,
+  t,
+}: {
+  apiKey: string;
+  portalURL: string;
+  t: Translator;
+}): string {
+  return [
+    t("apiKeys.promptShareKeyLine", { apiKey }),
+    "",
+    t("apiKeys.promptShareIntro"),
+    t("apiKeys.promptShareInstallerAdvantage"),
+    t("apiKeys.promptShareDownloadURL", { url: portalURL }),
+    t("apiKeys.promptShareRisk"),
+    t("apiKeys.promptShareMacQuarantine"),
+    "",
+    t("apiKeys.promptShareTrafficNote"),
+  ].join("\n");
+}
+
+function buildAPIKeysCSV(
+  keys: APIKeyRow[],
+  groups: AccountGroup[],
+  t: Translator,
+): string {
+  const headers = [
+    t("common.name"),
+    t("apiKeys.keyColumn"),
+    t("apiKeys.exportStatus"),
+    t("apiKeys.exportQuotaLimitUSD"),
+    t("apiKeys.exportQuotaUsedUSD"),
+    t("apiKeys.expiresColumn"),
+    t("common.createdAt"),
+    t("apiKeys.allowedGroups"),
+    t("apiKeys.exportModelAllow"),
+    t("apiKeys.exportModelDeny"),
+    t("apiKeys.exportRPM"),
+    t("apiKeys.exportRPD"),
+    t("apiKeys.exportCostLimit5h"),
+    t("apiKeys.exportCostLimit7d"),
+    t("apiKeys.exportTokenLimit5h"),
+    t("apiKeys.exportTokenLimit7d"),
+  ];
+  const rows = keys.map((keyRow) => {
+    const limits = keyRow.limits ?? {};
+    return [
+      keyRow.name,
+      keyRow.raw_key || keyRow.key,
+      t(`apiKeys.status.${getAPIKeyStatus(keyRow)}`),
+      keyRow.quota_limit > 0
+        ? String(keyRow.quota_limit)
+        : t("apiKeys.unlimited"),
+      String(keyRow.quota_used ?? 0),
+      keyRow.expires_at
+        ? formatBeijingTime(keyRow.expires_at)
+        : t("apiKeys.neverExpires"),
+      formatBeijingTime(keyRow.created_at),
+      formatExportGroups(keyRow.allowed_group_ids ?? [], groups, t),
+      (limits.model_allow ?? []).join("; "),
+      (limits.model_deny ?? []).join("; "),
+      formatOptionalNumber(limits.rpm),
+      formatOptionalNumber(limits.rpd),
+      formatOptionalNumber(limits.cost_limit_5h),
+      formatOptionalNumber(limits.cost_limit_7d),
+      formatOptionalNumber(limits.token_limit_5h),
+      formatOptionalNumber(limits.token_limit_7d),
+    ];
+  });
+  return [headers, ...rows]
+    .map((row) => row.map((value) => csvEscape(String(value ?? ""))).join(","))
+    .join("\n");
+}
+
+function formatExportGroups(
+  ids: number[],
+  groups: AccountGroup[],
+  t: Translator,
+): string {
+  if (ids.length === 0) return t("apiKeys.allowedGroupsAll");
+  const groupMap = new Map(groups.map((group) => [group.id, group.name]));
+  return ids.map((id) => groupMap.get(id) || `#${id}`).join("; ");
+}
+
+function formatOptionalNumber(value: number | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? String(value)
+    : "";
+}
+
+function csvEscape(value: string): string {
+  if (/[",\n\r]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
 
 function parseQuotaLimit(raw: string, t: Translator): number {
   const quotaLimitText = raw.trim();

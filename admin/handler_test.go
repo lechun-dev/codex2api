@@ -1558,6 +1558,20 @@ func TestSubscriptionUpgradeRoutesAreNotRegistered(t *testing.T) {
 	}
 }
 
+func TestRegisterRoutesIncludesDailyTokenUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	(&Handler{}).RegisterRoutes(router)
+
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodGet && route.Path == "/api/admin/usage/daily-tokens" {
+			return
+		}
+	}
+	t.Fatal("GET /api/admin/usage/daily-tokens is not registered")
+}
+
 func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

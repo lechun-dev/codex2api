@@ -2213,7 +2213,7 @@ func prepareResponsesBodyForOwnerDetailed(rawBody []byte, owner string) response
 			preparation.Bypassed = true
 		} else {
 			preparation.RequiresLocalContext = currentInput.IsArray() && inputHasFunctionCallOutput(currentInput)
-			preparation.CacheLookup = getResponseCacheResult(owner, prevID)
+			preparation.CacheLookup = getResponseCacheForReplay(owner, prevID)
 		}
 	}
 	preparedBody, expandedInputRaw := prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
@@ -2559,29 +2559,36 @@ func normalizeReasoningEffortForModel(effort, model string) string {
 
 // modelSupportsMaxReasoningEffort 判断模型是否支持 reasoning.effort=max
 // （gpt-5.6 及更高版本；带变体后缀如 gpt-5.6-sol 同样识别）。
+// Trusted Access for Cyber 的 gpt-daybreak-*-latest 稳定别名指向 5.6 家族
+// （blue=gpt-5.6-sol、red=gpt-5.6-cyber，issue #624），同样放行。
 func modelSupportsMaxReasoningEffort(model string) bool {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if !strings.HasPrefix(model, "gpt-") {
 		return false
+	}
+	if strings.HasPrefix(model, "gpt-daybreak-") {
+		return true
 	}
 	version := strings.TrimPrefix(model, "gpt-")
 	if dash := strings.IndexByte(version, '-'); dash >= 0 {
 		version = version[:dash]
 	}
 	parts := strings.Split(version, ".")
-	if len(parts) < 2 {
-		return false
-	}
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
+		return false
+	}
+	// 只有大版本号的新一代型号（gpt-6-astra、gpt-6）：官方模型页明确列出
+	// Max 档位，按 major > 5 放行；缺少 ".x" 不能当成旧模型钳掉。
+	if major > 5 {
+		return true
+	}
+	if len(parts) < 2 {
 		return false
 	}
 	minor, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return false
-	}
-	if major > 5 {
-		return true
 	}
 	return major == 5 && minor >= 6
 }
@@ -2589,7 +2596,7 @@ func modelSupportsMaxReasoningEffort(model string) bool {
 // isAllowedServiceTier 判断 service_tier 是否在上游允许的范围内
 func isAllowedServiceTier(tier string) bool {
 	switch tier {
-	case "auto", "default", "flex", "priority", "scale", "fast":
+	case "auto", "default", "flex", "priority", "scale", "fast", "ultrafast":
 		return true
 	default:
 		return false
@@ -2597,11 +2604,13 @@ func isAllowedServiceTier(tier string) bool {
 }
 
 // upstreamServiceTier 将客户端 service_tier 映射为上游接受的值。
-// Codex 上游当前只接受 priority；auto/default/flex/scale 都不应显式转发。
+// priority/ultrafast 保留档位；auto/default/flex/scale 沿用现有省略策略。
 func upstreamServiceTier(tier string) (string, bool) {
 	switch tier {
 	case "fast", "priority":
 		return "priority", true
+	case "ultrafast":
+		return "ultrafast", true
 	case "auto", "default", "flex", "scale":
 		return "", false
 	default:
@@ -2894,7 +2903,7 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 		return body
 	}
 	switch tier {
-	case "auto", "default", "flex", "priority", "scale", "fast":
+	case "auto", "default", "flex", "priority", "scale", "fast", "ultrafast":
 		body, _ = sjson.DeleteBytes(body, "serviceTier")
 		if upstreamTier, ok := upstreamServiceTier(tier); ok {
 			body, _ = sjson.SetBytes(body, "service_tier", upstreamTier)
@@ -2992,7 +3001,7 @@ func billingServiceTierCostRank(tier string) (int, bool) {
 		return 0, true
 	case "", "default", "standard", "auto", "scale":
 		return 1, true
-	case "priority":
+	case "priority", "ultrafast":
 		return 2, true
 	default:
 		return 1, false

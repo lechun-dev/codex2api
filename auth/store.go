@@ -90,8 +90,12 @@ func NormalizeTestContent(content string) string {
 
 // Account 运行时账号状态
 type Account struct {
-	mu          sync.RWMutex
-	usageSyncMu sync.Mutex
+	codexLiteSupport          map[string]bool
+	codexCapabilityGeneration int64
+	codexCapabilityObservedAt int64
+	UpstreamRequestIDHeader   string
+	mu                        sync.RWMutex
+	usageSyncMu               sync.Mutex
 	// grokRuntimeFactsMu serializes inference-response observations for this
 	// account. The sink performs generation-fenced database writes before it
 	// publishes any hard gate or routing invalidation back to memory.
@@ -115,11 +119,16 @@ type Account struct {
 	// successful, generation-fenced sync can safely clear the provider fence.
 	AntigravityHardBlocked     bool
 	AntigravityHardBlockReason string
-	BaseURL                    string
-	APIKey                     string
-	Models                     []string
-	ModelMapping               string
-	CodexClientMetadataMode    string
+	// antigravityQuota* 是 antigravity_quota 凭据投影出的调度排序键（已用百分比），
+	// 见 scheduling_usage_key.go；随控制面同步快照更新。
+	antigravityQuotaUsedPercent float64
+	antigravityQuotaObservedAt  time.Time
+	antigravityQuotaValid       bool
+	BaseURL                     string
+	APIKey                      string
+	Models                      []string
+	ModelMapping                string
+	CodexClientMetadataMode     string
 	// CodexFingerprintMode 见 codex_fingerprint_mode.go：Codex 官方出站请求的
 	// 设备指纹收敛档位（off / device / session / full），默认 off。
 	CodexFingerprintMode string
@@ -2152,16 +2161,6 @@ func (s *Store) MarkUsage7dRateLimited(acc *Account) bool {
 	return true
 }
 
-// usagePercentForScheduling 返回调度排序用的用量百分比（7d 窗口有效则返回，否则 0）。
-func (a *Account) usagePercentForScheduling() float64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if a.UsagePercent7dValid {
-		return a.UsagePercent7d
-	}
-	return 0
-}
-
 // SetUsageSnapshot5h 更新 5h 用量快照
 func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
 	a.SetUsageSnapshot5hAt(pct, resetAt, time.Now())
@@ -3190,6 +3189,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
+	proxyAuditLabels                   map[string]ProxyAuditLabel
 	mu                                 sync.RWMutex
 	accountMutationMu                  sync.Mutex // serializes account-set and scheduler mutations without nesting their locks
 	accounts                           []*Account
@@ -3337,6 +3337,9 @@ type Store struct {
 	claudeSessionWindowLimit      int64        // Claude 账号默认并发会话窗口数（0=用全局 maxConcurrency）
 	claudeCLIVersionSyncDisabled  atomic.Bool  // Claude CLI 版本自动同步是否关闭（零值=开启）
 	claudeCLIVersionSyncIntervalH atomic.Int64 // Claude CLI 版本同步间隔小时（0=默认 12）
+	claudeFirstTokenTimeoutSec    atomic.Int64 // Claude 路径首字超时秒（0=跟随全局）
+	claudeFirstTokenTimeoutSet    atomic.Bool  // 首字超时是否被显式设置过（否则取默认 120）
+	claudeStreamKeepaliveDisabled atomic.Bool  // Claude 流式首字前 SSE 保活是否关闭（零值=开启）
 	grokAffinityMode              atomic.Value // string: "follow" / "bounded" / "off" / "strict"（"follow"=跟随全局）
 	grokProbeEnabled              atomic.Bool  // 定期探测 Grok 账号状态是否开启（默认关）
 	grokProbeIntervalMin          atomic.Int64 // 定期探测间隔（分钟，默认 30，下限 grokProbeMinIntervalMinutes）
@@ -3560,6 +3563,16 @@ func (s *Store) deleteCachedAccountCooldown(accountID int64) {
 	if err := s.tokenCache.DeleteRuntime(ctx, accountCooldownCacheNamespace, accountCooldownRuntimeKey(accountID)); err != nil {
 		log.Printf("[账号 %d] 删除账号冷却缓存失败: %v", accountID, err)
 	}
+}
+
+// ForgetCachedAccountCooldown 清除账号在跨实例冷却缓存里的记录。
+//
+// 管理端在数据库层直接清掉 error / unauthorized 状态（重新导入、重新授权、
+// 合并凭证）并重载运行时账号时必须一并调用：调度器每次挑号都会回读该缓存
+// 并把冷却重新盖回内存账号，只清库不清缓存会让刚复活的账号继续被挡到
+// 缓存 TTL（unauthorized 可达 24h）到期。
+func (s *Store) ForgetCachedAccountCooldown(accountID int64) {
+	s.deleteCachedAccountCooldown(accountID)
 }
 
 func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownRecord) {
@@ -3960,7 +3973,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.smartPacingWindows = normalizeSmartPacingWindows(settings.SmartPacingWindows)
 
 	// 加载代理池（含全部托管 URL，供禁用后 fail-closed 识别）
-	if settings.ProxyPoolEnabled && s.proxyPoolLoader != nil {
+	if s.proxyPoolLoader != nil {
 		if err := s.ReloadProxyPool(); err != nil {
 			log.Printf("代理池加载失败: %v", err)
 		}
@@ -4722,17 +4735,29 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	enabledURLs := collectProxyURLs(proxies)
 	managedURLs := enabledURLs
+	auditRows := proxies
 	if inventory := s.proxyInventoryLoader; inventory != nil {
 		allProxies, invErr := inventory(ctx)
 		if invErr != nil {
 			return invErr
 		}
 		managedURLs = collectProxyURLs(allProxies)
+		auditRows = allProxies
 	}
 	s.mu.Lock()
 	s.proxyPool = enabledURLs
 	s.proxyPoolSet = buildProxyPoolSet(enabledURLs)
 	s.managedProxySet = buildProxyPoolSet(managedURLs)
+	s.proxyAuditLabels = make(map[string]ProxyAuditLabel, len(auditRows))
+	for _, row := range auditRows {
+		if row != nil {
+			name := strings.TrimSpace(row.Label)
+			if name == "" {
+				name = "proxy"
+			}
+			s.proxyAuditLabels[row.URL] = ProxyAuditLabel{ID: row.ID, Name: name}
+		}
+	}
 	s.mu.Unlock()
 	log.Printf("代理池已重新加载: %d 个活跃代理", len(enabledURLs))
 	return nil
@@ -5156,6 +5181,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		SessionToken:                 st,
 		ProxyURL:                     strings.TrimSpace(row.ProxyURL),
 		CustomHeaders:                row.GetCredentialStringMap("custom_headers"),
+		UpstreamRequestIDHeader:      row.GetCredential(UpstreamRequestIDHeaderCredentialKey),
 		HealthTier:                   HealthTierWarm,
 		AddedAt:                      row.CreatedAt.UnixNano(),
 		UpstreamType:                 upstreamType,
@@ -5286,6 +5312,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.HealthTier = HealthTierRisky
 	}
 	if isAntigravityAccount {
+		account.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
 			account.AntigravityHardBlocked = true
 			account.AntigravityHardBlockReason = reason
@@ -5583,6 +5610,7 @@ func (s *Store) reconcileDispatchState(ctx context.Context) (bool, error) {
 			groupIDs := normalizeAllowedGroupIDs(memberships[row.ID])
 			allowedAPIKeyIDs := normalizeAllowedAPIKeyIDs(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 			acc.mu.Lock()
+			acc.UpstreamRequestIDHeader = row.GetCredential(UpstreamRequestIDHeaderCredentialKey)
 			accountMetadataChanged := !int64SliceEqual(normalizeAllowedGroupIDs(acc.GroupIDs), groupIDs) ||
 				!int64SliceEqual(normalizeAllowedAPIKeyIDs(acc.AllowedAPIKeyIDs), allowedAPIKeyIDs)
 			if accountMetadataChanged {
@@ -6668,7 +6696,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -6707,7 +6735,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
-				log.Printf("会话粘性容量溢出: key=%s 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", key, binding.accountID, fallback.DBID)
+				log.Printf("会话粘性容量溢出: 绑定账号=%d 并发满,本请求借用账号=%d(该请求预期上游缓存未命中)", binding.accountID, fallback.DBID)
 				return fallback, "", SessionAffinityGuard{preserveAccountID: binding.accountID}
 			}
 		}
@@ -10180,6 +10208,8 @@ func (s *Store) SaveGrokFreeQuotaSnapshot(acc *Account, snap GrokFreeQuotaSnapsh
 		return
 	}
 	acc.SetGrokFreeQuotaSnapshot(snap)
+	// 权威用量变了，调度模式的排序键随之变化。
+	s.fastSchedulerUpdate(acc)
 	if s.db == nil {
 		return
 	}
@@ -11537,6 +11567,7 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.ProxyURL = strings.TrimSpace(row.ProxyURL)
 	acc.AntigravityHardBlocked = hardReason != ""
 	acc.AntigravityHardBlockReason = hardReason
+	acc.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
 	if permanentRefresh {
 		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
 	} else if hardReason == "" {

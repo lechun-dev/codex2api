@@ -74,6 +74,8 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"codex_ws_stateless_slots INT DEFAULT 8",
 		"github_token TEXT NULL",
 		"github_proxy_url TEXT NULL",
+		"invite_guide_config TEXT NULL",
+		"visible_channels_config TEXT NULL",
 		"codex_overload_pause_enabled TINYINT(1) DEFAULT 0",
 		"codex_overload_threshold_percent INT DEFAULT 20",
 		"codex_overload_pause_minutes INT DEFAULT 30",
@@ -108,6 +110,8 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"upstream_user_agent TEXT DEFAULT",
 		"github_token TEXT DEFAULT",
 		"github_proxy_url TEXT DEFAULT",
+		"invite_guide_config TEXT DEFAULT",
+		"visible_channels_config TEXT DEFAULT",
 	} {
 		if strings.Contains(ddl, incompatible) {
 			t.Fatalf("MySQL 5.6 incompatible text default leaked into DDL: %q", incompatible)

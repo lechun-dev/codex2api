@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -259,6 +260,74 @@ func TestRewriteSQLForMySQLUpsertKeepsParameterOrder(t *testing.T) {
 			t.Fatalf("parameter order = %v, want %v", order, wantOrder)
 		}
 	}
+}
+
+func TestRewriteSQLForMySQLModelRequestCounterUpsert(t *testing.T) {
+	got := rewriteSQLForMySQL(`INSERT INTO api_key_model_request_counters (api_key_id,rule_id,window_start,reset_at,used_requests) VALUES ($1,$2,$3,$4,1) ON CONFLICT (api_key_id,rule_id,window_start) DO UPDATE SET used_requests=used_requests+1`)
+	if !strings.Contains(got, "ON DUPLICATE KEY UPDATE used_requests=used_requests+1") {
+		t.Fatalf("unexpected MySQL model request counter upsert: %s", got)
+	}
+	if strings.Contains(got, "api_key_model_request_counters.used_requests") {
+		t.Fatalf("MySQL upsert retained a table-qualified assignment: %s", got)
+	}
+	assertNoMySQL56IncompatibleSQL(t, got)
+}
+
+func TestModelCapabilitiesMySQLDDLUsesMySQL56Types(t *testing.T) {
+	ddl := modelCapabilitiesMySQLDDL()
+	for _, want := range []string{"CREATE TABLE IF NOT EXISTS model_capability_snapshots", "MEDIUMTEXT", "ENGINE=InnoDB", "DEFAULT CHARSET=utf8"} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("MySQL model capabilities DDL missing %q: %s", want, ddl)
+		}
+	}
+	for _, incompatible := range []string{"REFERENCES", "ON CONFLICT", "JSONB", "TIMESTAMPTZ"} {
+		if strings.Contains(strings.ToUpper(ddl), incompatible) {
+			t.Fatalf("MySQL model capabilities DDL contains incompatible syntax %q: %s", incompatible, ddl)
+		}
+	}
+}
+
+func TestSaveModelCapabilitiesUsesMySQL56Upsert(t *testing.T) {
+	capture := &mysqlCaptureDriver{
+		queryRows: [][]driver.Value{
+			{int64(1)},
+			{},
+		},
+	}
+	db := newMySQLCaptureDB(t, capture)
+	err := db.SaveModelCapabilities(context.Background(), ModelCapabilitySnapshot{
+		AccountID:            7,
+		CredentialGeneration: 1,
+		ObservedAt:           10,
+		Models:               map[string]map[string]json.RawMessage{"gpt-5.6": {"context_window": json.RawMessage(`1000`)}},
+	})
+	if err != nil {
+		t.Fatalf("SaveModelCapabilities() error = %v", err)
+	}
+	if len(capture.queries) != 3 {
+		t.Fatalf("SaveModelCapabilities() queries = %#v, want account lookup, snapshot lookup, upsert", capture.queries)
+	}
+	query := capture.queries[2]
+	if !strings.Contains(query, "ON DUPLICATE KEY UPDATE") || !strings.Contains(query, "VALUES(models_json)") {
+		t.Fatalf("SaveModelCapabilities() did not use MySQL 5.6 upsert: %s", query)
+	}
+	assertNoMySQL56IncompatibleSQL(t, query)
+}
+
+func TestSaveVisibleChannelsConfigUsesMySQL56InsertIgnore(t *testing.T) {
+	capture := &mysqlCaptureDriver{}
+	db := newMySQLCaptureDB(t, capture)
+	if err := db.SaveVisibleChannelsConfig(context.Background(), VisibleChannelsConfig{Channels: []string{"grok"}}); err != nil {
+		t.Fatalf("SaveVisibleChannelsConfig() error = %v", err)
+	}
+	if len(capture.queries) != 2 {
+		t.Fatalf("SaveVisibleChannelsConfig() queries = %#v, want insert and update", capture.queries)
+	}
+	if !strings.Contains(capture.queries[0], "INSERT IGNORE INTO system_settings") {
+		t.Fatalf("SaveVisibleChannelsConfig() did not use MySQL 5.6 insert-if-missing: %s", capture.queries[0])
+	}
+	assertNoMySQL56IncompatibleSQL(t, capture.queries[0])
+	assertNoMySQL56IncompatibleSQL(t, capture.queries[1])
 }
 
 func TestRewriteSQLForMySQLDoNothingHandlesSemicolonAndText(t *testing.T) {
@@ -706,6 +775,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 	if len(capture.args) != usageLogInsertColumnCount {
 		t.Fatalf("rewritten usage-log argument count = %d, want %d", len(capture.args), usageLogInsertColumnCount)
 	}
+	// 2026-09-05 coder(lq): Keep the assertion aligned with the request/proxy trace columns appended to usage_logs.
 	wantTail := []interface{}{
 		entry.ClientUserAgent,
 		entry.UpstreamUserAgent,
@@ -713,6 +783,10 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		entry.InternalReason,
 		entry.ParentRequestID,
 		entry.PromptPolicyIncidentID,
+		entry.RequestID,
+		entry.UpstreamRequestID,
+		entry.UpstreamProxyID,
+		entry.UpstreamProxyName,
 	}
 	for i, want := range wantTail {
 		got := capture.args[len(capture.args)-len(wantTail)+i].Value

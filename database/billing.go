@@ -56,6 +56,13 @@ var (
 	defaultModelPricing = &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 2.0}
 
 	modelPricingRules = []modelPricingRule{
+		// gpt-6-astra：Codex 长上下文例外，超过 272K 仍按 $10/$50、缓存 $1。
+		// 保留现有 fast（priority）2× 倍率，由 serviceTierCostMultiplier 兜底。
+		{model: "gpt-6-astra", pricing: ModelPricing{
+			InputPricePerMToken:     10.0,
+			OutputPricePerMToken:    50.0,
+			CacheReadPricePerMToken: 1.0,
+		}},
 		{model: "gpt-5.5", pricing: ModelPricing{
 			InputPricePerMToken:                 5.0,
 			InputPricePerMTokenPriority:         12.5,
@@ -444,6 +451,12 @@ func normalizeBillingModelName(model string) string {
 func normalizeCodexBillingModel(model string) (string, bool) {
 	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(strings.ToLower(model))
 	switch {
+	// gpt-6 世代（官方定价页 2026-09）：目前只有 astra 一个公开型号，
+	// 未知 gpt-6 变体按 astra 兜底，避免掉进 $1/$2 的默认价严重低估。
+	// 只认 gpt-6- / gpt-6. / 裸 gpt-6 前缀，gpt-5.6 不含 "gpt-6" 不会误命中。
+	case strings.HasPrefix(compact, "gpt-6-") || strings.HasPrefix(compact, "gpt-6.") || compact == "gpt-6" ||
+		strings.HasPrefix(compact, "gpt6-") || strings.HasPrefix(compact, "gpt6.") || compact == "gpt6":
+		return "gpt-6-astra", true
 	case strings.Contains(compact, "gpt-5.5-pro") || strings.Contains(compact, "gpt5-5-pro") || strings.Contains(compact, "gpt5.5-pro"):
 		return "gpt-5.5-pro", true
 	case strings.Contains(compact, "gpt-5.5") || strings.Contains(compact, "gpt5-5") || strings.Contains(compact, "gpt5.5"):
@@ -460,7 +473,14 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 	case strings.Contains(compact, "gpt-5.6-luna") || strings.Contains(compact, "gpt5-6-luna") || strings.Contains(compact, "gpt5.6-luna"):
 		return "gpt-5.6-luna", true
 	case strings.Contains(compact, "gpt-5.6") || strings.Contains(compact, "gpt5-6") || strings.Contains(compact, "gpt5.6"):
-		// 未知 gpt-5.6 变体：按最贵的 sol 兜底，避免低估计费。
+		// 未知 gpt-5.6 变体（含 gpt-5.6-cyber）：按最贵的 sol 兜底，避免低估计费。
+		return "gpt-5.6-sol", true
+	case strings.HasPrefix(compact, "gpt-daybreak-"):
+		// Trusted Access for Cyber 的稳定别名（issue #624）：官方文档写明
+		// gpt-daybreak-blue-latest 即 gpt-5.6-sol，gpt-daybreak-red-latest 即
+		// gpt-5.6-cyber（无独立公开定价）。两者都归到 5.6 家族最贵的 sol，
+		// 否则会落到 $1/$2 的默认价严重低估。只认 gpt-daybreak- 前缀，
+		// 带版本号的 ID（如 gpt-5.4-daybreak）仍走各自版本规则。
 		return "gpt-5.6-sol", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true
@@ -578,7 +598,7 @@ func geminiFamilyPricing(model string) *ModelPricing {
 
 func usePriorityPricing(serviceTier string, pricing *ModelPricing) bool {
 	tier := normalizeServiceTier(serviceTier)
-	if tier != "priority" && tier != "fast" {
+	if tier != "priority" && tier != "fast" && tier != "ultrafast" {
 		return false
 	}
 	return pricing.InputPricePerMTokenPriority > 0 ||
@@ -588,7 +608,9 @@ func usePriorityPricing(serviceTier string, pricing *ModelPricing) bool {
 
 func serviceTierCostMultiplier(serviceTier string) float64 {
 	switch normalizeServiceTier(serviceTier) {
-	case "priority", "fast":
+	// Ultrafast follows this gateway's Fast pricing policy, including custom
+	// priority prices. This is a billing default, not an official tariff claim.
+	case "priority", "fast", "ultrafast":
 		return 2.0
 	case "flex":
 		return 0.5

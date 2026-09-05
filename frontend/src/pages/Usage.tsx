@@ -19,6 +19,7 @@ import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePer
 import type { APIKeyRow, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, UsageDailyTokenStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
 import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
+import { getUsageTokenBreakdown } from '../lib/usageTokenDisplay'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -32,7 +33,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, DatabaseBackup, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -323,12 +324,13 @@ function formatTokenPricePerMillion(value?: number | null): string {
 
 function isFastTier(tier?: string | null): boolean {
   const normalized = (tier || '').trim().toLowerCase()
-  return normalized === 'fast' || normalized === 'priority'
+  return normalized === 'fast' || normalized === 'priority' || normalized === 'ultrafast'
 }
 
 function formatServiceTierLabel(t: ReturnType<typeof useTranslation>['t'], tier?: string | null): string {
   const normalized = (tier || '').trim().toLowerCase()
   if (!normalized) return '-'
+  if (normalized === 'ultrafast') return 'Ultrafast'
   if (isFastTier(normalized)) return t('usage.billingTierFast')
   if (normalized === 'default') return t('usage.billingTierStandard')
   return normalized
@@ -1017,7 +1019,7 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
       ? t('usage.userAgentOverridden')
       : t('usage.userAgentPreserved')
 
-  if (!hasAudit) {
+  if (!hasAudit && !log.request_id && !log.upstream_request_id) {
     return (
       <div className="font-mono text-[11px] text-muted-foreground" title={t('usage.userAgentNotRecorded')}>
         UA: -
@@ -1027,6 +1029,7 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
 
   const content = (
     <div className={`${mobile ? 'w-full' : 'w-[260px] max-w-[28vw]'} space-y-1 font-mono text-[11px] leading-relaxed`}>
+      {log.request_id ? <div className="truncate text-muted-foreground" title={`Request ID: ${log.request_id}`}>ID: {log.request_id}</div> : null}
       <div className="flex min-w-0 items-center gap-1.5" title={t('usage.clientUserAgent')}>
         <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">C</span>
         <span className="min-w-0 truncate text-foreground/80">{clientUserAgent || '-'}</span>
@@ -1071,6 +1074,9 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
             <div className="font-semibold text-background/70">{t('usage.upstreamUserAgent')}</div>
             <div className="mt-0.5 break-all font-mono leading-relaxed">{upstreamLabel}</div>
           </div>
+          {log.request_id ? <div className="break-all font-mono">Request ID: {log.request_id}</div> : null}
+          {log.upstream_request_id ? <div className="break-all font-mono">Upstream ID: {log.upstream_request_id}</div> : null}
+          {log.upstream_proxy_name ? <div className="break-all">Proxy: {log.upstream_proxy_name}{log.upstream_proxy_id ? ` (#${log.upstream_proxy_id})` : ''}</div> : null}
           <div className="font-semibold">{statusLabel}</div>
           {log.via_websocket ? (
             <div className="leading-relaxed text-background/70">{t('usage.userAgentWebSocketHint')}</div>
@@ -1220,6 +1226,52 @@ const usageTableHeadClass = 'text-[12px] font-semibold'
 const usageTableTextClass = 'text-[14px]'
 const usageTableMonoClass = 'font-mono text-[13px] tabular-nums'
 const usageTableBadgeClass = 'text-[13px]'
+
+function UsageInputTokenCount({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const tokens = getUsageTokenBreakdown(log)
+  const title = tokens.isClaude
+    ? t('usage.claudeInputTooltip', {
+      input: formatTokens(tokens.inputTokens, true),
+      total: formatTokens(tokens.totalInputTokens, true),
+      read: formatTokens(tokens.cacheReadTokens, true),
+      write: formatTokens(tokens.cacheWriteTokens, true),
+    })
+    : `${t('usage.inputTokens')}: ${formatTokens(tokens.inputTokens, true)}`
+
+  return <span className="text-blue-500" title={title}>↓{formatTokens(tokens.inputTokens, true)}</span>
+}
+
+function UsageCacheBadges({ log, align = 'end' }: { log: UsageLog; align?: 'start' | 'end' }) {
+  const { t } = useTranslation()
+  const tokens = getUsageTokenBreakdown(log)
+  if (tokens.cacheReadTokens === 0 && tokens.cacheWriteTokens === 0) {
+    return <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
+  }
+  const readTitle = t('usage.cacheReadTooltip', { tokens: formatTokens(tokens.cacheReadTokens, true) })
+  const writeTitle = t('usage.cacheCreateTooltip', {
+    tokens: formatTokens(tokens.cacheWriteTokens, true),
+    m5: formatTokens(tokens.cacheWrite5mTokens, true),
+    h1: formatTokens(tokens.cacheWrite1hTokens, true),
+  })
+
+  return (
+    <div className={cn('flex flex-col gap-1', align === 'start' ? 'items-start' : 'items-end')}>
+      {tokens.cacheReadTokens > 0 && (
+        <Badge variant="outline" title={readTitle} aria-label={readTitle} className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
+          <DatabaseZap className="size-3.5" aria-hidden="true" />
+          {formatTokens(tokens.cacheReadTokens, true)}
+        </Badge>
+      )}
+      {tokens.cacheWriteTokens > 0 && (
+        <Badge variant="outline" title={writeTitle} aria-label={writeTitle} className={`${usageTableBadgeClass} gap-1 border-transparent bg-amber-500/10 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400`}>
+          <DatabaseBackup className="size-3.5" aria-hidden="true" />
+          {formatTokens(tokens.cacheWriteTokens, true)}
+        </Badge>
+      )}
+    </div>
+  )
+}
 
 function StreamBadge({ stream }: { stream: boolean }) {
   return (
@@ -2235,7 +2287,7 @@ export default function Usage() {
                 {formatTokens(rangeTokens, showFullUsageNumbers)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span>{t('usage.inputTokens')}: {formatTokens(rangePromptTokens, showFullUsageNumbers)}</span>
+                <span>{t('usage.totalInputTokens')}: {formatTokens(rangePromptTokens, showFullUsageNumbers)}</span>
                 <span>{t('usage.outputTokens')}: {formatTokens(rangeCompletionTokens, showFullUsageNumbers)}</span>
                 <span>{t('usage.cumulative')}: {formatTokens(cumulativeTokens, showFullUsageNumbers)}</span>
               </div>
@@ -2696,7 +2748,7 @@ export default function Usage() {
               <div className="grid gap-3 lg:hidden">
                 {logs.map((log: UsageLog) => {
                   const hasDetails = visibleColumns.account || visibleColumns.apiKey || visibleColumns.clientIp || visibleColumns.endpoint || visibleColumns.userAgent
-                  const hasMetrics = visibleColumns.token || visibleColumns.timing || visibleColumns.tokensPerSec || visibleColumns.cost
+                  const hasMetrics = visibleColumns.token || visibleColumns.cached || visibleColumns.timing || visibleColumns.tokensPerSec || visibleColumns.cost
                   return (
                     <div
                       key={log.id}
@@ -2746,7 +2798,7 @@ export default function Usage() {
                               className="gap-0.5 border-transparent bg-blue-500/12 text-[11px] font-semibold text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
                             >
                               <Zap className="size-3" />
-                              Fast
+                              {formatServiceTierLabel(t, log.billing_service_tier || log.service_tier)}
                             </Badge>
                           ) : null}
                           {visibleColumns.type && <StreamBadge stream={log.stream} />}
@@ -2807,13 +2859,21 @@ export default function Usage() {
                               <div className="mt-1 font-mono tabular-nums">
                                 {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
                                   <>
-                                    <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
+                                    <UsageInputTokenCount log={log} />
                                     <span className="mx-0.5 text-border">/</span>
                                     <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
                                   </>
                                 ) : (
                                   <span className="text-muted-foreground">-</span>
                                 )}
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.cached && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCached')}</div>
+                              <div className="mt-1.5">
+                                <UsageCacheBadges log={log} align="start" />
                               </div>
                             </div>
                           )}
@@ -2958,7 +3018,7 @@ export default function Usage() {
                                 title={`${t('usage.billingTier')}: ${formatServiceTierLabel(t, log.billing_service_tier || log.service_tier)}`}
                               >
                                 <Zap className="size-3" />
-                                Fast
+                                {formatServiceTierLabel(t, log.billing_service_tier || log.service_tier)}
                               </Badge>
                             )}
                           </div>
@@ -3009,7 +3069,7 @@ export default function Usage() {
                         {visibleColumns.token && <TableCell className="text-right">
                           {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
                             <div className={`${usageTableMonoClass} leading-relaxed`}>
-                              <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
+                              <UsageInputTokenCount log={log} />
                               <span className="mx-1 text-border">|</span>
                               <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
                               {log.reasoning_tokens > 0 && (
@@ -3024,23 +3084,7 @@ export default function Usage() {
                           )}
                         </TableCell>}
                         {visibleColumns.cached && <TableCell className="text-right">
-                          {log.cached_tokens > 0 || (log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0) > 0 ? (
-                            <div className="flex flex-col items-end gap-0.5">
-                              {log.cached_tokens > 0 && (
-                                <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
-                                  <DatabaseZap className="size-3.5" />
-                                  {formatTokens(log.cached_tokens, true)}
-                                </Badge>
-                              )}
-                              {(log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0) > 0 && (
-                                <span className={`${usageTableMonoClass} text-[10px] text-amber-600 dark:text-amber-400`} title={t('usage.cacheWriteTooltip', { m5: formatTokens(log.cache_write_5m_tokens ?? 0, true), h1: formatTokens(log.cache_write_1h_tokens ?? 0, true) })}>
-                                  {t('usage.cacheWriteBadge', { tokens: formatTokens((log.cache_write_5m_tokens ?? 0) + (log.cache_write_1h_tokens ?? 0), true) })}
-                                </span>
-                              )}
-                            </div>
-                          ) : (
-                            <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
-                          )}
+                          <UsageCacheBadges log={log} />
                         </TableCell>}
                         {visibleColumns.wsAcquire && <TableCell className="text-right">
                           {(log.ws_acquire_ms ?? 0) > 0 ? (

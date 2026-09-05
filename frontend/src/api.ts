@@ -46,6 +46,8 @@ import type {
   APIKeyTokenStat,
   APIKeyAccountStatsResponse,
   APIKeyScopeUsageItem,
+  APIKeyLimits,
+  APIKeyModelRequestUsage,
   APIKeyScopeSummaryItem,
   AccountsResponse,
   AccountAnalysisResponse,
@@ -76,6 +78,7 @@ import type {
   InviteTrackingResponse,
   MessageResponse,
   ModelSyncResponse,
+  RefreshAllModelsResponse,
   ModelPricingOverride,
 	OfficialPricingSyncConfig,
 	OfficialPricingSyncResult,
@@ -136,6 +139,7 @@ import type {
   UpdateAccountGroupRequest,
   UpstreamChannel,
   ClaudeGlobalConfig,
+  VisibleChannelsSettings,
 } from './types'
 
 const BASE = '/api/admin'
@@ -780,6 +784,11 @@ export const api = {
       method: 'POST',
       timeoutMs: 60_000,
     }),
+  refreshAllModels: () =>
+    request<RefreshAllModelsResponse>('/models/refresh-all', {
+      method: 'POST',
+      timeoutMs: 130_000,
+    }),
   batchUpdateGrokModels: (data: BatchUpdateGrokModelsRequest) =>
     request<BatchUpdateGrokModelsResponse>('/accounts/grok/batch-models', {
       method: 'POST',
@@ -946,6 +955,12 @@ export const api = {
     request<{ queued: number; skipped: number }>('/accounts/invite/plan/probe', {
       method: 'POST',
       body: JSON.stringify({ ids }),
+    }),
+  getVisibleChannels: () => request<VisibleChannelsSettings>('/settings/visible-channels'),
+  updateVisibleChannels: (channels: readonly UpstreamChannel[]) =>
+    request<VisibleChannelsSettings>('/settings/visible-channels', {
+      method: 'PUT',
+      body: JSON.stringify({ channels }),
     }),
   getInviteGuideSettings: () => request<{ enabled: boolean }>('/settings/invite-guide'),
   updateInviteGuideSettings: (enabled: boolean) =>
@@ -1169,7 +1184,7 @@ export const api = {
   regenerateAPIKey: (id: number) =>
     request<RegenerateAPIKeyResponse>(`/keys/${id}/regenerate`, { method: 'POST' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
-    request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<MessageResponse & { limits?: APIKeyLimits }>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   resetAPIKeyQuota: (id: number) =>
     request<MessageResponse>(`/keys/${id}/reset-quota`, { method: 'POST' }),
   resetAllAPIKeyQuotas: () =>
@@ -1177,6 +1192,8 @@ export const api = {
   // 分组 / 账号维度限额的当前用量（issue #439）。
   getAPIKeyScopeUsage: (id: number) =>
     request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
+  getAPIKeyModelRequestUsage: (id: number) =>
+    request<{ model_request_usage: APIKeyModelRequestUsage[] }>(`/keys/${id}/model-request-usage`),
   // 列表页用的全量概览：一次拿到所有 Key 的 scope 预算占比。
   getAPIKeysScopeSummary: () =>
     request<{ summary: Record<string, APIKeyScopeSummaryItem[]> }>('/keys-scope-summary'),

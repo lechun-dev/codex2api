@@ -69,6 +69,9 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_ws_stateless_slots", def: "INT DEFAULT 8"},
 	{table: "system_settings", name: "github_token", def: "TEXT NULL"},
 	{table: "system_settings", name: "github_proxy_url", def: "TEXT NULL"},
+	// 2026-09-06 coder(lq): MySQL 5.6 cannot define defaults on TEXT columns; readers supply the empty JSON fallback.
+	{table: "system_settings", name: "invite_guide_config", def: "TEXT NULL"},
+	{table: "system_settings", name: "visible_channels_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "codex_overload_pause_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_overload_threshold_percent", def: "INT DEFAULT 20"},
 	{table: "system_settings", name: "codex_overload_pause_minutes", def: "INT DEFAULT 30"},
@@ -189,6 +192,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			error_message VARCHAR(2048) DEFAULT '',
 			internal_reason VARCHAR(64) DEFAULT '',
 			parent_request_id VARCHAR(128) DEFAULT '',
+			request_id VARCHAR(128) DEFAULT '',
+			upstream_request_id VARCHAR(128) DEFAULT '',
+			upstream_proxy_id BIGINT DEFAULT 0,
+			upstream_proxy_name VARCHAR(255) DEFAULT '',
 			prompt_policy_incident_id VARCHAR(64) NULL
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
@@ -208,6 +215,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		apiKeyScopeCountersMySQLDDL(),
 		accountGroupsMySQLDDL(),
+		apiKeyModelRequestCountersMySQLDDL(),
+		apiKeyModelRequestLedgerMySQLDDL(),
+		modelCapabilitiesMySQLDDL(),
 		`CREATE TABLE IF NOT EXISTS account_group_members (
 			account_id BIGINT NOT NULL,
 			group_id BIGINT NOT NULL,
@@ -400,6 +410,10 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "error_message", "VARCHAR(2048) DEFAULT ''"},
 		{"usage_logs", "internal_reason", "VARCHAR(64) DEFAULT ''"},
 		{"usage_logs", "parent_request_id", "VARCHAR(128) DEFAULT ''"},
+		{"usage_logs", "request_id", "VARCHAR(128) DEFAULT ''"},
+		{"usage_logs", "upstream_request_id", "VARCHAR(128) DEFAULT ''"},
+		{"usage_logs", "upstream_proxy_id", "BIGINT DEFAULT 0"},
+		{"usage_logs", "upstream_proxy_name", "VARCHAR(255) DEFAULT ''"},
 		{"usage_logs", "prompt_policy_incident_id", "VARCHAR(64) NULL"},
 		{"api_keys", "total_used", "DOUBLE DEFAULT 0"},
 		{"api_keys", "reset_count", "INT DEFAULT 0"},
@@ -660,6 +674,30 @@ func apiKeyScopeCountersMySQLDDL() string {
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 
+// 2026-09-05 coder(lq): Keep request-limit counters available on MySQL 5.6
+// without relying on PostgreSQL upsert syntax or multi-statement execution.
+func apiKeyModelRequestCountersMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
+		api_key_id BIGINT NOT NULL,
+		rule_id VARCHAR(80) CHARACTER SET ascii NOT NULL,
+		window_start BIGINT NOT NULL,
+		reset_at BIGINT NOT NULL,
+		used_requests BIGINT NOT NULL DEFAULT 0,
+		PRIMARY KEY (api_key_id, rule_id, window_start)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
+func apiKeyModelRequestLedgerMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS api_key_model_request_ledger (
+		api_key_id BIGINT NOT NULL,
+		rule_id VARCHAR(80) CHARACTER SET ascii NOT NULL,
+		request_id VARCHAR(200) CHARACTER SET ascii NOT NULL,
+		window_start BIGINT NOT NULL,
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY (api_key_id, rule_id, request_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
 func promptFilterLogsMySQLDDL() string {
 	return `CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -837,6 +875,8 @@ func systemSettingsMySQLDDL() string {
 		codex_ws_stateless_slots INT DEFAULT 8,
 		github_token TEXT NULL,
 		github_proxy_url TEXT NULL,
+		invite_guide_config TEXT NULL,
+		visible_channels_config TEXT NULL,
 		codex_overload_pause_enabled TINYINT(1) DEFAULT 0,
 		codex_overload_threshold_percent INT DEFAULT 20,
 		codex_overload_pause_minutes INT DEFAULT 30,

@@ -1,10 +1,17 @@
 # GitHub Actions 部署
 
-仓库包含 `.github/workflows/deploy-ssh.yml`，可在 GitHub Actions 中手动构建并通过 SSH 部署到 Linux 服务器。
+仓库包含两套互相独立的 SSH 部署工作流，不要把两台服务器写进同一个 Action：
+
+| 工作流 | 文件 | 目标服务器 |
+| --- | --- | --- |
+| `Deploy SSH` | `.github/workflows/deploy-ssh.yml` | 现有国内服务器 |
+| `Deploy SSH (codexProxyNew)` | `.github/workflows/deploy-ssh-codexproxynew.yml` | `codexProxyNew`（`47.245.107.32`） |
+
+两套工作流都只支持在 GitHub Actions 里手动运行，不会因为推送到 `main` 自动部署。
 
 ## 回滚
 
-在 Actions 中运行 `Deploy SSH`，将 `action` 选择为 `rollback`，并在 `rollback_release` 中填写服务器上已有的 release 目录名，例如 `42-abc1234`。可在服务器执行以下命令查看可回滚版本：
+在 Actions 中运行对应服务器的工作流（`Deploy SSH` 或 `Deploy SSH (codexProxyNew)`），将 `action` 选择为 `rollback`，并在 `rollback_release` 中填写该服务器上已有的 release 目录名，例如 `42-abc1234`。可在目标服务器执行以下命令查看可回滚版本：
 
 ```bash
 find /deploy/codex2api/releases -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V
@@ -14,13 +21,23 @@ find /deploy/codex2api/releases -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
 
 ## GitHub Secrets
 
-在 GitHub 仓库设置中进入 `Settings -> Secrets and variables -> Actions`，新增：
+在 GitHub 仓库设置中进入 `Settings -> Secrets and variables -> Actions`，按工作流分别新增。两套 secrets 不要混用。
+
+### Deploy SSH（现有服务器）
 
 | Secret | 说明 |
 | --- | --- |
-| `DEPLOY_HOST` | 部署服务器 IP 或域名 |
+| `DEPLOY_HOST` | 现有部署服务器 IP 或域名 |
 | `DEPLOY_USER` | SSH 用户，例如 `deployuser` |
-| `DEPLOY_SSH_KEY` | SSH 私钥内容，可登录部署服务器 |
+| `DEPLOY_SSH_KEY` | 可登录现有服务器的 SSH 私钥内容 |
+
+### Deploy SSH (codexProxyNew)
+
+| Secret | 说明 |
+| --- | --- |
+| `CODEXPROXYNEW_DEPLOY_HOST` | `47.245.107.32` |
+| `CODEXPROXYNEW_DEPLOY_USER` | `deployuser` |
+| `CODEXPROXYNEW_DEPLOY_SSH_KEY` | 可登录 `codexProxyNew` 的 SSH 私钥内容 |
 
 数据库密码、Redis 密码仍放在服务器本地 `.env`，不要放进仓库。
 
@@ -111,11 +128,14 @@ deployuser ALL=(root) NOPASSWD: /bin/systemctl restart codex2api, /bin/systemctl
 
 ## 触发部署
 
-推送到 `main` 分支会自动部署到服务器。也可以进入 GitHub 仓库手动触发：
+进入 GitHub 仓库手动触发对应工作流：
 
 ```text
 Actions -> Deploy SSH -> Run workflow
+Actions -> Deploy SSH (codexProxyNew) -> Run workflow
 ```
+
+`codexProxyNew` 这台机器在海外，启动时连国内数据库会比较慢，对应工作流的服务重启等待时间更长。
 
 参数：
 

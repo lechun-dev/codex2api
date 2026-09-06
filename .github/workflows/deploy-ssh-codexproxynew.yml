@@ -1,0 +1,245 @@
+# 2026-09-06 coder(lq): 独立部署到 codexProxyNew (47.245.107.32)，不并入现有 Deploy SSH。
+# Secrets: CODEXPROXYNEW_DEPLOY_HOST / CODEXPROXYNEW_DEPLOY_USER / CODEXPROXYNEW_DEPLOY_SSH_KEY
+name: Deploy SSH (codexProxyNew)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Deployment action
+        type: choice
+        options:
+          - deploy
+          - rollback
+        default: deploy
+      rollback_release:
+        description: Existing release directory name, for example 42-abc1234
+        type: string
+        default: ''
+      goarch:
+        description: Linux target architecture
+        type: choice
+        options:
+          - amd64
+          - arm64
+        default: amd64
+      deploy_dir:
+        description: Application directory on the deployment server
+        type: string
+        default: /deploy/codex2api
+      service_name:
+        description: systemd service name
+        type: string
+        default: codex2api
+      healthcheck_url:
+        description: Optional URL checked after restart
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ssh-codexproxynew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ inputs.action != 'rollback' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TARGET_GOARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.goarch || 'amd64' }}
+      DEPLOY_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_dir || '/deploy/codex2api' }}
+      SERVICE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.service_name || 'codex2api' }}
+      HEALTHCHECK_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.healthcheck_url || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_APP_VERSION: ${{ github.sha }}
+        run: |
+          npm ci
+          npm run build
+          npm run typecheck
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build Linux binary
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go build -trimpath -ldflags="-s -w" -o build/codex2api .
+          file build/codex2api
+
+      - name: Install SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_HOST"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy binary
+        timeout-minutes: 30
+        env:
+          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.CODEXPROXYNEW_DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_USER"
+          [[ "$DEPLOY_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          [[ "$DEPLOY_DIR" != *".."* ]]
+          [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]
+
+          release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          upload_tmp="/tmp/codex2api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh_opts=(
+            -i ~/.ssh/deploy_key
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+            -o StrictHostKeyChecking=yes
+          )
+
+          echo "::group::Prepare remote release directory"
+          ssh "${ssh_opts[@]}" "$remote" "mkdir -p '$release' '$DEPLOY_DIR/shared'"
+          echo "::endgroup::"
+
+          echo "::group::Upload binary"
+          echo "Uploading $(du -h build/codex2api | cut -f1) to $DEPLOY_HOST"
+          scp -C "${ssh_opts[@]}" build/codex2api "$remote:$upload_tmp"
+          echo "::endgroup::"
+
+          echo "::group::Activate release"
+          ssh "${ssh_opts[@]}" "$remote" "
+            set -eu
+            test -f '$DEPLOY_DIR/shared/.env'
+            install -m 755 '$upload_tmp' '$release/codex2api'
+            rm -f '$upload_tmp'
+            ln -sfn '$release' '$DEPLOY_DIR/current'
+          "
+          echo "::endgroup::"
+
+          echo "::group::Restart service"
+          if ! timeout --signal=TERM 300s ssh "${ssh_opts[@]}" "$remote" "
+            set -eu
+            sudo -n systemctl restart '$SERVICE_NAME'
+            systemctl is-active --quiet '$SERVICE_NAME'
+          "; then
+            echo "Service restart failed or timed out; collecting diagnostics" >&2
+            ssh "${ssh_opts[@]}" "$remote" "
+              systemctl --no-pager --full status '$SERVICE_NAME' || true
+              journalctl -u '$SERVICE_NAME' --no-pager -n 50 || true
+            " || true
+            exit 1
+          fi
+          echo "Service $SERVICE_NAME is active"
+          echo "::endgroup::"
+
+      - name: Healthcheck
+        if: ${{ inputs.healthcheck_url != '' }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "$HEALTHCHECK_URL" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "healthcheck failed: $HEALTHCHECK_URL" >&2
+          exit 1
+
+  rollback:
+    if: ${{ inputs.action == 'rollback' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DEPLOY_DIR: ${{ inputs.deploy_dir || '/deploy/codex2api' }}
+      SERVICE_NAME: ${{ inputs.service_name || 'codex2api' }}
+      HEALTHCHECK_URL: ${{ inputs.healthcheck_url || '' }}
+      ROLLBACK_RELEASE: ${{ inputs.rollback_release }}
+    steps:
+      - name: Install SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_HOST"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Roll back release
+        timeout-minutes: 10
+        env:
+          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.CODEXPROXYNEW_DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_USER"
+          [[ "$DEPLOY_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]
+          [[ "$DEPLOY_DIR" != *".."* ]]
+          [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]
+          [[ "$ROLLBACK_RELEASE" =~ ^[A-Za-z0-9._-]+$ ]]
+          remote="$DEPLOY_USER@$DEPLOY_HOST"
+          release="$DEPLOY_DIR/releases/$ROLLBACK_RELEASE"
+          ssh_opts=(
+            -i ~/.ssh/deploy_key
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3
+            -o StrictHostKeyChecking=yes
+          )
+
+          ssh "${ssh_opts[@]}" "$remote" "
+            set -eu
+            test -f '$release/codex2api'
+            test -f '$DEPLOY_DIR/shared/.env'
+            ln -sfn '$release' '$DEPLOY_DIR/current'
+            sudo -n systemctl restart '$SERVICE_NAME'
+            systemctl is-active --quiet '$SERVICE_NAME'
+          "
+          echo "Rolled back to $ROLLBACK_RELEASE"
+
+      - name: Healthcheck
+        if: ${{ inputs.healthcheck_url != '' }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 "$HEALTHCHECK_URL" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "healthcheck failed: $HEALTHCHECK_URL" >&2
+          exit 1

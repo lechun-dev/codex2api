@@ -112,6 +112,65 @@ func TestForwardGrokNativeStreamRequiresTerminalAndEmitsProtocolError(t *testing
 	}
 }
 
+func TestForwardGrokNativeResponsesKeepsCodexDownstreamAliveAfterFirstFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousInterval := downstreamSSEKeepaliveInterval
+	downstreamSSEKeepaliveInterval = 5 * time.Millisecond
+	t.Cleanup(func() { downstreamSSEKeepaliveInterval = previousInterval })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Request.Header.Set("User-Agent", "codex-tui/0.142.0")
+	reader, writer := io.Pipe()
+	go func() {
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"started\"}\n\n")
+		time.Sleep(30 * time.Millisecond)
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		_ = writer.Close()
+	}()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}
+
+	_, outcome, wrote, _ := forwardGrokNativeResponse(ctx, resp, GrokProtocolResponses, true, time.Now(), nil)
+	if !wrote || outcome.logStatusCode != http.StatusOK {
+		t.Fatalf("outcome/wrote = %#v %v", outcome, wrote)
+	}
+	body := recorder.Body.String()
+	first := strings.Index(body, `"delta":"started"`)
+	heartbeat := strings.Index(body, downstreamSSEKeepaliveEvent)
+	terminal := strings.Index(body, `"type":"response.completed"`)
+	if first < 0 || heartbeat <= first || terminal <= heartbeat {
+		t.Fatalf("heartbeat order invalid: first=%d heartbeat=%d terminal=%d body=%q", first, heartbeat, terminal, body)
+	}
+}
+
+func TestForwardGrokNativeResponsesDoesNotKeepaliveBeforeFirstFrame(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousInterval := downstreamSSEKeepaliveInterval
+	downstreamSSEKeepaliveInterval = 5 * time.Millisecond
+	t.Cleanup(func() { downstreamSSEKeepaliveInterval = previousInterval })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Request.Header.Set("User-Agent", "codex-tui/0.142.0")
+	reader, writer := io.Pipe()
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"status_code\":429,\"error\":{\"message\":\"busy\"}}}\n\n")
+		_ = writer.Close()
+	}()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}
+
+	_, outcome, wrote, _ := forwardGrokNativeResponse(ctx, resp, GrokProtocolResponses, true, time.Now(), nil)
+	if wrote || recorder.Body.Len() != 0 {
+		t.Fatalf("pre-output heartbeat committed stream: outcome=%#v body=%q", outcome, recorder.Body.String())
+	}
+	if outcome.logStatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; outcome=%#v", outcome.logStatusCode, outcome)
+	}
+}
+
 func TestForwardGrokNativeFailureBeforeVisibleOutputWritesNothing(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

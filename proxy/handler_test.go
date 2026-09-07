@@ -1563,6 +1563,7 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "codex-tui/0.142.0")
 	req.Header.Set("X-Codex2API-Affinity-Key", "tenant-user-42")
 	req.Header.Set("X-OpenAI-Internal-Codex-Responses-Lite", "true")
 	sessionIdentity := resolveRequestSessionIdentity(req.Header, body)
@@ -1616,6 +1617,15 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 }
 
 func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testing.T) {
+	testResponsesHTTPIngressKeepaliveFrame(t, "codex-tui/0.142.0", downstreamSSEKeepaliveEvent)
+}
+
+func TestResponsesHTTPIngressKeepsCommentHeartbeatForOtherClients(t *testing.T) {
+	testResponsesHTTPIngressKeepaliveFrame(t, "curl/8.0", downstreamSSEKeepaliveComment)
+}
+
+func testResponsesHTTPIngressKeepaliveFrame(t *testing.T, userAgent, wantKeepalive string) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 
 	previousExec := WebsocketExecuteFunc
@@ -1651,6 +1661,7 @@ func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testin
 	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = req
@@ -1661,7 +1672,7 @@ func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testin
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	got := recorder.Body.String()
-	for _, want := range []string{`"delta":"started"`, downstreamSSEKeepaliveComment, `"type":"response.completed"`} {
+	for _, want := range []string{`"delta":"started"`, wantKeepalive, `"type":"response.completed"`} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stream missing %q; body=%q", want, got)
 		}

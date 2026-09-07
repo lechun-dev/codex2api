@@ -2,10 +2,43 @@ package proxy
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
+
+func TestDownstreamSSEKeepaliveFrameForRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name       string
+		path       string
+		userAgent  string
+		originator string
+		want       string
+	}{
+		{name: "codex v1 responses", path: "/v1/responses", userAgent: "codex-tui/0.142.0", want: downstreamSSEKeepaliveEvent},
+		{name: "codex prefixless responses", path: "/responses", userAgent: "codex_cli_rs/0.128.0", want: downstreamSSEKeepaliveEvent},
+		{name: "codex originator", path: "/v1/responses", originator: "codex-tui", want: downstreamSSEKeepaliveEvent},
+		{name: "ordinary responses client", path: "/v1/responses", userAgent: "curl/8.0", want: downstreamSSEKeepaliveComment},
+		{name: "codex chat completions", path: "/v1/chat/completions", userAgent: "codex-tui/0.142.0", want: downstreamSSEKeepaliveComment},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, tc.path, nil)
+			c.Request.Header.Set("User-Agent", tc.userAgent)
+			c.Request.Header.Set("Originator", tc.originator)
+			if got := downstreamSSEKeepaliveFrameForRequest(c); got != tc.want {
+				t.Fatalf("keepalive frame = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestDownstreamSSEKeepaliveStopsAndJoins(t *testing.T) {
 	var writes atomic.Int32

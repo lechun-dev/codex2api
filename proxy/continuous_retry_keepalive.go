@@ -74,11 +74,12 @@ func installContinuousRetrySSEKeepalive(c *gin.Context, stream bool, contentType
 	if contentType == "" {
 		contentType = "text/event-stream"
 	}
+	keepaliveFrame := downstreamSSEKeepaliveFrameForRequest(c)
 	original := c.Request
 	requestCtx, cancel := context.WithCancelCause(original.Context())
 	keepalive := &requestContinuousRetryKeepalive{write: func() error {
 		setSSEStreamHeaders(c, contentType)
-		if _, err := c.Writer.WriteString(continuousRetryKeepaliveComment); err != nil {
+		if _, err := c.Writer.WriteString(keepaliveFrame); err != nil {
 			return err
 		}
 		if flusher, ok := c.Writer.(http.Flusher); ok {

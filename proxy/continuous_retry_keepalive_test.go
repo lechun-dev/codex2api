@@ -285,6 +285,26 @@ func TestContinuousRetrySSEKeepaliveAndCommittedErrors(t *testing.T) {
 	}
 }
 
+func TestContinuousRetrySSEKeepaliveUsesCodexResponsesEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex-tui/0.142.0")
+	stop := installContinuousRetrySSEKeepalive(c, true, "text/event-stream")
+	defer stop()
+
+	keepalive := continuousRetryKeepaliveForContext(c.Request.Context()).(*requestContinuousRetryKeepalive)
+	keepalive.Activate()
+	keepalive.last = time.Time{}
+	if err := keepalive.Keepalive(); err != nil {
+		t.Fatalf("write SSE heartbeat: %v", err)
+	}
+	if got := recorder.Body.String(); got != downstreamSSEKeepaliveEvent {
+		t.Fatalf("SSE heartbeat body = %q, want %q", got, downstreamSSEKeepaliveEvent)
+	}
+}
+
 func TestContinuousRetryHTTPInformationalKeepalivePreservesFinalJSONStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()

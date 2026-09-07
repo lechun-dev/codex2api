@@ -1049,6 +1049,29 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 	var pending bytes.Buffer
 	writeErr := error(nil)
 	frameErr := error(nil)
+	// 2026-09-07 coder(lq): 原生 SSE 透传也需要下游保活。仅在首个真实帧
+	// 已成功写出后发送，并与正常帧串行化，避免心跳插进半个 SSE 帧。
+	var downstreamMu sync.Mutex
+	stopDownstreamKeepalive := func() {}
+	if !privateAttempt {
+		keepaliveFrame := downstreamSSEKeepaliveFrameForRequest(c)
+		stopDownstreamKeepalive = startDownstreamSSEKeepalive(c.Request.Context(), downstreamSSEKeepaliveInterval, func() bool {
+			downstreamMu.Lock()
+			defer downstreamMu.Unlock()
+			if c.Request.Context().Err() != nil || writeErr != nil {
+				return false
+			}
+			if !wrote {
+				return true
+			}
+			if _, err := io.WriteString(output, keepaliveFrame); err != nil {
+				writeErr = err
+				return false
+			}
+			outputFlusher.Flush()
+			return true
+		})
+	}
 	readErr := readRawGrokSSEFramesWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(frame rawGrokSSEFrame) bool {
 		if frame.HasData && !frame.Done {
 			usage = mergeGrokNativeUsage(usage, grokNativeUsage(protocol, frame.Data))
@@ -1099,6 +1122,11 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 			pending.Reset()
 			return false
 		}
+		downstreamMu.Lock()
+		defer downstreamMu.Unlock()
+		if writeErr != nil {
+			return false
+		}
 		if pending.Len() > 0 {
 			if _, err := output.Write(pending.Bytes()); err != nil {
 				writeErr = err
@@ -1117,6 +1145,7 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 		outputFlusher.Flush()
 		return !isTerminal
 	})
+	stopDownstreamKeepalive()
 	if frameErr != nil {
 		readErr = frameErr
 	}
@@ -5037,6 +5066,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			streamAttempt = h.newContinuousRetryStreamAttempt(continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, flusher)
 			streamWriter := h.newAttemptStreamFlushWriter(c, streamAttempt, c.Writer, flusher)
 			streamWriter.diag = streamDiag
+			downstreamKeepaliveFrame := downstreamSSEKeepaliveFrameForRequest(c)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -5214,7 +5244,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					if !wroteAnyBody {
 						return true
 					}
-					if err := streamWriter.WriteSSEComment(downstreamSSEKeepaliveComment); err != nil {
+					if err := streamWriter.WriteSSEKeepalive(downstreamKeepaliveFrame); err != nil {
 						writeErr = err
 						clientGone = true
 						return false
@@ -5266,7 +5296,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						if clientGone || !wroteAnyBody {
 							return !clientGone
 						}
-						if err := streamWriter.WriteSSEComment(continueKeepaliveComment); err != nil {
+						if err := streamWriter.WriteSSEKeepalive(downstreamKeepaliveFrame); err != nil {
 							writeErr = err
 							clientGone = true
 							return false

@@ -1537,12 +1537,18 @@ func (h *Handler) streamResponsesWSUpstream(
 		return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 	}
 	if outcome.logStatusCode != http.StatusOK && len(terminalFailurePayload) == 0 {
-		errCode := api.ErrCodeUpstreamError
 		if outcome.logStatusCode == logStatusUpstreamStreamBreak {
-			// 断流(598)用稳定错误码 upstream_stream_break，下游可编程识别并重试
-			// (issue #473)；其余上游异常保持通用 upstream_error。
-			errCode = api.ErrorCode(ErrorCodeUpstreamStreamBreak)
+			// 2026-09-08 coder(lq): Treat an upstream EOF as a failed logical turn so
+			// Codex sees a valid Responses terminal and can reuse the WebSocket.
+			if !claimContinuousRetrySuccessContext(c.Request.Context()) {
+				return errResponsesWSClientGone
+			}
+			if err := writeResponsesWSStreamBreakEvent(conn); err != nil {
+				return errResponsesWSClientGone
+			}
+			return nil
 		}
+		errCode := api.ErrCodeUpstreamError
 		apiErr := api.NewAPIError(errCode, outcome.failureMessage, api.ErrorTypeUpstream)
 		clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
 		if !claimContinuousRetrySuccessContext(c.Request.Context()) {
@@ -1666,6 +1672,44 @@ func writeResponsesWSError(conn *websocket.Conn, apiErr *api.APIError) error {
 	}{
 		Type:  "error",
 		Error: apiErr,
+	})
+	if err != nil {
+		return err
+	}
+	return writeResponsesWSMessage(conn, payload)
+}
+
+func writeResponsesWSStreamBreakEvent(conn *websocket.Conn) error {
+	payload, err := json.Marshal(struct {
+		Type     string `json:"type"`
+		Response struct {
+			CreatedAt int64  `json:"created_at"`
+			Status    string `json:"status"`
+			Error     struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}{
+		Type: "response.failed",
+		Response: struct {
+			CreatedAt int64  `json:"created_at"`
+			Status    string `json:"status"`
+			Error     struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}{
+			CreatedAt: time.Now().Unix(),
+			Status:    "failed",
+			Error: struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}{
+				Code:    ErrorCodeUpstreamStreamBreak,
+				Message: upstreamStreamBreakMessage,
+			},
+		},
 	})
 	if err != nil {
 		return err

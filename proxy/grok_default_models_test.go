@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 )
@@ -91,5 +92,45 @@ func TestGrokChannelSupportsModelUsesCatalogBeforeDefaults(t *testing.T) {
 	}
 	if account.GrokChannelSupportsModel("grok-4.5") {
 		t.Fatal("non-empty catalog must replace conservative default set")
+	}
+}
+
+func TestGrokChannelSupportsModelFallsBackWhenCatalogIsStale(t *testing.T) {
+	account := &auth.Account{UpstreamType: auth.UpstreamGrok, RefreshToken: "rt"}
+	account.SetGrokRoutingState(auth.GrokRoutingState{
+		CatalogKnown: true,
+		ObservedAt:   time.Now().Add(-2 * time.Hour),
+		Models:       []auth.GrokModelRoute{{ModelID: "grok-catalog-only", APIBackend: auth.GrokProtocolResponses}},
+	})
+
+	if !account.GrokChannelSupportsModel("grok-4.6") {
+		t.Fatal("stale catalog should fall back to the OAuth default model set")
+	}
+	if account.GrokChannelSupportsModel("grok-catalog-only") {
+		t.Fatal("stale catalog model must not remain an authorization source")
+	}
+}
+
+func TestGrokChannelSupportsModelFallsBackWhenCatalogCredentialGenerationChanges(t *testing.T) {
+	account := &auth.Account{
+		UpstreamType:         auth.UpstreamGrok,
+		RefreshToken:         "rt",
+		CredentialGeneration: 2,
+	}
+	account.SetGrokRoutingState(auth.GrokRoutingState{
+		CatalogKnown:         true,
+		CredentialGeneration: 1,
+		ObservedAt:           time.Now(),
+		Models: []auth.GrokModelRoute{{
+			ModelID:    "grok-catalog-only",
+			APIBackend: auth.GrokProtocolResponses,
+		}},
+	})
+
+	if !account.GrokChannelSupportsModel("grok-4.5") {
+		t.Fatal("credential-mismatched catalog should fall back to the OAuth default model set")
+	}
+	if account.GrokChannelSupportsModel("grok-catalog-only") {
+		t.Fatal("catalog from the previous credential generation must not remain an authorization source")
 	}
 }

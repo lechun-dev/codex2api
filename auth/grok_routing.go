@@ -174,6 +174,18 @@ func grokCatalogRoutable(state *GrokRoutingState, now time.Time) bool {
 	return now.Before(state.ObservedAt.Add(grokCatalogStaleIfError))
 }
 
+// 2026-09-08 coder(lq): 统一判断 Grok 目录是否仍可作为账号模型授权依据，避免过期或旧凭据目录提前筛掉可用账号。
+func (a *Account) grokCatalogUsableLocked(now time.Time) bool {
+	if a == nil || a.grokRouting == nil || !a.grokRouting.CatalogKnown {
+		return false
+	}
+	if a.CredentialGeneration > 0 && a.grokRouting.CredentialGeneration > 0 &&
+		a.grokRouting.CredentialGeneration != a.CredentialGeneration {
+		return false
+	}
+	return grokCatalogRoutable(a.grokRouting, now)
+}
+
 // GetGrokModelRoute 以目录 apiBackend 为上游协议。新鲜同协议探针只决定
 // Native 直通，不能把协议改成和目录不一致的另一条口。
 // 官方 grok-4.6 目录是 responses；Messages 探针只用 user:hi 测通，

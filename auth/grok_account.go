@@ -354,7 +354,7 @@ func (a *Account) GrokChannelSupportsModel(model string) bool {
 	var candidates []string
 	if len(a.Models) > 0 {
 		candidates = a.Models
-	} else if a.grokRouting != nil && a.grokRouting.CatalogKnown {
+	} else if a.grokCatalogUsableLocked(time.Now()) {
 		for _, route := range a.grokRouting.Models {
 			if route.Hidden || (a.GrokAuthKindLocked() == GrokAuthKindAPIKey && route.SupportedInAPI != nil && !*route.SupportedInAPI) {
 				continue
@@ -363,8 +363,10 @@ func (a *Account) GrokChannelSupportsModel(model string) bool {
 		}
 	}
 	// A successfully fetched empty catalog is authoritative. It must not be
-	// confused with "catalog has never been fetched" and reopen defaults.
-	if len(candidates) == 0 && (a.grokRouting == nil || !a.grokRouting.CatalogKnown) {
+	// confused with "catalog has never been fetched" and reopen defaults. An
+	// expired or credential-mismatched catalog is no longer authoritative, so
+	// the credential-specific defaults keep otherwise usable accounts routable.
+	if len(candidates) == 0 && !a.grokCatalogUsableLocked(time.Now()) {
 		if a.GrokAuthKindLocked() == GrokAuthKindAPIKey {
 			candidates = GrokAPIKeyDefaultModelIDs()
 		} else {

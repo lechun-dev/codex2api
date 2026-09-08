@@ -48,9 +48,14 @@ func TestUnavailablePoolLogIsSampledAndDoesNotLogCredentials(t *testing.T) {
 	old := log.Writer()
 	log.SetOutput(&output)
 	t.Cleanup(func() { log.SetOutput(old) })
-	s.LogUnavailablePool("req-test", "test-model", 42, nil, DispatchPolicyStandard)
-	s.LogUnavailablePool("req-suppressed", "test-model", 42, nil, DispatchPolicyStandard)
+	calls := 0
+	details := func() any { calls++; return map[string]string{"original_model": "original-test-model"} }
+	s.LogUnavailablePool("req-test", "test-model", 42, nil, DispatchPolicyStandard, details)
+	s.LogUnavailablePool("req-suppressed", "test-model", 42, nil, DispatchPolicyStandard, details)
 	text := output.String()
+	if calls != 1 || !strings.Contains(text, "original-test-model") {
+		t.Fatalf("lazy details calls=%d log=%s", calls, text)
+	}
 	if !strings.Contains(text, "req-test") || strings.Contains(text, "req-suppressed") || strings.Contains(text, acc.AccessToken) {
 		t.Fatalf("unexpected diagnostic log: %s", text)
 	}

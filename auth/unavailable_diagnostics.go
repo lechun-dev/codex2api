@@ -83,7 +83,7 @@ func (s *Store) unavailablePoolSnapshot(apiKeyID int64, exclude map[int64]bool, 
 
 // 2026-09-08 coder(lq): Sample at most once per ten seconds per store, before
 // scanning the pool. Never include credentials, user names or request content.
-func (s *Store) LogUnavailablePool(requestID, model string, apiKeyID int64, exclude map[int64]bool, policy DispatchPolicy) {
+func (s *Store) LogUnavailablePool(requestID, model string, apiKeyID int64, exclude map[int64]bool, policy DispatchPolicy, requestDetails ...func() any) {
 	if s == nil {
 		return
 	}
@@ -92,13 +92,17 @@ func (s *Store) LogUnavailablePool(requestID, model string, apiKeyID int64, excl
 	if now-last < int64(10*time.Second) || !s.unavailableLogNS.CompareAndSwap(last, now) {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
+	details := map[string]any{
 		"event": "account_pool_unavailable", "request_id": requestID,
 		"model": model, "api_key_id": apiKeyID, "scheduler_engine": s.SchedulerEngine(),
 		"policy": policy, "base_concurrency": atomic.LoadInt64(&s.maxConcurrency),
 		"snapshot": s.unavailablePoolSnapshot(apiKeyID, exclude, policy),
 		"scope":    "local_cached_state_only; group/model/egress/Redis/continuation constraints not evaluated",
-	})
+	}
+	if len(requestDetails) > 0 && requestDetails[0] != nil {
+		details["request_diagnostics"] = requestDetails[0]()
+	}
+	payload, err := json.Marshal(details)
 	if err == nil {
 		log.Printf("[account_pool_unavailable] %s", payload)
 	}

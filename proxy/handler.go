@@ -3829,20 +3829,22 @@ func (h *Handler) Responses(c *gin.Context) {
 		defer releaseAPIKeyConcurrency()
 	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	filterTrace := &accountFilterTrace{}
 	var accountFilter auth.AccountFilter
 	if nativeRemoteCompactionV2 {
 		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = filterTrace.wrap("model_support", accountFilter)
+	accountFilter = filterTrace.wrap("model_cooldown", h.withModelCooldownFilter(effectiveModel, accountFilter))
 	if continuationUnavailable {
-		accountFilter = relayOnlyAccountFilter(accountFilter)
+		accountFilter = filterTrace.wrap("continuation_relay_only", relayOnlyAccountFilter(accountFilter))
 	}
-	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
-	accountFilter = excludeClaudeAccountsFilter(accountFilter)
-	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
-	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	accountFilter = filterTrace.wrap("upstream_channel", h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter))
+	accountFilter = filterTrace.wrap("endpoint_protocol", excludeClaudeAccountsFilter(accountFilter))
+	accountFilter = filterTrace.wrap("affinity_group", applyAffinityGroupRouting(c, sessionIdentity, accountFilter))
+	accountFilter = filterTrace.wrap("scope_budget", h.applyScopeBudgetFilter(c, accountFilter))
 	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
 	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
@@ -3851,7 +3853,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	if compactionAffinity.Known {
-		accountFilter = compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter)
+		accountFilter = filterTrace.wrap("compaction_domain", compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter))
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -3952,7 +3954,20 @@ func (h *Handler) Responses(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy)
+			h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy, func() any {
+				return map[string]any{
+					"original_model":           logModel,
+					"effective_model":          effectiveModel,
+					"mapping_applied":          mappingApplied,
+					"native_remote_compaction": nativeRemoteCompactionV2,
+					"upstream_channel":         upstreamChannel,
+					"allow_codex_accounts":     allowCodexAccounts,
+					"continuation_unavailable": continuationUnavailable,
+					"turn_continuation_pinned": turnContinuationPinned,
+					"filter_observations":      filterTrace.snapshot(),
+					"scope":                    "last observed outcomes per account per cumulative filter; not a pool census; stages may short-circuit; Redis/acquisition not observed",
+				}
+			})
 			if isStream && writeCommittedResponsesRetryError(c, noAvailableAccountMessage(effectiveModel)) {
 				return
 			}

@@ -3952,6 +3952,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
+			h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy)
 			if isStream && writeCommittedResponsesRetryError(c, noAvailableAccountMessage(effectiveModel)) {
 				return
 			}
@@ -6690,6 +6691,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
+			h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy)
 			if isStream && writeCommittedChatRetryError(c, noAvailableAccountMessage(effectiveModel)) {
 				return
 			}

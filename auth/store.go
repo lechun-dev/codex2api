@@ -3272,6 +3272,7 @@ type Store struct {
 	routingSchedulerAliases  int
 	routingGeneration        atomic.Uint64
 	indexedMissFallbackNS    atomic.Int64
+	unavailableLogNS         atomic.Int64
 	schedulerEngine          atomic.Value // string: legacy / shadow / indexed
 	schedulerMetrics         *schedulerRuntimeMetrics
 	availability             atomic.Pointer[availabilityHub]

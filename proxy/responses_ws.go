@@ -612,6 +612,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, "Codex 账号用量窗口已达上限", api.ErrorTypeRateLimit)
 			} else {
+				h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy)
 				apiErr = api.NewAPIError(api.ErrCodeServiceUnavailable, noAvailableAccountMessage(effectiveModel), api.ErrorTypeServer)
 			}
 			if !claimContinuousRetrySuccessContext(c.Request.Context()) {

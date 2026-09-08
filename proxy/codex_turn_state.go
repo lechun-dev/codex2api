@@ -41,7 +41,7 @@ func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, accou
 		return
 	}
 	token := ""
-	if headers != nil {
+	if headers != nil && !c.GetBool("suppress_borrowed_turn_state") {
 		token = strings.TrimSpace(headers.Get(codexTurnStateHeader))
 	}
 	if token == "" {
@@ -65,7 +65,7 @@ func (h *Handler) commitResponsesStreamAttempt(c *gin.Context, attempt *continuo
 
 	token := ""
 	stagedHeader := false
-	if headers != nil {
+	if headers != nil && (c == nil || !c.GetBool("suppress_borrowed_turn_state")) {
 		token = strings.TrimSpace(headers.Get(codexTurnStateHeader))
 	}
 	if c != nil && c.Writer != nil && !c.Writer.Written() {

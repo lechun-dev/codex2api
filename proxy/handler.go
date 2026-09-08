@@ -3783,6 +3783,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
 	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	turnContinuationPinned := turnContinuation && turnHasBinding
+	replayableTurn := turnContinuationPinned && canReplayTextContinuation(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -3894,9 +3895,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
 	grokQualityAttempts := 0
+	borrowedContinuation := false
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
+			borrowedContinuation = false
 			affinityGuard = auth.SessionAffinityGuard{}
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
 				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
@@ -3906,7 +3909,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			} else if continuationUnavailable && !relayContinuationAttempted {
 				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			} else if turnContinuationPinned {
-				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				if replayableTurn && !compactionAffinity.Known && !continuationUnavailable && c.Request.Context().Err() == nil {
+					account, stickyProxyURL, affinityGuard, borrowedContinuation = h.store.NextReplayableContinuationWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+				}
+				if account == nil {
+					account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				}
 			} else {
 				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
@@ -4026,6 +4034,16 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
+		c.Set("suppress_borrowed_turn_state", borrowedContinuation)
+		if borrowedContinuation {
+			// 2026-09-08 coder(lq): Never forward the original account's turn state
+			// when borrowing capacity, including its body metadata representation.
+			downstreamHeaders.Del(codexTurnStateHeader)
+			rawBody, _ = sjson.DeleteBytes(rawBody, "client_metadata.x-codex-turn-state")
+			codexBody, _ = sjson.DeleteBytes(codexBody, "client_metadata.x-codex-turn-state")
+			resetOpenAIResponsesBody()
+			log.Printf("[continuation_capacity_borrowed] api_key_id=%d account_id=%d", apiKeyID, account.ID())
+		}
 
 		if account.IsRelayStyle() {
 			relayContinuationAttempted = true

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -1828,6 +1829,15 @@ func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
+func excludeAntigravityAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || account.IsAntigravityAPI() {
+			return false
+		}
+		return inner == nil || inner(account)
+	}
+}
+
 func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
 		if account == nil || !account.IsRelayStyle() {
@@ -2069,6 +2079,9 @@ type streamOutcome struct {
 	// WS 通道下 token 失效表现为上游主动关闭而非 401，需异步跑一次探针确认账号鉴权状态，
 	// 命中 401 才按 unauthorized 冷却，避免失效账号不被封、反复被调度。
 	verifyAccountAuth bool
+	// requestScoped 标记故障由本次请求内容触发（如零输出的 response.incomplete）：
+	// penalize 保持 true 以复用首包前透明重试/换号，但不计入账号健康度。
+	requestScoped bool
 	// terminalLocal marks proxy replay/storage failures; they never affect
 	// upstream retry or account health and must exit as protocol terminal errors.
 	// terminalLocal 标记代理自身的回放/存储失败；它们不参与上游重试或账号健康度，
@@ -2225,6 +2238,12 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 			kind = "client"
 		}
 	}
+	// 零输出的 response.incomplete 由网关改写成 response.failed（见
+	// codex_empty_incomplete.go）：按 502 走透明重试，但不惩罚账号。
+	emptyIncomplete := isEmptyIncompleteFailurePayload(payload)
+	if emptyIncomplete {
+		kind = codexEmptyIncompleteFailureKind
+	}
 	// 400 中"账号不支持该模型"属账号权益问题，冷却后换号重试有意义，视同可重试故障。
 	modelUnsupported := statusCode == http.StatusBadRequest && isCodexModelUnsupportedError(errorBody)
 	return streamOutcome{
@@ -2234,6 +2253,7 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 		failurePayload: append([]byte(nil), payload...),
 		penalize:       !safetyPolicy && (statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500 || modelUnsupported),
 		capacityShed:   !capacityShedHandlingDisabled() && isCapacityShedPayload(payload),
+		requestScoped:  emptyIncomplete,
 	}
 }
 
@@ -2241,7 +2261,7 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 // 例外：它是按模型/身份容量分桶的请求级瞬时信号，换号不改变被降载因素，计入连击只会
 // 在高峰期把整池账号逐个调度降权。跳过上报即"软信号保留、硬惩罚移除"。
 func (h *Handler) reportStreamOutcomeFailure(account *auth.Account, outcome streamOutcome, d time.Duration) {
-	if outcome.capacityShed {
+	if outcome.capacityShed || outcome.requestScoped {
 		return
 	}
 	h.store.ReportRequestFailure(account, outcome.failureKind, d)
@@ -2839,29 +2859,37 @@ func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMe
 	if len(responseJSON) == 0 || len(outputItems) == 0 {
 		return responseJSON
 	}
-	var response map[string]any
-	if err := json.Unmarshal(responseJSON, &response); err != nil {
+	terminalOutput := gjson.GetBytes(responseJSON, "output")
+	terminalCount := int64(-1)
+	if terminalOutput.IsArray() {
+		terminalCount = terminalOutput.Get("#").Int()
+	}
+	if terminalCount >= int64(len(outputItems)) {
 		return responseJSON
 	}
-	outputs := make([]any, 0, len(outputItems))
+	outputs := make([]json.RawMessage, 0, len(outputItems))
 	for _, rawItem := range outputItems {
 		if len(rawItem) == 0 || !gjson.ValidBytes(rawItem) {
 			continue
 		}
-		var decoded any
-		if err := json.Unmarshal(rawItem, &decoded); err != nil {
-			continue
-		}
-		outputs = append(outputs, decoded)
+		outputs = append(outputs, rawItem)
 	}
 	if len(outputs) == 0 {
 		return responseJSON
 	}
-	if terminalOutputs, ok := response["output"].([]any); ok && len(terminalOutputs) >= len(outputs) {
+	if terminalCount >= int64(len(outputs)) {
 		return responseJSON
 	}
-	response["output"] = outputs
-	restored, err := json.Marshal(response)
+	if firstNonSpace(responseJSON) != '{' || !gjson.ValidBytes(responseJSON) {
+		return responseJSON
+	}
+	encoded, err := json.Marshal(outputs)
+	if err != nil {
+		return responseJSON
+	}
+	// Patch only output. Large usage/attribution trees stay opaque, preserving
+	// unknown fields and exact JSON numbers while avoiding a full map round trip.
+	restored, err := sjson.SetRawBytes(responseJSON, "output", encoded)
 	if err != nil {
 		return responseJSON
 	}
@@ -3020,6 +3048,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		h.Responses(c)
 	})
 	codexDirect.GET("/:call_id", h.LiveSideband)
+
+	// Native Gemini API (Antigravity OAuth accounts only).
+	v1beta := r.Group("/v1beta")
+	v1beta.Use(auth)
+	v1beta.GET("/models", h.GeminiListModels)
+	v1beta.GET("/models/*action", h.GeminiGetModel)
+	v1beta.POST("/models/*action", h.GeminiModelsAction)
 }
 
 // APIKeyAuthMiddleware exposes the standard /v1 API key authentication middleware
@@ -3057,30 +3092,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		authHeader := c.GetHeader("Authorization")
-		// OpenAI-compatible WebSocket clients may carry the API key in the
-		// standard subprotocol list instead of an Authorization header:
-		//   Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.<key>
-		// Only honor it on an actual WebSocket upgrade so an ordinary HTTP
-		// request cannot smuggle authentication through an unrelated header.
-		if authHeader == "" && isResponsesWebSocketUpgradeRequest(c.Request) {
-			if key := apiKeyFromWebSocketSubprotocol(c.GetHeader("Sec-WebSocket-Protocol")); key != "" {
-				authHeader = "Bearer " + key
-			}
-		}
-		// 兼容 Anthropic 客户端的多种认证方式:
-		// - x-api-key: Anthropic SDK 默认方式
-		// - ANTHROPIC_AUTH_TOKEN: Claude Code 通过此环境变量设置，
-		//   实际发送为 Authorization: Bearer <token>（已被上面覆盖）
-		//   或 anthropic-auth-token 自定义 header
-		if authHeader == "" {
-			for _, h := range []string{"x-api-key", "anthropic-auth-token"} {
-				if v := strings.TrimSpace(c.GetHeader(h)); v != "" {
-					authHeader = "Bearer " + v
-					break
-				}
-			}
-		}
+		authHeader := downstreamAuthorizationHeader(c.Request)
 		if authHeader == "" {
 			// Use standardized error format from api package
 			api.SendError(c, api.ErrMissingAPIKey)
@@ -3705,13 +3717,33 @@ func (h *Handler) Responses(c *gin.Context) {
 	upstreamChannel := requestUpstreamChannel(c)
 	var requestModel, mappedModel string
 	var mappingApplied bool
-	if upstreamChannel == database.UpstreamChannelAntigravity {
+	nativeAntigravityModel := false
+	if upstreamChannel == database.UpstreamChannelAuto {
+		if logical, known := antigravityLogicalCompatibilityModel(gjson.GetBytes(rawBody, "model").String()); known {
+			for _, account := range h.store.Accounts() {
+				if !account.IsAntigravityAPI() || !account.AntigravityDispatchEnabled() {
+					continue
+				}
+				for _, variant := range logical.variants {
+					if antigravityAccountSupportsPublicModel(account, logical.id+"-"+variant.level) {
+						nativeAntigravityModel = true
+					}
+				}
+			}
+		}
+	}
+	if upstreamChannel == database.UpstreamChannelAntigravity || nativeAntigravityModel {
 		// Antigravity is a native, fixed public surface. Do not let global Codex
 		// aliases or synthesized reasoning aliases rewrite an Antigravity-only
 		// request before validation; the adapter performs the sole public->wire
 		// translation after an account proves it owns the required backing model.
 		requestModel = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
-		mappedModel = requestModel
+		var foldErr *api.APIError
+		rawBody, mappedModel, foldErr = antigravityFoldLogicalModel(rawBody, requestModel)
+		if foldErr != nil {
+			api.SendError(c, foldErr)
+			return
+		}
 	} else if nativeRemoteCompactionV2 {
 		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	} else {
@@ -3729,7 +3761,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	case database.UpstreamChannelAntigravity:
 		// Antigravity 专用 Key 公开稳定的逻辑模型，同时继续接受旧的固定
 		// effort 别名；raw backing 与 account model_mapping 不是下游模型名。
-		rules["model"] = append(rules["model"], api.ModelValidator(antigravityAcceptedModelIDs()))
+		rules["model"] = append(rules["model"], api.ModelValidator(h.antigravityAcceptedModels()))
 	default:
 		rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	}
@@ -4461,6 +4493,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				streamWriter.diag = streamDiag
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
+				emptyIncomplete := &emptyIncompleteTracker{}
 				readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 					streamDiag.markUpstreamFrame()
 					if continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -4485,6 +4518,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
+					eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 					if isResponsesSuccessTerminalEvent(eventType) {
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -4573,6 +4607,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					if isEmptyIncompleteResponseBody(respBody) {
+						respBody = synthesizeEmptyIncompleteFailureBody(respBody)
+					}
 					nonStreamResponseBody = append([]byte(nil), respBody...)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
@@ -4818,6 +4855,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
@@ -5117,6 +5155,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			preflightSettings := CurrentRuntimeSettings()
 			preflightSettings.ContinuousRetryPolicy = continuousRetryPolicy
 			preflightPassthrough := continuousRetryPreflightPassthrough(preflightSettings)
+			emptyIncomplete := &emptyIncompleteTracker{}
 			forwardWithEvent := func(sseEvent string, data []byte) bool {
 				streamDiag.markUpstreamFrame()
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
@@ -5160,6 +5199,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
 				outputCollector.Add(data)
+				eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 
 				// 提取 usage + service_tier
 				if isResponsesSuccessTerminalEvent(eventType) {
@@ -5405,6 +5445,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var lastResponseData []byte
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
+			emptyIncomplete := &emptyIncompleteTracker{}
 			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
@@ -5436,6 +5477,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -6605,7 +6647,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	responseModel := logModel
 	if model == "" {
-		model = "gpt-5.4"
+		model = defaultAnthropicFallbackModel
 		logModel = model
 		responseModel = model
 	}
@@ -6641,6 +6683,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	// 工具名在转换时可能被净化改写（codex_tool_names.go），响应侧按此表还原。
+	toolNameRestore := ChatToolNameRestoreMap(rawBody)
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
@@ -6805,6 +6849,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
@@ -7140,10 +7185,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var streamAttempt *continuousRetryStreamAttempt
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
+		emptyIncomplete := &emptyIncompleteTracker{}
 		created := time.Now().Unix()
 
 		if isStream {
 			streamTranslator := NewStreamTranslator(chunkID, responseModel, created)
+			streamTranslator.SetToolNameRestore(toolNameRestore)
 			setSSEStreamHeaders(c, "text/event-stream")
 
 			flusher, ok := c.Writer.(http.Flusher)
@@ -7236,6 +7283,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -7367,9 +7415,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var fullContent strings.Builder
 			var fullReasoning strings.Builder
 			var toolCalls []ToolCallResult
+			outputCollector := newResponseOutputCollector()
 			var finishReasonOverride string
 
 			readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+				outputCollector.Add(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				ttftGuard.MarkProgress(eventType)
@@ -7377,6 +7427,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				eventType, data, parsed = rewriteEmptyIncompleteTerminal(emptyIncomplete, eventType, data, parsed)
 				switch eventType {
 				case "response.output_text.delta":
 					delta := parsed.Get("delta").String()
@@ -7397,10 +7448,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					// arguments 若被截断，整次上游响应按协议错误处理，不能把坏调用
 					// 返回并在下一轮继续污染历史。
 					var toolErr error
-					toolCalls, toolErr = ExtractToolCallsFromOutputValidated(data)
+					toolCalls, toolErr = ExtractToolCallsFromOutputValidated(restoreMissingResponseOutputsInEvent(data, outputCollector.Items()))
 					if toolErr != nil {
 						terminalFailurePayload = malformedToolArgumentsFailurePayload(toolErr)
 					}
+					toolCalls = restoreToolCallNames(toolCalls, toolNameRestore)
 					gotTerminal = true
 					preContentErrorCandidate = nil
 					return false
@@ -7418,7 +7470,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponseWithFinishReason(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage, finishReasonOverride)
+			compactResult = BuildCompactChatResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage, finishReasonOverride, actualServiceTier)
 		}
 
 		// 断流检测 + token 估算
@@ -7807,6 +7859,33 @@ func isCodexModelUnsupportedError(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// codexUnsupportedModelRe 匹配上游 "The 'gpt-5.4-mini' model is not supported when
+// using Codex with a ChatGPT account." 里被拒绝的模型名。
+var codexUnsupportedModelRe = regexp.MustCompile(`(?i)the '([^']+)' model is not supported`)
+
+// codexUnsupportedModelFromBody 从"模型不支持"400 里抽出被拒绝的模型名;不是该类
+// 错误或抽不出名字时返回空串。调用方据此区分被拒的是请求模型还是生图驱动主模型。
+func codexUnsupportedModelFromBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "detail").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		if match := codexUnsupportedModelRe.FindStringSubmatch(candidate); len(match) == 2 {
+			return strings.TrimSpace(match[1])
+		}
+	}
+	return ""
 }
 
 func isCodexModelCapacityError(body []byte) bool {
@@ -8659,7 +8738,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 	// middleware (including older embedders); a real key always gets an
 	// isolated, read-only account snapshot.
 	if row := apiKeyRowFromContext(c); row != nil {
-		api.SendList(c, "list", h.scopedModels(ctx, row))
+		api.SendList(c, "list", collapseAntigravityModelChoices(h.scopedModels(ctx, row)))
 		return
 	}
 	modelIDs := h.supportedModelIDs(ctx)
@@ -8672,7 +8751,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 			OwnedBy: "openai",
 		})
 	}
-	api.SendList(c, "list", models)
+	api.SendList(c, "list", collapseAntigravityModelChoices(models))
 }
 
 func (h *Handler) supportedModelIDs(ctx context.Context) []string {
@@ -8750,4 +8829,30 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 		}
 	}
 	return models
+}
+
+// downstreamAuthorizationHeader is shared by authentication and per-key memory
+// namespaces so supported header forms cannot collapse into an anonymous key.
+//
+// 接受的凭据形态:Authorization: Bearer、x-api-key / anthropic-auth-token
+// (Anthropic 系客户端)、x-goog-api-key(google-genai SDK、ADK 与聚合网关的
+// Gemini 渠道打 /v1beta 时的默认头)。不接受 ?key= 查询串:密钥会进 URL 与访问日志。
+func downstreamAuthorizationHeader(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	if value := req.Header.Get("Authorization"); value != "" {
+		return value
+	}
+	if isResponsesWebSocketUpgradeRequest(req) {
+		if key := apiKeyFromWebSocketSubprotocol(req.Header.Get("Sec-WebSocket-Protocol")); key != "" {
+			return "Bearer " + key
+		}
+	}
+	for _, name := range []string{"x-api-key", "anthropic-auth-token", "x-goog-api-key"} {
+		if value := strings.TrimSpace(req.Header.Get(name)); value != "" {
+			return "Bearer " + value
+		}
+	}
+	return ""
 }

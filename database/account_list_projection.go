@@ -46,7 +46,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			avatar_url text, verified_email boolean, project_id text,
 			antigravity_sync_error text, antigravity_sync_warning text,
 			antigravity_permissions text, antigravity_entitlements text, antigravity_quota text,
-			claude_usage_probe_at text, claude_usage_probe_error text
+			claude_usage_probe_at text, claude_usage_probe_error text,
+			claude_auth_kind text
 		)`
 	credentialColumns := `
 		COALESCE(account_public.upstream_type, ''),
@@ -65,7 +66,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(NULLIF(account_public.antigravity_permissions, ''), account_public.antigravity_entitlements, ''),
 		COALESCE(account_public.antigravity_quota, ''),
 		COALESCE(account_public.claude_usage_probe_at, ''),
-		COALESCE(account_public.claude_usage_probe_error, '')`
+		COALESCE(account_public.claude_usage_probe_error, ''),
+		COALESCE(account_public.claude_auth_kind, '')`
 	if db.isSQLite() {
 		upstreamExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 		fromClause = `FROM accounts`
@@ -86,7 +88,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			COALESCE(NULLIF(json_extract(credentials, '$.antigravity_permissions'), ''), json_extract(credentials, '$.antigravity_entitlements'), '{}'),
 			COALESCE(json_extract(credentials, '$.antigravity_quota'), '{}'),
 			COALESCE(json_extract(credentials, '$.claude_usage_probe_at'), ''),
-			COALESCE(json_extract(credentials, '$.claude_usage_probe_error'), '')`
+			COALESCE(json_extract(credentials, '$.claude_usage_probe_error'), ''),
+			COALESCE(json_extract(credentials, '$.claude_auth_kind'), '')`
 	}
 	switch channel {
 	case UpstreamChannelGrok:
@@ -157,7 +160,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	var upstreamType, email, baseURL, planType, schedulerPriority string
 	var avatarURL, projectID string
 	var antigravitySyncError, antigravitySyncWarning, antigravityPermissions, antigravityQuota string
-	var claudeUsageProbeAt, claudeUsageProbeError string
+	var claudeUsageProbeAt, claudeUsageProbeError, claudeAuthKind string
 	var modelsRaw interface{}
 	var hasAPIKey, hasRefreshToken, verifiedEmail bool
 	if err := scanner.Scan(
@@ -168,7 +171,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		&hasAPIKey, &hasRefreshToken, &schedulerPriority,
 		&avatarURL, &verifiedEmail, &projectID,
 		&antigravitySyncError, &antigravitySyncWarning, &antigravityPermissions, &antigravityQuota,
-		&claudeUsageProbeAt, &claudeUsageProbeError,
+		&claudeUsageProbeAt, &claudeUsageProbeError, &claudeAuthKind,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
@@ -194,6 +197,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		"antigravity_quota":        antigravityQuota,
 		"claude_usage_probe_at":    claudeUsageProbeAt,
 		"claude_usage_probe_error": claudeUsageProbeError,
+		"claude_auth_kind":         claudeAuthKind,
 	})
 	return row, nil
 }
@@ -237,6 +241,7 @@ func projectAccountCredentials(credentials map[string]interface{}) map[string]in
 	for _, key := range []string{
 		"avatar_url", "project_id", "antigravity_sync_error", "antigravity_sync_warning",
 		"antigravity_permissions", "antigravity_quota", "claude_usage_probe_at", "claude_usage_probe_error",
+		"claude_auth_kind",
 	} {
 		if value := credentials[key]; value != nil && strings.TrimSpace(projectionStringValue(value)) != "" {
 			projected[key] = value

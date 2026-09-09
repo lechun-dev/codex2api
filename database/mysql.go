@@ -22,6 +22,9 @@ const (
 )
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	// 2026-09-09 coder(lq): New upstream JSON settings use reader fallbacks instead of unsupported TEXT defaults.
+	{table: "system_settings", name: "channel_test_config", def: "TEXT NULL"},
+	{table: "system_settings", name: "antigravity_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "grok_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "claude_config", def: "TEXT NULL"},
 	// 2026-09-03 coder(lq): Keep the Antigravity OAuth JSON setting available in existing MySQL 5.6 schemas.
@@ -545,6 +548,12 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	if err := db.ensureMySQLColumnDefault(ctx, "system_settings", "test_model", "gpt-5.5", "VARCHAR(100) DEFAULT 'gpt-5.5'"); err != nil {
+		return err
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE system_settings SET test_model = 'gpt-5.5' WHERE LOWER(COALESCE(test_model, '')) IN ('gpt-5.4', 'gpt-5.4-mini')`); err != nil {
+		return err
+	}
 	// Only move untouched, disabled review settings to the new upstream default.
 	if _, err := db.conn.ExecContext(ctx, `
 		UPDATE system_settings
@@ -750,7 +759,7 @@ func systemSettingsMySQLDDL() string {
 		grok_config TEXT NULL,
 		max_concurrency INT DEFAULT 2,
 		global_rpm INT DEFAULT 0,
-		test_model VARCHAR(100) DEFAULT 'gpt-5.4',
+		test_model VARCHAR(100) DEFAULT 'gpt-5.5',
 		test_concurrency INT DEFAULT 50,
 		proxy_url VARCHAR(500) DEFAULT '',
 		pg_max_conns INT DEFAULT 50,
@@ -877,6 +886,8 @@ func systemSettingsMySQLDDL() string {
 		github_proxy_url TEXT NULL,
 		invite_guide_config TEXT NULL,
 		visible_channels_config TEXT NULL,
+		channel_test_config TEXT NULL,
+		antigravity_config TEXT NULL,
 		codex_overload_pause_enabled TINYINT(1) DEFAULT 0,
 		codex_overload_threshold_percent INT DEFAULT 20,
 		codex_overload_pause_minutes INT DEFAULT 30,

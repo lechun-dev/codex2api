@@ -60,7 +60,7 @@ func TestResponsesWebSocketStreamBreakReturnsFailedTerminalAndKeepsConnection(t 
 		MaxRetries:          0,
 		MaxRateLimitRetries: 0,
 		TestConcurrency:     1,
-		TestModel:           "gpt-5.4",
+		TestModel:           "gpt-5.5",
 	})
 	t.Cleanup(store.Stop)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
@@ -82,7 +82,7 @@ func TestResponsesWebSocketStreamBreakReturnsFailedTerminalAndKeepsConnection(t 
 	t.Cleanup(func() { _ = conn.Close() })
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"first"}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"first"}`)); err != nil {
 		t.Fatalf("write first request: %v", err)
 	}
 	failed := readResponsesWSTerminalEvent(t, conn)
@@ -95,7 +95,7 @@ func TestResponsesWebSocketStreamBreakReturnsFailedTerminalAndKeepsConnection(t 
 
 	// 2026-09-08 coder(lq): A failed turn must not force Codex to reconnect the
 	// transport; the next response.create should complete on the same connection.
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"second"}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"second"}`)); err != nil {
 		t.Fatalf("write second request on reused connection: %v", err)
 	}
 	completed := readResponsesWSTerminalEvent(t, conn)

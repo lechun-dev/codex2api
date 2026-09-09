@@ -5,6 +5,7 @@ import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, B
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
+import { buildVersionLabel } from '../lib/buildVersion'
 import { useTheme } from '../hooks/useTheme'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useToast } from '../hooks/useToast'
@@ -375,7 +376,7 @@ export default function Layout({ children }: PropsWithChildren) {
                         tabIndex={sidebarCollapsed ? -1 : 0}
                         onClick={() => setShowVersionPopover((current) => !current)}
                       >
-                        {__APP_VERSION__}
+                        {buildVersionLabel(__APP_VERSION__)}
                       </button>
                       {showVersionPopover && versionPopoverPos && createPortal(
                         <div
@@ -611,7 +612,7 @@ export default function Layout({ children }: PropsWithChildren) {
                 title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
                 onClick={() => setShowVersionPopover((current) => !current)}
               >
-                {__APP_VERSION__}
+                {buildVersionLabel(__APP_VERSION__)}
               </button>
             </div>
             <div className="flex shrink-0 items-center gap-0.5">
@@ -753,7 +754,7 @@ export default function Layout({ children }: PropsWithChildren) {
                     {t('common.online')}
                   </span>
                   <span className="font-mono text-[11px] font-semibold">
-                    v{__APP_VERSION__}
+                    {buildVersionLabel(__APP_VERSION__)}
                   </span>
                 </div>
               </div>

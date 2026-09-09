@@ -95,6 +95,10 @@ func TestGetAccountPageStatsBackfillsMissingOfficialUsage(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	ageAccountForOfficialUsage(t, store, codexID)
 
 	var mu sync.Mutex
@@ -166,6 +170,10 @@ func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	ageAccountForOfficialUsage(t, store, id)
 
 	var mu sync.Mutex
@@ -186,7 +194,8 @@ func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for !handler.whamDailySyncedOnceFor(id) {
 		if time.Now().After(deadline) {
-			t.Fatal("empty upstream sync did not mark the account as synced")
+			account := store.FindByID(id)
+			t.Fatalf("empty upstream sync did not mark the account as synced: eligible=%v status=%s age=%s", whamDailyUsageAutoRefreshEligible(account, time.Now()), account.RuntimeStatus(), time.Since(time.Unix(0, account.AddedAt)))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -232,6 +241,10 @@ func TestWhamDailyBackfillFailureCooldownSkipsRetry(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	ageAccountForOfficialUsage(t, store, id)
 
 	var mu sync.Mutex
@@ -313,6 +326,10 @@ func TestGetAccountPageStatsSkipsOfficialBackfillForNewAccounts(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
 		t.Fatal("new account must not hit official usage upstream")
 		return nil, nil, nil
@@ -342,6 +359,10 @@ func TestGetAccountPageStatsSkipsOfficialBackfillForCodexAT(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	ageAccountForOfficialUsage(t, store, id)
 	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
 		t.Fatal("codex_at account must not hit official usage upstream")
@@ -390,6 +411,10 @@ func TestGetAccountPageStatsSkipsOfficialBackfillWhenSnapshotExists(t *testing.T
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
 		t.Fatal("existing snapshot must not hit upstream")
 		return nil, nil, nil
@@ -432,6 +457,10 @@ func TestGetAccountPageStatsOfficialUSDIncludesOlderSnapshots(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 	handler.queryWhamDailyUsage = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error) {
 		t.Fatal("existing snapshot must not hit upstream")
 		return nil, nil, nil
@@ -486,6 +515,10 @@ func TestGetAccountPageStatsIncludesTodayModelCounts(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
 	handler := NewHandler(store, db, tokenCache, nil, "")
+	// 2026-09-09 coder(lq): Do not contact the live breakdown endpoint in unit tests.
+	handler.queryWhamDailyTokenBreakdown = func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyTokenBreakdownResponse, *http.Response, error) {
+		return &proxy.WhamDailyTokenBreakdownResponse{}, nil, nil
+	}
 
 	stats := invokeAccountPageStats(t, handler, []int64{id})
 	today := stats[strconv.FormatInt(id, 10)].UsageTodayDetail

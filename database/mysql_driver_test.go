@@ -579,6 +579,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		ClaudeConfig:                        `{"base_url":"https://claude.example.test"}`,
 		SchedulerEngine:                     "outbox",
 		CodexRequestCompression:             true,
+		CodexImagesMainModel:                "gpt-5.6-luna",
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -618,16 +619,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"session_affinity_spread = VALUES(session_affinity_spread)",
 		"scheduler_engine = VALUES(scheduler_engine)",
 		"codex_request_compression = VALUES(codex_request_compression)",
+		"codex_images_main_model = VALUES(codex_images_main_model)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 123 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 123", got)
+	if got := strings.Count(capture.query, "?"); got != 124 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 124", got)
 	}
-	if len(capture.args) != 123 {
-		t.Fatalf("rewritten settings argument count = %d, want 123", len(capture.args))
+	if len(capture.args) != 124 {
+		t.Fatalf("rewritten settings argument count = %d, want 124", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -642,6 +644,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.AutoActivate5hWindowEnabled,
 		settings.SchedulerEngine,
 		settings.CodexRequestCompression,
+		settings.CodexImagesMainModel,
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}
@@ -740,6 +743,9 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		ConversationID:         "conversation-1",
 		PreviousResponseID:     "response-1",
 		RequestText:            "hello",
+		ImageInputTokens:       123,
+		ImageOutputTokens:      456,
+		CachedImageInputTokens: 78,
 		HasCompactionHistory:   true,
 		WsAcquireMs:            1234,
 		ClientUserAgent:        "Codex Desktop/0.144.2",
@@ -764,6 +770,9 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		"internal_reason",
 		"parent_request_id",
 		"prompt_policy_incident_id",
+		"image_input_tokens",
+		"image_output_tokens",
+		"cached_image_input_tokens",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten usage-log insert missing %q: %s", fragment, capture.query)
@@ -774,6 +783,18 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 	}
 	if len(capture.args) != usageLogInsertColumnCount {
 		t.Fatalf("rewritten usage-log argument count = %d, want %d", len(capture.args), usageLogInsertColumnCount)
+	}
+	// 2026-09-09 coder(lq): Match values by column so image additions cannot shift existing audit fields.
+	columns := strings.Split(strings.SplitN(strings.SplitN(capture.query, "(", 2)[1], ")", 2)[0], ",")
+	for i, column := range columns {
+		want, ok := map[string]interface{}{
+			"image_input_tokens": int64(123), "image_output_tokens": int64(456),
+			"cached_image_input_tokens": int64(78), "session_id": entry.SessionID,
+			"conversation_id": entry.ConversationID, "request_text": entry.RequestText,
+		}[strings.TrimSpace(column)]
+		if ok && capture.args[i].Value != want {
+			t.Fatalf("column %s = %#v, want %#v", column, capture.args[i].Value, want)
+		}
 	}
 	// 2026-09-05 coder(lq): Keep the assertion aligned with the request/proxy trace columns appended to usage_logs.
 	wantTail := []interface{}{

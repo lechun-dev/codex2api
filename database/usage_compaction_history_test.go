@@ -153,9 +153,8 @@ func TestUsageLogCompactionStatesRoundTripAndFilter(t *testing.T) {
 }
 
 func TestUsageLogInsertColumnCountIncludesCompactionHistory(t *testing.T) {
-	// 2026-09-05 coder(lq): Keep the expected usage-log shape aligned with request/proxy trace fields.
-	// 50 legacy columns + 2 cache-write fields + 4 request/proxy trace fields.
-	const want = 60
+	// 2026-09-09 coder(lq): Preserve the 60 local columns and add three image-token fields.
+	const want = 63
 	if usageLogInsertColumnCount != want {
 		t.Fatalf("usageLogInsertColumnCount = %d, want %d", usageLogInsertColumnCount, want)
 	}

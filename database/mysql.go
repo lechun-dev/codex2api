@@ -22,6 +22,8 @@ const (
 )
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	// 2026-09-09 coder(lq): Use VARCHAR so MySQL 5.6 supports the empty deployment-default value.
+	{table: "system_settings", name: "codex_images_main_model", def: "VARCHAR(128) DEFAULT ''"},
 	// 2026-09-09 coder(lq): New upstream JSON settings use reader fallbacks instead of unsupported TEXT defaults.
 	{table: "system_settings", name: "channel_test_config", def: "TEXT NULL"},
 	{table: "system_settings", name: "antigravity_config", def: "TEXT NULL"},
@@ -185,6 +187,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			image_width INT DEFAULT 0,
 			image_height INT DEFAULT 0,
 			image_bytes INT DEFAULT 0,
+			image_input_tokens INT DEFAULT 0,
+			image_output_tokens INT DEFAULT 0,
+			cached_image_input_tokens INT DEFAULT 0,
 			image_format VARCHAR(100) DEFAULT '',
 			image_size VARCHAR(32) DEFAULT '',
 			account_billed DOUBLE DEFAULT 0,
@@ -403,6 +408,9 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "image_width", "INT DEFAULT 0"},
 		{"usage_logs", "image_height", "INT DEFAULT 0"},
 		{"usage_logs", "image_bytes", "INT DEFAULT 0"},
+		{"usage_logs", "image_input_tokens", "INT DEFAULT 0"},
+		{"usage_logs", "image_output_tokens", "INT DEFAULT 0"},
+		{"usage_logs", "cached_image_input_tokens", "INT DEFAULT 0"},
 		{"usage_logs", "image_format", "VARCHAR(100) DEFAULT ''"},
 		{"usage_logs", "image_size", "VARCHAR(32) DEFAULT ''"},
 		{"usage_logs", "account_billed", "DOUBLE DEFAULT 0"},
@@ -808,6 +816,7 @@ func systemSettingsMySQLDDL() string {
 		client_compat_mode VARCHAR(20) DEFAULT 'preserve',
 		codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1',
 		codex_user_agent_config TEXT NULL,
+		codex_images_main_model VARCHAR(128) DEFAULT '',
 		usage_log_mode VARCHAR(20) DEFAULT 'full',
 		usage_log_batch_size INT DEFAULT 200,
 		usage_log_flush_interval_seconds INT DEFAULT 5,

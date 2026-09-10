@@ -1274,6 +1274,34 @@ func TestPrepareOpenAIResponsesBody_NormalizesLegacyImageContentPart(t *testing.
 	}
 }
 
+func TestPrepareOpenAIResponsesBodyRepairsToolOutputMissingCallID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-terra",
+		"previous_response_id":"resp_previous",
+		"input":[
+			{"type":"function_call_output","output":"missing id result"},
+			{"type":"function_call_output","call_id":"call_upstream","output":"valid continuation"}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("missing-call-id output type = %q, want message; body=%s", typ, got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(text, "missing id result") {
+		t.Fatalf("repaired message should retain output, got %q; body=%s", text, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call_output" {
+		t.Fatalf("valid continuation output type = %q, want function_call_output; body=%s", typ, got)
+	}
+	if callID := gjson.GetBytes(got, "input.1.call_id").String(); callID != "call_upstream" {
+		t.Fatalf("valid continuation call_id = %q, want call_upstream; body=%s", callID, got)
+	}
+	if prevID := gjson.GetBytes(got, "previous_response_id").String(); prevID != "resp_previous" {
+		t.Fatalf("previous_response_id = %q, want resp_previous; body=%s", prevID, got)
+	}
+}
+
 func TestPrepareOpenAIResponsesBody_ImageGenerationToolChoiceInjectsTool(t *testing.T) {
 	tests := []struct {
 		name string

@@ -1179,6 +1179,33 @@ func orphanToolOutputAsMessage(callID string, output any) map[string]any {
 	}
 }
 
+// 2026-09-10 coder(lq): Relay requests may carry valid outputs whose calls live
+// in upstream previous_response_id state. Only downgrade outputs that cannot be
+// valid in any context because call_id is absent; leave all other pairing alone.
+func repairResponsesToolOutputsMissingCallID(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok || len(inputItems) == 0 {
+		return false
+	}
+
+	modified := false
+	for index, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || !isCodexToolCallOutputType(strings.TrimSpace(firstNonEmptyAnyString(item["type"]))) {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(item["call_id"])) != "" {
+			continue
+		}
+		inputItems[index] = orphanToolOutputAsMessage("", item["output"])
+		modified = true
+	}
+	if modified {
+		body["input"] = inputItems
+	}
+	return modified
+}
+
 // flattenToolOutputText 把 *_call_output 的 output 字段拍平成纯文本。
 // output 可能是 string，也可能是 [{type:"output_text",text:"..."}] 形式的内容数组。
 func flattenToolOutputText(output any) string {
@@ -2533,6 +2560,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
+	repairResponsesToolOutputsMissingCallID(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
 		ensureResponsesImageGenerationTool(body)
 	}

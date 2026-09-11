@@ -577,15 +577,19 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	grokQualityAttempts := 0
 	var lastClaudePolicyErr *Error
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolAnthropic) {
+				return
+			}
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
 				return
 			}

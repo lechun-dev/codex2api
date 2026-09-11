@@ -1634,7 +1634,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				return
 			}
 			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
-			account, stickyProxyURL = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
+			var selectionErr error
+			account, stickyProxyURL, selectionErr = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+				return
+			}
 			if account != nil && c.Request.Context().Err() != nil {
 				h.store.Release(account)
 				if continuousRetryDeadlineExceeded(c.Request.Context()) {

@@ -581,6 +581,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "upstream_request_id", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_proxy_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_proxy_name", "TEXT DEFAULT ''"},
+		{"usage_logs", "user_billing_mode", "TEXT DEFAULT ''"},
+		{"usage_logs", "image_unit_price", "REAL DEFAULT 0"},
+		{"usage_logs", "billed_image_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_width", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_height", "INTEGER DEFAULT 0"},
@@ -1129,9 +1132,10 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 
 // getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
 // rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
-func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool) (*UsageStats, error) {
+func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool, dim UsageLogFilter) (*UsageStats, error) {
 	now := time.Now()
 	explicitRange := !rangeStart.IsZero()
+	dimFiltered := dim.HasDimensionFilter()
 	if rangeStart.IsZero() {
 		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	}
@@ -1147,7 +1151,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0)
-	FROM usage_logs WHERE created_at >= $1 AND status_code <> 499
+	FROM usage_logs u WHERE created_at >= $1 AND status_code <> 499
 	  AND TRIM(COALESCE(internal_reason, '')) = ''`
 	args := []interface{}{db.timeArg(rangeStart), db.timeArg(minuteAgo)}
 	if !rangeEnd.IsZero() {
@@ -1157,6 +1161,13 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 	if channel != "" {
 		query += fmt.Sprintf(" AND channel = $%d", len(args)+1)
 		args = append(args, channel)
+	}
+	if dimFiltered {
+		dimParts, dimArgs := usageLogDimensionWhere(dim, len(args)+1)
+		for _, part := range dimParts {
+			query += " AND " + part
+		}
+		args = append(args, dimArgs...)
 	}
 
 	stats := &UsageStats{}
@@ -1196,7 +1207,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 	if stats.TotalRequests > 0 {
 		stats.TotalCacheRate = float64(rollup.CacheHitRequests) / float64(stats.TotalRequests) * 100
 	}
-	if !explicitRange && rollup.FirstTokenSamples > 0 {
+	if !explicitRange && !dimFiltered && rollup.FirstTokenSamples > 0 {
 		stats.AvgFirstTokenMs = rollup.FirstTokenMsSum / float64(rollup.FirstTokenSamples)
 	}
 	if stats.TotalRequests > 0 {
@@ -1204,11 +1215,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel)
+		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
 		if err != nil {
 			return nil, err
 		}
-		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel); err != nil {
+		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}
 	} else {

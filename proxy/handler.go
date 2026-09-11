@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/sync/singleflight"
 )
 
 const consoleUpstreamErrorLogMaxBytes = 4 * 1024
@@ -52,20 +54,24 @@ func upstreamErrorConsoleBody(body []byte) string {
 
 // Handler API 路由处理器
 type Handler struct {
-	store        *auth.Store
-	configKeys   map[string]bool // 配置文件中的静态 key
-	db           *database.DB
-	cfg          *config.Config       // 全局配置
-	deviceCfg    *DeviceProfileConfig // 设备指纹配置
-	cache        cache.TokenCache     // Redis/Memory 运行态缓存
+	store           *auth.Store
+	configKeys      map[string]bool // 配置文件中的静态 key
+	db              *database.DB
+	cfg             *config.Config       // 全局配置
+	deviceCfg       *DeviceProfileConfig // 设备指纹配置
+	cache           cache.TokenCache     // Redis/Memory 运行态缓存
 	// 2026-09-03 coder(lq): 会话记录器独立于请求路径，避免串到热路径上的 DB 写。
-	convRecorder *conversationRecorder
-	apiKeyGateMu sync.Mutex
-	promptRiskMu sync.Mutex
-	apiKeyGate   *apiKeyConcurrencyLimiter
-	scopeUsageMu sync.Mutex
-	scopeUsage   *apiKeyScopeUsageTracker
-	liveStore    *liveCallStore
+	convRecorder    *conversationRecorder
+	apiKeyLookups   singleflight.Group
+	authCache       *apiKeyAuthCache
+	apiKeyGateMu    sync.Mutex
+	promptRiskMu    sync.Mutex
+	apiKeyGate      *apiKeyConcurrencyLimiter
+	scopeUsageMu    sync.Mutex
+	scopeUsage      *apiKeyScopeUsageTracker
+	scopeDeltaInit  sync.Once
+	scopeDeltaSlots chan struct{}
+	liveStore       *liveCallStore
 	// Responses WebSocket 同作用域会话的本机抢占注册表；跨实例所有权由 runtime cache 协调。
 	responsesWSSessionPreemptions responsesWSSessionPreemptRegistry
 	// 指纹重放冷却的存在性闸门缓存(见 hasActiveFingerprintReplayLocks)。
@@ -455,17 +461,33 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 }
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
-	candidates := compactMappingCandidates(originalModel, effectiveModel)
-	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
-		return resolveAccountCompactModelMappingForCandidates(account, candidates)
-	})
+	inner := accountFilterForInlineCompactionModelWithOriginal(originalModel, effectiveModel, allowCodexAccounts)
 	return func(account *auth.Account) bool {
-		// Grok/Antigravity 上游都没有 Responses compact 适配器。尤其不能让
-		// Antigravity Google bearer 落入官方 Codex executor。
-		if account.IsGrokAPI() || account.IsAntigravityAPI() || account.IsClaudeOAuth() {
+		// The dedicated compact executor has no Grok adapter. Inline compaction
+		// on ordinary Responses has a separate provider capability boundary.
+		return account != nil && !account.IsGrokAPI() && inner(account)
+	}
+}
+
+func accountFilterForInlineCompactionModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	candidates := compactMappingCandidates(originalModel, effectiveModel)
+	resolveMapping := func(account *auth.Account) (string, bool) {
+		return resolveAccountCompactModelMappingForCandidates(account, candidates)
+	}
+	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, resolveMapping)
+	return func(account *auth.Account) bool {
+		if account == nil || account.IsAntigravityAPI() || account.IsClaudeOAuth() || !inner(account) {
 			return false
 		}
-		return inner(account)
+		if account.IsGrokAPI() {
+			model := effectiveModel
+			if mapped, ok := resolveMapping(account); ok {
+				model = mapped
+			}
+			// Chat/Messages conversion cannot represent compaction_trigger.
+			return ResolveGrokUpstreamRoute(account, model, GrokProtocolResponses, time.Now()).Protocol == GrokProtocolResponses
+		}
+		return true
 	}
 }
 
@@ -999,6 +1021,12 @@ func forwardGrokNativeResponse(c *gin.Context, resp *http.Response, protocol Gro
 }
 
 func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher) (*UsageInfo, streamOutcome, bool, int) {
+	return forwardGrokNativeResponseObserved(c, resp, protocol, streaming, startedAt, firstVisible, output, outputFlusher, nil)
+}
+
+// observe stages metadata without changing the provider's wire bytes. The
+// handler commits that metadata only after this attempt and its replay succeed.
+func forwardGrokNativeResponseObserved(c *gin.Context, resp *http.Response, protocol GrokProtocol, streaming bool, startedAt time.Time, firstVisible func(), output io.Writer, outputFlusher http.Flusher, observe func([]byte)) (*UsageInfo, streamOutcome, bool, int) {
 	privateAttempt := output != nil && output != c.Writer
 	resp.Header.Del(grokNativeRouteHeader)
 	if !streaming {
@@ -1018,7 +1046,15 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 		if contentType == "" {
 			contentType = "application/json"
 		}
-		c.Data(resp.StatusCode, contentType, body)
+		c.Header("Content-Type", contentType)
+		c.Status(resp.StatusCode)
+		written, writeErr := c.Writer.Write(body)
+		if writeErr != nil {
+			return usage, classifyStreamOutcome(nil, nil, writeErr, true), written > 0, 0
+		}
+		if observe != nil {
+			observe(body)
+		}
 		return usage, streamOutcome{logStatusCode: http.StatusOK}, len(body) > 0, 0
 	}
 	if !privateAttempt {
@@ -1078,6 +1114,9 @@ func forwardGrokNativeResponseTo(c *gin.Context, resp *http.Response, protocol G
 	}
 	readErr := readRawGrokSSEFramesWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(frame rawGrokSSEFrame) bool {
 		if frame.HasData && !frame.Done {
+			if observe != nil {
+				observe(frame.Data)
+			}
 			usage = mergeGrokNativeUsage(usage, grokNativeUsage(protocol, frame.Data))
 			if auth.NormalizeGrokProtocol(string(protocol)) == GrokProtocolResponses &&
 				strings.EqualFold(normalizedUpstreamSSEEventType(frame.Event, frame.Data), "response.created") {
@@ -1235,6 +1274,13 @@ func (h *Handler) SetRuntimeCache(tc cache.TokenCache) {
 		return
 	}
 	h.cache = tc
+	if h.authCache != nil {
+		h.authCache.close()
+		h.authCache = nil
+	}
+	if h.cfg != nil && h.cfg.APIKeyAuthCacheEnabled && h.db != nil {
+		h.authCache = newAPIKeyAuthCache(h.db, tc)
+	}
 }
 
 // NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
@@ -1257,7 +1303,7 @@ func (h *Handler) Close() {
 //
 // 关键：绝不能把"数据库连接耗尽/超时"这类暂时性故障当成"客户端 key 无效"
 // 返回 401，否则压测或 DB 抖动时客户端会误以为自己的凭证失效（issue #323）。
-func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
+func (h *Handler) resolveAPIKeyUnshared(key string) (*database.APIKeyRow, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, false, nil
@@ -1366,8 +1412,25 @@ func (h *Handler) isValidKey(key string) bool {
 
 // hasAnyKeys 检查是否配置了任何密钥
 func (h *Handler) hasAnyKeys() bool {
+	configured, err := h.hasAnyKeysWithError()
+	return err == nil && configured
+}
+
+func (h *Handler) hasAnyKeysWithError() (bool, error) {
 	if len(h.configKeys) > 0 {
-		return true
+		return true, nil
+	}
+	if h.authCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for i := 0; i < 3; i++ {
+			state, _, err := h.authCache.revision(ctx)
+			if errors.Is(err, errAPIKeyAuthRetry) {
+				continue
+			}
+			return state.KeyCount > 0, err
+		}
+		return false, errAPIKeyAuthRetry
 	}
 	if h.cache != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -1378,19 +1441,19 @@ func (h *Handler) hasAnyKeys() bool {
 		} else if ok {
 			var record apiKeyCountRuntimeRecord
 			if err := json.Unmarshal(raw, &record); err == nil {
-				return record.Count > 0
+				return record.Count > 0, nil
 			}
 		}
 	}
 	if h.db == nil {
-		return false
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	count, err := h.db.CountAPIKeys(ctx)
 	if err != nil {
 		log.Printf("统计 API Key 数量失败: %v", err)
-		return false
+		return false, err
 	}
 	if h.cache != nil {
 		payload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: count})
@@ -1400,7 +1463,7 @@ func (h *Handler) hasAnyKeys() bool {
 		}
 		cacheCancel()
 	}
-	return count > 0
+	return count > 0, nil
 }
 
 // logUsage 记录请求日志（非阻塞，写入内存缓冲由后台批量 flush）
@@ -1413,6 +1476,7 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	// failure and transport-retry paths cannot accidentally omit it. A retry
 	// that switches accounts naturally resolves the replacement account here.
 	// Non-Grok and unresolved accounts deliberately remain legacy/unscoped (0).
+	input = database.SnapshotUsageLogBilling(input)
 	h.populateUsageCredentialGeneration(input)
 	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
 	h.recordAPIKeyScopeUsage(input)
@@ -1497,6 +1561,10 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateUpstreamTrace(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
+	input = database.SnapshotUsageLogBilling(input)
+	if deferImageUsage(c, h, input) {
+		return
+	}
 	h.logUsage(input)
 }
 
@@ -3066,19 +3134,35 @@ func (h *Handler) APIKeyAuthMiddleware() gin.HandlerFunc {
 	return h.authMiddleware()
 }
 
+// APIKeyReadAuthMiddleware permits exhausted keys to retrieve their own stored
+// results. All other authentication checks remain in force; writes stay blocked.
+func (h *Handler) APIKeyReadAuthMiddleware() gin.HandlerFunc {
+	return h.authMiddlewareWithQuotaRead(true)
+}
+
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
 //
 // 安全策略（fail-closed）：
 //   - 默认情况下，未配置任何 API Key 时直接拒绝请求（503），避免裸奔账号池。
 //   - 仅当显式设置 CODEX_ALLOW_ANONYMOUS=true 时才在无密钥情况下放行（兼容内网/测试）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
+	return h.authMiddlewareWithQuotaRead(false)
+}
+
+func (h *Handler) authMiddlewareWithQuotaRead(allowQuotaRead bool) gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
 		attachUserAgentAudit(c)
 		attachWsAcquireAudit(c)
 		attachUpstreamTrace(c, h.store)
 		// 如果没有配置任何密钥
-		if !h.hasAnyKeys() {
+		hasKeys, presenceErr := h.hasAnyKeysWithError()
+		if presenceErr != nil {
+			api.SendError(c, api.ErrServiceUnavailable)
+			c.Abort()
+			return
+		}
+		if !hasKeys {
 			if allowAnonymous {
 				// 显式允许匿名访问（旧行为，仅在 CODEX_ALLOW_ANONYMOUS=true 时启用）
 				c.Next()
@@ -3107,7 +3191,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		authHeader = security.SanitizeInput(authHeader)
 
 		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-		apiKeyRow, ok, resolveErr := h.resolveAPIKey(key)
+		apiKeyRow, ok, resolveErr := h.resolveAPIKeyContext(c.Request.Context(), key)
 		if resolveErr != nil {
 			// DB/基础设施暂时性故障：返回 503，不当成客户端 key 无效（issue #323）。
 			// 不记 AUTH_FAILED 审计日志，避免污染凭证攻击告警。
@@ -3138,7 +3222,8 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if apiKeyRow.IsQuotaExhausted() {
+		readOnly := allowQuotaRead && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead)
+		if apiKeyRow.IsQuotaExhausted() && !readOnly {
 			maskedKey := security.MaskAPIKey(key)
 			security.SecurityAuditLog("AUTH_FAILED_QUOTA_EXHAUSTED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
 			api.SendError(c, api.NewAPIError(api.ErrCodeRateLimitReached, "API key quota exhausted", api.ErrorTypeRateLimit))
@@ -3868,7 +3953,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	filterTrace := &accountFilterTrace{}
 	var accountFilter auth.AccountFilter
 	if nativeRemoteCompactionV2 {
-		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+		accountFilter = accountFilterForInlineCompactionModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
@@ -3890,6 +3975,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	if compactionAffinity.Known {
 		accountFilter = filterTrace.wrap("compaction_domain", compactionDomainFilter(compactionAffinity.CompatibilityDomain, accountFilter))
+		c.Request = c.Request.WithContext(withCompactionAffinity(c.Request.Context(), compactionAffinity))
 	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -3929,6 +4015,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	grokQualityAttempts := 0
 	borrowedContinuation := false
 	for attempt := 0; ; attempt++ {
@@ -3948,13 +4035,16 @@ func (h *Handler) Responses(c *gin.Context) {
 					account, stickyProxyURL, affinityGuard, borrowedContinuation = h.store.NextReplayableContinuationWithDispatch(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 				}
 				if account == nil {
-					account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+					account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 				}
 			} else {
-				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+				return
+			}
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 				return
 			}
@@ -3983,11 +4073,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
-			if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
-				if isStream && writeCommittedResponsesRetryError(c, "Codex account usage window limit reached") {
+			if limited := h.store.UsageLimitedCandidateSummary(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy); limited.Found {
+				// 瞬时 throttle 与额度耗尽要给下游不同信号：前者带 Retry-After 让它秒级
+				// 退避后重试同一上游，后者才值得 failover/标记账号。
+				msg := usageLimitedPoolMessages(limited)
+				if isStream && writeCommittedResponsesRetryError(c, msg.English) {
 					return
 				}
-				SendAPIKeyLimitError(c, http.StatusTooManyRequests, "Codex 账号用量窗口已达上限")
+				if msg.RetryAfterSeconds > 0 {
+					c.Header("Retry-After", strconv.Itoa(msg.RetryAfterSeconds))
+				}
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg.Chinese)
 				return
 			}
 			if continuationUnavailable && !relayContinuationAttempted {
@@ -4242,7 +4338,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) && len(grokCompactionDigestsForAccount(upstreamCtx, account)) == 0 {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
 					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
 					if rawChanged || codexChanged {
@@ -4355,7 +4451,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			if isGrokNativeRouteResponse(resp) {
 				downstreamFlusher, _ := c.Writer.(http.Flusher)
 				streamAttempt := h.newContinuousRetryStreamAttempt(isStream && continuousRetryBuffersAttempts(continuousRetryPolicy), c.Writer, downstreamFlusher)
-				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseTo(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher))
+				var compactionDigests compactionProvenanceDigests
+				usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponseObserved(c, resp, GrokProtocolResponses, isStream, start, stopTTFTGuard, streamAttempt.writerOr(c.Writer), streamAttempt.flusherOr(downstreamFlusher), compactionDigests.addPayload)
 				totalDuration := int(time.Since(start).Milliseconds())
 				stopTTFTGuard()
 				resp.Body.Close()
@@ -4387,6 +4484,8 @@ func (h *Handler) Responses(c *gin.Context) {
 							abortContinuousRetryCommitFailure(h, account, resp, streamAttempt)
 							return
 						}
+					} else {
+						h.recordCompactionProvenanceDigests(context.Background(), account, compactionDigests)
 					}
 				}
 				_ = streamAttempt.Close()
@@ -4469,7 +4568,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var nonStreamFailure *streamOutcome
 			var nonStreamResponseBody []byte
 			nonStreamContentType := "application/json"
-			var compactionProvenancePayloads [][]byte
+			var compactionDigests compactionProvenanceDigests
 			promptPolicyIncidentID := ""
 			upstreamCyberPolicyLogged := false
 			var streamAttempt *continuousRetryStreamAttempt
@@ -4500,8 +4599,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				emptyIncomplete := &emptyIncompleteTracker{}
 				readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
 					streamDiag.markUpstreamFrame()
-					if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-						compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
+					if account.IsGrokAPI() || continuousRetryBuffersAttempts(continuousRetryPolicy) {
+						compactionDigests.addPayload(data)
 					} else {
 						h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 					}
@@ -4724,9 +4823,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						return
 					}
 				} else {
-					for _, payload := range compactionProvenancePayloads {
-						h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
-					}
+					h.recordCompactionProvenanceDigests(context.Background(), account, compactionDigests)
 				}
 			}
 			_ = streamAttempt.Close()
@@ -5930,6 +6027,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		var account *auth.Account
 		var stickyProxyURL string
 		var affinityGuard auth.SessionAffinityGuard
+		var selectionErr error
 		if attempt == 0 && compactionAffinity.Known {
 			account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			if account != nil {
@@ -5964,8 +6062,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			if account == nil {
+				if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+					return
+				}
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					return
 				}
@@ -6748,14 +6849,18 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 		}
 		if account == nil {
+			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolChat) {
+				return
+			}
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolChat) {
 				return
 			}
@@ -8025,10 +8130,10 @@ func responseHasCodex5hHeaders(resp *http.Response) bool {
 	return secondary.valid && codexWindowType(secondary.windowMin) == codexRateLimitWindow5h
 }
 
-// classifySpark429RateLimit keeps every Spark rejection scoped to the Spark
-// model. Explicit quota evidence (body reset or an exhausted 5h/7d window)
-// drives the independent Spark usage window; transient
-// rejections retain the normal short model cooldown.
+// classifySpark429RateLimit keeps Spark quota exhaustion on the Spark model.
+// Explicit quota evidence (body reset or an exhausted 5h/7d window) drives
+// the independent Spark usage window. Transient throttles freeze the whole
+// account so a model alias cannot bypass the shared budget.
 func classifySpark429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
 	decision := codex429Decision{
 		Scope:  rateLimitScopeModel,
@@ -8073,8 +8178,12 @@ func classifySpark429RateLimit(account *auth.Account, body []byte, resp *http.Re
 		decision.ResetAt = now.Add(decision.Cooldown)
 		return decision
 	}
-	decision.Cooldown = 5 * time.Minute
-	return decision
+	if decision.Reason == "model_capacity" {
+		decision.Cooldown = 5 * time.Minute
+		return decision
+	}
+	// Spark 瞬时 throttle 与主模型共享账号预算；只冻 Spark 模型会被别名绕过。
+	return transientAccountRateLimitDecision(body, resp, now)
 }
 
 func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
@@ -8130,22 +8239,48 @@ func classify429RateLimit(account *auth.Account, body []byte, resp *http.Respons
 		return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_7d", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
 	}
 
-	if model != "" {
-		reason := "rate_limited_model"
-		if isCodexModelCapacityError(body) {
-			reason = "model_capacity"
-		}
+	if isCodexModelCapacityError(body) && model != "" {
 		return codex429Decision{
 			Scope:    rateLimitScopeModel,
-			Reason:   reason,
+			Reason:   "model_capacity",
 			Model:    model,
 			Cooldown: 5 * time.Minute,
 		}
 	}
 
-	cooldown := 5 * time.Minute
-	resetAt = now.Add(cooldown)
-	return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited", ResetAt: resetAt, Cooldown: cooldown}
+	// 裸 429 / rate_limit* 是账号级瞬时限流。只冻当前模型时，同一号换个别名
+	// 会立刻再打上游。额度耗尽与 5h/7d=100% 已在上面分流。
+	return transientAccountRateLimitDecision(body, resp, now)
+}
+
+func transientAccountRateLimitDecision(body []byte, resp *http.Response, now time.Time) codex429Decision {
+	cooldown := auth.TransientRateLimitBackoffBase
+	if retryAfter := transient429RetryAfter(body, resp, now); retryAfter > cooldown {
+		cooldown = retryAfter
+	}
+	if cooldown > auth.TransientRateLimitBackoffMax {
+		cooldown = auth.TransientRateLimitBackoffMax
+	}
+	return codex429Decision{
+		Scope:    rateLimitScopeAccount,
+		Reason:   "rate_limited",
+		ResetAt:  now.Add(cooldown),
+		Cooldown: cooldown,
+	}
+}
+
+func transient429RetryAfter(body []byte, resp *http.Response, now time.Time) time.Duration {
+	if resp != nil {
+		if retryAfter := parseRetryAfterHeader(resp.Header.Get("Retry-After")); retryAfter > 0 {
+			return retryAfter
+		}
+	}
+	if resetAt, ok := parseRetryAfterResetAt(body, now); ok {
+		if remaining := resetAt.Sub(now); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }
 
 func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duration {
@@ -8238,6 +8373,16 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 	}
 	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
 		store.MarkResponsesPremium5hRateLimited(account, decision.ResetAt)
+		return decision
+	}
+	if decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited" {
+		// Pass only an actual upstream hint. Reusing the synthetic 15s floor
+		// here would slide the same cooldown forward on every in-flight 429.
+		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))
+		decision.Cooldown = applied
+		if applied > 0 {
+			decision.ResetAt = time.Now().Add(applied)
+		}
 		return decision
 	}
 	store.MarkResponsesRateLimited(account, decision.Cooldown)

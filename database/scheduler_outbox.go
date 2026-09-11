@@ -291,6 +291,7 @@ func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
 		`CREATE TRIGGER scheduler_outbox_api_keys_insert AFTER INSERT ON api_keys FOR EACH ROW
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('api_key',NEW.id,'created');
+			UPDATE api_key_auth_cache_state SET generation=generation+1,key_count=key_count+1 WHERE id=1;
 		END`,
 		`CREATE TRIGGER scheduler_outbox_api_keys_update AFTER UPDATE ON api_keys FOR EACH ROW
 		BEGIN
@@ -299,10 +300,20 @@ func (db *DB) installMySQLSchedulerOutboxTriggers(ctx context.Context) error {
 				OR NOT (OLD.expires_at <=> NEW.expires_at) THEN
 				INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('api_key',NEW.id,'updated');
 			END IF;
+			IF NOT (OLD.name <=> NEW.name)
+				OR NOT (OLD.key <=> NEW.key)
+				OR NOT (OLD.enabled <=> NEW.enabled)
+				OR NOT (OLD.quota_limit <=> NEW.quota_limit)
+				OR NOT (OLD.expires_at <=> NEW.expires_at)
+				OR NOT (OLD.allowed_group_ids <=> NEW.allowed_group_ids)
+				OR NOT (OLD.limits <=> NEW.limits) THEN
+				UPDATE api_key_auth_cache_state SET generation=generation+1 WHERE id=1;
+			END IF;
 		END`,
 		`CREATE TRIGGER scheduler_outbox_api_keys_delete AFTER DELETE ON api_keys FOR EACH ROW
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('api_key',OLD.id,'deleted');
+			UPDATE api_key_auth_cache_state SET generation=generation+1,key_count=GREATEST(key_count-1,0) WHERE id=1;
 		END`,
 		`CREATE TRIGGER scheduler_outbox_groups_insert AFTER INSERT ON account_groups FOR EACH ROW
 		BEGIN

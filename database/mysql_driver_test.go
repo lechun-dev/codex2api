@@ -40,6 +40,20 @@ func TestRewriteModelCooldownInsertForMySQL56(t *testing.T) {
 	assertNoMySQL56IncompatibleSQL(t, got)
 }
 
+func TestAPIKeyAuthCacheStateDDLUsesMySQL56Syntax(t *testing.T) {
+	query := apiKeyAuthCacheStateMySQLDDL()
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS api_key_auth_cache_state",
+		"namespace VARCHAR(64) CHARACTER SET ascii NOT NULL",
+		"ENGINE=InnoDB DEFAULT CHARSET=utf8",
+	} {
+		if !strings.Contains(query, fragment) {
+			t.Fatalf("API key auth cache DDL missing %q: %s", fragment, query)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, query)
+}
+
 func TestAccountChannelPredicateUsesMySQL56CompatibleSQL(t *testing.T) {
 	db := &DB{driver: "mysql"}
 	got := db.accountUpstreamTypeIsGrokPredicate()
@@ -791,28 +805,14 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 			"image_input_tokens": int64(123), "image_output_tokens": int64(456),
 			"cached_image_input_tokens": int64(78), "session_id": entry.SessionID,
 			"conversation_id": entry.ConversationID, "request_text": entry.RequestText,
+			"client_user_agent": entry.ClientUserAgent, "upstream_user_agent": entry.UpstreamUserAgent,
+			"user_agent_overridden": entry.UserAgentOverridden, "internal_reason": entry.InternalReason,
+			"parent_request_id": entry.ParentRequestID, "prompt_policy_incident_id": entry.PromptPolicyIncidentID,
+			"request_id": entry.RequestID, "upstream_request_id": entry.UpstreamRequestID,
+			"upstream_proxy_id": entry.UpstreamProxyID, "upstream_proxy_name": entry.UpstreamProxyName,
 		}[strings.TrimSpace(column)]
 		if ok && capture.args[i].Value != want {
 			t.Fatalf("column %s = %#v, want %#v", column, capture.args[i].Value, want)
-		}
-	}
-	// 2026-09-05 coder(lq): Keep the assertion aligned with the request/proxy trace columns appended to usage_logs.
-	wantTail := []interface{}{
-		entry.ClientUserAgent,
-		entry.UpstreamUserAgent,
-		entry.UserAgentOverridden,
-		entry.InternalReason,
-		entry.ParentRequestID,
-		entry.PromptPolicyIncidentID,
-		entry.RequestID,
-		entry.UpstreamRequestID,
-		entry.UpstreamProxyID,
-		entry.UpstreamProxyName,
-	}
-	for i, want := range wantTail {
-		got := capture.args[len(capture.args)-len(wantTail)+i].Value
-		if got != want {
-			t.Fatalf("usage-log tail argument %d = %#v, want %#v", i, got, want)
 		}
 	}
 }

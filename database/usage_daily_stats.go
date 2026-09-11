@@ -52,7 +52,7 @@ func (db *DB) GetDailyTokenUsage(ctx context.Context, rangeStart, rangeEnd time.
 		return nil, fmt.Errorf("end must be after start")
 	}
 
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel)
+	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, UsageLogFilter{})
 	modelExpr := "COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown')"
 	if model = strings.TrimSpace(model); model != "" {
 		placeholder := fmt.Sprintf("$%d", len(args)+1)

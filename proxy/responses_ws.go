@@ -570,6 +570,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
 	var affinityGuard auth.SessionAffinityGuard
+	var selectionErr error
 	for attempt := 0; ; attempt++ {
 		if c.Request.Context().Err() != nil {
 			return errResponsesWSClientGone
@@ -597,16 +598,18 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationPinned {
-				account, stickyProxyURL = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			} else {
-				account, stickyProxyURL, affinityGuard = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 			}
 		}
 		if account == nil {
 			if c.Request.Context().Err() != nil {
 				return errResponsesWSClientGone
 			}
-			if compactionAffinity.Known {
+			if errors.Is(selectionErr, auth.ErrSchedulerQueueFull) {
+				apiErr = schedulerQueueFullAPIError()
+			} else if compactionAffinity.Known {
 				apiErr = compactionUpstreamUnavailableAPIError()
 			} else if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
@@ -615,8 +618,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				// 候选被 scope 预算剔空（issue #439）：按限流语义回帧，而不是「无可用账号」。
 				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, msg, api.ErrorTypeRateLimit)
-			} else if h.store.HasUsageLimitedCandidateWithDispatch(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
-				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, "Codex 账号用量窗口已达上限", api.ErrorTypeRateLimit)
+			} else if limited := h.store.UsageLimitedCandidateSummary(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy); limited.Found {
+				// WS 帧没有 Retry-After 头，瞬时 throttle 的等待秒数写进文案。
+				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, usageLimitedPoolMessages(limited).Chinese, api.ErrorTypeRateLimit)
 			} else {
 				h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy)
 				apiErr = api.NewAPIError(api.ErrCodeServiceUnavailable, noAvailableAccountMessage(effectiveModel), api.ErrorTypeServer)

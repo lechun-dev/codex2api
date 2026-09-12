@@ -146,6 +146,160 @@ func TestScopedAntigravityManifestKeepsOnlyAvailableEfforts(t *testing.T) {
 	}
 }
 
+func TestScopedCodexManifestAdvertisesGrok4ImageInput(t *testing.T) {
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "grok-4.5"},
+		{ID: "grok-4.6"},
+		{ID: "grok-4"},
+		{ID: "grok-4-fast"},
+		{ID: "grok-imagine-image"},
+		{ID: "grok-imagine-image-quality"},
+		{ID: "grok-imagine-video"},
+		{ID: "grok-imagine-video-1.5"},
+		{ID: "grok-3"},
+		{ID: "gemini-3.8-flash"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, item := range payload.Models {
+		got[item.Slug] = append([]string(nil), item.InputModalities...)
+	}
+	wantImage := []string{"text", "image"}
+	wantText := []string{"text"}
+	for _, slug := range []string{"grok-4.5", "grok-4.6", "grok-4", "grok-4-fast", "grok-imagine-image", "grok-imagine-image-quality"} {
+		if strings.Join(got[slug], ",") != strings.Join(wantImage, ",") {
+			t.Fatalf("%s input_modalities = %v, want %v", slug, got[slug], wantImage)
+		}
+	}
+	for _, slug := range []string{"grok-imagine-video", "grok-imagine-video-1.5", "grok-3", "gemini-3.8-flash"} {
+		if strings.Join(got[slug], ",") != strings.Join(wantText, ",") {
+			t.Fatalf("%s input_modalities = %v, want %v", slug, got[slug], wantText)
+		}
+	}
+}
+
+func TestScopedCodexManifestAdvertisesGrokReasoningLevels(t *testing.T) {
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "grok-4.5"},
+		{ID: "grok-4.6"},
+		{ID: "grok-4"},
+		{ID: "grok-4-fast"},
+		{ID: "grok-imagine-image"},
+		{ID: "grok-3"},
+		{ID: "claude-opus-4-6-thinking", OwnedBy: "google"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]scopedCodexManifestItem{}
+	for _, item := range payload.Models {
+		got[item.Slug] = item
+	}
+	assertGrokReasoning := func(slug string, want []string) {
+		item, ok := got[slug]
+		if !ok {
+			t.Fatalf("missing %s", slug)
+		}
+		var levels []string
+		for _, option := range item.SupportedReasoningLevels {
+			levels = append(levels, option.Effort)
+		}
+		if strings.Join(levels, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s supported_reasoning_levels = %v, want %v", slug, levels, want)
+		}
+		if len(want) == 0 {
+			if item.DefaultReasoningLevel != "none" || item.SupportsReasoningSummaries {
+				t.Fatalf("%s default=%q summaries=%v, want none/false", slug, item.DefaultReasoningLevel, item.SupportsReasoningSummaries)
+			}
+			return
+		}
+		if item.DefaultReasoningLevel != "high" || !item.SupportsReasoningSummaries {
+			t.Fatalf("%s default=%q summaries=%v, want high/true", slug, item.DefaultReasoningLevel, item.SupportsReasoningSummaries)
+		}
+	}
+	assertGrokReasoning("grok-4.5", []string{"low", "medium", "high"})
+	assertGrokReasoning("grok-4.6", []string{"low", "medium", "high", "xhigh"})
+	for _, slug := range []string{"grok-4", "grok-4-fast", "grok-imagine-image", "grok-3", "claude-opus-4-6-thinking"} {
+		assertGrokReasoning(slug, nil)
+	}
+}
+
+func TestMergeCodexManifestModelsReplacesStaleGrokCapabilities(t *testing.T) {
+	merged, err := mergeCodexManifestModels(
+		[]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT"},{"slug":"grok-4.5","input_modalities":["text"],"supported_reasoning_levels":[],"default_reasoning_level":"none"},{"slug":"grok-4.6","input_modalities":["text"],"supported_reasoning_levels":[]}],"future":true}`),
+		[]api.Model{{ID: "gpt-5.4"}, {ID: "grok-4.5"}, {ID: "grok-4.6"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Future bool `json:"future"`
+		Models []struct {
+			Slug                       string                `json:"slug"`
+			DisplayName                string                `json:"display_name"`
+			InputModalities            []string              `json:"input_modalities"`
+			SupportedReasoningLevels   []codexReasoningLevel `json:"supported_reasoning_levels"`
+			DefaultReasoningLevel      string                `json:"default_reasoning_level"`
+			SupportsReasoningSummaries bool                  `json:"supports_reasoning_summaries"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(merged, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Future || len(payload.Models) != 3 {
+		t.Fatalf("merged = %s", merged)
+	}
+	got := map[string]struct {
+		display  string
+		modal    string
+		levels   string
+		defaultL string
+		summary  bool
+	}{}
+	for _, model := range payload.Models {
+		var levels []string
+		for _, option := range model.SupportedReasoningLevels {
+			levels = append(levels, option.Effort)
+		}
+		got[model.Slug] = struct {
+			display  string
+			modal    string
+			levels   string
+			defaultL string
+			summary  bool
+		}{
+			display:  model.DisplayName,
+			modal:    strings.Join(model.InputModalities, ","),
+			levels:   strings.Join(levels, ","),
+			defaultL: model.DefaultReasoningLevel,
+			summary:  model.SupportsReasoningSummaries,
+		}
+	}
+	if gpt := got["gpt-5.4"]; gpt.display != "GPT" {
+		t.Fatalf("gpt-5.4 display_name = %q, want GPT; merged=%s", gpt.display, merged)
+	}
+	if grok45 := got["grok-4.5"]; grok45.modal != "text,image" || grok45.levels != "low,medium,high" || grok45.defaultL != "high" || !grok45.summary {
+		t.Fatalf("stale grok-4.5 retained: %+v merged=%s", grok45, merged)
+	}
+	if grok46 := got["grok-4.6"]; grok46.modal != "text,image" || grok46.levels != "low,medium,high,xhigh" || grok46.defaultL != "high" || !grok46.summary {
+		t.Fatalf("stale grok-4.6 retained: %+v merged=%s", grok46, merged)
+	}
+}
+
 func TestAntigravityManifestDoesNotInferReasoningFromNonGeminiNames(t *testing.T) {
 	body, err := buildScopedCodexManifest([]api.Model{
 		{ID: "claude-opus-4-6-thinking", OwnedBy: "google"},

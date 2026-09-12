@@ -419,13 +419,12 @@ func mapGrokReasoningEffort(effort, model string) (string, bool) {
 	}
 }
 
-// grokSupportsXHighReasoningEffort 判断模型是否接受 reasoning.effort=xhigh。
-// xAI 文档：grok-4.6 支持；grok-4.5 等不支持的模型会把 xhigh 当成 high。
-// 版本线按 grok-4.6 起放行（grok-4.6-beta / grok-4.6-build / grok-4.20-multi-agent 同样识别）。
-func grokSupportsXHighReasoningEffort(model string) bool {
+// grokModelVersion 解析 grok-<major>[.<minor>][-suffix] 的主/次版本。
+// grok-4.6-beta / grok-4.20-multi-agent 取 4.6 / 4.20；grok-4-fast 只有 major=4。
+func grokModelVersion(model string) (major, minor int, hasMinor, ok bool) {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if !strings.HasPrefix(model, "grok-") {
-		return false
+		return 0, 0, false, false
 	}
 	version := strings.TrimPrefix(model, "grok-")
 	if dash := strings.IndexByte(version, '-'); dash >= 0 {
@@ -434,19 +433,48 @@ func grokSupportsXHighReasoningEffort(model string) bool {
 	parts := strings.Split(version, ".")
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
+		return 0, 0, false, false
+	}
+	if len(parts) < 2 {
+		return major, 0, false, true
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return major, 0, false, true
+	}
+	return major, minor, true, true
+}
+
+// grokSupportsXHighReasoningEffort 判断模型是否接受 reasoning.effort=xhigh。
+// xAI 文档：grok-4.6 支持；grok-4.5 等不支持的模型会把 xhigh 当成 high。
+// 版本线按 grok-4.6 起放行（grok-4.6-beta / grok-4.6-build / grok-4.20-multi-agent 同样识别）。
+func grokSupportsXHighReasoningEffort(model string) bool {
+	major, minor, hasMinor, ok := grokModelVersion(model)
+	if !ok {
 		return false
 	}
 	if major > 4 {
 		return true
 	}
-	if major != 4 || len(parts) < 2 {
-		return false
+	return major == 4 && hasMinor && minor >= 6
+}
+
+// grokCodexReasoningLevels 是 Codex Desktop 思考强度菜单。
+// 只给 grok-4.5 起的文本模型挂档位：4.5 为 low/medium/high，4.6 起再加 xhigh。
+// grok-4、grok-4-fast、grok-3、grok-imagine-* 不挂，避免客户端露出无效开关。
+func grokCodexReasoningLevels(model string) (levels []string, defaultLevel string) {
+	major, minor, hasMinor, ok := grokModelVersion(model)
+	if !ok {
+		return nil, ""
 	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return false
+	if major < 4 || (major == 4 && (!hasMinor || minor < 5)) {
+		return nil, ""
 	}
-	return minor >= 6
+	levels = []string{"low", "medium", "high"}
+	if grokSupportsXHighReasoningEffort(model) {
+		levels = append(levels, "xhigh")
+	}
+	return levels, "high"
 }
 
 // clampGrokReasoningEffort 规范化发给 Grok 上游的思考强度：同时覆盖 Responses

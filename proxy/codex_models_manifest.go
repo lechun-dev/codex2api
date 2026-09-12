@@ -202,6 +202,20 @@ type scopedCodexManifestItem struct {
 	ContextWindow              int                   `json:"context_window,omitempty"`
 }
 
+func scopedCodexInputModalities(slug string) []string {
+	key := strings.ToLower(strings.TrimSpace(slug))
+	if strings.Contains(key, "video") {
+		return []string{"text"}
+	}
+	// Grok 4 text models accept vision on the protocol path. Advertise it so
+	// Codex Desktop enables image input instead of treating them as text-only
+	// because the slug does not contain "image".
+	if strings.Contains(key, "image") || strings.HasPrefix(key, "grok-4") {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
+}
+
 func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 	fold, levels := antigravityModelChoiceGroups(models)
 	items := make([]scopedCodexManifestItem, 0, len(models))
@@ -226,7 +240,7 @@ func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 			SupportedInAPI:           true,
 			PreferWebsockets:         false,
 			UseResponsesLite:         false,
-			InputModalities:          []string{"text"},
+			InputModalities:          scopedCodexInputModalities(slug),
 			SupportedReasoningLevels: []codexReasoningLevel{},
 			DefaultReasoningLevel:    "none",
 			Description:              "Gateway model: " + slug,
@@ -234,9 +248,6 @@ func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 			BaseInstructions:           "You are a helpful coding assistant.",
 			ExperimentalSupportedTools: []string{},
 			TruncationPolicy:           map[string]any{"mode": "tokens", "limit": 10000},
-		}
-		if strings.Contains(key, "image") {
-			item.InputModalities = []string{"text", "image"}
 		}
 		// Antigravity's reasoning metadata is provider-specific. Never infer
 		// levels from names such as "thinking" or "reason": Claude Opus
@@ -246,6 +257,12 @@ func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
 				item.SupportedReasoningLevels = append(item.SupportedReasoningLevels, codexReasoningLevel{Effort: level, Description: "Antigravity " + level + " reasoning"})
 			}
 			item.DefaultReasoningLevel = available[0]
+			item.SupportsReasoningSummaries = true
+		} else if grokLevels, grokDefault := grokCodexReasoningLevels(slug); len(grokLevels) > 0 {
+			for _, level := range grokLevels {
+				item.SupportedReasoningLevels = append(item.SupportedReasoningLevels, codexReasoningLevel{Effort: level, Description: "Grok " + level + " reasoning"})
+			}
+			item.DefaultReasoningLevel = grokDefault
 			item.SupportsReasoningSummaries = true
 		}
 		if slug == "gemini-3.8-flash" {
@@ -306,6 +323,15 @@ func mergeCodexManifestModels(body []byte, extras []api.Model) ([]byte, error) {
 		replacedSlugs[definition.id] = true
 		for _, variant := range definition.variants {
 			replacedSlugs[definition.id+"-"+variant.level] = true
+		}
+	}
+	// Local Grok extras own the Codex picker contract for those slugs.
+	// ChatGPT/cached entries can be text-only with empty reasoning levels;
+	// keep upstream metadata when extras do not include the same slug.
+	for _, extra := range extras {
+		slug := strings.ToLower(strings.TrimSpace(extra.ID))
+		if strings.HasPrefix(slug, "grok-") {
+			replacedSlugs[slug] = true
 		}
 	}
 	retained := models[:0]

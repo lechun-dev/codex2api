@@ -1,10 +1,38 @@
 package proxy
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestGrokCodexReasoningLevels(t *testing.T) {
+	cases := []struct {
+		model        string
+		levels       string
+		defaultLevel string
+	}{
+		{"grok-4.5", "low,medium,high", "high"},
+		{"grok-4.5-build", "low,medium,high", "high"},
+		{"grok-4.6", "low,medium,high,xhigh", "high"},
+		{"grok-4.6-beta", "low,medium,high,xhigh", "high"},
+		{"grok-4.20-multi-agent", "low,medium,high,xhigh", "high"},
+		{"grok-5", "low,medium,high,xhigh", "high"},
+		{"grok-4", "", ""},
+		{"grok-4-fast", "", ""},
+		{"grok-3", "", ""},
+		{"grok-imagine-image", "", ""},
+		{"gpt-5.6-sol", "", ""},
+	}
+	for _, c := range cases {
+		levels, defaultLevel := grokCodexReasoningLevels(c.model)
+		got := strings.Join(levels, ",")
+		if got != c.levels || defaultLevel != c.defaultLevel {
+			t.Fatalf("%q levels=%q default=%q, want %q %q", c.model, got, defaultLevel, c.levels, c.defaultLevel)
+		}
+	}
+}
 
 func TestGrokSupportsXHighReasoningEffort(t *testing.T) {
 	cases := []struct {

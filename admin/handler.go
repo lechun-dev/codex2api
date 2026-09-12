@@ -1625,6 +1625,8 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
+	CodexLastRefreshAt      string `json:"codex_last_refresh_at,omitempty"`
+	CodexRefreshError       string `json:"codex_refresh_error,omitempty"`
 	UpstreamRequestIDHeader string `json:"upstream_request_id_header"`
 	DetailLoaded            bool   `json:"detail_loaded,omitempty"`
 	ID                      int64  `json:"id"`
@@ -9186,6 +9188,7 @@ type settingsResponse struct {
 	UsageProbeResponsesFallbackEnabled  bool   `json:"usage_probe_responses_fallback_enabled"`
 	RecoveryProbeIntervalMinutes        int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                            bool   `json:"lazy_mode"`
+	CodexOAuthKeepaliveEnabled          bool   `json:"codex_oauth_keepalive_enabled"`
 	ProxyURL                            string `json:"proxy_url"`
 	PgMaxConns                          int    `json:"pg_max_conns"`
 	RedisPoolSize                       int    `json:"redis_pool_size"`
@@ -9303,6 +9306,8 @@ type settingsResponse struct {
 	ClientCompatMode                   string                           `json:"client_compat_mode"`
 	CodexMinCLIVersion                 string                           `json:"codex_min_cli_version"`
 	CodexUserAgentConfig               string                           `json:"codex_user_agent_config"`
+	CodexTelemetryEnabled              bool                             `json:"codex_telemetry_enabled"`
+	CodexTelemetryTimingDebug          bool                             `json:"codex_telemetry_timing_debug"`
 	UsageLogMode                       string                           `json:"usage_log_mode"`
 	UsageLogBatchSize                  int                              `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int                              `json:"usage_log_flush_interval_seconds"`
@@ -9367,6 +9372,7 @@ type updateSettingsReq struct {
 	UsageProbeResponsesFallbackEnabled  *bool                            `json:"usage_probe_responses_fallback_enabled"`
 	RecoveryProbeIntervalMinutes        *int                             `json:"recovery_probe_interval_minutes"`
 	LazyMode                            *bool                            `json:"lazy_mode"`
+	CodexOAuthKeepaliveEnabled          *bool                            `json:"codex_oauth_keepalive_enabled"`
 	ProxyURL                            *string                          `json:"proxy_url"`
 	PgMaxConns                          *int                             `json:"pg_max_conns"`
 	RedisPoolSize                       *int                             `json:"redis_pool_size"`
@@ -9469,6 +9475,8 @@ type updateSettingsReq struct {
 	ClientCompatMode                    *string                          `json:"client_compat_mode"`
 	CodexMinCLIVersion                  *string                          `json:"codex_min_cli_version"`
 	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
+	CodexTelemetryEnabled               *bool                            `json:"codex_telemetry_enabled"`
+	CodexTelemetryTimingDebug           *bool                            `json:"codex_telemetry_timing_debug"`
 	UsageLogMode                        *string                          `json:"usage_log_mode"`
 	UsageLogBatchSize                   *int                             `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds        *int                             `json:"usage_log_flush_interval_seconds"`
@@ -10193,6 +10201,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
 		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
 		ProxyURL:                            h.store.GetProxyURL(),
 		PgMaxConns:                          h.pgMaxConns,
 		RedisPoolSize:                       h.redisPoolSize,
@@ -10302,6 +10311,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
 		UsageLogMode:                        h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
@@ -10836,6 +10847,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: recovery_probe_interval_minutes = %d", v)
 	}
 
+	if req.CodexOAuthKeepaliveEnabled != nil {
+		h.store.SetCodexOAuthKeepalive(*req.CodexOAuthKeepaliveEnabled)
+	}
 	if req.LazyMode != nil {
 		h.store.SetLazyMode(*req.LazyMode)
 		log.Printf("设置已更新: lazy_mode = %t", *req.LazyMode)
@@ -11365,6 +11379,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexUserAgentConfig = normalized
 		log.Printf("设置已更新: codex_user_agent_config")
 	}
+	if req.CodexTelemetryEnabled != nil {
+		runtimeCfg.CodexTelemetryEnabled = *req.CodexTelemetryEnabled
+		log.Printf("设置已更新: codex_telemetry_enabled = %t", runtimeCfg.CodexTelemetryEnabled)
+	}
+	if req.CodexTelemetryTimingDebug != nil {
+		runtimeCfg.CodexTelemetryTimingDebug = *req.CodexTelemetryTimingDebug
+		log.Printf("设置已更新: codex_telemetry_timing_debug = %t", runtimeCfg.CodexTelemetryTimingDebug)
+	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
 		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
@@ -11696,6 +11718,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
 		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
 		ProxyURL:                            h.store.GetProxyURL(),
 		PgMaxConns:                          h.pgMaxConns,
 		RedisPoolSize:                       h.redisPoolSize,
@@ -11780,6 +11803,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12017,6 +12042,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageProbeResponsesFallbackEnabled:  h.store.UsageProbeResponsesFallbackEnabled(),
 		RecoveryProbeIntervalMinutes:        h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                            h.store.GetLazyMode(),
+		CodexOAuthKeepaliveEnabled:          h.store.GetCodexOAuthKeepalive(),
 		ProxyURL:                            h.store.GetProxyURL(),
 		PgMaxConns:                          h.pgMaxConns,
 		RedisPoolSize:                       h.redisPoolSize,
@@ -12080,6 +12106,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		GrokQualityGuardHoldTimeoutSec:      h.store.GrokQualityGuardConfig().HoldTimeoutSec,
 		GrokQualityGuardOnExhausted:         h.store.GrokQualityGuardConfig().OnExhausted,
 		GrokQualityGuardCooldownHours:       h.store.GrokQualityGuardConfig().AccountCooldownHours,
+		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
+		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
+		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -12125,6 +12154,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ClientCompatMode:                    runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                  runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
+		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
+		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12135,6 +12166,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
+		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageBackend:                 imgCfg.Backend,
 		ImageS3Endpoint:                     imgCfg.Endpoint,
 		ImageS3Region:                       imgCfg.Region,

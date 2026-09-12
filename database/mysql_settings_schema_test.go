@@ -85,6 +85,9 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"antigravity_oauth_config TEXT NULL",
 		"scheduler_engine TEXT NULL",
 		"codex_request_compression TINYINT(1) DEFAULT 1",
+		"codex_telemetry_enabled TINYINT(1) DEFAULT 0",
+		"codex_oauth_keepalive_enabled TINYINT(1) DEFAULT 0",
+		"codex_telemetry_timing_debug TINYINT(1) DEFAULT 0",
 	} {
 		if !strings.Contains(ddl, needle) {
 			t.Fatalf("MySQL system_settings DDL missing %q: %s", needle, ddl)

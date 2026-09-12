@@ -41,6 +41,7 @@ scripts
 logs/
 AGENTS.md
 CLIProxyAPI/
+CLIProxyAPI-Pro/
 sub2api/
 new-api/
 CPA-Manager-Plus/

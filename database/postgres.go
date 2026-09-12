@@ -521,6 +521,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), databaseSchemaStartupTimeout)
 		defer postGrokCancel()
 		ctx = postGrokCtx
+		if err := db.ensureCodexRefreshSchema(ctx); err != nil {
+			return nil, fmt.Errorf("初始化 Codex 刷新保护表失败: %w", err)
+		}
 		if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
 			return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
 		}
@@ -1527,6 +1530,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS lazy_mode BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_oauth_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_model_mapping TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS payload_rules TEXT DEFAULT '{}';
@@ -1580,6 +1584,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.153.3';
 	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.153.3';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_telemetry_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ALTER COLUMN codex_telemetry_enabled SET DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_telemetry_timing_debug BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ALTER COLUMN codex_telemetry_timing_debug SET DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_images_main_model TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_mode VARCHAR(20) DEFAULT 'full';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_batch_size INT DEFAULT 200;
@@ -2545,6 +2553,7 @@ type SystemSettings struct {
 	AutoCleanError                     bool
 	AutoCleanExpired                   bool
 	LazyMode                           bool
+	CodexOAuthKeepaliveEnabled         bool
 	ProxyPoolEnabled                   bool
 	FastSchedulerEnabled               bool
 	SchedulerEngine                    string
@@ -2586,6 +2595,8 @@ type SystemSettings struct {
 	ClientCompatMode                   string
 	CodexMinCLIVersion                 string
 	CodexUserAgentConfig               string
+	CodexTelemetryEnabled              bool
+	CodexTelemetryTimingDebug          bool
 	CodexImagesMainModel               string // 空值沿用部署默认的生图文本驱动模型
 	UsageLogMode                       string
 	UsageLogBatchSize                  int
@@ -2861,10 +2872,13 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(session_slot_buffer_enabled, false),
 		       COALESCE(session_slot_buffer_seconds, 10),
 		       COALESCE(models_list_read_max_bytes, 8388608),
-	       COALESCE(auto_activate_5h_window_enabled, false)
-	       ,COALESCE(NULLIF(TRIM(scheduler_engine), ''), '')
-	       ,COALESCE(codex_request_compression, true)
-	       ,COALESCE(codex_images_main_model, '')
+		       COALESCE(auto_activate_5h_window_enabled, false),
+		       COALESCE(NULLIF(TRIM(scheduler_engine), ''), ''),
+		       COALESCE(codex_request_compression, true),
+		       COALESCE(codex_images_main_model, ''),
+		       COALESCE(codex_telemetry_enabled, false),
+		       COALESCE(codex_oauth_keepalive_enabled, false),
+		       COALESCE(codex_telemetry_timing_debug, false)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2948,6 +2962,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SchedulerEngine,
 		&s.CodexRequestCompression,
 		&s.CodexImagesMainModel,
+		&s.CodexTelemetryEnabled,
+		&s.CodexOAuthKeepaliveEnabled,
+		&s.CodexTelemetryTimingDebug,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3106,9 +3123,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_activate_5h_window_enabled,
 					scheduler_engine,
 					codex_request_compression,
-					codex_images_main_model
+					codex_images_main_model,
+					codex_telemetry_enabled,
+					codex_oauth_keepalive_enabled,
+					codex_telemetry_timing_debug
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -3148,10 +3168,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-					prompt_filter_custom_patterns = CASE WHEN $123 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $126 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-					prompt_filter_review_api_key = CASE WHEN $124 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+					prompt_filter_review_api_key = CASE WHEN $127 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3228,7 +3248,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					models_list_read_max_bytes = EXCLUDED.models_list_read_max_bytes,
 					auto_activate_5h_window_enabled = EXCLUDED.auto_activate_5h_window_enabled,
 					scheduler_engine = EXCLUDED.scheduler_engine,
-					codex_request_compression = EXCLUDED.codex_request_compression
+					codex_request_compression = EXCLUDED.codex_request_compression,
+					codex_telemetry_enabled = EXCLUDED.codex_telemetry_enabled,
+					codex_oauth_keepalive_enabled = EXCLUDED.codex_oauth_keepalive_enabled,
+					codex_telemetry_timing_debug = EXCLUDED.codex_telemetry_timing_debug
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -3280,6 +3303,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		schedulerEngine,
 		s.CodexRequestCompression,
 		strings.TrimSpace(s.CodexImagesMainModel),
+		s.CodexTelemetryEnabled,
+		s.CodexOAuthKeepaliveEnabled,
+		s.CodexTelemetryTimingDebug,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -7498,7 +7524,7 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 		if len(credentialUpdates) > 0 {
 			current := decodeCredentials(currentRaw)
 			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
-			identityChanged := grokIdentityCredentialChanged(current, merged)
+			identityChanged := grokIdentityCredentialChanged(current, merged) || codexIdentityCredentialChanged(current, merged)
 			credJSON, err := marshalCredentialsForStorage(merged)
 			if err != nil {
 				return fmt.Errorf("序列化 credentials 失败: %w", err)
@@ -7725,7 +7751,7 @@ func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, cur
 		// so an idempotent update for one row does not inherit another row's
 		// generation bump.
 		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
-		identityChanged := grokIdentityCredentialChanged(credentials, merged)
+		identityChanged := grokIdentityCredentialChanged(credentials, merged) || codexIdentityCredentialChanged(credentials, merged)
 		credJSON, err := marshalCredentialsForStorage(merged)
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
@@ -7912,7 +7938,7 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
+	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged) || codexIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
 	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
@@ -8003,7 +8029,7 @@ func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id i
 
 	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
-	identityChanged := grokIdentityCredentialChanged(current, merged)
+	identityChanged := grokIdentityCredentialChanged(current, merged) || codexIdentityCredentialChanged(current, merged)
 	credJSON, err := marshalCredentialsForStorage(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
@@ -8026,6 +8052,9 @@ var grokIdentityCredentialKeys = map[string]struct{}{
 }
 
 func grokIdentityUpdateKeysPresent(updates map[string]interface{}) bool {
+	if _, ok := updates["session_token"]; ok {
+		return true
+	}
 	for key := range updates {
 		if _, ok := grokIdentityCredentialKeys[key]; ok {
 			return true

@@ -83,6 +83,9 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_overload_window_minutes", def: "INT DEFAULT 5"},
 	{table: "system_settings", name: "scheduler_engine", def: "TEXT NULL"},
 	{table: "system_settings", name: "codex_request_compression", def: "TINYINT(1) DEFAULT 1"},
+	{table: "system_settings", name: "codex_telemetry_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_oauth_keepalive_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_telemetry_timing_debug", def: "TINYINT(1) DEFAULT 0"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -891,6 +894,9 @@ func systemSettingsMySQLDDL() string {
 		auto_activate_5h_window_enabled TINYINT(1) DEFAULT 0,
 		scheduler_engine TEXT NULL,
 		codex_request_compression TINYINT(1) DEFAULT 1,
+		codex_telemetry_enabled TINYINT(1) DEFAULT 0,
+		codex_oauth_keepalive_enabled TINYINT(1) DEFAULT 0,
+		codex_telemetry_timing_debug TINYINT(1) DEFAULT 0,
 		relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off',
 		relay_model_cooldown_seconds INT NOT NULL DEFAULT 2,
 		relay_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 0,

@@ -143,6 +143,8 @@
     }
   },
   "accounts": {
+    "lastTokenRefresh": "最近 Token 續期",
+    "tokenRefreshNotice": "授權續期提示",
     "todayStats": "今日統計",
     "todayStatsHint": "今日(0 點起)經由本閘道的請求數、Token 與成本",
     "largePoolSortDisabled": "後台正在聚合查詢中，請稍後再試",
@@ -210,6 +212,11 @@
     "testDiagRetry": "重新測試",
     "testDiagPending": "等待上游回應…",
     "openDetail": "查看詳情",
+    "cardDetails": "詳情",
+    "cardConfigure": "設定",
+    "cardUsage": "用量",
+    "cardUsageTitle": "額度與用量",
+    "cardUsageEmpty": "暫無用量資料",
     "pendingReview": {
       "title": "自助提交待審核",
       "desc": "他人透過帳號自助入口提交、等待審核的帳號",
@@ -227,6 +234,12 @@
     "proxyPoolLinkedHint": "已關聯代理池節點（按位址綁定）：在「代理」頁修改該節點位址會同步到所有綁定帳號，刪除則自動解除綁定。"
   },
   "settings": {
+    "codexOAuthKeepalive": "惰性模式下保持 Codex 授權",
+    "codexOAuthKeepaliveDesc": "開啟後，惰性模式仍會為即將到期的 Codex Token 續期，包括額度冷卻中的帳號；不會解除冷卻或發送生成請求。預設關閉。",
+    "codexTelemetry": "用戶端遙測（實驗性）",
+    "codexTelemetryDesc": "使用所選用戶端身分傳送模擬的 Codex 分析事件與 OTLP 指標。事件為合成，並非來自真實工具呼叫。預設關閉；可用 CODEX_TELEMETRY_ENABLED=false 在部署層強制關閉。",
+    "codexTelemetryTiming": "遙測計時探針（臨時）",
+    "codexTelemetryTimingDesc": "僅診斷用：列印 [TELEMETRY-TIMING] 日誌（請求入口、啟動指標建構、串流解析耗時）。預設關閉、關閉時零開銷；也可用 CODEX_TELEMETRY_TIMING_DEBUG=1 開啟。",
     "pricing": {
       "contextThreshold": "長上下文閾值",
       "revertThreshold": "還原為 {{value}} tokens",

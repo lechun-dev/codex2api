@@ -594,6 +594,9 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		SchedulerEngine:                     "outbox",
 		CodexRequestCompression:             true,
 		CodexImagesMainModel:                "gpt-5.6-luna",
+		CodexTelemetryEnabled:               true,
+		CodexOAuthKeepaliveEnabled:          true,
+		CodexTelemetryTimingDebug:           true,
 	}
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("UpdateSystemSettings() error = %v", err)
@@ -634,16 +637,19 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"scheduler_engine = VALUES(scheduler_engine)",
 		"codex_request_compression = VALUES(codex_request_compression)",
 		"codex_images_main_model = VALUES(codex_images_main_model)",
+		"codex_telemetry_enabled = VALUES(codex_telemetry_enabled)",
+		"codex_oauth_keepalive_enabled = VALUES(codex_oauth_keepalive_enabled)",
+		"codex_telemetry_timing_debug = VALUES(codex_telemetry_timing_debug)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 124 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 124", got)
+	if got := strings.Count(capture.query, "?"); got != 127 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 127", got)
 	}
-	if len(capture.args) != 124 {
-		t.Fatalf("rewritten settings argument count = %d, want 124", len(capture.args))
+	if len(capture.args) != 127 {
+		t.Fatalf("rewritten settings argument count = %d, want 127", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -659,6 +665,9 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.SchedulerEngine,
 		settings.CodexRequestCompression,
 		settings.CodexImagesMainModel,
+		settings.CodexTelemetryEnabled,
+		settings.CodexOAuthKeepaliveEnabled,
+		settings.CodexTelemetryTimingDebug,
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}

@@ -787,6 +787,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		"request_text",
 		"ws_acquire_ms",
 		"has_compaction_history",
+		"ultra",
 		"client_user_agent",
 		"upstream_user_agent",
 		"user_agent_overridden",

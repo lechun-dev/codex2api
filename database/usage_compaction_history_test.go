@@ -153,8 +153,8 @@ func TestUsageLogCompactionStatesRoundTripAndFilter(t *testing.T) {
 }
 
 func TestUsageLogInsertColumnCountIncludesCompactionHistory(t *testing.T) {
-	// 2026-09-11 coder(lq): Preserve all local trace columns and include upstream image billing fields.
-	const want = 66
+	// 2026-09-15 coder(lq): Preserve local trace columns and include upstream Ultra and image billing fields.
+	const want = 67
 	if usageLogInsertColumnCount != want {
 		t.Fatalf("usageLogInsertColumnCount = %d, want %d", usageLogInsertColumnCount, want)
 	}

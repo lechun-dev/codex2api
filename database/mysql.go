@@ -175,6 +175,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			stream TINYINT(1) DEFAULT 0,
 			compact TINYINT(1) DEFAULT 0,
 			has_compaction_history TINYINT(1) DEFAULT 0,
+			ultra TINYINT(1) DEFAULT 0,
 			via_websocket TINYINT(1) DEFAULT 0,
 			cached_tokens INT DEFAULT 0,
 			cache_write_5m_tokens INT DEFAULT 0,
@@ -392,6 +393,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "stream", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "compact", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "has_compaction_history", "TINYINT(1) DEFAULT 0"},
+		{"usage_logs", "ultra", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "via_websocket", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INT DEFAULT 0"},
 		// 2026-09-03 coder(lq): Add Claude cache-write token buckets to legacy MySQL 5.6 usage tables.

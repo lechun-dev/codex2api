@@ -12,13 +12,28 @@ const (
 	// 普通 Responses SSE 在上游长时间只思考、不产出可转发事件时，也要持续
 	// 刷新下游链路的 idle timer。10 秒低于常见的 30/60 秒反代超时，同时
 	// 2026-09-07 coder(lq): 每分钟仅增加少量字节；按客户端类型选择注释或完整事件。
-	defaultDownstreamSSEKeepaliveInterval = 10 * time.Second
-	downstreamSSEKeepaliveComment         = ": keepalive\n\n"
-	downstreamSSEKeepaliveEvent           = "event: codex.keepalive\ndata: {\"type\":\"codex.keepalive\"}\n\n"
+	defaultDownstreamHTTPKeepaliveInterval = 10 * time.Second
+	defaultDownstreamSSEKeepaliveInterval  = defaultDownstreamHTTPKeepaliveInterval
+	downstreamSSEKeepaliveComment          = ": keepalive\n\n"
+	downstreamSSEKeepaliveEvent            = "event: codex.keepalive\ndata: {\"type\":\"codex.keepalive\"}\n\n"
+	downstreamMessagesKeepaliveEvent       = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
 )
 
-// 变量形式只为处理器级测试缩短等待；生产运行保持默认 10 秒。
-var downstreamSSEKeepaliveInterval = defaultDownstreamSSEKeepaliveInterval
+// 变量形式只为处理器级测试缩短等待；生产运行从环境变量读取。
+var downstreamSSEKeepaliveInterval = downstreamSSEKeepaliveIntervalFromEnv()
+
+// downstreamSSEKeepaliveIntervalFromEnv 读取下游 HTTP/SSE 保活周期配置。
+func downstreamSSEKeepaliveIntervalFromEnv() time.Duration {
+	return durationFromEnv("DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL", defaultDownstreamSSEKeepaliveInterval)
+}
+
+// ConfigureDownstreamKeepaliveFromEnv 在 config.Load 读取 .env 后刷新保活配置。
+// 进程环境变量仍会在包初始化时生效。
+func ConfigureDownstreamKeepaliveFromEnv() {
+	downstreamSSEKeepaliveInterval = downstreamSSEKeepaliveIntervalFromEnv()
+	continuousRetryKeepaliveInterval = downstreamSSEKeepaliveInterval
+	downstreamWSKeepaliveInterval = downstreamWSKeepaliveIntervalFromEnv()
+}
 
 // 2026-09-07 coder(lq): Codex 客户端不会用 SSE 注释刷新事件空闲计时器，
 // 因此仅在官方客户端的 Responses 入口发送完整事件；其他兼容客户端保持注释。

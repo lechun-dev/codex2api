@@ -4914,6 +4914,8 @@
     "filterIssues": "Issues",
     "filterIssuesDesc": "Expired {{expired}} · Exhausted {{exhausted}}",
     "searchPlaceholder": "Search name or key fragment…",
+    "groupFilterAll": "All groups",
+    "groupFilterUnrestricted": "No group limit",
     "showingCount": "{{shown}} / {{total}}",
     "noFilterResults": "No matching keys",
     "noFilterResultsDesc": "Try adjusting filters or the search query.",

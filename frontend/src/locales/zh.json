@@ -4914,6 +4914,8 @@
     "filterIssues": "异常密钥",
     "filterIssuesDesc": "过期 {{expired}} · 额度耗尽 {{exhausted}}",
     "searchPlaceholder": "搜索名称或密钥片段…",
+    "groupFilterAll": "全部分组",
+    "groupFilterUnrestricted": "不限制分组",
     "showingCount": "{{shown}} / {{total}}",
     "noFilterResults": "没有匹配的密钥",
     "noFilterResultsDesc": "试试调整筛选条件或搜索关键词。",

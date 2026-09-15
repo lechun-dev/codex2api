@@ -95,6 +95,7 @@ type TokenLimitUnit = "token" | "k" | "m" | "b";
 type StatusFilter = "all" | "active" | "expired" | "quota_exhausted" | "expiring_soon" | "disabled";
 type APIKeyStatus = "active" | "expired" | "quota_exhausted" | "disabled";
 type SortMode = "created_desc" | "last_used_desc" | "quota_usage_desc" | "name_asc";
+type GroupFilter = "all" | "unrestricted" | `group:${number}`;
 
 const KEY_REVEAL_MS = 30_000;
 const EXPIRING_SOON_MS = 7 * 24 * 60 * 60 * 1000;
@@ -303,6 +304,7 @@ export default function APIKeys() {
   const revealTimers = useRef<Map<number, number>>(new Map());
   const [activeTab, setActiveTab] = useState<"keys" | "token-usage">("keys");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [groupFilter, setGroupFilter] = useState<GroupFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("created_desc");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -572,6 +574,12 @@ export default function APIKeys() {
         if (!(expiresAt > now && expiresAt - now <= EXPIRING_SOON_MS))
           return false;
       }
+      if (groupFilter === "unrestricted") {
+        if ((keyRow.allowed_group_ids?.length ?? 0) > 0) return false;
+      } else if (groupFilter.startsWith("group:")) {
+        const groupID = Number(groupFilter.slice("group:".length));
+        if (!keyRow.allowed_group_ids?.includes(groupID)) return false;
+      }
       if (!q) return true;
       const haystack = [
         keyRow.name,
@@ -622,7 +630,35 @@ export default function APIKeys() {
       }
     });
     return sorted;
-  }, [keys, searchQuery, sortMode, statusFilter]);
+  }, [groupFilter, keys, searchQuery, sortMode, statusFilter]);
+
+  const groupFilterOptions = useMemo<SelectOption[]>(() => {
+    const sortedGroups = [...groups].sort(
+      (a, b) => a.sort_order - b.sort_order || a.name.localeCompare(b.name),
+    );
+    return [
+      { label: t("apiKeys.groupFilterAll"), value: "all" },
+      {
+        label: t("apiKeys.groupFilterUnrestricted"),
+        value: "unrestricted",
+      },
+      ...sortedGroups.map((group) => ({
+        label: group.name,
+        value: `group:${group.id}`,
+      })),
+    ];
+  }, [groups, t]);
+
+  useEffect(() => {
+    if (
+      groupFilter.startsWith("group:") &&
+      !groups.some(
+        (group) => `group:${group.id}` === groupFilter,
+      )
+    ) {
+      setGroupFilter("all");
+    }
+  }, [groupFilter, groups]);
 
   const sortOptions = useMemo(
     () => [
@@ -1502,6 +1538,18 @@ export default function APIKeys() {
                     />
                   </div>
                   <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:min-w-[10.5rem]">
+                    <Waypoints className="size-3.5 shrink-0 text-muted-foreground" />
+                    <Select
+                      className="w-full min-w-0"
+                      value={groupFilter}
+                      onValueChange={(value) =>
+                        setGroupFilter(value as GroupFilter)
+                      }
+                      options={groupFilterOptions}
+                      compact
+                    />
+                  </div>
+                  <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:min-w-[10.5rem]">
                     <ArrowUpDown className="size-3.5 shrink-0 text-muted-foreground" />
                     <Select
                       className="w-full min-w-0"
@@ -1561,6 +1609,7 @@ export default function APIKeys() {
                       size="sm"
                       onClick={() => {
                         setStatusFilter("all");
+                        setGroupFilter("all");
                         setSearchQuery("");
                       }}
                     >

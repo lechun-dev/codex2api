@@ -238,6 +238,66 @@ func TestScopedCodexManifestAdvertisesGrokReasoningLevels(t *testing.T) {
 	}
 }
 
+func TestScopedCodexManifestAdvertisesDeepSeekFlashImageInput(t *testing.T) {
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "deepseek-flash"},
+		{ID: "deepseek-v4-flash"},
+		{ID: "deepseek-v4-flash-vision-exp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []scopedCodexManifestItem `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, item := range payload.Models {
+		got[item.Slug] = strings.Join(item.InputModalities, ",")
+	}
+	for _, slug := range []string{"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"} {
+		if got[slug] != "text,image" {
+			t.Fatalf("%s input_modalities = %q, want text,image", slug, got[slug])
+		}
+	}
+}
+
+func TestMergeCodexManifestModelsRepairsStaleDeepSeekFlashCapabilities(t *testing.T) {
+	merged, err := mergeCodexManifestModels(
+		[]byte(`{"models":[{"slug":"deepseek-flash","display_name":"DeepSeek V4.1 Flash","input_modalities":["text"],"context_window":128000}]}`),
+		[]api.Model{{ID: "deepseek-flash"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Models []struct {
+			Slug            string   `json:"slug"`
+			DisplayName     string   `json:"display_name"`
+			InputModalities []string `json:"input_modalities"`
+			ContextWindow   int      `json:"context_window"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(merged, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Models) != 1 {
+		t.Fatalf("merged = %s", merged)
+	}
+	model := payload.Models[0]
+	if model.Slug != "deepseek-flash" || model.DisplayName != "DeepSeek V4.1 Flash" {
+		t.Fatalf("upstream metadata should be preserved: %+v merged=%s", model, merged)
+	}
+	if strings.Join(model.InputModalities, ",") != "text,image" {
+		t.Fatalf("stale text-only capability should be repaired: %+v merged=%s", model, merged)
+	}
+	if model.ContextWindow != 128000 {
+		t.Fatalf("unrelated upstream fields should be preserved: %+v merged=%s", model, merged)
+	}
+}
+
 func TestMergeCodexManifestModelsReplacesStaleGrokCapabilities(t *testing.T) {
 	merged, err := mergeCodexManifestModels(
 		[]byte(`{"models":[{"slug":"gpt-5.4","display_name":"GPT"},{"slug":"grok-4.5","input_modalities":["text"],"supported_reasoning_levels":[],"default_reasoning_level":"none"},{"slug":"grok-4.6","input_modalities":["text"],"supported_reasoning_levels":[]}],"future":true}`),

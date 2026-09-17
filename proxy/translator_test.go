@@ -11,6 +11,16 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func countFunctionCallOutputs(raw []byte) int {
+	count := 0
+	for _, item := range gjson.GetBytes(raw, "input").Array() {
+		if item.Get("type").String() == "function_call_output" {
+			count++
+		}
+	}
+	return count
+}
+
 func TestNormalizeServiceTierField(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.4","serviceTier":"fast"}`)
 
@@ -61,13 +71,7 @@ func TestTranslateRequestAcceptsParallelToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parallel tool results should be valid: %v", err)
 	}
-	count := 0
-	for _, item := range gjson.GetBytes(got, "input").Array() {
-		if item.Get("type").String() == "function_call_output" {
-			count++
-		}
-	}
-	if count != 2 {
+	if count := countFunctionCallOutputs(got); count != 2 {
 		t.Fatalf("function_call_output count = %d, want 2; body=%s", count, got)
 	}
 }
@@ -1164,7 +1168,7 @@ func TestPrepareResponsesBody_FlattensOrphanOutputContentParts(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesWebSocketBody_SkipsPairingRepairWithPreviousResponseID(t *testing.T) {
+func TestPrepareResponsesWebSocketBody_PreservesOutputOnlyWithPreviousResponseID(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.5",
 		"previous_response_id":"resp_123",
@@ -1177,6 +1181,87 @@ func TestPrepareResponsesWebSocketBody_SkipsPairingRepairWithPreviousResponseID(
 
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "function_call_output" {
 		t.Fatalf("orphan output is legitimate when previous_response_id is preserved, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_SynthesizesOutputForCallWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call","call_id":"call_missing","name":"get_weather","arguments":"{}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "function_call" {
+		t.Fatalf("call should be preserved, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call_output" {
+		t.Fatalf("missing output should be synthesized, got %q; body=%s", typ, got)
+	}
+	if callID := gjson.GetBytes(got, "input.1.call_id").String(); callID != "call_missing" {
+		t.Fatalf("placeholder call_id = %q, want call_missing; body=%s", callID, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_SynthesizesOutputsForParallelCallsWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call","call_id":"call_a","name":"get_weather","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"get_time","arguments":"{}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if count := countFunctionCallOutputs(got); count != 2 {
+		t.Fatalf("synthesized output count = %d, want 2; body=%s", count, got)
+	}
+	for index, callID := range []string{"call_a", "call_b"} {
+		path := fmt.Sprintf("input.%d.call_id", index*2+1)
+		if gotCallID := gjson.GetBytes(got, path).String(); gotCallID != callID {
+			t.Fatalf("output %d call_id = %q, want %q; body=%s", index, gotCallID, callID, got)
+		}
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_DeduplicatesMissingOutputByCallIDWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call","call_id":"call_duplicate","name":"get_weather","arguments":"{}"},
+			{"type":"function_call","call_id":"call_duplicate","name":"get_weather","arguments":"{}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if count := countFunctionCallOutputs(got); count != 1 {
+		t.Fatalf("synthesized output count = %d, want 1; body=%s", count, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_RewritesOutputMissingCallIDWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call_output","output":"unkeyed result"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("output missing call_id must be rewritten, got %q; body=%s", typ, got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); !strings.Contains(text, "unkeyed result") {
+		t.Fatalf("rewritten output should preserve content, got %q; body=%s", text, got)
 	}
 }
 

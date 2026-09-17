@@ -1206,6 +1206,64 @@ func repairResponsesToolOutputsMissingCallID(body map[string]any) bool {
 	return modified
 }
 
+// repairResponsesToolCallsMissingOutputs 仅补齐当前 input[] 中实际存在的
+// 工具调用所缺失的占位输出。previous_response_id 续链场景下，历史调用可能已
+// 保存在上游状态里，因此不能像 repairResponsesToolCallPairing 那样改写当前
+// input 中只有输出的条目；但客户端若把调用项重新带进当前 input，上游仍会因
+// 缺少对应 output 报 "No tool output found for function call ...".
+func repairResponsesToolCallsMissingOutputs(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok || len(inputItems) == 0 {
+		return false
+	}
+
+	outputIDs := make(map[string]bool)
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || !isCodexToolCallOutputType(strings.TrimSpace(firstNonEmptyAnyString(item["type"]))) {
+			continue
+		}
+		if callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"])); callID != "" {
+			outputIDs[callID] = true
+		}
+	}
+
+	added := 0
+	out := make([]any, 0, len(inputItems))
+	for _, raw := range inputItems {
+		out = append(out, raw)
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+		if !isCodexToolCallContextType(typ) {
+			continue
+		}
+		callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"]))
+		if callID == "" || outputIDs[callID] {
+			continue
+		}
+		outputType := codexToolCallOutputTypeForCall(typ)
+		if outputType == "" {
+			continue
+		}
+		out = append(out, map[string]any{
+			"type":    outputType,
+			"call_id": callID,
+			"output":  "[tool output was not recorded]",
+		})
+		outputIDs[callID] = true
+		added++
+	}
+	if added == 0 {
+		return false
+	}
+	body["input"] = out
+	log.Printf("已修复 previous_response_id 续链中缺失的工具输出: 补占位输出 %d 条", added)
+	return true
+}
+
 // flattenToolOutputText 把 *_call_output 的 output 字段拍平成纯文本。
 // output 可能是 string，也可能是 [{type:"output_text",text:"..."}] 形式的内容数组。
 func flattenToolOutputText(output any) string {
@@ -2480,9 +2538,13 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesInputItemIDs(body)
 	dropBareReasoningInputItems(body)
 	// 6c. 修复工具调用/输出的 call_id 配对（issue #414）。
-	// previous_response_id 保留给上游的原生续链场景跳过：历史存于上游服务端，
-	// 本地看似孤儿的输出项是合法续链，不能改写。
-	if !(opts.preservePreviousResponseID && prevID != "") {
+	// previous_response_id 保留给上游的原生续链场景：历史存于上游服务端，
+	// 当前 input 中只有输出的条目是合法续链，不能改写为 message；但当前 input
+	// 里确实重新带上的调用项仍必须补齐输出，否则上游报 "No tool output found".
+	if opts.preservePreviousResponseID && prevID != "" {
+		repairResponsesToolOutputsMissingCallID(body)
+		repairResponsesToolCallsMissingOutputs(body)
+	} else {
 		repairResponsesToolCallPairing(body)
 	}
 

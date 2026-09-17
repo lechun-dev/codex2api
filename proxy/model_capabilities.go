@@ -309,6 +309,12 @@ func (h *Handler) applyStoredModelCapabilities(ctx context.Context, row *databas
 			candidates = append(candidates, fields)
 		}
 		for name, value := range intersectCodexCapabilities(candidates) {
+			// DeepSeek Flash 的协议能力是本地的确定性契约，不能被上游旧快照
+			// 里的 text-only 记录覆盖回纯文本。
+			if name == "input_modalities" && isDeepSeekFlashModel(slug) {
+				model[name], _ = json.Marshal(codexTextImageInputModalities())
+				continue
+			}
 			if bytes.Equal(value, []byte("null")) {
 				if name == "input_modalities" {
 					model[name] = json.RawMessage(`["text"]`)

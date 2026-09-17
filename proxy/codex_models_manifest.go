@@ -202,6 +202,18 @@ type scopedCodexManifestItem struct {
 	ContextWindow              int                   `json:"context_window,omitempty"`
 }
 
+// isDeepSeekFlashModel 判断 slug 是否属于 DeepSeek Flash 系列。
+// 这些模型经网关协议支持图像输入，但 slug 不含 image，需要显式声明，
+// 否则 Codex Desktop 会把它们当作纯文本模型。
+func isDeepSeekFlashModel(slug string) bool {
+	key := strings.ToLower(strings.TrimSpace(slug))
+	return strings.Contains(key, "deepseek") && strings.Contains(key, "flash")
+}
+
+func codexTextImageInputModalities() []string {
+	return []string{"text", "image"}
+}
+
 func scopedCodexInputModalities(slug string) []string {
 	key := strings.ToLower(strings.TrimSpace(slug))
 	if strings.Contains(key, "video") {
@@ -210,10 +222,34 @@ func scopedCodexInputModalities(slug string) []string {
 	// Grok 4 text models accept vision on the protocol path. Advertise it so
 	// Codex Desktop enables image input instead of treating them as text-only
 	// because the slug does not contain "image".
-	if strings.Contains(key, "image") || strings.HasPrefix(key, "grok-4") {
-		return []string{"text", "image"}
+	if strings.Contains(key, "image") || strings.Contains(key, "vision") ||
+		strings.HasPrefix(key, "grok-4") || isDeepSeekFlashModel(key) {
+		return codexTextImageInputModalities()
 	}
 	return []string{"text"}
+}
+
+// forceCodexModelInputModalities 在保留上游条目其它字段（尤其是 display_name）
+// 的前提下，覆盖 input_modalities。用于上游清单仍是旧能力快照时纠正本地路由
+// 模型的协议能力。
+func forceCodexModelInputModalities(raw json.RawMessage, slug string, modalities []string) json.RawMessage {
+	if len(modalities) == 0 {
+		return raw
+	}
+	var item map[string]json.RawMessage
+	if json.Unmarshal(raw, &item) != nil {
+		return raw
+	}
+	encoded, err := json.Marshal(modalities)
+	if err != nil {
+		return raw
+	}
+	item["input_modalities"] = encoded
+	patched, err := json.Marshal(item)
+	if err != nil {
+		return raw
+	}
+	return patched
 }
 
 func buildScopedCodexManifest(models []api.Model) ([]byte, error) {
@@ -339,8 +375,14 @@ func mergeCodexManifestModels(body []byte, extras []api.Model) ([]byte, error) {
 		var item struct {
 			Slug string `json:"slug"`
 		}
-		if json.Unmarshal(raw, &item) == nil && replacedSlugs[strings.ToLower(strings.TrimSpace(item.Slug))] {
-			continue
+		if json.Unmarshal(raw, &item) == nil {
+			slug := strings.ToLower(strings.TrimSpace(item.Slug))
+			if replacedSlugs[slug] {
+				continue
+			}
+			if isDeepSeekFlashModel(slug) {
+				raw = forceCodexModelInputModalities(raw, slug, codexTextImageInputModalities())
+			}
 		}
 		retained = append(retained, raw)
 	}

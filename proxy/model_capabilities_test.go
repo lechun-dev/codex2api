@@ -84,3 +84,48 @@ func TestStoredModelCapabilitiesRestoreAndScope(t *testing.T) {
 		}
 	}
 }
+
+func TestStoredModelCapabilitiesDoNotDowngradeDeepSeekFlashImageInput(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	store := auth.NewStore(nil, nil, nil)
+	id, err := db.InsertAccount(ctx, "caps", "deepseek-refresh", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &auth.Account{DBID: id, CredentialGeneration: row.CredentialGeneration, AccessToken: "test-deepseek", PlanType: "plus"}
+	store.AddAccount(account)
+	err = db.SaveModelCapabilities(ctx, database.ModelCapabilitySnapshot{
+		AccountID:            id,
+		CredentialGeneration: row.CredentialGeneration,
+		ObservedAt:           time.Now().UnixNano(),
+		Models: map[string]map[string]json.RawMessage{
+			"deepseek-flash":               {"input_modalities": json.RawMessage(`["text"]`)},
+			"deepseek-v4-flash":            {"input_modalities": json.RawMessage(`["text"]`)},
+			"deepseek-v4-flash-vision-exp": {"input_modalities": json.RawMessage(`["text"]`)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(store, db, nil, nil)
+	body, err := buildScopedCodexManifest([]api.Model{
+		{ID: "deepseek-flash"},
+		{ID: "deepseek-v4-flash"},
+		{ID: "deepseek-v4-flash-vision-exp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := h.applyStoredModelCapabilities(ctx, &database.APIKeyRow{ID: 1}, body)
+	for index, slug := range []string{"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"} {
+		path := fmt.Sprintf("models.%d.input_modalities", index)
+		if modalities := gjson.GetBytes(got, path).Array(); len(modalities) != 2 || modalities[0].String() != "text" || modalities[1].String() != "image" {
+			t.Fatalf("%s stored snapshot downgraded image input: %s", slug, got)
+		}
+	}
+}

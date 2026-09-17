@@ -429,10 +429,16 @@ func TestCodexTelemetryDefaultOff(t *testing.T) {
 }
 
 func TestCodexTelemetryJobRoutesThroughResin(t *testing.T) {
+	const expectedPath = "/token/test/https/chatgpt.com/backend-api/codex/analytics-events/events"
 	requests := make(chan *http.Request, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		_, _ = io.Copy(io.Discard, request.Body)
-		requests <- request.Clone(request.Context())
+		if request.URL.Path == expectedPath {
+			select {
+			case requests <- request.Clone(request.Context()):
+			default:
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -444,7 +450,7 @@ func TestCodexTelemetryJobRoutesThroughResin(t *testing.T) {
 		t.Fatalf("send telemetry via resin: %v", err)
 	}
 	got := <-requests
-	if got.URL.Path != "/token/test/https/chatgpt.com/backend-api/codex/analytics-events/events" {
+	if got.URL.Path != expectedPath {
 		t.Fatalf("resin path = %q", got.URL.Path)
 	}
 	if got.Header.Get("X-Resin-Account") != ResinAccountID(profile.client.account) || got.Header.Get("Authorization") != "Bearer test-token" {

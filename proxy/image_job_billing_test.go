@@ -42,7 +42,12 @@ func TestImagePerImageRetryBilling(t *testing.T) {
 				t.Fatal(err)
 			}
 			var calls atomic.Int32
+			const expectedPath = "/image-fee-retry-test/https/chatgpt.com/backend-api/codex/responses"
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != expectedPath {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				if calls.Add(1) == 1 {
 					fmt.Fprint(w, "event: error\ndata: {\"type\":\"future_image_failure\",\"error\":{\"message\":\"retry me\"}}\n\n")

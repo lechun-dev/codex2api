@@ -847,8 +847,13 @@ func TestForwardImagesSelectiveRetryBuffersWholeExplicitErrorAttempt(t *testing.
 	}
 	ApplyRuntimeSettings(nextRuntime)
 
+	const expectedPath = "/image-selective-replay-test/https/chatgpt.com/backend-api/codex/responses"
 	var calls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != expectedPath {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if calls.Add(1) == 1 {
 			_, _ = fmt.Fprint(w, `data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"ZmFpbGVkLXBhcnRpYWw=","partial_image_index":0}`+"\n\n")

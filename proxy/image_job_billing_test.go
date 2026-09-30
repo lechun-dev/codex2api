@@ -15,6 +15,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestImagePerImageRetryBilling(t *testing.T) {
@@ -44,7 +45,10 @@ func TestImagePerImageRetryBilling(t *testing.T) {
 			var calls atomic.Int32
 			const expectedPath = "/image-fee-retry-test/https/chatgpt.com/backend-api/codex/responses"
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != expectedPath {
+				// Runtime background probes can share Resin routing with this mock.
+				// Count only actual image requests so probes cannot consume a retry
+				// or make the billing assertion depend on other tests' timing.
+				if r.URL.Path != expectedPath || !gjson.GetBytes(readUpstreamRequestBody(r), `tools.#(type=="image_generation")`).Exists() {
 					w.WriteHeader(http.StatusNoContent)
 					return
 				}

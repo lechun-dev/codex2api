@@ -429,11 +429,17 @@ func TestCodexTelemetryDefaultOff(t *testing.T) {
 }
 
 func TestCodexTelemetryJobRoutesThroughResin(t *testing.T) {
-	const expectedPath = "/token/test/https/chatgpt.com/backend-api/codex/analytics-events/events"
+	// The telemetry worker pool is process-global. Jobs queued by earlier
+	// tests may still be draining while this test points the global Resin
+	// config at its own server, so the handler must only capture this
+	// test's request (matched by body) and must never block on the channel:
+	// a blocked handler would stall the client until timeout and then hang
+	// the deferred server.Close forever.
+	const marker = `{"codex2api_test":"resin-route"}`
 	requests := make(chan *http.Request, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		_, _ = io.Copy(io.Discard, request.Body)
-		if request.URL.Path == expectedPath {
+		body, _ := io.ReadAll(request.Body)
+		if string(body) == marker {
 			select {
 			case requests <- request.Clone(request.Context()):
 			default:
@@ -445,12 +451,17 @@ func TestCodexTelemetryJobRoutesThroughResin(t *testing.T) {
 	SetResinConfig(&ResinConfig{BaseURL: server.URL + "/token", PlatformName: "test"})
 	defer SetResinConfig(nil)
 	profile := testCodexTelemetryProfile()
-	job := codexTelemetryJob{client: profile.client, url: "https://chatgpt.com/backend-api/codex/analytics-events/events", body: []byte(`{}`)}
+	job := codexTelemetryJob{client: profile.client, url: "https://chatgpt.com/backend-api/codex/analytics-events/events", body: []byte(marker)}
 	if err := sendCodexTelemetryJob(job); err != nil {
 		t.Fatalf("send telemetry via resin: %v", err)
 	}
-	got := <-requests
-	if got.URL.Path != expectedPath {
+	var got *http.Request
+	select {
+	case got = <-requests:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resin server did not receive the telemetry request")
+	}
+	if got.URL.Path != "/token/test/https/chatgpt.com/backend-api/codex/analytics-events/events" {
 		t.Fatalf("resin path = %q", got.URL.Path)
 	}
 	if got.Header.Get("X-Resin-Account") != ResinAccountID(profile.client.account) || got.Header.Get("Authorization") != "Bearer test-token" {

@@ -153,8 +153,8 @@ func TestUsageLogCompactionStatesRoundTripAndFilter(t *testing.T) {
 }
 
 func TestUsageLogInsertColumnCountIncludesCompactionHistory(t *testing.T) {
-	// 2026-09-15 coder(lq): Preserve local trace columns and include upstream Ultra and image billing fields.
-	const want = 67
+	// Upstream v3.0.5 has 71 columns; preserve the four local conversation trace columns as well.
+	const want = 75
 	if usageLogInsertColumnCount != want {
 		t.Fatalf("usageLogInsertColumnCount = %d, want %d", usageLogInsertColumnCount, want)
 	}

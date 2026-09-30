@@ -271,6 +271,7 @@ func TestMySQLIntegrationSmoke(t *testing.T) {
 	}
 
 	if err := db.batchInsertLogs(ctx, []usageLogEntry{{
+		StoreUsageLog:       true,
 		AccountID:           accountID,
 		ClientIP:            "127.0.0.1",
 		SessionID:           "mysql-smoke-session",

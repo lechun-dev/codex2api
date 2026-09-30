@@ -59,7 +59,7 @@ func TestMySQLSettingsSchemaIncludesCodexUserAgentConfig(t *testing.T) {
 		"compact_via_responses_enabled TINYINT(1) DEFAULT 0",
 		"codex_preflight_sse_passthrough_enabled TINYINT(1) DEFAULT 0",
 		"utls_shutdown_timeout_minutes INT DEFAULT 30",
-		"codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off'",
+		"codex_fingerprint_default_mode VARCHAR(64) DEFAULT 'off'",
 		"response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864",
 		"response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608",
 		"response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864",

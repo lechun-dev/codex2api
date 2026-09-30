@@ -127,6 +127,31 @@ jobs:
           CODEX2API_TEST_POSTGRES_DSN: postgres://codex2api_test:test-only@localhost:5432/codex2api_test?sslmode=disable
         run: go test -race -count=1 ./database -run '^TestPostgresTraceAndCapabilities$'
 
+  mysql56-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      mysql:
+        image: mysql:5.6
+        env:
+          MYSQL_ROOT_PASSWORD: test-only
+          MYSQL_DATABASE: codex2api_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest-only"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Test MySQL 5.6 startup, settings, audit fields and image migrations
+        env:
+          CODEX2API_MYSQL_TEST_DSN: root:test-only@tcp(127.0.0.1:3306)/codex2api_test?parseTime=true&charset=utf8&loc=UTC
+          CODEX2API_TEST_MYSQL_DSN: root:test-only@tcp(127.0.0.1:3306)/codex2api_test?parseTime=true&charset=utf8&loc=UTC
+        run: go test -race -count=1 ./database -run 'TestMySQL.*Integration|TestAPIKeyAuthRevisionMySQL'
+
   test-race:
     name: test-race (${{ matrix.name }})
     runs-on: ubuntu-latest

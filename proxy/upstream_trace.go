@@ -17,6 +17,8 @@ type upstreamTraceAttempt struct {
 	accountID int64
 	requestID string
 	proxy     auth.ProxyAuditLabel
+	// upstreamTurnState 是上游响应回带的 X-Codex-Turn-State，空串表示没有。
+	upstreamTurnState string
 }
 
 type upstreamTraceSnapshot struct {
@@ -24,6 +26,8 @@ type upstreamTraceSnapshot struct {
 	accountID         int64
 	UpstreamRequestID string
 	Proxy             auth.ProxyAuditLabel
+	InjectedTurnState string
+	UpstreamTurnState string
 }
 
 func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
@@ -38,6 +42,7 @@ func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
 		result.accountID = a.current.accountID
 		result.UpstreamRequestID = a.current.requestID
 		result.Proxy = a.current.proxy
+		result.UpstreamTurnState = a.current.upstreamTurnState
 	}
 	return result
 }
@@ -48,6 +53,8 @@ func (s upstreamTraceSnapshot) apply(input *database.UsageLogInput) {
 		input.UpstreamRequestID = s.UpstreamRequestID
 		input.UpstreamProxyID = s.Proxy.ID
 		input.UpstreamProxyName = s.Proxy.Name
+		input.InjectedTurnState = s.InjectedTurnState
+		input.UpstreamTurnState = s.UpstreamTurnState
 	}
 }
 
@@ -116,7 +123,8 @@ func beginUpstreamTrace(ctx context.Context, account *auth.Account, proxyURL str
 	return func(resp *http.Response) {
 		if resp == nil || ws {
 			return
-		} // A WS handshake ID is not a per-turn ID.
+		} // A WS handshake ID is not a per-turn ID; WS turn state arrives per frame, see ObserveCodexTurnStateFrame.
+		turnState := observedCodexTurnState(resp.Header.Get(codexTurnStateHeader))
 		id := ""
 		if header != "" && auth.ValidateUpstreamRequestIDHeader(header) == nil {
 			id = resp.Header.Get(header)
@@ -132,8 +140,25 @@ func beginUpstreamTrace(ctx context.Context, account *auth.Account, proxyURL str
 		defer a.mu.Unlock()
 		if a.current == attempt {
 			attempt.requestID = id
+			if turnState != "" {
+				attempt.upstreamTurnState = turnState
+			}
 		}
 	}
+}
+
+// noteUpstreamTurnState 把上游回带的 turn state 记到当前尝试上；WS 路径逐帧调用，
+// 后到的值覆盖先到的。
+func noteUpstreamTurnState(ctx context.Context, state string) {
+	a := upstreamTraceFromContext(ctx)
+	if a == nil || state == "" {
+		return
+	}
+	a.mu.Lock()
+	if a.current != nil {
+		a.current.upstreamTurnState = state
+	}
+	a.mu.Unlock()
 }
 
 func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *auth.Account, proxyURL string) (*http.Response, error) {
@@ -161,5 +186,6 @@ func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput) {
 		input.UpstreamRequestID = current.requestID
 		input.UpstreamProxyID = current.proxy.ID
 		input.UpstreamProxyName = current.proxy.Name
+		input.UpstreamTurnState = current.upstreamTurnState
 	}
 }

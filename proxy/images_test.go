@@ -1209,7 +1209,7 @@ func TestForwardImagesCatchAllRetriesBeyondOrdinaryAttemptCap(t *testing.T) {
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 
 	recorder := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(recorder)
+	c, _ := gin.CreateTestContext(&informationalRecordingWriter{ResponseRecorder: recorder})
 	requestCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil).WithContext(requestCtx)

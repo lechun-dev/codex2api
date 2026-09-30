@@ -50,7 +50,7 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "first_token_excludes_ws_acquire", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_preflight_sse_passthrough_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "utls_shutdown_timeout_minutes", def: "INT DEFAULT 30"},
-	{table: "system_settings", name: "codex_fingerprint_default_mode", def: "VARCHAR(20) DEFAULT 'off'"},
+	{table: "system_settings", name: "codex_fingerprint_default_mode", def: "VARCHAR(64) DEFAULT 'off'"},
 	// 2026-09-03 coder(lq): Keep the Claude CLI sync marker available in existing MySQL 5.6 schemas.
 	{table: "system_settings", name: "claude_synced_cli_version", def: "VARCHAR(64) DEFAULT ''"},
 	{table: "system_settings", name: "response_cache_local_max_bytes", def: "BIGINT NOT NULL DEFAULT 67108864"},
@@ -86,6 +86,18 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_telemetry_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_oauth_keepalive_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_telemetry_timing_debug", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_turn_state_template_cache_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_turn_state_account_mode", def: "VARCHAR(20) DEFAULT 'auto'"},
+	{table: "system_settings", name: "codex_basispoints_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_basispoints_models", def: "TEXT NULL"},
+	{table: "system_settings", name: "codex_basispoints_403_pause_disabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_basispoints_403_probe_interval_minutes", def: "INT DEFAULT 1"},
+	{table: "system_settings", name: "codex_basispoints_429_cooldown_seconds", def: "INT DEFAULT 5"},
+	{table: "system_settings", name: "codex_basispoints_cache_creation_as_input", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_synced_desktop_mac_build", def: "TEXT NULL"},
+	{table: "system_settings", name: "codex_synced_desktop_windows_build", def: "TEXT NULL"},
+	{table: "system_settings", name: "codex_synced_vscode_build", def: "TEXT NULL"},
+	{table: "system_settings", name: "auto_reset_credits_on_exhaustion_enabled", def: "TINYINT(1) DEFAULT 0"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -177,6 +189,14 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			has_compaction_history TINYINT(1) DEFAULT 0,
 			ultra TINYINT(1) DEFAULT 0,
 			via_websocket TINYINT(1) DEFAULT 0,
+			daybreak_program VARCHAR(32) NOT NULL DEFAULT '',
+			upstream_response_model VARCHAR(200) NULL,
+			upstream_model_mismatch TINYINT(1) NULL,
+			turn_state_overridden TINYINT(1) DEFAULT 0,
+			turn_state_rewrite_note TEXT NULL,
+			injected_turn_state TEXT NULL,
+			upstream_turn_state TEXT NULL,
+			video_seconds INT DEFAULT 0,
 			cached_tokens INT DEFAULT 0,
 			cache_write_5m_tokens INT DEFAULT 0,
 			cache_write_1h_tokens INT DEFAULT 0,
@@ -395,6 +415,14 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"usage_logs", "has_compaction_history", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "ultra", "TINYINT(1) DEFAULT 0"},
 		{"usage_logs", "via_websocket", "TINYINT(1) DEFAULT 0"},
+		{"usage_logs", "daybreak_program", "VARCHAR(32) NOT NULL DEFAULT ''"},
+		{"usage_logs", "upstream_response_model", "VARCHAR(200) NULL"},
+		{"usage_logs", "upstream_model_mismatch", "TINYINT(1) NULL"},
+		{"usage_logs", "turn_state_overridden", "TINYINT(1) DEFAULT 0"},
+		{"usage_logs", "turn_state_rewrite_note", "TEXT NULL"},
+		{"usage_logs", "injected_turn_state", "TEXT NULL"},
+		{"usage_logs", "upstream_turn_state", "TEXT NULL"},
+		{"usage_logs", "video_seconds", "INT DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INT DEFAULT 0"},
 		// 2026-09-03 coder(lq): Add Claude cache-write token buckets to legacy MySQL 5.6 usage tables.
 		{"usage_logs", "cache_write_5m_tokens", "INT DEFAULT 0"},
@@ -667,6 +695,13 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		return err
 	}
 
+	if _, err := db.conn.ExecContext(ctx, daybreakMySQLSchema); err != nil {
+		return err
+	}
+	if err := db.ensureMySQLVarcharMinLength(ctx, "system_settings", "codex_fingerprint_default_mode", 64, "VARCHAR(64) DEFAULT 'off'"); err != nil {
+		return err
+	}
+
 	return db.runDataMigrationsWithTimeout()
 }
 
@@ -883,7 +918,7 @@ func systemSettingsMySQLDDL() string {
 		auto_reset_credits_enabled TINYINT(1) DEFAULT 0,
 		auto_reset_credits_before_expiry_min INT DEFAULT 60,
 		utls_shutdown_timeout_minutes INT DEFAULT 30,
-		codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off',
+		codex_fingerprint_default_mode VARCHAR(64) DEFAULT 'off',
 		response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 		response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 		response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
@@ -898,6 +933,18 @@ func systemSettingsMySQLDDL() string {
 		codex_request_compression TINYINT(1) DEFAULT 1,
 		codex_telemetry_enabled TINYINT(1) DEFAULT 0,
 		codex_oauth_keepalive_enabled TINYINT(1) DEFAULT 0,
+		codex_turn_state_template_cache_enabled TINYINT(1) DEFAULT 0,
+		codex_turn_state_account_mode VARCHAR(20) DEFAULT 'auto',
+		codex_basispoints_enabled TINYINT(1) DEFAULT 0,
+		codex_basispoints_models TEXT NULL,
+		codex_basispoints_403_pause_disabled TINYINT(1) DEFAULT 0,
+		codex_basispoints_403_probe_interval_minutes INT DEFAULT 1,
+		codex_basispoints_429_cooldown_seconds INT DEFAULT 5,
+		codex_basispoints_cache_creation_as_input TINYINT(1) DEFAULT 0,
+		codex_synced_desktop_mac_build TEXT NULL,
+		codex_synced_desktop_windows_build TEXT NULL,
+		codex_synced_vscode_build TEXT NULL,
+		auto_reset_credits_on_exhaustion_enabled TINYINT(1) DEFAULT 0,
 		codex_telemetry_timing_debug TINYINT(1) DEFAULT 0,
 		relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off',
 		relay_model_cooldown_seconds INT NOT NULL DEFAULT 2,

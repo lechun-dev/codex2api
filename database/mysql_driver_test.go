@@ -645,11 +645,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 127 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 127", got)
+	if got := strings.Count(capture.query, "?"); got != 136 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 136", got)
 	}
-	if len(capture.args) != 127 {
-		t.Fatalf("rewritten settings argument count = %d, want 127", len(capture.args))
+	if len(capture.args) != 136 {
+		t.Fatalf("rewritten settings argument count = %d, want 136", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -666,8 +666,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexRequestCompression,
 		settings.CodexImagesMainModel,
 		settings.CodexTelemetryEnabled,
+		false,
+		"auto",
 		settings.CodexOAuthKeepaliveEnabled,
 		settings.CodexTelemetryTimingDebug,
+		settings.AutoResetCreditsOnExhaustionEnabled,
+		settings.CodexBasispointsEnabled,
+		NormalizeCodexBasispointsModels(settings.CodexBasispointsModels),
+		settings.CodexBasispoints403PauseDisabled,
+		int64(NormalizeCodexBasispoints403ProbeIntervalMinutes(settings.CodexBasispointsProbeMinutes)),
+		int64(NormalizeCodexBasispoints429CooldownSeconds(settings.CodexBasispoints429CooldownSeconds)),
+		settings.CodexBasispointsCacheWriteAsInput,
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}

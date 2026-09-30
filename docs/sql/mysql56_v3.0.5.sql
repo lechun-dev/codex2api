@@ -56,6 +56,13 @@ CALL c2a_add_column_if_missing('image_generation_jobs', 'queue_owner', 'VARCHAR(
 CALL c2a_add_column_if_missing('image_generation_jobs', 'queue_lease_until', 'BIGINT NOT NULL DEFAULT 0');
 CALL c2a_add_column_if_missing('image_assets', 'expires_at', 'BIGINT NOT NULL DEFAULT 0');
 CALL c2a_add_column_if_missing('image_assets', 'delete_after_read', 'TINYINT(1) NOT NULL DEFAULT 0');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'reviewed', 'TINYINT(1) DEFAULT 0');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_confidence', 'DOUBLE NULL');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_threshold', 'DOUBLE NULL');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_reason', 'TEXT NULL');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_endpoint', 'VARCHAR(512) DEFAULT ''''');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_request_mode', 'VARCHAR(32) DEFAULT ''''');
+CALL c2a_add_column_if_missing('prompt_filter_logs', 'review_latency_ms', 'BIGINT NULL');
 
 ALTER TABLE system_settings MODIFY COLUMN codex_fingerprint_default_mode VARCHAR(64) DEFAULT 'off';
 DROP PROCEDURE IF EXISTS c2a_add_column_if_missing;

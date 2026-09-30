@@ -109,6 +109,13 @@ var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
 	{table: "prompt_filter_logs", name: "primary_origin", def: "VARCHAR(50) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "strike_eligible", def: "TINYINT(1) DEFAULT 0"},
 	{table: "prompt_filter_logs", name: "match_context", def: "TEXT NULL"},
+	{table: "prompt_filter_logs", name: "reviewed", def: "TINYINT(1) DEFAULT 0"},
+	{table: "prompt_filter_logs", name: "review_confidence", def: "DOUBLE NULL"},
+	{table: "prompt_filter_logs", name: "review_threshold", def: "DOUBLE NULL"},
+	{table: "prompt_filter_logs", name: "review_reason", def: "TEXT NULL"},
+	{table: "prompt_filter_logs", name: "review_endpoint", def: "VARCHAR(512) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "review_request_mode", def: "VARCHAR(32) DEFAULT ''"},
+	{table: "prompt_filter_logs", name: "review_latency_ms", def: "BIGINT NULL"},
 	{table: "prompt_filter_logs", name: "request_correlation_id", def: "VARCHAR(64) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "newapi_policy_status", def: "VARCHAR(32) DEFAULT ''"},
 	{table: "prompt_filter_logs", name: "newapi_platform", def: "VARCHAR(100) DEFAULT ''"},
@@ -798,6 +805,13 @@ func promptFilterLogsMySQLDDL() string {
 		review_model VARCHAR(100) DEFAULT '',
 		review_flagged TINYINT(1) DEFAULT 0,
 		review_error TEXT NULL,
+		reviewed TINYINT(1) DEFAULT 0,
+		review_confidence DOUBLE NULL,
+		review_threshold DOUBLE NULL,
+		review_reason TEXT NULL,
+		review_endpoint VARCHAR(512) DEFAULT '',
+		review_request_mode VARCHAR(32) DEFAULT '',
+		review_latency_ms BIGINT NULL,
 		full_text MEDIUMTEXT NULL
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }

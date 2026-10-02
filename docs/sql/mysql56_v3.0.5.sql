@@ -34,12 +34,6 @@ DELIMITER ;
 
 CALL c2a_add_column_if_missing('system_settings', 'codex_turn_state_template_cache_enabled', 'TINYINT(1) DEFAULT 0');
 CALL c2a_add_column_if_missing('system_settings', 'codex_turn_state_account_mode', 'VARCHAR(20) DEFAULT ''auto''');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_enabled', 'TINYINT(1) DEFAULT 0');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_models', 'TEXT NULL');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_403_pause_disabled', 'TINYINT(1) DEFAULT 0');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_403_probe_interval_minutes', 'INT DEFAULT 1');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_429_cooldown_seconds', 'INT DEFAULT 5');
-CALL c2a_add_column_if_missing('system_settings', 'codex_basispoints_cache_creation_as_input', 'TINYINT(1) DEFAULT 0');
 CALL c2a_add_column_if_missing('system_settings', 'codex_synced_desktop_mac_build', 'TEXT NULL');
 CALL c2a_add_column_if_missing('system_settings', 'codex_synced_desktop_windows_build', 'TEXT NULL');
 CALL c2a_add_column_if_missing('system_settings', 'codex_synced_vscode_build', 'TEXT NULL');

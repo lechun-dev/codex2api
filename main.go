@@ -444,7 +444,6 @@ func main() {
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	defer handler.Close()
 	handler.SetRuntimeCache(tc)
-	proxy.ConfigureExcelBPSReplay(tc)
 	defer handler.CloseAPIKeyAuthCache()
 	adminHandler.SetAPIKeyAuthCacheHandler(handler)
 

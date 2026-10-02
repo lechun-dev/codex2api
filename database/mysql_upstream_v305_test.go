@@ -74,9 +74,14 @@ func TestMySQL305ImageSchema(t *testing.T) {
 
 func TestMySQL305SettingsAndUsageSQL(t *testing.T) {
 	ddl := systemSettingsMySQLDDL()
-	for _, name := range []string{"codex_basispoints_enabled", "codex_basispoints_models", "codex_basispoints_403_pause_disabled", "codex_basispoints_403_probe_interval_minutes", "codex_basispoints_429_cooldown_seconds", "codex_basispoints_cache_creation_as_input", "auto_reset_credits_on_exhaustion_enabled", "codex_turn_state_template_cache_enabled", "codex_turn_state_account_mode", "codex_synced_desktop_mac_build", "codex_synced_desktop_windows_build", "codex_synced_vscode_build"} {
+	for _, name := range []string{"auto_reset_credits_on_exhaustion_enabled", "codex_turn_state_template_cache_enabled", "codex_turn_state_account_mode", "codex_synced_desktop_mac_build", "codex_synced_desktop_windows_build", "codex_synced_vscode_build"} {
 		if !strings.Contains(ddl, name+" ") {
 			t.Fatalf("missing setting %s", name)
+		}
+	}
+	for _, retired := range []string{"codex_basispoints_enabled", "codex_basispoints_models", "codex_basispoints_403_pause_disabled", "codex_basispoints_403_probe_interval_minutes", "codex_basispoints_429_cooldown_seconds", "codex_basispoints_cache_creation_as_input"} {
+		if strings.Contains(ddl, retired+" ") {
+			t.Fatalf("fresh MySQL schema contains retired setting %s", retired)
 		}
 	}
 	capture := &mysqlCaptureDriver{}
@@ -93,6 +98,68 @@ func TestMySQL305SettingsAndUsageSQL(t *testing.T) {
 		}
 	}
 	assertNoMySQL56IncompatibleSQL(t, capture.query)
+}
+
+func TestMySQLRetiredBasispointsColumnsRemainUntouched(t *testing.T) {
+	db := newMySQLPromptReviewIntegrationDB(t)
+	ctx := context.Background()
+	legacyColumns := []mysqlColumnDefinition{
+		{"system_settings", "codex_basispoints_enabled", "TINYINT(1) DEFAULT 0"},
+		{"system_settings", "codex_basispoints_models", "TEXT NULL"},
+		{"system_settings", "codex_basispoints_403_pause_disabled", "TINYINT(1) DEFAULT 0"},
+		{"system_settings", "codex_basispoints_403_probe_interval_minutes", "INT DEFAULT 1"},
+		{"system_settings", "codex_basispoints_429_cooldown_seconds", "INT DEFAULT 5"},
+		{"system_settings", "codex_basispoints_cache_creation_as_input", "TINYINT(1) DEFAULT 0"},
+	}
+	for _, column := range legacyColumns {
+		var count int
+		if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, column.table, column.name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("fresh MySQL schema contains retired column %s", column.name)
+		}
+		if err := db.ensureMySQLColumn(ctx, column.table, column.name, column.def); err != nil {
+			t.Fatalf("restore legacy column %s: %v", column.name, err)
+		}
+	}
+	if err := db.UpdateSystemSettings(ctx, &SystemSettings{SiteName: "Before upgrade", MaxConcurrency: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE system_settings SET
+		codex_basispoints_enabled=1,
+		codex_basispoints_models='retired-model',
+		codex_basispoints_403_pause_disabled=1,
+		codex_basispoints_403_probe_interval_minutes=60,
+		codex_basispoints_429_cooldown_seconds=90,
+		codex_basispoints_cache_creation_as_input=1
+		WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.SiteName = "After upgrade"
+	settings.MaxConcurrency = 8
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	var enabled, pauseDisabled, probeMinutes, cooldownSeconds, cacheAsInput int
+	var models string
+	if err := db.conn.QueryRowContext(ctx, `SELECT
+		codex_basispoints_enabled,
+		codex_basispoints_models,
+		codex_basispoints_403_pause_disabled,
+		codex_basispoints_403_probe_interval_minutes,
+		codex_basispoints_429_cooldown_seconds,
+		codex_basispoints_cache_creation_as_input
+		FROM system_settings WHERE id=1`).Scan(&enabled, &models, &pauseDisabled, &probeMinutes, &cooldownSeconds, &cacheAsInput); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 || models != "retired-model" || pauseDisabled != 1 || probeMinutes != 60 || cooldownSeconds != 90 || cacheAsInput != 1 {
+		t.Fatalf("legacy MySQL settings changed: enabled=%d models=%q pause=%d probe=%d cooldown=%d cache=%d", enabled, models, pauseDisabled, probeMinutes, cooldownSeconds, cacheAsInput)
+	}
 }
 
 func TestMySQL305DaybreakConditionalUpsert(t *testing.T) {
@@ -149,7 +216,7 @@ func TestMySQL305Integration(t *testing.T) {
 			_, _ = db.conn.ExecContext(ctx, "DELETE FROM system_settings WHERE id=1")
 		}
 	}()
-	s := &SystemSettings{CodexBasispointsEnabled: true, CodexBasispointsModels: "gpt-6", CodexBasispoints403PauseDisabled: true, CodexBasispointsProbeMinutes: 7, CodexBasispoints429CooldownSeconds: 13, CodexBasispointsCacheWriteAsInput: true, AutoResetCreditsOnExhaustionEnabled: true, CodexFingerprintDefaultMode: "single_machine_multi_window"}
+	s := &SystemSettings{AutoResetCreditsOnExhaustionEnabled: true, CodexFingerprintDefaultMode: "single_machine_multi_window"}
 	if err = db.UpdateSystemSettings(ctx, s); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +224,7 @@ func TestMySQL305Integration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CodexFingerprintDefaultMode != "single_machine_multi_window" || !got.CodexBasispointsEnabled || got.CodexBasispointsModels != "gpt-6" || !got.CodexBasispoints403PauseDisabled || got.CodexBasispointsProbeMinutes != 7 || got.CodexBasispoints429CooldownSeconds != 13 || !got.CodexBasispointsCacheWriteAsInput || !got.AutoResetCreditsOnExhaustionEnabled {
+	if got.CodexFingerprintDefaultMode != "single_machine_multi_window" || !got.AutoResetCreditsOnExhaustionEnabled {
 		t.Fatalf("settings roundtrip: %+v", got)
 	}
 	if err = db.UpdateCodexSyncedAppBuild(ctx, "desktop-windows", "12345"); err != nil {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"log"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,9 +18,10 @@ func TestUnavailablePoolSnapshotClassifiesLocalGates(t *testing.T) {
 	accounts[2].Status = StatusCooldown
 	accounts[2].CooldownUtil = time.Now().Add(time.Hour)
 	accounts[3].AccessToken = ""
-	accounts[4].OccupiedRequests = 2
+	accounts[4].OccupiedRequests.Store(2)
 	accounts[5].DynamicConcurrencyLimit = 0
-	s := &Store{accounts: accounts, maxConcurrency: 2}
+	s := &Store{accounts: accounts}
+	s.maxConcurrency.Store(2)
 	got := s.unavailablePoolSnapshot(0, nil, DispatchPolicyStandard)
 	for _, reason := range []string{"disabled", "dispatch_paused", "cooldown", "missing_credential", "cached_capacity_full", "cached_concurrency_zero"} {
 		if got.Reasons[reason] != 1 {
@@ -31,7 +31,7 @@ func TestUnavailablePoolSnapshotClassifiesLocalGates(t *testing.T) {
 	if got.Total != 7 || got.LocalCandidates != 1 || got.Active != 0 || got.Occupied != 2 || got.Buffered != 2 {
 		t.Fatalf("unexpected snapshot: %+v", got)
 	}
-	if accounts[4].OccupiedRequests != 2 || accounts[5].DynamicConcurrencyLimit != 0 {
+	if accounts[4].OccupiedRequests.Load() != 2 || accounts[5].DynamicConcurrencyLimit != 0 {
 		t.Fatal("diagnostics mutated scheduling state")
 	}
 	got = s.unavailablePoolSnapshot(0, map[int64]bool{7: true}, DispatchPolicyStandard)
@@ -43,7 +43,8 @@ func TestUnavailablePoolSnapshotClassifiesLocalGates(t *testing.T) {
 func TestUnavailablePoolLogIsSampledAndDoesNotLogCredentials(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
 	acc.AccessToken = "secret-must-not-appear"
-	s := &Store{accounts: []*Account{acc}, maxConcurrency: 2}
+	s := &Store{accounts: []*Account{acc}}
+	s.maxConcurrency.Store(2)
 	var output bytes.Buffer
 	old := log.Writer()
 	log.SetOutput(&output)
@@ -59,7 +60,7 @@ func TestUnavailablePoolLogIsSampledAndDoesNotLogCredentials(t *testing.T) {
 	if !strings.Contains(text, "req-test") || strings.Contains(text, "req-suppressed") || strings.Contains(text, acc.AccessToken) {
 		t.Fatalf("unexpected diagnostic log: %s", text)
 	}
-	if atomic.LoadInt64(&acc.ActiveRequests) != 0 || atomic.LoadInt64(&acc.TotalRequests) != 0 {
+	if acc.ActiveRequests.Load() != 0 || acc.TotalRequests.Load() != 0 {
 		t.Fatal("diagnostics acquired an account")
 	}
 }

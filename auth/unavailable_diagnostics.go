@@ -26,8 +26,8 @@ func (s *Store) unavailablePoolSnapshot(apiKeyID int64, exclude map[int64]bool, 
 			continue
 		}
 		out.Total++
-		active := atomic.LoadInt64(&acc.ActiveRequests)
-		occupied := atomic.LoadInt64(&acc.OccupiedRequests)
+		active := acc.ActiveRequests.Load()
+		occupied := acc.OccupiedRequests.Load()
 		if occupied < active {
 			occupied = active
 		}
@@ -95,7 +95,7 @@ func (s *Store) LogUnavailablePool(requestID, model string, apiKeyID int64, excl
 	details := map[string]any{
 		"event": "account_pool_unavailable", "request_id": requestID,
 		"model": model, "api_key_id": apiKeyID, "scheduler_engine": s.SchedulerEngine(),
-		"policy": policy, "base_concurrency": atomic.LoadInt64(&s.maxConcurrency),
+		"policy": policy, "base_concurrency": s.maxConcurrency.Load(),
 		"snapshot": s.unavailablePoolSnapshot(apiKeyID, exclude, policy),
 		"scope":    "local_cached_state_only; group/model/egress/Redis/continuation constraints not evaluated",
 	}

@@ -133,7 +133,7 @@ export default function OperationsErrors() {
         page,
         pageSize,
       }),
-      api.getAPIKeys().catch(() => ({ keys: [] as APIKeyRow[] })),
+      api.getAPIKeys({ view: 'lite' }).catch(() => ({ keys: [] as APIKeyRow[] })),
     ])
 
     return {

@@ -225,12 +225,12 @@ type DB struct {
 	logWg   sync.WaitGroup
 
 	// 缓冲溢出/脏数据丢弃的累计条数，暴露在运行状态里供运维观察
-	usageLogDropped   int64
+	usageLogDropped   atomic.Int64
 	usageLogDropLogAt time.Time // 溢出日志的限流时间戳，由 logMu 保护
 
 	usageLogMode                 atomic.Value // string: full|errors|off
-	usageLogBatchSize            int64
-	usageLogFlushInterval        int64        // ns
+	usageLogBatchSize            atomic.Int64
+	usageLogFlushInterval        atomic.Int64 // ns
 	usageLogRequestTextMasterKey atomic.Value // []byte
 	logFlushNotify               chan struct{}
 	accountInsertMu              sync.Mutex
@@ -239,16 +239,17 @@ type DB struct {
 
 	// API Key 客户端统计按 (key ID, 客户端哈希) 在内存中合并后异步落库，
 	// 避免每个代理请求同步写数据库。
-	clientSeenMu          sync.Mutex
-	clientSeenFlushMu     sync.Mutex
-	clientSeenPending     map[apiKeyClientIdentity]time.Time
-	clientSeenDeleted     map[int64]struct{}
-	clientSeenNotify      chan struct{}
-	clientSeenStop        chan struct{}
-	clientSeenStopOnce    sync.Once
-	clientSeenWg          sync.WaitGroup
-	clientSeenClosing     bool
-	clientSeenDropped     int64
+	clientSeenMu       sync.Mutex
+	clientSeenFlushMu  sync.Mutex
+	clientSeenPending  map[apiKeyClientIdentity]time.Time
+	clientSeenDeleted  map[int64]struct{}
+	clientSeenNotify   chan struct{}
+	clientSeenStop     chan struct{}
+	clientSeenStopOnce sync.Once
+	clientSeenWg       sync.WaitGroup
+	clientSeenClosing  bool
+	// 2026-10-08 coder(lq): Keep the 64-bit counter aligned on 32-bit deployments.
+	clientSeenDropped     atomic.Int64
 	channelMonitorOnce    sync.Once
 	channelMonitorInitErr error
 
@@ -1145,8 +1146,8 @@ func (db *DB) SetUsageLogConfig(mode string, batchSize int, flushIntervalSeconds
 	batchSize = NormalizeUsageLogBatchSize(batchSize)
 	flushIntervalSeconds = NormalizeUsageLogFlushIntervalSeconds(flushIntervalSeconds)
 	db.usageLogMode.Store(mode)
-	atomic.StoreInt64(&db.usageLogBatchSize, int64(batchSize))
-	atomic.StoreInt64(&db.usageLogFlushInterval, int64(time.Duration(flushIntervalSeconds)*time.Second))
+	db.usageLogBatchSize.Store(int64(batchSize))
+	db.usageLogFlushInterval.Store(int64(time.Duration(flushIntervalSeconds) * time.Second))
 }
 
 func (db *DB) GetUsageLogMode() string {
@@ -1163,7 +1164,7 @@ func (db *DB) GetUsageLogBatchSize() int {
 	if db == nil {
 		return defaultUsageLogBatchSize
 	}
-	n := int(atomic.LoadInt64(&db.usageLogBatchSize))
+	n := int(db.usageLogBatchSize.Load())
 	return NormalizeUsageLogBatchSize(n)
 }
 
@@ -1171,7 +1172,7 @@ func (db *DB) GetUsageLogFlushIntervalSeconds() int {
 	if db == nil {
 		return defaultUsageLogFlushIntervalSeconds
 	}
-	d := time.Duration(atomic.LoadInt64(&db.usageLogFlushInterval))
+	d := time.Duration(db.usageLogFlushInterval.Load())
 	if d <= 0 {
 		return defaultUsageLogFlushIntervalSeconds
 	}
@@ -1213,7 +1214,7 @@ func (db *DB) GetUsageLogRuntimeStats() UsageLogRuntimeStats {
 	stats.BufferCapacity = cap(db.logBuf)
 	db.logMu.Unlock()
 	stats.BufferLimit = usageLogBufferHardLimit
-	stats.DroppedTotal = atomic.LoadInt64(&db.usageLogDropped)
+	stats.DroppedTotal = db.usageLogDropped.Load()
 
 	return stats
 }
@@ -1222,7 +1223,7 @@ func (db *DB) getUsageLogFlushInterval() time.Duration {
 	if db == nil {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
 	}
-	d := time.Duration(atomic.LoadInt64(&db.usageLogFlushInterval))
+	d := time.Duration(db.usageLogFlushInterval.Load())
 	if d <= 0 {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
 	}
@@ -1258,7 +1259,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	if db.isMySQL() {
 		return db.migrateMySQL(ctx)
 	}
-	query := `
+	query := codexClientVersionCacheSchema + `;
 	CREATE TABLE IF NOT EXISTS accounts (
 		id            SERIAL PRIMARY KEY,
 		name          VARCHAR(255) DEFAULT '',
@@ -1636,6 +1637,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS billing_tier_policy VARCHAR(20) DEFAULT 'actual';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_full_usage_numbers BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_upstream_model_mismatch BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_key_usage_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_image_studio_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_account_portal_page_enabled BOOLEAN DEFAULT FALSE;
@@ -1684,6 +1686,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_on_exhaustion_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_unified_client_identity_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
@@ -2643,6 +2646,7 @@ type SystemSettings struct {
 	CodexUserAgentConfig               string
 	CodexTelemetryEnabled              bool
 	CodexTelemetryTimingDebug          bool
+	CodexUnifiedClientIdentityEnabled  bool   // 网关自发维护请求统一使用配置的客户端身份（默认关闭，issue #774）
 	CodexImagesMainModel               string // 空值沿用部署默认的生图文本驱动模型
 	UsageLogMode                       string
 	UsageLogBatchSize                  int
@@ -2654,21 +2658,24 @@ type SystemSettings struct {
 	BillingTierPolicy                  string
 	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 	ShowFullUsageNumbers               bool
-	PublicKeyUsagePageEnabled          bool
-	PublicImageStudioPageEnabled       bool
-	PublicAccountPortalPageEnabled     bool // 账号自助添加公开门户开关，默认 false
-	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
-	CodexWSWeakNetworkMode             bool // WS 弱网保守复用模式，默认 false
-	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
-	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
-	CodexWSHideUpstreamErrors          bool // 隐藏上游 WS 原始错误，默认 true
-	CodexWSSilentRetryEnabled          bool // 首包前 WS 上游错误静默换号重试，默认 true
-	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
-	CodexWSSizeRouterEnabled           bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
-	CodexWSBusyAcquireMaxWaitSec       int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
-	CodexWSBusyOverflowEnabled         bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
-	CodexWSBusyPatienceSec             int  // 触发溢出前的短等待（秒），默认 2（issue #413）
-	CodexWSStatelessSlots              int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
+	// ShowUpstreamModelMismatch 控制用量页是否标出上游响应模型与请求模型不一致。
+	// 只影响展示和筛选，不停止记录。默认开启。
+	ShowUpstreamModelMismatch      bool
+	PublicKeyUsagePageEnabled      bool
+	PublicImageStudioPageEnabled   bool
+	PublicAccountPortalPageEnabled bool // 账号自助添加公开门户开关，默认 false
+	CodexForceWebsocket            bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexWSWeakNetworkMode         bool // WS 弱网保守复用模式，默认 false
+	CodexWSKeepaliveEnabled        bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
+	CodexWSKeepaliveIntervalSec    int  // WS 保活 Ping 间隔（秒），默认 60
+	CodexWSHideUpstreamErrors      bool // 隐藏上游 WS 原始错误，默认 true
+	CodexWSSilentRetryEnabled      bool // 首包前 WS 上游错误静默换号重试，默认 true
+	CodexWSSilentMaxRetries        int  // WS 静默换号最大重试次数，默认 2
+	CodexWSSizeRouterEnabled       bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
+	CodexWSBusyAcquireMaxWaitSec   int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
+	CodexWSBusyOverflowEnabled     bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
+	CodexWSBusyPatienceSec         int  // 触发溢出前的短等待（秒），默认 2（issue #413）
+	CodexWSStatelessSlots          int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
 	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -2866,11 +2873,12 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(NULLIF(TRIM(first_token_mode), ''), 'loose'),
 			       COALESCE(first_token_timeout_seconds, 0),
 			       COALESCE(NULLIF(TRIM(billing_tier_policy), ''), 'actual'),
-			       COALESCE(image_storage_config, '{}'),
+	       COALESCE(image_storage_config, '{}'),
 	       COALESCE(background_config, '{}'),
 	       COALESCE(grok_config, '{}'),
 	       COALESCE(claude_config, '{}'),
 	       COALESCE(show_full_usage_numbers, false),
+	       COALESCE(show_upstream_model_mismatch, true),
 		       COALESCE(public_key_usage_page_enabled, true),
 		       COALESCE(public_image_studio_page_enabled, true),
 		       COALESCE(public_account_portal_page_enabled, false),
@@ -2932,7 +2940,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(NULLIF(TRIM(codex_turn_state_account_mode), ''), 'auto'),
 		       COALESCE(codex_oauth_keepalive_enabled, false),
 		       COALESCE(codex_telemetry_timing_debug, false),
-		       COALESCE(auto_reset_credits_on_exhaustion_enabled, false)
+		       COALESCE(auto_reset_credits_on_exhaustion_enabled, false),
+		       COALESCE(codex_unified_client_identity_enabled, false)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2960,6 +2969,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.GrokConfig,
 		&s.ClaudeConfig,
 		&s.ShowFullUsageNumbers,
+		&s.ShowUpstreamModelMismatch,
 		&s.PublicKeyUsagePageEnabled,
 		&s.PublicImageStudioPageEnabled,
 		&s.PublicAccountPortalPageEnabled,
@@ -3022,6 +3032,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOAuthKeepaliveEnabled,
 		&s.CodexTelemetryTimingDebug,
 		&s.AutoResetCreditsOnExhaustionEnabled,
+		&s.CodexUnifiedClientIdentityEnabled,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3131,12 +3142,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				scheduler_mode,
 				affinity_mode,
 				session_affinity_spread,
-					background_config,
-					grok_config,
-					claude_config,
-					show_full_usage_numbers,
-					public_key_usage_page_enabled,
-					public_image_studio_page_enabled,
+				background_config,
+				grok_config,
+				claude_config,
+				show_full_usage_numbers,
+				show_upstream_model_mismatch,
+				public_key_usage_page_enabled,
+				public_image_studio_page_enabled,
 					reasoning_effort_models,
 					codex_force_websocket,
 					codex_ws_keepalive_enabled,
@@ -3197,9 +3209,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_turn_state_account_mode,
 					codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug,
-					auto_reset_credits_on_exhaustion_enabled
+					auto_reset_credits_on_exhaustion_enabled,
+					codex_unified_client_identity_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126, $127, $128)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126, $127, $128, $129, $130)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -3239,10 +3252,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $129 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $131 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $130 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $132 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3267,6 +3280,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				grok_config = EXCLUDED.grok_config,
 				claude_config = EXCLUDED.claude_config,
 				show_full_usage_numbers = EXCLUDED.show_full_usage_numbers,
+				show_upstream_model_mismatch = EXCLUDED.show_upstream_model_mismatch,
 				public_key_usage_page_enabled = EXCLUDED.public_key_usage_page_enabled,
 				public_image_studio_page_enabled = EXCLUDED.public_image_studio_page_enabled,
 					reasoning_effort_models = EXCLUDED.reasoning_effort_models,
@@ -3325,7 +3339,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_turn_state_account_mode = EXCLUDED.codex_turn_state_account_mode,
 					codex_oauth_keepalive_enabled = EXCLUDED.codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug = EXCLUDED.codex_telemetry_timing_debug,
-					auto_reset_credits_on_exhaustion_enabled = EXCLUDED.auto_reset_credits_on_exhaustion_enabled
+					auto_reset_credits_on_exhaustion_enabled = EXCLUDED.auto_reset_credits_on_exhaustion_enabled,
+					codex_unified_client_identity_enabled = EXCLUDED.codex_unified_client_identity_enabled
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -3339,7 +3354,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
 		s.ClientCompatMode, s.CodexMinCLIVersion, codexUserAgentConfig, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.SessionAffinitySpread, s.BackgroundConfig, normalizeGrokConfig(s.GrokConfig), claudeConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, s.PublicImageStudioPageEnabled, reasoningEffortModels,
+		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.SessionAffinitySpread, s.BackgroundConfig, normalizeGrokConfig(s.GrokConfig), claudeConfig, s.ShowFullUsageNumbers, s.ShowUpstreamModelMismatch, s.PublicKeyUsagePageEnabled, s.PublicImageStudioPageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
 		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
@@ -3383,6 +3398,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexOAuthKeepaliveEnabled,
 		s.CodexTelemetryTimingDebug,
 		s.AutoResetCreditsOnExhaustionEnabled,
+		s.CodexUnifiedClientIdentityEnabled,
 		s.PreservePromptFilterCustomPatterns,
 		s.PreservePromptFilterReviewAPIKey)
 	return err
@@ -4621,7 +4637,7 @@ func (db *DB) trimUsageLogBufferLocked() {
 		return
 	}
 	db.logBuf = append(db.logBuf[:0], db.logBuf[overflow:]...)
-	total := atomic.AddInt64(&db.usageLogDropped, int64(overflow))
+	total := db.usageLogDropped.Add(int64(overflow))
 	if now := time.Now(); now.Sub(db.usageLogDropLogAt) >= 30*time.Second {
 		db.usageLogDropLogAt = now
 		log.Printf("用量日志缓冲已达上限 %d 条，丢弃最旧的 %d 条（累计丢弃 %d 条），请检查数据库是否可写",
@@ -5032,7 +5048,7 @@ func (db *DB) flushLogBatch(drain bool) bool {
 		// 脏数据重试多少次都写不进去，隔离出来丢掉，其余照常落库。
 		pending, dropped := db.salvageUsageLogBatch(ctx, batch, err)
 		if dropped > 0 {
-			total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
+			total := db.usageLogDropped.Add(int64(dropped))
 			log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
 				dropped, total, err)
 		}
@@ -5578,10 +5594,6 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
-		if err != nil {
-			return nil, err
-		}
 		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}
@@ -5647,16 +5659,20 @@ func (db *DB) usageStatsTimeWhere(column string, rangeStart, rangeEnd time.Time,
 	return where, args
 }
 
-func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageModelStat, error) {
-	if limit <= 0 {
-		limit = 10
+// populateUsageBreakdownStats 用一次按(模型, 端点, API Key)分组的扫描填出模型排行(前 10)、
+// 端点/API Key 排行(前 8)与功能构成。以前是四条各扫一遍区间的聚合;分组数通常只有
+// 几十到几百行,排序取前 N 在 Go 里做。
+func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) error {
+	if stats == nil {
+		return nil
 	}
 	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT
 			COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown') AS model_name,
+			COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
+			COALESCE(api_key_id, 0) AS api_key_id,
+			COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
 			COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -5664,53 +5680,7 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, ran
 			COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
 			COALESCE(SUM(account_billed), 0) AS account_billed,
 			COALESCE(SUM(user_billed), 0) AS user_billed,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1
-		ORDER BY user_billed DESC, requests DESC, model_name ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	stats := make([]UsageModelStat, 0, limit)
-	for rows.Next() {
-		var item UsageModelStat
-		if err := rows.Scan(
-			&item.Model,
-			&item.Requests,
-			&item.Tokens,
-			&item.InputTokens,
-			&item.OutputTokens,
-			&item.CachedTokens,
-			&item.AccountBilled,
-			&item.UserBilled,
-			&item.ErrorCount,
-		); err != nil {
-			return nil, err
-		}
-		stats = append(stats, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if stats == nil {
-		stats = []UsageModelStat{}
-	}
-	return stats, nil
-}
-
-func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) error {
-	if stats == nil {
-		return nil
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	if err := db.conn.QueryRowContext(ctx, `
-		SELECT
+			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
 			COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
 			COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0) AS sync_requests,
 			COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(billing_service_tier, ''), service_tier, '')) IN ('fast', 'priority', 'ultrafast') THEN 1 ELSE 0 END), 0) AS fast_requests,
@@ -5720,122 +5690,125 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 			-- attempt_index 是 1-based（首次尝试写 1，第一次重试写 2），所以「重试出来的请求」
 			-- 只能用 > 1。写成 > 0 会把每个请求都算进去，这个指标就恒等于总请求数（100%）；
 			-- is_retry_attempt 标的是「本次失败且将要重试」的那条失败记录，算进来会重复计一次。
-			COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END), 0) AS retry_requests,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
+			COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END), 0) AS retry_requests
 		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
-	`, args...).Scan(
-		&stats.FeatureStats.StreamRequests,
-		&stats.FeatureStats.SyncRequests,
-		&stats.FeatureStats.FastRequests,
-		&stats.FeatureStats.CacheHitRequests,
-		&stats.FeatureStats.ReasoningRequests,
-		&stats.FeatureStats.ImageRequests,
-		&stats.FeatureStats.RetryRequests,
-		&stats.FeatureStats.ErrorRequests,
-	); err != nil {
+		GROUP BY 1, 2, 3, 4
+	`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type apiKeyGroup struct {
+		id    int64
+		label string
+	}
+	models := map[string]*UsageModelStat{}
+	endpoints := map[string]*UsageEndpointStat{}
+	apiKeys := map[apiKeyGroup]*UsageAPIKeyStat{}
+	features := UsageFeatureStat{}
+	for rows.Next() {
+		var g UsageModelStat
+		var endpoint string
+		var key apiKeyGroup
+		var stream, sync, fast, cacheHit, reasoning, image, retry int64
+		if err := rows.Scan(
+			&g.Model, &endpoint, &key.id, &key.label,
+			&g.Requests, &g.Tokens, &g.InputTokens, &g.OutputTokens, &g.CachedTokens,
+			&g.AccountBilled, &g.UserBilled, &g.ErrorCount,
+			&stream, &sync, &fast, &cacheHit, &reasoning, &image, &retry,
+		); err != nil {
+			return err
+		}
+		features.StreamRequests += stream
+		features.SyncRequests += sync
+		features.FastRequests += fast
+		features.CacheHitRequests += cacheHit
+		features.ReasoningRequests += reasoning
+		features.ImageRequests += image
+		features.RetryRequests += retry
+		features.ErrorRequests += g.ErrorCount
+
+		model := models[g.Model]
+		if model == nil {
+			model = &UsageModelStat{Model: g.Model}
+			models[g.Model] = model
+		}
+		model.Requests += g.Requests
+		model.Tokens += g.Tokens
+		model.InputTokens += g.InputTokens
+		model.OutputTokens += g.OutputTokens
+		model.CachedTokens += g.CachedTokens
+		model.AccountBilled += g.AccountBilled
+		model.UserBilled += g.UserBilled
+		model.ErrorCount += g.ErrorCount
+
+		ep := endpoints[endpoint]
+		if ep == nil {
+			ep = &UsageEndpointStat{Endpoint: endpoint}
+			endpoints[endpoint] = ep
+		}
+		ep.Requests += g.Requests
+		ep.Tokens += g.Tokens
+		ep.ErrorCount += g.ErrorCount
+		ep.UserBilled += g.UserBilled
+
+		ak := apiKeys[key]
+		if ak == nil {
+			ak = &UsageAPIKeyStat{APIKeyID: key.id, Label: key.label}
+			apiKeys[key] = ak
+		}
+		ak.Requests += g.Requests
+		ak.Tokens += g.Tokens
+		ak.ErrorCount += g.ErrorCount
+		ak.UserBilled += g.UserBilled
+	}
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	endpoints, err := db.getUsageEndpointStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
-	if err != nil {
-		return err
-	}
-	apiKeys, err := db.getUsageAPIKeyStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
-	if err != nil {
-		return err
-	}
-	stats.EndpointStats = endpoints
-	stats.APIKeyStats = apiKeys
+	stats.FeatureStats = features
+	stats.ModelStats = topUsageStats(models, 10, func(a, b *UsageModelStat) bool {
+		if a.UserBilled != b.UserBilled {
+			return a.UserBilled > b.UserBilled
+		}
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Model < b.Model
+	})
+	stats.EndpointStats = topUsageStats(endpoints, 8, func(a, b *UsageEndpointStat) bool {
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Endpoint < b.Endpoint
+	})
+	stats.APIKeyStats = topUsageStats(apiKeys, 8, func(a, b *UsageAPIKeyStat) bool {
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Label < b.Label
+	})
 	return nil
 }
 
-func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageEndpointStat, error) {
-	if limit <= 0 {
-		limit = 8
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
-			COUNT(*) AS requests,
-			COALESCE(SUM(total_tokens), 0) AS tokens,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1
-		ORDER BY requests DESC, endpoint_name ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	items := make([]UsageEndpointStat, 0, limit)
-	for rows.Next() {
-		var item UsageEndpointStat
-		if err := rows.Scan(&item.Endpoint, &item.Requests, &item.Tokens, &item.ErrorCount, &item.UserBilled); err != nil {
-			return nil, err
-		}
+// topUsageStats 按 less 排序后取前 limit 项(值拷贝),空时返回非 nil 空切片。
+func topUsageStats[K comparable, T any](byKey map[K]*T, limit int, less func(a, b *T) bool) []T {
+	items := make([]*T, 0, len(byKey))
+	for _, item := range byKey {
 		items = append(items, item)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	sort.Slice(items, func(i, j int) bool { return less(items[i], items[j]) })
+	if len(items) > limit {
+		items = items[:limit]
 	}
-	if items == nil {
-		items = []UsageEndpointStat{}
+	out := make([]T, len(items))
+	for i, item := range items {
+		out[i] = *item
 	}
-	return items, nil
-}
-
-func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageAPIKeyStat, error) {
-	if limit <= 0 {
-		limit = 8
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(api_key_id, 0) AS api_key_id,
-			COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
-			COUNT(*) AS requests,
-			COALESCE(SUM(total_tokens), 0) AS tokens,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1, 2
-		ORDER BY requests DESC, api_key_label ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	items := make([]UsageAPIKeyStat, 0, limit)
-	for rows.Next() {
-		var item UsageAPIKeyStat
-		if err := rows.Scan(&item.APIKeyID, &item.Label, &item.Requests, &item.Tokens, &item.ErrorCount, &item.UserBilled); err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if items == nil {
-		items = []UsageAPIKeyStat{}
-	}
-	return items, nil
+	return out
 }
 
 // GetTrafficSnapshot 获取近实时流量快照
@@ -6721,7 +6694,6 @@ func (db *DB) GetUsageErrorSummary(ctx context.Context, f UsageLogFilter) (*Usag
 		COALESCE(SUM(CASE WHEN COALESCE(u.is_retry_attempt, false) THEN 1 ELSE 0 END), 0),
 		COALESCE(AVG(u.duration_ms), 0)
 		FROM usage_logs u
-		LEFT JOIN accounts a ON u.account_id = a.id
 		WHERE ` + where
 
 	result := &UsageErrorSummary{}
@@ -6751,21 +6723,24 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	}
 
 	where, args := db.buildUsageLogWhere(f)
+
+	// 总数单独计数:不 JOIN 账号、不取宽列;默认筛选(时间 + 排除 499)只走
+	// (created_at, status_code) 覆盖索引。以前用 COUNT(*) OVER() 和分页同查,
+	// SQLite 会把整个区间的宽行连同账号凭据物化进临时 B-tree 全量排序后才 LIMIT,
+	// 慢盘部署上 7 天区间就能超时。
 	result := &UsageLogPage{Logs: []*UsageLog{}}
-	countQuery := `SELECT COUNT(*)
-		   FROM usage_logs u
-		   LEFT JOIN accounts a ON u.account_id = a.id
-		   WHERE ` + where
-	if err := db.conn.QueryRowContext(ctx, countQuery, args...).Scan(&result.Total); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs u WHERE `+where, args...).Scan(&result.Total); err != nil {
 		return nil, err
 	}
-	if result.Total == 0 {
+	offset := (f.Page - 1) * f.PageSize
+	if result.Total == 0 || int64(offset) >= result.Total {
 		return result, nil
 	}
 
-	offset := (f.Page - 1) * f.PageSize
+	// 先按索引顺序只取本页 id,再回表取宽列并关联账号:宽列与凭据只读 page_size 行。
+	// id 作次级排序键:批量落库会产生大量同一时刻的记录,没有确定顺序时翻页会重复/漏行。
 	paramIdx := len(args) + 1
-	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
+	pageIDs := fmt.Sprintf(`SELECT u.id FROM usage_logs u WHERE %s ORDER BY u.created_at DESC, u.id DESC LIMIT $%d OFFSET $%d`, where, paramIdx, paramIdx+1)
 	args = append(args, f.PageSize, offset)
 
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), COALESCE(u.upstream_response_model, ''), u.upstream_model_mismatch, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
@@ -6781,9 +6756,10 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			            COALESCE(u.client_user_agent, ''), COALESCE(u.upstream_user_agent, ''), COALESCE(u.user_agent_overridden, false), COALESCE(u.turn_state_overridden, false), COALESCE(u.turn_state_rewrite_note, ''), COALESCE(u.channel, ''),
 			            COALESCE(u.internal_reason, ''), COALESCE(u.parent_request_id, ''), COALESCE(u.prompt_policy_incident_id, ''), COALESCE(u.request_id, ''), COALESCE(u.upstream_request_id, ''), COALESCE(u.upstream_proxy_id, 0), COALESCE(u.upstream_proxy_name, ''), COALESCE(u.injected_turn_state, ''), COALESCE(u.upstream_turn_state, ''), COALESCE(u.daybreak_program, ''),
 			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
-	           FROM usage_logs u
+	           FROM (` + pageIDs + `) page
+	           JOIN usage_logs u ON u.id = page.id
 	           LEFT JOIN accounts a ON u.account_id = a.id
-	           WHERE ` + where
+	           ORDER BY u.created_at DESC, u.id DESC`
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {

@@ -301,6 +301,23 @@ func TestModelCapabilitiesMySQLDDLUsesMySQL56Types(t *testing.T) {
 	}
 }
 
+func TestCodexClientVersionCacheMySQLDDLUsesMySQL56Types(t *testing.T) {
+	ddl := codexClientVersionCacheMySQLDDL()
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS codex_client_version_cache",
+		"client_kind VARCHAR(64) CHARACTER SET ascii NOT NULL",
+		"target_platform VARCHAR(64) CHARACTER SET ascii NOT NULL",
+		"payload MEDIUMTEXT NOT NULL",
+		"PRIMARY KEY (client_kind, target_platform)",
+		"ENGINE=InnoDB DEFAULT CHARSET=utf8",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("MySQL client version cache DDL missing %q: %s", want, ddl)
+		}
+	}
+	assertNoMySQL56IncompatibleSQL(t, ddl)
+}
+
 func TestHydrateGrokDisplayUsesMySQL56CompatibleSQL(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	capture := &mysqlCaptureDriver{
@@ -672,6 +689,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"first_token_excludes_ws_acquire = VALUES(first_token_excludes_ws_acquire)",
 		"grok_config = VALUES(grok_config)",
 		"claude_config = VALUES(claude_config)",
+		"show_upstream_model_mismatch = VALUES(show_upstream_model_mismatch)",
 		"codex_preflight_sse_passthrough_enabled = VALUES(codex_preflight_sse_passthrough_enabled)",
 		"utls_shutdown_timeout_minutes = VALUES(utls_shutdown_timeout_minutes)",
 		"session_affinity_spread = VALUES(session_affinity_spread)",
@@ -681,16 +699,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_telemetry_enabled = VALUES(codex_telemetry_enabled)",
 		"codex_oauth_keepalive_enabled = VALUES(codex_oauth_keepalive_enabled)",
 		"codex_telemetry_timing_debug = VALUES(codex_telemetry_timing_debug)",
+		"codex_unified_client_identity_enabled = VALUES(codex_unified_client_identity_enabled)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 130 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 130", got)
+	if got := strings.Count(capture.query, "?"); got != 132 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 132", got)
 	}
-	if len(capture.args) != 130 {
-		t.Fatalf("rewritten settings argument count = %d, want 130", len(capture.args))
+	if len(capture.args) != 132 {
+		t.Fatalf("rewritten settings argument count = %d, want 132", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -712,6 +731,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexOAuthKeepaliveEnabled,
 		settings.CodexTelemetryTimingDebug,
 		settings.AutoResetCreditsOnExhaustionEnabled,
+		settings.CodexUnifiedClientIdentityEnabled,
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}

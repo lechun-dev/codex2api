@@ -57,8 +57,8 @@ func TestResponsesTextContinuationBorrowsCapacityWithoutTurnState(t *testing.T) 
 	fallback := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "fallback", Models: []string{"gpt-5.4"}, PlanType: "api"}
 	store.AddAccount(bound)
 	store.AddAccount(fallback)
-	atomic.StoreInt64(&bound.ActiveRequests, 1)
-	atomic.StoreInt64(&bound.OccupiedRequests, 1)
+	bound.ActiveRequests.Store(1)
+	bound.OccupiedRequests.Store(1)
 	store.BindSessionAffinity("borrow-turn", bound, "")
 	h := NewHandler(store, nil, nil, nil)
 	recorder := invokeResponsesHandlerWithContext(t, func(c *gin.Context) {
@@ -74,7 +74,7 @@ func TestResponsesTextContinuationBorrowsCapacityWithoutTurnState(t *testing.T) 
 	if recorder.Header().Get(codexTurnStateHeader) != "" {
 		t.Fatal("borrowed state was paired with original binding")
 	}
-	if atomic.LoadInt64(&fallback.ActiveRequests) != 0 || atomic.LoadInt64(&fallback.OccupiedRequests) != 0 {
+	if fallback.ActiveRequests.Load() != 0 || fallback.OccupiedRequests.Load() != 0 {
 		t.Fatal("borrowed slot leaked")
 	}
 }

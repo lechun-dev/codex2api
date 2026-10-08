@@ -438,7 +438,8 @@ func excludeClaudeAccountsFilter(filter auth.AccountFilter) auth.AccountFilter {
 }
 
 // grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
-// mapping 先行，再按账号可见目录准入；显式 Models 白名单只会进一步收窄。
+// mapping 先行。账号写了模型列表时，只调度列表里的模型；列表为空时用可见目录，
+// 还没同步目录时用默认模型列表。
 func grokChannelAccountFilter(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
@@ -549,10 +550,10 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 }
 
 // relayAccountSupportsModel 判断 relay 风格账号能否服务指定模型。
-// 普通 relay 中转必须显式声明 models 白名单；Grok 账号未声明白名单时按默认
+// 普通 relay 中转必须显式声明 models 列表；Grok 账号没有模型列表时按默认
 // Grok 模型集放行——与 /v1/models 的默认集注册（supportedModelIDs）保持一致，
 // 否则通用 Key 在模型列表里看得到 grok-4.5 却永远调度不到（恒 503）。
-// 声明了白名单的 Grok 账号仍以白名单为准。
+// 写了模型列表的 Grok 账号只调度列表里的模型。
 func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	if account == nil {
 		return false
@@ -579,9 +580,10 @@ func relayAccountSupportsModel(account *auth.Account, model string) bool {
 }
 
 // grokAccountSupportsVisibleModel keeps request admission aligned with the
-// account-scoped catalog exposed by /v1/models. An explicit Models setting is
-// a narrowing whitelist, never authority to invent or unhide a model absent
-// from the account catalog (or conservative no-catalog defaults).
+// account-scoped model list exposed by /v1/models. A saved model list is the
+// set of text models that account can serve. It does not inherit sibling
+// names from the catalog. An empty list still uses the visible catalog, or
+// conservative defaults before the first catalog sync.
 func grokAccountSupportsVisibleModel(account *auth.Account, model string) bool {
 	if account == nil || !account.IsGrokAPI() || !account.GrokChannelSupportsModel(model) {
 		return false
@@ -2383,6 +2385,12 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 // 在高峰期把整池账号逐个调度降权。跳过上报即"软信号保留、硬惩罚移除"。
 func (h *Handler) reportStreamOutcomeFailure(account *auth.Account, outcome streamOutcome, d time.Duration) {
 	if outcome.capacityShed || outcome.requestScoped {
+		return
+	}
+	// Cloud Code can report a model capacity shortage inside an HTTP 200
+	// stream. Like the HTTP 503, it describes Google's shared pool rather than
+	// this credential.
+	if antigravityNonPenalizingUpstreamFailure(account, outcome.logStatusCode, responseFailedErrorBody(outcome.failurePayload)) {
 		return
 	}
 	h.store.ReportRequestFailure(account, outcome.failureKind, d)
@@ -7062,16 +7070,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
-		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+		// 非流式且要下发 Antigravity 思考时上游改取非流式(见下),首个 token 要等整段
+		// 生成完才到,首字超时守卫不适用。
+		bufferAntigravity := account.IsAntigravityAPI() && AntigravityBuffersUpstream(account, isStream, codexBody)
+		var ttftGuard *firstTokenTimeoutGuard
+		if !bufferAntigravity {
+			ttftGuard = newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+		}
 		var resp *http.Response
 		var reqErr error
 		if account.IsAntigravityAPI() {
 			// Chat 入站已在上面翻译成 Responses 形态，正是 Antigravity 适配器的入参；
 			// 回程走下面的 Responses→Chat 翻译（issue #595）。该翻译只吃 SSE——
 			// TranslateRequest 恒置 stream:true，非流式客户端也是在网关侧聚合的，
-			// 所以上游一律取流，不跟随下游 stream 标志。
+			// 所以上游默认取流，不跟随下游 stream 标志。例外是非流式客户端要思考内容:
+			// 上游流式几乎不下发 thought 摘要,改取非流式再回放成 SSE（issue #752）。
 			// Antigravity 只认原生公共模型 ID，账号级 OpenAI 别名不参与映射。
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
+				if bufferAntigravity {
+					return ExecuteAntigravityResponsesRequestBuffered(upstreamCtx, account, attemptEffectiveModel, codexBody, proxyURL)
+				}
 				return ExecuteAntigravityResponsesRequest(upstreamCtx, account, attemptEffectiveModel, codexBody, true, proxyURL)
 			})
 		} else if isRelayAccount {

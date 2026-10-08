@@ -88,10 +88,12 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "codex_telemetry_timing_debug", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_turn_state_template_cache_enabled", def: "TINYINT(1) DEFAULT 0"},
 	{table: "system_settings", name: "codex_turn_state_account_mode", def: "VARCHAR(20) DEFAULT 'auto'"},
+	{table: "system_settings", name: "show_upstream_model_mismatch", def: "TINYINT(1) DEFAULT 1"},
 	{table: "system_settings", name: "codex_synced_desktop_mac_build", def: "TEXT NULL"},
 	{table: "system_settings", name: "codex_synced_desktop_windows_build", def: "TEXT NULL"},
 	{table: "system_settings", name: "codex_synced_vscode_build", def: "TEXT NULL"},
 	{table: "system_settings", name: "auto_reset_credits_on_exhaustion_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "codex_unified_client_identity_enabled", def: "TINYINT(1) DEFAULT 0"},
 }
 
 var mysql56PromptFilterLogColumns = []mysqlColumnDefinition{
@@ -287,6 +289,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 			PRIMARY KEY (entity_id, job_kind)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		systemSettingsMySQLDDL(),
+		codexClientVersionCacheMySQLDDL(),
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id VARCHAR(100) NOT NULL PRIMARY KEY,
 			enabled TINYINT(1) DEFAULT 1,
@@ -884,6 +887,7 @@ func systemSettingsMySQLDDL() string {
 		billing_tier_policy VARCHAR(20) DEFAULT 'actual',
 		image_storage_config TEXT NULL,
 		show_full_usage_numbers TINYINT(1) DEFAULT 0,
+		show_upstream_model_mismatch TINYINT(1) DEFAULT 1,
 		public_key_usage_page_enabled TINYINT(1) DEFAULT 1,
 		public_image_studio_page_enabled TINYINT(1) DEFAULT 1,
 		public_account_portal_page_enabled TINYINT(1) DEFAULT 0,
@@ -947,6 +951,7 @@ func systemSettingsMySQLDDL() string {
 		codex_synced_desktop_windows_build TEXT NULL,
 		codex_synced_vscode_build TEXT NULL,
 		auto_reset_credits_on_exhaustion_enabled TINYINT(1) DEFAULT 0,
+		codex_unified_client_identity_enabled TINYINT(1) DEFAULT 0,
 		codex_telemetry_timing_debug TINYINT(1) DEFAULT 0,
 		relay_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'off',
 		relay_model_cooldown_seconds INT NOT NULL DEFAULT 2,
@@ -965,6 +970,16 @@ func systemSettingsMySQLDDL() string {
 		codex_overload_threshold_percent INT DEFAULT 20,
 		codex_overload_pause_minutes INT DEFAULT 30,
 		codex_overload_window_minutes INT DEFAULT 5
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
+}
+
+// 2026-10-08 coder(lq): MySQL 5.6 cannot use TEXT columns in a primary key or assign them defaults.
+func codexClientVersionCacheMySQLDDL() string {
+	return `CREATE TABLE IF NOT EXISTS codex_client_version_cache (
+		client_kind VARCHAR(64) CHARACTER SET ascii NOT NULL,
+		target_platform VARCHAR(64) CHARACTER SET ascii NOT NULL,
+		payload MEDIUMTEXT NOT NULL,
+		PRIMARY KEY (client_kind, target_platform)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8`
 }
 

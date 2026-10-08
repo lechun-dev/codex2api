@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"sync/atomic"
 	"testing"
 
 	"github.com/codex2api/database"
@@ -20,8 +19,8 @@ func TestReplayableContinuationOnlyBorrowsForCapacity(t *testing.T) {
 				s.BindSessionAffinity("turn", bound, "")
 			}
 			if mode != "available" {
-				atomic.StoreInt64(&bound.ActiveRequests, 1)
-				atomic.StoreInt64(&bound.OccupiedRequests, 1)
+				bound.ActiveRequests.Store(1)
+				bound.OccupiedRequests.Store(1)
 			}
 			filter := func(a *Account) bool {
 				return !(mode == "filtered" && a.ID() == 1) && !(mode == "fallback_filtered" && a.ID() == 2)

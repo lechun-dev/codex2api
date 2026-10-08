@@ -8,7 +8,6 @@ import (
 	"log"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -110,7 +109,7 @@ func (db *DB) RecordAPIKeyClient(apiKeyID int64, clientID string) bool {
 		return true
 	}
 	if len(db.clientSeenPending) >= apiKeyClientPendingLimit {
-		dropped := atomic.AddInt64(&db.clientSeenDropped, 1)
+		dropped := db.clientSeenDropped.Add(1)
 		if dropped == 1 || dropped%1000 == 0 {
 			log.Printf("API Key 客户端统计缓冲已满，累计丢弃 %d 个新客户端标识", dropped)
 		}
@@ -222,7 +221,7 @@ func (db *DB) requeueAPIKeyClients(rows []apiKeyClientSeen) {
 			continue
 		}
 		if len(db.clientSeenPending) >= apiKeyClientPendingLimit {
-			atomic.AddInt64(&db.clientSeenDropped, 1)
+			db.clientSeenDropped.Add(1)
 			continue
 		}
 		db.clientSeenPending[row.identity] = row.seenAt

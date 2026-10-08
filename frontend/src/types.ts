@@ -116,6 +116,7 @@ export interface AntigravityRedirectChoice {
 export interface AntigravitySettingsResponse {
   model_redirects: Record<string, string>
   redirect_overrides_effort: boolean
+  expose_thoughts: boolean
   choices: AntigravityRedirectChoice[]
 }
 
@@ -440,6 +441,7 @@ export interface AccountRow {
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   skip_warm_tier?: boolean
+  keep_concurrency_on_degrade?: boolean
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
@@ -1546,6 +1548,7 @@ export interface UpdateAccountSchedulerRequest {
   score_bias_override?: number | null
   base_concurrency_override?: number | null
   skip_warm_tier?: boolean
+  keep_concurrency_on_degrade?: boolean
   allowed_api_key_ids?: number[] | null
   proxy_url?: string | null
   tags?: string[] | null
@@ -1825,6 +1828,7 @@ export interface AdminErrorResponse {
 
 export interface HealthResponse {
   status: 'ok' | string
+  build_version?: string
   available: number
   total: number
 }
@@ -2155,6 +2159,7 @@ export interface SystemSettings {
   codex_force_websocket: boolean
   codex_telemetry_enabled: boolean
   codex_telemetry_timing_debug: boolean
+  codex_unified_client_identity_enabled: boolean
   codex_request_compression: boolean
   codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
@@ -2286,6 +2291,8 @@ export interface SystemSettings {
   codex_synced_desktop_mac_build?: string
   codex_synced_desktop_windows_build?: string
   codex_synced_vscode_build?: string
+  /** 已验证的应用与内置 CLI 配对；只读，不随设置保存。 */
+  codex_client_versions?: CodexClientVersionTarget[]
   codex_effective_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
@@ -2299,6 +2306,7 @@ export interface SystemSettings {
   billing_tier_policy: 'actual' | 'requested' | string
   models_list_read_max_bytes: number
   show_full_usage_numbers: boolean
+  show_upstream_model_mismatch: boolean
   public_key_usage_page_enabled: boolean
   public_image_studio_page_enabled: boolean
   public_account_portal_page_enabled: boolean
@@ -4316,6 +4324,41 @@ export interface CodexUserAgentPersona {
   user_agent: string
   originator: string
   version: string
+  app_version?: string
+  target_platform?: string
+  source?: string
+  status?: string
+}
+
+export interface CodexClientVersionPair {
+  app_version: string
+  cli_version: string
+  package_version?: string
+  source: string
+  artifact_url?: string
+  artifact_id?: string
+  verified_at?: number
+}
+
+export interface CodexClientVersionTarget {
+  client_kind: string
+  target_platform: string
+  status: string
+  error?: string
+  checked_at: number
+  pairs: CodexClientVersionPair[]
+}
+
+export interface CodexClientVersionSyncResult {
+  fetched_version?: string
+  synced_version?: string
+  effective_version: string
+  cli_version?: string
+  source?: string
+  status: string
+  targets?: CodexClientVersionTarget[]
+  updated: boolean
+  error?: string
 }
 
 export interface CodexUserAgentPreview {

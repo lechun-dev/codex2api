@@ -46,7 +46,7 @@ func ageAccountForOfficialUsage(t *testing.T, store *auth.Store, id int64) {
 	if account == nil {
 		t.Fatalf("account %d not in store", id)
 	}
-	account.AddedAt = time.Now().Add(-25 * time.Hour).UnixNano()
+	account.AddedAt.Store(time.Now().Add(-25 * time.Hour).UnixNano())
 }
 
 func waitAccountDailyUsage(t *testing.T, db *database.DB, id int64) {
@@ -198,7 +198,7 @@ func TestGetAccountPageStatsMarksSyncedWhenUpstreamHasNoData(t *testing.T) {
 	for !handler.whamDailySyncedOnceFor(id) {
 		if time.Now().After(deadline) {
 			account := store.FindByID(id)
-			t.Fatalf("empty upstream sync did not mark the account as synced: eligible=%v status=%s age=%s", whamDailyUsageAutoRefreshEligible(account, time.Now()), account.RuntimeStatus(), time.Since(time.Unix(0, account.AddedAt)))
+			t.Fatalf("empty upstream sync did not mark the account as synced: eligible=%v status=%s age=%s", whamDailyUsageAutoRefreshEligible(account, time.Now()), account.RuntimeStatus(), time.Since(time.Unix(0, account.AddedAt.Load())))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

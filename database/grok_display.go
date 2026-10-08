@@ -59,7 +59,11 @@ func (db *DB) HydrateGrokDisplay(ctx context.Context, accounts []*AccountRow) er
 			byID[a.ID] = a
 			a.GrokModels = &GrokModelSummary{Models: []string{}, Status: "unknown"}
 			args = append(args, a.ID)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+			if db.isMySQL() {
+				placeholders = append(placeholders, "?")
+			} else {
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+			}
 		}
 	}
 	if len(byID) == 0 {
@@ -75,6 +79,9 @@ func (db *DB) HydrateGrokDisplay(ctx context.Context, accounts []*AccountRow) er
 	planExpr := `COALESCE(NULLIF(BTRIM(s.payload_json->>'subscriptionTier'),''),NULLIF(BTRIM(s.payload_json->>'subscription_tier'),''),NULLIF(BTRIM(s.payload_json->>'subscription_tier_display'),''),'')`
 	if db.isSQLite() {
 		planExpr = `COALESCE(NULLIF(TRIM(json_extract(s.payload_json,'$.subscriptionTier')),''),NULLIF(TRIM(json_extract(s.payload_json,'$.subscription_tier')),''),NULLIF(TRIM(json_extract(s.payload_json,'$.subscription_tier_display')),''),'')`
+	} else if db.isMySQL() {
+		// 2026-10-08 coder(lq): MySQL 5.6 has no JSON functions; read MEDIUMTEXT and extract the plan in Go.
+		planExpr = `s.payload_json`
 	}
 	rows, err := db.conn.QueryContext(ctx, `SELECT s.account_id,s.credential_generation,s.fact_kind,s.status,s.http_status,`+planExpr+`,s.observed_at,s.expires_at FROM grok_account_fact_snapshots s WHERE s.fact_kind IN ('user','settings')`+filter, args...)
 	if err != nil {
@@ -84,10 +91,15 @@ func (db *DB) HydrateGrokDisplay(ctx context.Context, accounts []*AccountRow) er
 	for rows.Next() {
 		var id, generation int64
 		var f grokDisplayFact
-		var observed, expires any
-		if err = rows.Scan(&id, &generation, &f.Kind, &f.Status, &f.HTTPStatus, &f.Plan, &observed, &expires); err != nil {
+		var planRaw, observed, expires any
+		if err = rows.Scan(&id, &generation, &f.Kind, &f.Status, &f.HTTPStatus, &planRaw, &observed, &expires); err != nil {
 			rows.Close()
 			return err
+		}
+		if db.isMySQL() {
+			f.Plan = grokPlanFromPayload(planRaw)
+		} else {
+			f.Plan = strings.TrimSpace(string(bytesFromDBValue(planRaw)))
 		}
 		a := byID[id]
 		if a == nil || max(a.CredentialGeneration, 1) != generation {
@@ -177,4 +189,14 @@ func (db *DB) HydrateGrokDisplay(ctx context.Context, accounts []*AccountRow) er
 		sort.Strings(a.GrokModels.Models)
 	}
 	return rows.Err()
+}
+
+func grokPlanFromPayload(raw any) string {
+	payload := decodeJSONMap(raw)
+	for _, key := range []string{"subscriptionTier", "subscription_tier", "subscription_tier_display"} {
+		if plan := strings.TrimSpace(credentialStringFromMap(payload, key)); plan != "" {
+			return plan
+		}
+	}
+	return ""
 }

@@ -301,6 +301,47 @@ func TestModelCapabilitiesMySQLDDLUsesMySQL56Types(t *testing.T) {
 	}
 }
 
+func TestHydrateGrokDisplayUsesMySQL56CompatibleSQL(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	capture := &mysqlCaptureDriver{
+		queryRows: [][]driver.Value{
+			{int64(7), int64(1), "settings", "ok", int64(200), `{"subscription_tier_display":" SuperGrok "}`, now, now.Add(time.Hour)},
+			{int64(7), int64(1), "ok", now, now.Add(time.Hour), "grok-4.6", false, true, `{"supported_in_api":"value"}`},
+		},
+	}
+	db := newMySQLCaptureDB(t, capture)
+	account := &AccountRow{
+		ID:                   7,
+		CredentialGeneration: 1,
+		Credentials: map[string]interface{}{
+			"upstream_type": "grok",
+			"plan_type":     "Free",
+		},
+	}
+
+	if err := db.HydrateGrokDisplay(context.Background(), []*AccountRow{account}); err != nil {
+		t.Fatalf("HydrateGrokDisplay() error = %v", err)
+	}
+	if account.GrokPlanDisplay == nil || account.GrokPlanDisplay.Plan != "SuperGrok" || account.GrokPlanDisplay.Status != "fresh" {
+		t.Fatalf("GrokPlanDisplay = %+v, want fresh SuperGrok", account.GrokPlanDisplay)
+	}
+	if account.GrokModels == nil || len(account.GrokModels.Models) != 1 || account.GrokModels.Models[0] != "grok-4.6" {
+		t.Fatalf("GrokModels = %+v, want grok-4.6", account.GrokModels)
+	}
+	if len(capture.queries) != 2 {
+		t.Fatalf("HydrateGrokDisplay() queries = %d, want 2", len(capture.queries))
+	}
+	for _, query := range capture.queries {
+		assertNoMySQL56IncompatibleSQL(t, query)
+		if strings.Contains(strings.ToUpper(query), "BTRIM(") {
+			t.Fatalf("PostgreSQL BTRIM leaked into MySQL query: %s", query)
+		}
+	}
+	if !strings.Contains(capture.queries[0], "s.payload_json") {
+		t.Fatalf("MySQL Grok display query must select raw payload_json: %s", capture.queries[0])
+	}
+}
+
 func TestSaveModelCapabilitiesUsesMySQL56Upsert(t *testing.T) {
 	capture := &mysqlCaptureDriver{
 		queryRows: [][]driver.Value{

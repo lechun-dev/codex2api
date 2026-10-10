@@ -72,6 +72,8 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "oauth_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 300"},
 	{table: "system_settings", name: "oauth_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 1"},
 	{table: "system_settings", name: "codex_ws_stateless_slots", def: "INT DEFAULT 8"},
+	// 2026-10-10 coder(lq): Add the independent chat retention budget to both upgraded and fresh MySQL schemas.
+	{table: "system_settings", name: "codex_ws_downstream_keepalive_slots", def: "INT DEFAULT 8"},
 	{table: "system_settings", name: "github_token", def: "TEXT NULL"},
 	{table: "system_settings", name: "github_proxy_url", def: "TEXT NULL"},
 	// 2026-09-06 coder(lq): MySQL 5.6 cannot define defaults on TEXT columns; readers supply the empty JSON fallback.
@@ -960,6 +962,7 @@ func systemSettingsMySQLDDL() string {
 		oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300,
 		oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1,
 		codex_ws_stateless_slots INT DEFAULT 8,
+		codex_ws_downstream_keepalive_slots INT DEFAULT 8,
 		github_token TEXT NULL,
 		github_proxy_url TEXT NULL,
 		invite_guide_config TEXT NULL,

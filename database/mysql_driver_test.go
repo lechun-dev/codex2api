@@ -637,6 +637,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		CodexWSBusyOverflowEnabled:          true,
 		CodexWSBusyPatienceSec:              3,
 		CodexWSStatelessSlots:               12,
+		CodexWSDownstreamKeepaliveSlots:     17,
 		GithubToken:                         "github-token-test",
 		GithubProxyURL:                      "http://127.0.0.1:7890",
 		CodexOverloadPauseEnabled:           true,
@@ -678,6 +679,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_ws_busy_overflow_enabled = VALUES(codex_ws_busy_overflow_enabled)",
 		"codex_ws_busy_patience_sec = VALUES(codex_ws_busy_patience_sec)",
 		"codex_ws_stateless_slots = VALUES(codex_ws_stateless_slots)",
+		"codex_ws_downstream_keepalive_slots = VALUES(codex_ws_downstream_keepalive_slots)",
 		"github_token = VALUES(github_token)",
 		"github_proxy_url = VALUES(github_proxy_url)",
 		"codex_overload_pause_enabled = VALUES(codex_overload_pause_enabled)",
@@ -705,11 +707,11 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 132 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 132", got)
+	if got := strings.Count(capture.query, "?"); got != 133 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 133", got)
 	}
-	if len(capture.args) != 132 {
-		t.Fatalf("rewritten settings argument count = %d, want 132", len(capture.args))
+	if len(capture.args) != 133 {
+		t.Fatalf("rewritten settings argument count = %d, want 133", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -732,6 +734,7 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexTelemetryTimingDebug,
 		settings.AutoResetCreditsOnExhaustionEnabled,
 		settings.CodexUnifiedClientIdentityEnabled,
+		int64(settings.CodexWSDownstreamKeepaliveSlots),
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}
@@ -842,7 +845,7 @@ func TestUsageLogBatchInsertRewritesAuditFieldsForMySQL56(t *testing.T) {
 		ParentRequestID:        "parent-request-1",
 		PromptPolicyIncidentID: "incident-1",
 	}
-	if err := db.batchInsertLogsChunk(context.Background(), conn, []usageLogEntry{entry}); err != nil {
+	if _, err := db.batchInsertLogsChunk(context.Background(), conn, []usageLogEntry{entry}); err != nil {
 		t.Fatalf("batchInsertLogsChunk() error = %v", err)
 	}
 

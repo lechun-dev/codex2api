@@ -204,6 +204,7 @@ func rewriteSQLForMySQLWithParamOrder(query string) (string, []int) {
 		return query, nil
 	}
 	query = rewritePostgresUpsertForMySQL(query)
+	query = rewriteMySQLBigintCasts(query)
 	query = mysqlCastAsTextPattern.ReplaceAllString(query, "CAST($1 AS CHAR)")
 	if strings.Contains(strings.ToLower(query), "api_keys") {
 		query = quoteMySQLAPIKeyIdentifier(query)
@@ -834,4 +835,19 @@ func ensureMySQLClientFoundRows(dsn string) string {
 		return dsn + "&clientFoundRows=true"
 	}
 	return dsn + "?clientFoundRows=true"
+}
+
+// 2026-10-10 coder(lq): MySQL 5.6/8.0 CAST uses SIGNED, not BIGINT.
+// Reuse the SQL tokenizer so comments and quoted error messages stay untouched.
+func rewriteMySQLBigintCasts(query string) string {
+	tokens := scanMySQLSQLTokens(query)
+	for i := len(tokens) - 1; i > 0; i-- {
+		t := tokens[i]
+		if t.value == "bigint" && tokens[i-1].value == "as" &&
+			tokens[i-1].statement == t.statement &&
+			strings.HasPrefix(strings.TrimSpace(query[t.end:]), ")") {
+			query = query[:t.start] + "SIGNED" + query[t.end:]
+		}
+	}
+	return query
 }

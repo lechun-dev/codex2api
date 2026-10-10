@@ -52,7 +52,13 @@ func (db *DB) GetDailyTokenUsage(ctx context.Context, rangeStart, rangeEnd time.
 		return nil, fmt.Errorf("end must be after start")
 	}
 
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, UsageLogFilter{})
+	// 2026-10-10 coder(lq): Reuse the upstream range builder without changing
+	// the local daily-token endpoint's channel/filter and exclusion semantics.
+	timeWhere, args := db.usageSpanWhere("created_at", usageTimeSpan{rangeStart, rangeEnd}, nil)
+	if channel = strings.TrimSpace(channel); channel != "" {
+		args = append(args, channel)
+		timeWhere += fmt.Sprintf(" AND channel = $%d", len(args))
+	}
 	modelExpr := "COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown')"
 	if model = strings.TrimSpace(model); model != "" {
 		placeholder := fmt.Sprintf("$%d", len(args)+1)

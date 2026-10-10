@@ -9392,6 +9392,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     int    `json:"codex_ws_downstream_keepalive_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
@@ -9587,6 +9588,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     *int                             `json:"codex_ws_downstream_keepalive_slots"`
 	GithubToken                         *string                          `json:"github_token"`
 	GithubProxyURL                      *string                          `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           *bool                            `json:"codex_overload_pause_enabled"`
@@ -10424,6 +10426,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -11231,6 +11234,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
 	}
 
+	if req.CodexWSDownstreamKeepaliveSlots != nil {
+		v := database.NormalizeCodexWSDownstreamKeepaliveSlots(*req.CodexWSDownstreamKeepaliveSlots)
+		h.store.SetCodexWSDownstreamKeepaliveSlots(v)
+		runtimeCfg.CodexWSDownstreamKeepaliveSlots = v
+		log.Printf("设置已更新: codex_ws_downstream_keepalive_slots = %d", v)
+	}
+
 	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
 	if req.GithubToken != nil {
 		v := strings.TrimSpace(*req.GithubToken)
@@ -11970,6 +11980,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -12307,6 +12318,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,

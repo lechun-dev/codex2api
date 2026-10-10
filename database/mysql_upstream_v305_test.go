@@ -86,7 +86,7 @@ func TestMySQL305SettingsAndUsageSQL(t *testing.T) {
 	}
 	capture := &mysqlCaptureDriver{}
 	db := newMySQLCaptureDB(t, capture)
-	if err := db.batchInsertLogsChunk(context.Background(), db.conn, []usageLogEntry{{AccountID: 1, StoreUsageLog: true}}); err != nil {
+	if _, err := db.batchInsertLogsChunk(context.Background(), db.conn, []usageLogEntry{{AccountID: 1, StoreUsageLog: true}}); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Count(capture.query, "?") != 75 || len(capture.args) != 75 {
@@ -301,7 +301,7 @@ func TestMySQL305Integration(t *testing.T) {
 	if err != nil || loaded.ObservedAt != 20 || loaded.CheckedAt != 21 || len(loaded.Models) != 1 {
 		t.Fatalf("stale overwrite: %+v %v", loaded, err)
 	}
-	if err = db.batchInsertLogsChunk(ctx, db.conn, []usageLogEntry{{AccountID: id, StoreUsageLog: true, Model: "gpt-6", EffectiveModel: "gpt-6", UpstreamResponseModel: "gpt-6", UpstreamModelMismatch: boolPointer(true), DaybreakProgram: "daybreak_blue", VideoSeconds: 5, SessionID: "mysql305-session", RequestText: "local trace", InjectedTurnState: "injected", UpstreamTurnState: "observed", TurnStateOverridden: true}}); err != nil {
+	if _, err = db.batchInsertLogsChunk(ctx, db.conn, []usageLogEntry{{AccountID: id, StoreUsageLog: true, Model: "gpt-6", EffectiveModel: "gpt-6", UpstreamResponseModel: "gpt-6", UpstreamModelMismatch: boolPointer(true), DaybreakProgram: "daybreak_blue", VideoSeconds: 5, SessionID: "mysql305-session", RequestText: "local trace", InjectedTurnState: "injected", UpstreamTurnState: "observed", TurnStateOverridden: true}}); err != nil {
 		t.Fatal(err)
 	}
 	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{Start: now.Add(-time.Hour), End: now.Add(time.Hour), AccountID: &id, Page: 1, PageSize: 20})

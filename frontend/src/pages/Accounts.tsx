@@ -6339,7 +6339,10 @@ export default function Accounts() {
   if (providerView === "antigravity") {
     return (
       <div key="provider-antigravity" className="animate-channel-switch-in">
-        <AntigravityAccounts headerSlot={providerSwitcher} />
+        <AntigravityAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+        />
       </div>
     );
   }

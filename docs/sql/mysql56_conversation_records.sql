@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS conversation_records (
     input_tokens         INT NOT NULL DEFAULT 0,
     output_tokens        INT NOT NULL DEFAULT 0,
     duration_ms          INT NOT NULL DEFAULT 0,
+    stream               TINYINT(1) NOT NULL DEFAULT 0,
+    truncated            TINYINT(1) NOT NULL DEFAULT 0,
     created_at           DATETIME NOT NULL,
     updated_at           DATETIME NOT NULL,
     completed_at         DATETIME NULL,
@@ -32,3 +34,7 @@ CREATE TABLE IF NOT EXISTS conversation_records (
     KEY idx_conversation_created_at (created_at),
     KEY idx_conversation_previous_response (api_key_id, previous_response_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- 存量库升级（5.6 没有 ADD COLUMN IF NOT EXISTS，按需逐条执行）
+-- ALTER TABLE conversation_records ADD COLUMN stream TINYINT(1) NOT NULL DEFAULT 0;
+-- ALTER TABLE conversation_records ADD COLUMN truncated TINYINT(1) NOT NULL DEFAULT 0;

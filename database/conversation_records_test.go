@@ -230,13 +230,24 @@ func TestSaveConversationRecordUsesMySQL56PlaceholderRewrite(t *testing.T) {
 		t.Fatalf("SaveConversationRecord() error = %v", err)
 	}
 
-	if strings.Contains(capture.query, "$1") || strings.Count(capture.query, "?") != 20 {
+	if strings.Contains(capture.query, "$1") || strings.Count(capture.query, "?") != 22 {
 		t.Fatalf("unexpected rewritten MySQL query: %s", capture.query)
 	}
-	if len(capture.args) != 20 {
-		t.Fatalf("rewritten MySQL argument count = %d, want 20", len(capture.args))
+	if len(capture.args) != 22 {
+		t.Fatalf("rewritten MySQL argument count = %d, want 22", len(capture.args))
 	}
-	if capture.args[0].Value != "session-mysql56" || capture.args[19].Value != "request-mysql56" {
-		t.Fatalf("rewritten MySQL argument order is wrong: first=%#v last=%#v", capture.args[0].Value, capture.args[19].Value)
+	// 新增列后 WHERE 的 request_id 不再是最后一个占位符，按值校验更稳。
+	if capture.args[0].Value != "session-mysql56" {
+		t.Fatalf("rewritten MySQL argument order is wrong: first=%#v", capture.args[0].Value)
+	}
+	foundRequestID := false
+	for _, arg := range capture.args {
+		if arg.Value == "request-mysql56" {
+			foundRequestID = true
+			break
+		}
+	}
+	if !foundRequestID {
+		t.Fatalf("rewritten MySQL argument order is wrong: %#v", capture.args)
 	}
 }

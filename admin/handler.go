@@ -46,25 +46,28 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	intelligenceDeviceConfig *proxy.DeviceProfileConfig
-	intelligenceOnce         sync.Once
-	intelligenceWG           sync.WaitGroup
-	imageQueue               *imageJobQueue
-	qualityTestContext       context.Context
-	qualityTestWG            sync.WaitGroup
-	store                    *auth.Store
-	modelRefreshFuncs        map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
-	proxyRiskJobsMu          sync.RWMutex
-	proxyRiskJobs            map[string]*proxyRiskScoringJob
-	cache                    cache.TokenCache
-	authCacheProxy           *proxy.Handler
-	db                       *database.DB
-	cacheCfgStore            responseCacheSettingsStore
-	rateLimiter              *proxy.RateLimiter
-	systemUpdate             *systemUpdater
-	systemUpdateOnce         sync.Once
-	refreshAccount           func(context.Context, int64) error
-	probeUsage               func(context.Context, *auth.Account) error
+	// 会话存档内部通道（HMAC 共享密钥）；secret 为空时路由不注册。
+	internalConversationSecret  string
+	internalConversationMaxSkew time.Duration
+	intelligenceDeviceConfig    *proxy.DeviceProfileConfig
+	intelligenceOnce            sync.Once
+	intelligenceWG              sync.WaitGroup
+	imageQueue                  *imageJobQueue
+	qualityTestContext          context.Context
+	qualityTestWG               sync.WaitGroup
+	store                       *auth.Store
+	modelRefreshFuncs           map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu             sync.RWMutex
+	proxyRiskJobs               map[string]*proxyRiskScoringJob
+	cache                       cache.TokenCache
+	authCacheProxy              *proxy.Handler
+	db                          *database.DB
+	cacheCfgStore               responseCacheSettingsStore
+	rateLimiter                 *proxy.RateLimiter
+	systemUpdate                *systemUpdater
+	systemUpdateOnce            sync.Once
+	refreshAccount              func(context.Context, int64) error
+	probeUsage                  func(context.Context, *auth.Account) error
 
 	codexUsageRefreshRunning atomic.Bool
 
@@ -1150,6 +1153,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 	api := r.Group("/api/admin")
 	api.Use(h.adminAuthMiddleware())
+	h.registerConversationArchiveRoutes(api)
+	h.registerInternalConversationArchiveRoutes(r)
 	api.Use(func(c *gin.Context) {
 		c.Next()
 		if shouldInvalidateAccountSnapshotCaches(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {

@@ -26,7 +26,13 @@
 - 配置优先级
 - 常见问题
 
-### 4. 架构文档 ([ARCHITECTURE.md](ARCHITECTURE.md))
+### 4. 会话存档 ([conversation-archive.md](conversation-archive.md))
+- 归档范围与体积上限
+- 表结构与启用方式
+- 管理端与内部（HMAC）查询接口
+- 保留策略与 MySQL 5.6 注意事项
+
+### 5. 架构文档 ([ARCHITECTURE.md](ARCHITECTURE.md))
 - 系统架构图
 - 核心组件说明
 - 数据流分析

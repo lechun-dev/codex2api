@@ -65,6 +65,7 @@ type Handler struct {
 	cache      cache.TokenCache     // Redis/Memory 运行态缓存
 	// 2026-09-03 coder(lq): 会话记录器独立于请求路径，避免串到热路径上的 DB 写。
 	convRecorder    *conversationRecorder
+	convArchiver    *conversationArchiver
 	apiKeyLookups   singleflight.Group
 	authCache       *apiKeyAuthCache
 	apiKeyGateMu    sync.Mutex
@@ -1443,6 +1444,9 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 		convRecorder: newConversationRecorder(db),
 		apiKeyGate:   newAPIKeyConcurrencyLimiter(),
 	}
+	if cfg != nil && cfg.ConversationRecording {
+		handler.convArchiver = newConversationArchiver(db)
+	}
 	handler.liveStore = newLiveCallStore(handler)
 	return handler
 }
@@ -1471,6 +1475,9 @@ func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *
 func (h *Handler) Close() {
 	if h == nil || h.convRecorder == nil {
 		return
+	}
+	if h.convArchiver != nil {
+		h.convArchiver.Close()
 	}
 	h.convRecorder.Close()
 }
@@ -3297,6 +3304,8 @@ func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.
 
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	// 会话存档在全局中间件里做路径过滤，只处理 /v1 文本端点；未启用时直通。
+	r.Use(h.ConversationArchiveMiddleware())
 	auth := h.authMiddleware()
 
 	// /v1 前缀路由（标准路径）

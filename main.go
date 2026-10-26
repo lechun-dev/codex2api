@@ -467,6 +467,34 @@ func main() {
 	// handler 不再接收 cfg.APIKeys
 	// 从环境变量读取 Codex 画像与 Beta 配置。
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
+	// API Key 归属人邮箱（存档按人查询会 join 这一列，与存档开关无关，始终保证存在）。
+	if err := db.EnsureAPIKeyOwnerEmail(backgroundCtx); err != nil {
+		log.Printf("API Key 归属人邮箱列初始化失败: %v", err)
+	}
+
+	// 会话存档：开关打开时建表/补列并启动按天清理；关闭时零开销。
+	if cfg.ConversationRecording {
+		if err := db.EnsureConversationRecords(backgroundCtx); err != nil {
+			log.Printf("会话存档建表失败: %v", err)
+		} else if err := db.EnsureConversationArchiveSchema(backgroundCtx); err != nil {
+			log.Printf("会话存档补列失败: %v", err)
+		}
+		StartConversationArchiveRetention(backgroundCtx, db, cfg.ConversationRetentionDays)
+		log.Printf("会话存档已启用（保留 %d 天，0 表示永久）", cfg.ConversationRetentionDays)
+	}
+
+	// 内部调用通道（lechun-tools/AI）：HMAC 共享密钥，未配置时不注册路由。
+	if secret := strings.TrimSpace(os.Getenv("CODEX_INTERNAL_CONVERSATION_SECRET")); secret != "" {
+		maxSkew := 5 * time.Minute
+		if raw := strings.TrimSpace(os.Getenv("CODEX_INTERNAL_CONVERSATION_MAX_SKEW_SECONDS")); raw != "" {
+			if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+				maxSkew = time.Duration(seconds) * time.Second
+			}
+		}
+		adminHandler.SetInternalConversationArchive(secret, maxSkew)
+		log.Printf("会话存档内部接口已启用（/api/internal/conversation-archives）")
+	}
+
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	defer handler.Close()
 	handler.SetRuntimeCache(tc)

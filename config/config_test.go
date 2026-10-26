@@ -67,8 +67,8 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
 	}
-	if !cfg.ConversationRecording {
-		t.Fatal("ConversationRecording = false, want default true")
+	if cfg.ConversationRecording {
+		t.Fatal("ConversationRecording = true, want default false")
 	}
 	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
 		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)

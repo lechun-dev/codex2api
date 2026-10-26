@@ -36,33 +36,40 @@ type ConversationRecordInput struct {
 	InputTokens        int
 	OutputTokens       int
 	DurationMs         int
+	Stream             bool
+	Truncated          bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	CompletedAt        *time.Time
 }
 
 type ConversationRecord struct {
-	ID                 int64      `json:"id"`
-	RequestID          string     `json:"request_id"`
-	SessionID          string     `json:"session_id"`
-	APIKeyID           int64      `json:"api_key_id"`
-	APIKeyName         string     `json:"api_key_name"`
-	ClientID           string     `json:"client_id"`
-	ClientIP           string     `json:"client_ip"`
-	ResponseID         string     `json:"response_id"`
-	PreviousResponseID string     `json:"previous_response_id"`
-	Endpoint           string     `json:"endpoint"`
-	Model              string     `json:"model"`
-	UserMessage        string     `json:"user_message"`
-	AssistantMessage   string     `json:"assistant_message"`
-	Status             string     `json:"status"`
-	StatusCode         int        `json:"status_code"`
-	InputTokens        int        `json:"input_tokens"`
-	OutputTokens       int        `json:"output_tokens"`
-	DurationMs         int        `json:"duration_ms"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+	ID                  int64      `json:"id"`
+	RequestID           string     `json:"request_id"`
+	SessionID           string     `json:"session_id"`
+	APIKeyID            int64      `json:"api_key_id"`
+	APIKeyName          string     `json:"api_key_name"`
+	ClientID            string     `json:"client_id"`
+	ClientIP            string     `json:"client_ip"`
+	ResponseID          string     `json:"response_id"`
+	PreviousResponseID  string     `json:"previous_response_id"`
+	Endpoint            string     `json:"endpoint"`
+	Model               string     `json:"model"`
+	UserMessage         string     `json:"user_message"`
+	AssistantMessage    string     `json:"assistant_message"`
+	Status              string     `json:"status"`
+	StatusCode          int        `json:"status_code"`
+	Stream              bool       `json:"stream"`
+	Truncated           bool       `json:"truncated"`
+	OwnerEmail          string     `json:"owner_email"`
+	UserMessageLen      int        `json:"user_message_len,omitempty"`
+	AssistantMessageLen int        `json:"assistant_message_len,omitempty"`
+	InputTokens         int        `json:"input_tokens"`
+	OutputTokens        int        `json:"output_tokens"`
+	DurationMs          int        `json:"duration_ms"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	CompletedAt         *time.Time `json:"completed_at,omitempty"`
 }
 
 const conversationRecordsPostgresDDL = `
@@ -85,6 +92,8 @@ CREATE TABLE IF NOT EXISTS conversation_records (
 	input_tokens         INT NOT NULL DEFAULT 0,
 	output_tokens        INT NOT NULL DEFAULT 0,
 	duration_ms          INT NOT NULL DEFAULT 0,
+	stream               BOOLEAN NOT NULL DEFAULT FALSE,
+	truncated            BOOLEAN NOT NULL DEFAULT FALSE,
 	created_at           TIMESTAMP NOT NULL,
 	updated_at           TIMESTAMP NOT NULL,
 	completed_at         TIMESTAMP
@@ -121,6 +130,8 @@ CREATE TABLE IF NOT EXISTS conversation_records (
 	input_tokens         INTEGER NOT NULL DEFAULT 0,
 	output_tokens        INTEGER NOT NULL DEFAULT 0,
 	duration_ms          INTEGER NOT NULL DEFAULT 0,
+	stream               INTEGER NOT NULL DEFAULT 0,
+	truncated            INTEGER NOT NULL DEFAULT 0,
 	created_at           DATETIME NOT NULL,
 	updated_at           DATETIME NOT NULL,
 	completed_at         DATETIME
@@ -160,6 +171,8 @@ CREATE TABLE IF NOT EXISTS conversation_records (
 	input_tokens         INT NOT NULL DEFAULT 0,
 	output_tokens        INT NOT NULL DEFAULT 0,
 	duration_ms          INT NOT NULL DEFAULT 0,
+	stream               TINYINT(1) NOT NULL DEFAULT 0,
+	truncated            TINYINT(1) NOT NULL DEFAULT 0,
 	created_at           DATETIME NOT NULL,
 	updated_at           DATETIME NOT NULL,
 	completed_at         DATETIME NULL,
@@ -284,6 +297,8 @@ func (db *DB) SaveConversationRecord(ctx context.Context, input ConversationReco
 		db.timeArg(input.UpdatedAt),
 		nil,
 		input.RequestID,
+		input.Stream,
+		input.Truncated,
 	}
 	if input.CompletedAt != nil && !input.CompletedAt.IsZero() {
 		args[18] = db.timeArg(*input.CompletedAt)
@@ -309,7 +324,9 @@ func (db *DB) SaveConversationRecord(ctx context.Context, input ConversationReco
 			duration_ms=$16,
 			created_at=$17,
 			updated_at=$18,
-			completed_at=$19
+			completed_at=$19,
+			stream=$21,
+			truncated=$22
 		WHERE request_id=$20
 	`, args...)
 	if err != nil {
@@ -326,13 +343,15 @@ func (db *DB) SaveConversationRecord(ctx context.Context, input ConversationReco
 			response_id, previous_response_id, endpoint, model,
 			user_message, assistant_message, status, status_code,
 			input_tokens, output_tokens, duration_ms,
-			created_at, updated_at, completed_at
+			created_at, updated_at, completed_at,
+			stream, truncated
 		) VALUES (
 			$1, $2, $3, $4, $5, $6,
 			$7, $8, $9, $10,
 			$11, $12, $13, $14,
 			$15, $16, $17,
-			$18, $19, $20
+			$18, $19, $20,
+			$21, $22
 		)
 	`,
 		input.RequestID,
@@ -355,6 +374,8 @@ func (db *DB) SaveConversationRecord(ctx context.Context, input ConversationReco
 		db.timeArg(input.CreatedAt),
 		db.timeArg(input.UpdatedAt),
 		args[18],
+		input.Stream,
+		input.Truncated,
 	)
 	if err == nil {
 		return nil
@@ -368,7 +389,8 @@ func (db *DB) SaveConversationRecord(ctx context.Context, input ConversationReco
 				response_id=$6, previous_response_id=$7, endpoint=$8, model=$9,
 			user_message=$10, assistant_message=$11, status=$12, status_code=$13,
 			input_tokens=$14, output_tokens=$15, duration_ms=$16,
-			created_at=$17, updated_at=$18, completed_at=$19
+			created_at=$17, updated_at=$18, completed_at=$19,
+			stream=$21, truncated=$22
 		WHERE request_id=$20
 	`, args...)
 	if retryErr != nil {

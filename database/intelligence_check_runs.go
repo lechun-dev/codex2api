@@ -95,7 +95,11 @@ func (db *DB) intelligenceEnqueueTx(ctx context.Context, tx *sql.Tx, s ic.Settin
 		if source == "manual" && existing.Source == "automatic" && existing.Status == "queued" {
 			existing.Source = "manual"
 			raw, _ := json.Marshal(existing)
-			if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_runs SET run_json=$1 WHERE id=$2`, string(raw), existing.ID); err != nil {
+			if db.isMySQL() {
+				if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_runs SET run_json=$1,source=$3 WHERE id=$2`, string(raw), existing.ID, existing.Source); err != nil {
+					return 0, err
+				}
+			} else if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_runs SET run_json=$1 WHERE id=$2`, string(raw), existing.ID); err != nil {
 				return 0, err
 			}
 		}
@@ -113,6 +117,16 @@ func (db *DB) intelligenceEnqueueTx(ctx context.Context, tx *sql.Tx, s ic.Settin
 		return 0, err
 	}
 	var id int64
+	if db.isMySQL() {
+		res, execErr := tx.ExecContext(ctx,
+			`INSERT INTO intelligence_check_runs(account_id,status,run_json,created_ms,ready_ms,source,account_name,channel) VALUES($1,'queued',$2,$3,$3,$4,$5,$6)`,
+			a.AccountID, string(raw), now.UnixMilli(), source, intelligenceTruncateForColumn(a.AccountName, 255), r.Channel)
+		if execErr != nil {
+			return 0, execErr
+		}
+		id, err = res.LastInsertId()
+		return id, err
+	}
 	err = tx.QueryRowContext(ctx, `INSERT INTO intelligence_check_runs(account_id,status,run_json,created_ms,ready_ms) VALUES($1,'queued',$2,$3,$3) RETURNING id`, a.AccountID, string(raw), now.UnixMilli()).Scan(&id)
 	return id, err
 }
@@ -147,6 +161,19 @@ func (db *DB) EnqueueDueIntelligenceChecks(ctx context.Context, now time.Time, l
 		s, err := db.intelligenceSettingsTx(ctx, tx)
 		if err != nil {
 			return err
+		}
+		if db.isMySQL() {
+			// MySQL 侧没有 AFTER INSERT 触发器：调度前把新账号补进来，语义等价于
+			// 上游「新账号按设置自动 opt-in」。
+			targetChannel := ""
+			if s.Action == "switch_group" {
+				if ch, chErr := intelligenceTargetGroupChannel(ctx, tx, s); chErr == nil {
+					targetChannel = ch
+				}
+			}
+			if err := db.enrollIntelligenceCheckAccountsMySQLTx(ctx, tx, s, targetChannel); err != nil {
+				return err
+			}
 		}
 		if !s.Enabled {
 			return nil
@@ -326,6 +353,39 @@ func (db *DB) intelligenceTerminalTx(ctx context.Context, tx *sql.Tx, r *Intelli
 	return err
 }
 func (db *DB) intelligenceRetainTx(ctx context.Context, tx *sql.Tx, accountID int64, retention int) error {
+	if db.isMySQL() {
+		// MySQL 5.6 不支持「IN 子查询里带 LIMIT」：先取出要保留的 id，再显式删除。
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM intelligence_check_runs WHERE account_id=$1 AND status NOT IN ('queued','running') ORDER BY id DESC LIMIT $2`, accountID, retention)
+		if err != nil {
+			return err
+		}
+		keep := []int64{}
+		for rows.Next() {
+			var id int64
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			keep = append(keep, id)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if len(keep) == 0 {
+			return nil
+		}
+		args := make([]interface{}, 0, len(keep)+1)
+		args = append(args, accountID)
+		ph := make([]string, len(keep))
+		for i, id := range keep {
+			ph[i] = fmt.Sprintf("$%d", i+2)
+			args = append(args, id)
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM intelligence_check_runs WHERE account_id=$1 AND status NOT IN ('queued','running') AND id NOT IN (`+strings.Join(ph, ",")+`)`, args...)
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM intelligence_check_runs WHERE account_id=$1 AND status NOT IN ('queued','running') AND id NOT IN (SELECT id FROM intelligence_check_runs WHERE account_id=$1 AND status NOT IN ('queued','running') ORDER BY id DESC LIMIT $2)`, accountID, retention)
 	return err
 }
@@ -375,7 +435,13 @@ func (db *DB) FinishIntelligenceCheck(ctx context.Context, id int64, owner strin
 			if grade.Status != "interrupted" {
 				cursor++
 			}
-			if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_accounts SET state_json=$1,quality_paused=$2,next_due_ms=$3,question_cursor=$4,status=$5 WHERE account_id=$6`, string(raw), a.QualityPaused, now.Add(time.Duration(delay)*time.Second).UnixMilli(), cursor, grade.Status, r.AccountID); err != nil {
+			updateQuery := `UPDATE intelligence_check_accounts SET state_json=$1,quality_paused=$2,next_due_ms=$3,question_cursor=$4,status=$5 WHERE account_id=$6`
+			updateArgs := []interface{}{string(raw), a.QualityPaused, now.Add(time.Duration(delay) * time.Second).UnixMilli(), cursor, grade.Status, r.AccountID}
+			if db.isMySQL() {
+				updateQuery = `UPDATE intelligence_check_accounts SET state_json=$1,quality_paused=$2,next_due_ms=$3,question_cursor=$4,status=$5,state_action=$7 WHERE account_id=$6`
+				updateArgs = append(updateArgs, intelligenceStateActionValue(a.State))
+			}
+			if _, err = tx.ExecContext(ctx, updateQuery, updateArgs...); err != nil {
 				return err
 			}
 		} else {
@@ -522,6 +588,13 @@ func (db *DB) intelligenceJSONField(field string) string {
 	if db.isSQLite() {
 		return "json_extract(run_json,'$." + field + "')"
 	}
+	if db.isMySQL() {
+		// 5.6 没有 JSON 函数：这些字段在写入时同步落成真实列。
+		if column := intelligenceRunJSONFieldMySQL(field); column != "" {
+			return column
+		}
+		return "''"
+	}
 	return "(run_json::jsonb->>'" + field + "')"
 }
 func (db *DB) ListIntelligenceCheckRuns(ctx context.Context, f IntelligenceCheckRunFilter) ([]IntelligenceCheckRun, int, error) {
@@ -581,6 +654,18 @@ func (db *DB) IntelligenceCheckBars(ctx context.Context, ids []int64) (map[int64
 	automaticEnabled := `(config_json::jsonb->>'enabled')::boolean`
 	if db.isSQLite() {
 		automaticEnabled = `json_extract(config_json,'$.enabled')`
+	}
+	if db.isMySQL() {
+		// 5.6 读不了 JSON：设置本来就在 Go 里，直接拼 TRUE/FALSE 字面量。
+		settings, settingsErr := db.GetIntelligenceCheckSettings(ctx)
+		if settingsErr != nil {
+			return nil, settingsErr
+		}
+		if settings.Enabled {
+			automaticEnabled = `TRUE`
+		} else {
+			automaticEnabled = `FALSE`
+		}
 	}
 	active := `r.status='running' OR (r.status='queued' AND (` + db.intelligenceJSONField("source") + `='manual' OR (` + intelligenceAutomaticSQL("acc", "a") + ` AND (SELECT ` + automaticEnabled + ` FROM intelligence_check_settings WHERE id=1))))`
 	rows, err := db.conn.QueryContext(ctx, `SELECT a.account_id,a.enabled,a.quality_paused,a.state_json,COALESCE(r.id,0),COALESCE(r.status,'') FROM intelligence_check_accounts a JOIN accounts acc ON acc.id=a.account_id LEFT JOIN intelligence_check_runs r ON r.account_id=a.account_id AND r.status IN ('queued','running') AND (`+active+`) WHERE a.account_id IN (`+ph+`)`, args...)

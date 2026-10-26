@@ -103,6 +103,11 @@ type IntelligenceCheckRunSummary struct {
 }
 
 func (db *DB) ensureIntelligenceCheckSchema(ctx context.Context) error {
+	// MySQL 5.6 没有 JSON 函数/窗口函数/部分索引，也没有 PG 方言触发器，
+	// 整套 DDL 走独立实现（见 intelligence_check_mysql.go）。
+	if db.isMySQL() {
+		return db.ensureIntelligenceCheckSchemaMySQL(ctx)
+	}
 	idType := "BIGSERIAL PRIMARY KEY"
 	if db.isSQLite() {
 		idType = "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -208,7 +213,32 @@ func (db *DB) SaveIntelligenceCheckSettings(ctx context.Context, s ic.Settings) 
 				return err
 			}
 			conflict := &IntelligenceCheckTargetConflictError{TargetGroupID: s.TargetGroupID, TargetGroupChannel: channel}
-			rows, err := tx.QueryContext(ctx, `SELECT a.id,COALESCE(a.name,''),`+db.intelligenceChannelExpr()+`,COUNT(*) OVER () FROM accounts a JOIN intelligence_check_accounts st ON st.account_id=a.id WHERE `+db.intelligenceEligibleSQL()+` AND st.enabled=TRUE AND COALESCE(`+db.intelligenceStateActionExpr("st")+`,'')='' AND `+db.intelligenceChannelExpr()+`<>$1 ORDER BY a.id LIMIT 200`, channel)
+			base := ` FROM accounts a JOIN intelligence_check_accounts st ON st.account_id=a.id WHERE ` + db.intelligenceEligibleSQL() + ` AND st.enabled=TRUE AND COALESCE(` + db.intelligenceStateActionExpr("st") + `,'')='' AND ` + db.intelligenceChannelExpr() + `<>$1`
+			if db.isMySQL() {
+				// MySQL 5.6 没有窗口函数：冲突总数单独 COUNT，名单再取前 200 条。
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+base, channel).Scan(&conflict.ConflictCount); err != nil {
+					return err
+				}
+				if conflict.ConflictCount > 0 {
+					rows, qErr := tx.QueryContext(ctx, `SELECT a.id,COALESCE(a.name,''),`+db.intelligenceChannelExpr()+base+` ORDER BY a.id LIMIT 200`, channel)
+					if qErr != nil {
+						return qErr
+					}
+					defer rows.Close()
+					for rows.Next() {
+						var account IntelligenceCheckTargetConflictAccount
+						if qErr = rows.Scan(&account.AccountID, &account.AccountName, &account.Channel); qErr != nil {
+							return qErr
+						}
+						conflict.Conflicts = append(conflict.Conflicts, account)
+					}
+					if qErr = rows.Err(); qErr != nil {
+						return qErr
+					}
+				}
+				return conflict
+			}
+			rows, err := tx.QueryContext(ctx, `SELECT a.id,COALESCE(a.name,''),`+db.intelligenceChannelExpr()+`,COUNT(*) OVER ()`+base+` ORDER BY a.id LIMIT 200`, channel)
 			if err != nil {
 				return err
 			}
@@ -275,12 +305,23 @@ func (db *DB) intelligenceUpstreamExpr() string {
 	if db.isSQLite() {
 		return `LOWER(COALESCE(json_extract(a.credentials,'$.upstream_type'),''))`
 	}
+	if db.isMySQL() {
+		// 5.6 没有 JSON 函数，只能对文本做正则；调用方在 MySQL 下改用
+		// intelligenceChannelExprMySQL / intelligenceEligibleSQLMySQL。
+		return `LOWER(COALESCE(CAST(a.credentials AS CHAR),''))`
+	}
 	return `LOWER(COALESCE(a.credentials->>'upstream_type',''))`
 }
 func (db *DB) intelligenceChannelExpr() string {
+	if db.isMySQL() {
+		return db.intelligenceChannelExprMySQL()
+	}
 	return `CASE WHEN ` + db.intelligenceUpstreamExpr() + `='claude' OR LOWER(COALESCE(a.platform,'')) IN ('anthropic','claude') THEN 'claude' ELSE 'codex' END`
 }
 func (db *DB) intelligenceEligibleSQL() string {
+	if db.isMySQL() {
+		return db.intelligenceEligibleSQLMySQL()
+	}
 	return `a.status<>'deleted' AND COALESCE(a.error_message,'')<>'deleted' AND ` + db.intelligenceUpstreamExpr() + ` NOT IN ('grok','antigravity') AND LOWER(COALESCE(a.platform,'openai')) NOT IN ('xai','grok','antigravity','google')`
 }
 
@@ -385,7 +426,10 @@ func (db *DB) ListIntelligenceCheckAccounts(ctx context.Context, f IntelligenceC
 }
 func (db *DB) intelligenceAccountTx(ctx context.Context, tx *sql.Tx, id int64) (IntelligenceCheckAccount, error) {
 	q := `SELECT ` + intelligenceAccountColumns + db.intelligenceChannelExpr() + ` FROM accounts a JOIN intelligence_check_accounts s ON s.account_id=a.id WHERE a.id=$1 AND ` + db.intelligenceEligibleSQL()
-	if !db.isSQLite() {
+	if db.isMySQL() {
+		// MySQL 5.6 不支持 FOR UPDATE OF <alias>，退化为锁住联接涉及的行。
+		q += ` FOR UPDATE`
+	} else if !db.isSQLite() {
 		q += ` FOR UPDATE OF s`
 	}
 	a, err := scanIntelligenceAccount(tx.QueryRowContext(ctx, q, id))
@@ -475,7 +519,11 @@ func (db *DB) intelligenceManualMutationTx(ctx context.Context, tx *sql.Tx, ids 
 			state.OwnedAction = ""
 		}
 		encoded, _ := json.Marshal(state)
-		if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_accounts SET manual_revision=manual_revision+1,state_json=$1,quality_paused=$2 WHERE account_id=$3`, string(encoded), paused, id); err != nil {
+		if db.isMySQL() {
+			if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_accounts SET manual_revision=manual_revision+1,state_json=$1,quality_paused=$2,state_action=$4 WHERE account_id=$3`, string(encoded), paused, id, intelligenceStateActionValue(state)); err != nil {
+				return err
+			}
+		} else if _, err = tx.ExecContext(ctx, `UPDATE intelligence_check_accounts SET manual_revision=manual_revision+1,state_json=$1,quality_paused=$2 WHERE account_id=$3`, string(encoded), paused, id); err != nil {
 			return err
 		}
 		if err = insertSchedulerOutboxEventTx(ctx, tx, SchedulerEntityAccount, id, "upsert"); err != nil {
@@ -546,6 +594,10 @@ func (db *DB) intelligenceStateActionExpr(alias string) string {
 	if db.isSQLite() {
 		return "json_extract(" + alias + ".state_json,'$.action')"
 	}
+	if db.isMySQL() {
+		// MySQL 5.6 没有 JSON 函数：写 state 时同步落一列 state_action。
+		return alias + ".state_action"
+	}
 	return "(" + alias + ".state_json::jsonb->>'action')"
 }
 
@@ -555,6 +607,11 @@ func (db *DB) ensureIntelligenceCheckSummariesTx(ctx context.Context, tx *sql.Tx
 	query := `SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='intelligence_check_runs'`
 	if db.isSQLite() {
 		query = `SELECT name FROM pragma_table_info('intelligence_check_runs')`
+	}
+	if db.isMySQL() {
+		// MySQL 的 current_schema() 等价物是 DATABASE()，且列名返回大写与否取决于
+		// information_schema 的大小写设置，这里统一 LOWER 后再比较。
+		query = `SELECT LOWER(column_name) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='intelligence_check_runs'`
 	}
 	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {
@@ -580,6 +637,11 @@ func (db *DB) ensureIntelligenceCheckSummariesTx(ctx context.Context, tx *sql.Tx
 				return err
 			}
 		}
+	}
+	if db.isMySQL() {
+		// 5.6 没有 JSON 函数，摘要回填放到 Go 里做；索引（无 WHERE 条件）由
+		// ensureIntelligenceCheckSchemaMySQL 用 ensureMySQLIndex 幂等创建。
+		return db.backfillIntelligenceRunSummariesMySQL(ctx)
 	}
 	nameExpr := `COALESCE(run_json::jsonb #>> '{question,name}','')`
 	durationExpr := `COALESCE((run_json::jsonb->>'duration_ms')::bigint,0)`

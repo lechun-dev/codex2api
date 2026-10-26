@@ -71,6 +71,9 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "oauth_model_cooldown_mode", def: "VARCHAR(20) NOT NULL DEFAULT 'adaptive'"},
 	{table: "system_settings", name: "oauth_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 300"},
 	{table: "system_settings", name: "oauth_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 1"},
+	// 2026-10-26 coder(lq): 上游 v3.1.1 新增的不支持模型冷却时长，默认 1800s。
+	{table: "system_settings", name: "oauth_unsupported_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 1800"},
+	{table: "system_settings", name: "codex_min_cli_version", def: "VARCHAR(32) DEFAULT '0.160.0'"},
 	{table: "system_settings", name: "codex_ws_stateless_slots", def: "INT DEFAULT 8"},
 	// 2026-10-10 coder(lq): Add the independent chat retention budget to both upgraded and fresh MySQL schemas.
 	{table: "system_settings", name: "codex_ws_downstream_keepalive_slots", def: "INT DEFAULT 8"},
@@ -536,7 +539,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "scheduler_mode", "VARCHAR(20) DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "VARCHAR(16) DEFAULT 'bounded'"},
 		{"system_settings", "client_compat_mode", "VARCHAR(20) DEFAULT 'preserve'"},
-		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.144.1'"},
+		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.160.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT NULL"},
 		{"system_settings", "usage_log_mode", "VARCHAR(20) DEFAULT 'full'"},
 		{"system_settings", "usage_log_batch_size", "INT DEFAULT 200"},
@@ -588,8 +591,8 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		ctx,
 		"system_settings",
 		"codex_min_cli_version",
-		"0.144.1",
-		"VARCHAR(32) DEFAULT '0.144.1'",
+		"0.160.0",
+		"VARCHAR(32) DEFAULT '0.160.0'",
 	); err != nil {
 		return err
 	}
@@ -874,7 +877,7 @@ func systemSettingsMySQLDDL() string {
 		prompt_filter_review_timeout_seconds INT DEFAULT 10,
 		prompt_filter_review_fail_closed TINYINT(1) DEFAULT 1,
 		client_compat_mode VARCHAR(20) DEFAULT 'preserve',
-		codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1',
+		codex_min_cli_version VARCHAR(32) DEFAULT '0.160.0',
 		codex_user_agent_config TEXT NULL,
 		codex_images_main_model VARCHAR(128) DEFAULT '',
 		usage_log_mode VARCHAR(20) DEFAULT 'full',
@@ -961,6 +964,7 @@ func systemSettingsMySQLDDL() string {
 		oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive',
 		oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300,
 		oauth_model_cooldown_backoff_enabled TINYINT(1) NOT NULL DEFAULT 1,
+		oauth_unsupported_model_cooldown_seconds INT NOT NULL DEFAULT 1800,
 		codex_ws_stateless_slots INT DEFAULT 8,
 		codex_ws_downstream_keepalive_slots INT DEFAULT 8,
 		github_token TEXT NULL,

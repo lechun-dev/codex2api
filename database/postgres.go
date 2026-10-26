@@ -8937,6 +8937,13 @@ func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_capability_snapshots WHERE account_id = $1`, id); err != nil {
 		return err
 	}
+	// SQLite 默认不启用外键、MySQL 5.6 侧没有建外键，智能检查的两张表要显式清理。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM intelligence_check_runs WHERE account_id = $1`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM intelligence_check_accounts WHERE account_id = $1`, id); err != nil {
+		return err
+	}
 	query := `DELETE FROM accounts WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
 	res, err := tx.ExecContext(ctx, query, id)
 	if err != nil {
@@ -8967,6 +8974,12 @@ func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	if err := db.deleteGrokAccountStateTx(ctx, tx, deletedPredicate); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM intelligence_check_runs WHERE account_id `+deletedPredicate); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM intelligence_check_accounts WHERE account_id `+deletedPredicate); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `

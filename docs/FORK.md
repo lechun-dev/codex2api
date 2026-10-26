@@ -80,7 +80,39 @@ go test -count=1 ./database -run 'TestMySQL.*Integration|TestAPIKeyAuthRevisionM
 
 ---
 
-## 4. 新增 SQL 的自检
+## 4. 上游功能在 MySQL 上的移植：账号智能检查
+
+上游 v3.1.1 新增的「账号智能检查」（`database/intelligence_check*.go`）最初只有
+PostgreSQL / SQLite 实现，用到了 MySQL 5.6 完全没有的能力。fork 的做法是把
+「SQL 里读 JSON」换成「写入时落成真实列」，实现集中在
+`database/intelligence_check_mysql.go`：
+
+| 上游写法 | MySQL 5.6 替代 |
+| --- | --- |
+| `state_json::jsonb->>'action'` / `json_extract(state_json,'$.action')` | 写 state 时同步 `state_action VARCHAR(32)` 列 |
+| `run_json::jsonb->>'source' / account_name / channel / duration_ms` | 写入时同步同名真实列（`source`、`account_name`、`channel`、`duration_ms`、`question_name`） |
+| `COUNT(*) OVER ()` | 冲突总数单独 `COUNT(*)`，名单再取前 200 条 |
+| `credentials->>'upstream_type'` | `CAST(credentials AS CHAR) REGEXP '"upstream_type"\s*:\s*"claude"'` |
+| `CREATE UNIQUE INDEX ... WHERE status IN (...)` | 普通索引 + 事务内查重（`intelligenceEnqueueTx` 先查活跃 run） |
+| `CREATE INDEX IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` | `ensureMySQLIndex` / `ensureMySQLColumn` |
+| `INSERT ... RETURNING id` | `Exec` + `LastInsertId()` |
+| `AFTER INSERT` 触发器（含 JSON 解析） | 调度器每次 tick 前 `enrollIntelligenceCheckAccountsMySQLTx` 补插缺失账号 |
+| `DELETE ... WHERE id NOT IN (SELECT ... LIMIT n)` | 先查出要保留的 id，再按显式占位符删除 |
+| `TEXT NOT NULL DEFAULT '{}'` | 5.6 的 TEXT 不能带默认值：列保持 `NOT NULL`，所有插入显式写入 `'{}'` |
+| 外键 `REFERENCES accounts(id) ON DELETE CASCADE` | 不建外键；账号彻底删除时在 `PurgeAccount` / `PurgeDeletedAccounts` 显式清理两张表 |
+
+覆盖：`database/mysql_intelligence_integration_test.go`（测试名匹配
+`TestMySQL.*Integration`，由 CI 的 `mysql56-compatibility` 与部署门禁执行），
+`database/intelligence_check_mysql_test.go` 负责静态断言（DDL/查询里不允许出现
+`BIGSERIAL`、`IF NOT EXISTS`、部分索引、`->>`、`json_extract`、`RETURNING`）。
+
+移植时踩过的语义差异，改代码时别再踩：
+
+- SQLite 默认不启用外键，MySQL 侧没建外键，**都要显式清理**子表，否则回收站清空后留孤儿行。
+- `state_json` 在 SQLite/PG 上带 `DEFAULT '{}'`，MySQL 没有默认值，任何新增插入路径都必须写值。
+- MySQL 的 `utf8` 列按字符数计长度，截断账号名要用 rune 而不是 byte。
+
+## 5. 新增 SQL 的自检
 
 改任何 DB 代码后：
 
@@ -94,7 +126,7 @@ go test -count=1 ./database -run 'TestMySQL.*Integration|TestAPIKeyAuthRevisionM
 
 ---
 
-## 5. 部署布局
+## 6. 部署布局
 
 ```
 /deploy/codex2api/
@@ -111,7 +143,7 @@ go test -count=1 ./database -run 'TestMySQL.*Integration|TestAPIKeyAuthRevisionM
 
 ---
 
-## 6. 分支与评审
+## 7. 分支与评审
 
 - `main` 受保护：只接受 PR，必须 `mysql56-compatibility` + `test-race` 绿。
 - 上游同步用 `codex/upstream-merge-<YYYYMMDD>` 分支开 PR，不直接推 `main`。

@@ -39,6 +39,11 @@ scripts
 
 # Logs
 logs/
+# 直接 go run . 时审计日志等落在仓库根目录，避免误提交大文件
+audit.log
+*.log
+*.log.*
+
 AGENTS.md
 CLIProxyAPI/
 CLIProxyAPI-Pro/
@@ -61,3 +66,6 @@ diagrams/
 
 # local e2e test scaffolding (mock upstream + scripts, not for CI)
 /local-test/
+
+# 本地产物：生图工作台输出、临时截图
+/output/

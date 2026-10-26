@@ -8,6 +8,10 @@ Type=simple
 User=deployuser
 Group=deployuser
 WorkingDirectory=/deploy/codex2api/current
+# 审计日志默认是相对工作目录的 logs/security，而工作目录每次发版都换 release 目录，
+# 会导致日志随版本目录散落、老版本目录各自占满轮转配额；固定到 shared/ 下。
+# 这一行必须在 EnvironmentFile 之前：后加载的文件里的 SECURITY_LOG_DIR 可覆盖它。
+Environment=SECURITY_LOG_DIR=/deploy/codex2api/shared/logs/security
 EnvironmentFile=/deploy/codex2api/shared/.env
 ExecStart=/deploy/codex2api/current/codex2api
 Restart=always

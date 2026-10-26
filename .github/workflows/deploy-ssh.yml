@@ -46,6 +46,17 @@ jobs:
     if: ${{ inputs.action != 'rollback' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    services:
+      mysql:
+        image: mysql:5.6
+        env:
+          MYSQL_ROOT_PASSWORD: test-only
+          MYSQL_DATABASE: codex2api_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest-only"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       TARGET_GOARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.goarch || 'amd64' }}
       DEPLOY_DIR: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_dir || '/deploy/codex2api' }}
@@ -78,6 +89,14 @@ jobs:
 
       - name: Run Go tests
         run: go test ./...
+
+      # go test ./... 在没有 DSN 时会把 MySQL 5.6 集成测试 Skip 掉，等于没验证。
+      # 这里直接起 mysql:5.6 服务容器跑真集成测试，自包含、不依赖上游 CI 的 check 结果。
+      - name: Test MySQL 5.6 compatibility
+        env:
+          CODEX2API_MYSQL_TEST_DSN: root:test-only@tcp(127.0.0.1:3306)/codex2api_test?parseTime=true&charset=utf8&loc=UTC
+          CODEX2API_TEST_MYSQL_DSN: root:test-only@tcp(127.0.0.1:3306)/codex2api_test?parseTime=true&charset=utf8&loc=UTC
+        run: go test -count=1 ./database -run 'TestMySQL.*Integration|TestAPIKeyAuthRevisionMySQL'
 
       - name: Build Linux binary
         run: |
@@ -157,6 +176,10 @@ jobs:
             exit 1
           fi
           echo "Service $SERVICE_NAME is active"
+          echo "::endgroup::"
+
+          echo "::group::Prune old releases"
+          ssh "${ssh_opts[@]}" "$remote" "ls -1dt '$DEPLOY_DIR/releases'/*/ | tail -n +6 | xargs -r rm -rf"
           echo "::endgroup::"
 
       - name: Healthcheck

@@ -529,6 +529,10 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		if err := db.ensureAPIKeyClientsTable(ctx); err != nil {
 			return nil, fmt.Errorf("创建 API Key 客户端统计表失败: %w", err)
 		}
+		// 归属人邮箱：会话存档按人查询会 join 这一列，存量库需要在这里补齐。
+		if err := db.EnsureAPIKeyOwnerEmail(ctx); err != nil {
+			return nil, fmt.Errorf("初始化 API Key 归属人邮箱列失败: %w", err)
+		}
 		if err := db.ensureQualityTestSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化检测记录表失败: %w", err)
 		}
@@ -1477,6 +1481,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,
 		name       VARCHAR(255) DEFAULT '',
+		owner_email VARCHAR(255) NOT NULL DEFAULT '',
 		key        VARCHAR(255) NOT NULL UNIQUE,
 		enabled    BOOLEAN NOT NULL DEFAULT TRUE,
 		quota_limit DOUBLE PRECISION DEFAULT 0,
@@ -1488,6 +1493,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS quota_used DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS owner_email VARCHAR(255) NOT NULL DEFAULT '';
+	CREATE INDEX IF NOT EXISTS idx_api_keys_owner_email ON api_keys(owner_email);
 	CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS total_used DOUBLE PRECISION NOT NULL DEFAULT 0;
@@ -1963,6 +1970,7 @@ func (db *DB) migrate(ctx context.Context) error {
 type APIKeyRow struct {
 	ID              int64        `json:"id"`
 	Name            string       `json:"name"`
+	OwnerEmail      string       `json:"owner_email"`
 	Key             string       `json:"key"`
 	Enabled         bool         `json:"enabled"`
 	QuotaLimit      float64      `json:"quota_limit"`
@@ -2113,6 +2121,7 @@ func (l APIKeyLimits) IsZero() bool {
 
 type APIKeyInput struct {
 	Name            string
+	OwnerEmail      string
 	Key             string
 	QuotaLimit      float64
 	QuotaUsed       float64
@@ -2124,6 +2133,8 @@ type APIKeyInput struct {
 type APIKeyUpdate struct {
 	Name               string
 	NameSet            bool
+	OwnerEmail         string
+	OwnerEmailSet      bool
 	Enabled            bool
 	EnabledSet         bool
 	QuotaLimit         float64
@@ -2137,7 +2148,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), enabled`
+const apiKeySelectColumns = `id, name, COALESCE(owner_email, ''), key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), enabled`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -2214,9 +2225,9 @@ func (db *DB) InsertAPIKeyWithOptions(ctx context.Context, input APIKeyInput) (i
 		input.QuotaUsed = 0
 	}
 	return db.insertRowID(ctx,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING id`,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		input.Name, input.Key, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs), encodeAPIKeyLimits(input.Limits),
+		`INSERT INTO api_keys (name, owner_email, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb) RETURNING id`,
+		`INSERT INTO api_keys (name, owner_email, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		input.Name, input.OwnerEmail, input.Key, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs), encodeAPIKeyLimits(input.Limits),
 	)
 }
 
@@ -2407,6 +2418,9 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	}
 	if update.EnabledSet {
 		sets = append(sets, "enabled = "+setArg(update.Enabled))
+	}
+	if update.OwnerEmailSet {
+		sets = append(sets, "owner_email = "+setArg(update.OwnerEmail))
 	}
 	if update.QuotaLimitSet {
 		quotaLimit := update.QuotaLimit

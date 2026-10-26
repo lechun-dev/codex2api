@@ -244,6 +244,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(255) DEFAULT '',
+			owner_email VARCHAR(255) NOT NULL DEFAULT '',
 			` + "`key`" + ` VARCHAR(255) NOT NULL UNIQUE,
 			enabled TINYINT(1) NOT NULL DEFAULT 1,
 			quota_limit DOUBLE DEFAULT 0,

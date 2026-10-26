@@ -94,10 +94,14 @@ curl -s -H "X-Admin-Key: $ADMIN_SECRET" \
 - 新增/调整某人归属，只需要维护 `api_keys.owner_email`
 - **历史存档立刻按新邮箱可查**，不需要回填、重新采集或重建索引
 
-两种维护方式：
+三种维护方式：
+
+1. **管理台**：密钥列表 → 新建/编辑弹窗里的「归属邮箱」字段（列表里也会显示）
+2. 管理接口：`POST /api/admin/keys`（`owner_email` 字段）/ `PUT /api/admin/keys/:id`（`owner_email`）/ 专用 `PUT /api/admin/keys/:id/owner`
+3. 直接改库：`UPDATE api_keys SET owner_email='alice@lechun.cc' WHERE id=12;`
 
 ```bash
-# 1) 管理接口
+# 管理接口
 curl -s -X PUT -H "X-Admin-Key: $ADMIN_SECRET" -H 'Content-Type: application/json' \
   -d '{"owner_email":"alice@lechun.cc"}' \
   http://127.0.0.1:8080/api/admin/keys/12/owner

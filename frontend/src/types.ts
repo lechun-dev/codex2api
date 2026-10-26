@@ -3954,6 +3954,8 @@ export interface APIKeyWindowUsage {
 export interface APIKeyRow {
   id: number
   name: string
+  /** 归属人邮箱：会话存档按人查询用，由管理员维护。 */
+  owner_email?: string | null
   key: string
   raw_key: string
   quota_limit: number
@@ -4010,6 +4012,7 @@ export type UpdatePromptFilterNewAPIBindingRequest = Partial<
 
 export interface CreateAPIKeyRequest {
   name: string
+  owner_email?: string
   key?: string
   quota_limit?: number
   quota?: number
@@ -4021,6 +4024,7 @@ export interface CreateAPIKeyRequest {
 
 export interface UpdateAPIKeyRequest {
   name?: string
+  owner_email?: string
   quota_limit?: number | null
   quota?: number | null
   reset_quota?: boolean

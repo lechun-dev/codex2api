@@ -215,6 +215,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
+			owner_email TEXT NOT NULL DEFAULT '',
 			key TEXT NOT NULL UNIQUE,
 			enabled INTEGER NOT NULL DEFAULT 1,
 			quota_limit REAL DEFAULT 0,

@@ -5733,6 +5733,9 @@
     "createTitle": "创建密钥",
     "createDesc": "可以让系统自动生成 sk-*，也可以填入自定义密钥以兼容已有客户端。",
     "nameLabel": "名称",
+    "ownerEmailLabel": "归属邮箱",
+    "ownerEmailHelp": "用于会话存档按人查询；填好后历史记录立刻可按该邮箱检索",
+    "ownerEmailPlaceholder": "例如 alice@lechun.cc",
     "keyLabel": "密钥值",
     "quotaLimitLabel": "费用额度限制（USD）",
     "quotaLimitPlaceholder": "留空或 0 表示不限额",
@@ -5859,11 +5862,8 @@
       "disabled": "已禁用",
       "expired": "已过期",
       "quota_exhausted": "额度耗尽",
-      "expiring_soon": "即将过期",
-      "disabled": "已禁用"
+      "expiring_soon": "即将过期"
     },
-    "enable": "启用",
-    "disable": "禁用",
     "disableTitle": "禁用 API Key",
     "disableDesc": "禁用后该密钥的所有请求将立即被拒绝（401），已有配置与用量数据保留。可随时重新启用。",
     "disableConfirm": "确认禁用",

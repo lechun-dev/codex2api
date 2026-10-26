@@ -66,6 +66,7 @@ type apiKeysResponse struct {
 type MaskedAPIKeyRow struct {
 	ID              int64                    `json:"id"`
 	Name            string                   `json:"name"`
+	OwnerEmail      string                   `json:"owner_email"`
 	Key             string                   `json:"key"`
 	RawKey          string                   `json:"raw_key"`
 	QuotaLimit      float64                  `json:"quota_limit"`
@@ -114,6 +115,7 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 	return &MaskedAPIKeyRow{
 		ID:              row.ID,
 		Name:            row.Name,
+		OwnerEmail:      row.OwnerEmail,
 		Key:             security.MaskAPIKey(row.Key),
 		RawKey:          row.Key,
 		QuotaLimit:      row.QuotaLimit,

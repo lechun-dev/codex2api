@@ -8778,6 +8778,7 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 
 type createKeyReq struct {
 	Name            string              `json:"name"`
+	OwnerEmail      string              `json:"owner_email"`
 	Key             string              `json:"key"`
 	QuotaLimit      *float64            `json:"quota_limit"`
 	Quota           *float64            `json:"quota"`
@@ -8785,6 +8786,26 @@ type createKeyReq struct {
 	ExpiresInDays   *int                `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage     `json:"allowed_group_ids"`
 	Limits          *createAPIKeyLimits `json:"limits"`
+}
+
+// normalizeAPIKeyOwnerEmail 校验并清理归属人邮箱；空字符串表示不设置/清空。
+func normalizeAPIKeyOwnerEmail(raw string) (string, error) {
+	email := strings.TrimSpace(security.SanitizeInput(raw))
+	if email == "" {
+		return "", nil
+	}
+	if utf8.RuneCountInString(email) > 255 {
+		return "", errors.New("归属邮箱长度不能超过 255 字符")
+	}
+	// 轻量校验：必须有单个 @、两侧非空、不含空白。不做 RFC 全量校验。
+	if strings.Count(email, "@") != 1 || strings.ContainsAny(email, " \t\r\n") {
+		return "", errors.New("归属邮箱格式无效")
+	}
+	parts := strings.SplitN(email, "@", 2)
+	if parts[0] == "" || parts[1] == "" || !strings.Contains(parts[1], ".") {
+		return "", errors.New("归属邮箱格式无效")
+	}
+	return email, nil
 }
 
 // generateKey 生成随机 API Key
@@ -8900,8 +8921,14 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		}
 	}
 
+	ownerEmail, err := normalizeAPIKeyOwnerEmail(req.OwnerEmail)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
 		Name:            req.Name,
+		OwnerEmail:      ownerEmail,
 		Key:             key,
 		QuotaLimit:      quotaLimit,
 		ExpiresAt:       expiresAt,
@@ -8947,6 +8974,7 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 type updateAPIKeyReq struct {
 	Name            *string                `json:"name"`
+	OwnerEmail      *string                `json:"owner_email"`
 	QuotaLimit      json.RawMessage        `json:"quota_limit"`
 	Quota           json.RawMessage        `json:"quota"`
 	ResetQuota      *bool                  `json:"reset_quota"`
@@ -9047,6 +9075,15 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	if req.Name != nil {
 		update.Name = *req.Name
 		update.NameSet = true
+	}
+	if req.OwnerEmail != nil {
+		ownerEmail, emailErr := normalizeAPIKeyOwnerEmail(*req.OwnerEmail)
+		if emailErr != nil {
+			writeError(c, http.StatusBadRequest, emailErr.Error())
+			return
+		}
+		update.OwnerEmail = ownerEmail
+		update.OwnerEmailSet = true
 	}
 	if req.Enabled != nil {
 		update.Enabled = *req.Enabled

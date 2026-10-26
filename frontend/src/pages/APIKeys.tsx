@@ -106,6 +106,7 @@ const CODEX_TOOLKIT_PORTAL_URL =
 
 interface CreateKeyFormState {
   name: string;
+  ownerEmail: string;
   key: string;
   quotaLimit: string;
   expireMode: ExpireMode;
@@ -116,6 +117,7 @@ interface CreateKeyFormState {
 
 interface EditKeyFormState {
   name: string;
+  ownerEmail: string;
   quotaLimit: string;
   expireMode: ExpireMode;
   expiresAt: string;
@@ -274,6 +276,7 @@ const emptyLimitsForm: LimitsFormState = {
 
 const initialCreateForm: CreateKeyFormState = {
   name: "",
+  ownerEmail: "",
   key: "",
   quotaLimit: "",
   expireMode: "never",
@@ -284,6 +287,7 @@ const initialCreateForm: CreateKeyFormState = {
 
 const initialEditForm: EditKeyFormState = {
   name: "",
+  ownerEmail: "",
   quotaLimit: "",
   expireMode: "never",
   expiresAt: "",
@@ -822,6 +826,9 @@ export default function APIKeys() {
       };
       const payload = {
         name: createForm.name.trim() || t("apiKeys.defaultName"),
+        ...(createForm.ownerEmail.trim()
+          ? { owner_email: createForm.ownerEmail.trim() }
+          : {}),
         ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
         ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
         allowed_group_ids: createForm.allowedGroupIds,
@@ -1138,6 +1145,7 @@ export default function APIKeys() {
     }
     setEditForm({
       name: keyRow.name,
+      ownerEmail: keyRow.owner_email ?? "",
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
@@ -1248,6 +1256,7 @@ export default function APIKeys() {
       };
       const saved = await api.updateAPIKey(editingKey.id, {
         name: trimmed,
+        owner_email: editForm.ownerEmail.trim(),
         quota_limit: quotaLimit,
         allowed_group_ids: editForm.allowedGroupIds,
         limits: limitsPayload,
@@ -1276,6 +1285,7 @@ export default function APIKeys() {
           return {
             ...item,
             name: trimmed,
+            owner_email: editForm.ownerEmail.trim(),
             quota_limit: quotaLimit,
             allowed_group_ids: editForm.allowedGroupIds,
             limits: saved.limits ?? limitsPayload,
@@ -1653,6 +1663,11 @@ export default function APIKeys() {
                                   <span className="truncate text-sm font-semibold text-foreground">
                                     {keyRow.name}
                                   </span>
+                                  {keyRow.owner_email ? (
+                                    <span className="truncate text-xs text-muted-foreground">
+                                      {keyRow.owner_email}
+                                    </span>
+                                  ) : null}
                                   <APIKeyConcurrencyBadge
                                     current={concurrency?.[String(keyRow.id)] ?? (concurrency ? 0 : undefined)}
                                     limit={keyRow.limits?.max_concurrency}
@@ -1869,6 +1884,11 @@ export default function APIKeys() {
                                       <span className="truncate">
                                         {keyRow.name}
                                       </span>
+                                      {keyRow.owner_email ? (
+                                        <span className="truncate text-xs font-normal text-muted-foreground">
+                                          {keyRow.owner_email}
+                                        </span>
+                                      ) : null}
                                       <APIKeyConcurrencyBadge
                                         current={concurrency?.[String(keyRow.id)] ?? (concurrency ? 0 : undefined)}
                                         limit={keyRow.limits?.max_concurrency}
@@ -2393,6 +2413,21 @@ export default function APIKeys() {
               </FormField>
             </div>
 
+            <FormField label={t("apiKeys.ownerEmailLabel")}>
+              <Input
+                type="email"
+                inputMode="email"
+                placeholder={t("apiKeys.ownerEmailPlaceholder")}
+                value={createForm.ownerEmail}
+                onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                  updateCreateForm({ ownerEmail: event.target.value })
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("apiKeys.ownerEmailHelp")}
+              </p>
+            </FormField>
+
             <FormField
               label={t("apiKeys.limits.upstreamChannel")}
               icon={<Waypoints className="size-3.5" />}
@@ -2583,6 +2618,21 @@ export default function APIKeys() {
                       />
                     </FormField>
                   </div>
+
+                  <FormField label={t("apiKeys.ownerEmailLabel")}>
+                    <Input
+                      type="email"
+                      inputMode="email"
+                      placeholder={t("apiKeys.ownerEmailPlaceholder")}
+                      value={editForm.ownerEmail}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        updateEditForm({ ownerEmail: event.target.value })
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      {t("apiKeys.ownerEmailHelp")}
+                    </p>
+                  </FormField>
 
                   <FormField
                     label={t("apiKeys.limits.upstreamChannel")}

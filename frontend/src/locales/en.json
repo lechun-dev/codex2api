@@ -5734,6 +5734,9 @@
     "createTitle": "Create Key",
     "createDesc": "Let the system generate an sk-* key, or enter a custom key for existing clients.",
     "nameLabel": "Name",
+    "ownerEmailLabel": "Owner email",
+    "ownerEmailHelp": "Used by the conversation archive to attribute records; existing records become searchable by this email immediately",
+    "ownerEmailPlaceholder": "e.g. alice@lechun.cc",
     "keyLabel": "Key Value",
     "quotaLimitLabel": "Cost quota limit (USD)",
     "quotaLimitPlaceholder": "Blank or 0 means unlimited",
@@ -5860,11 +5863,8 @@
       "disabled": "Disabled",
       "expired": "Expired",
       "quota_exhausted": "Quota exhausted",
-      "expiring_soon": "Expiring soon",
-      "disabled": "Disabled"
+      "expiring_soon": "Expiring soon"
     },
-    "enable": "Enable",
-    "disable": "Disable",
     "disableTitle": "Disable API Key",
     "disableDesc": "All requests with this key will be rejected immediately (401). Configuration and usage data are preserved, and the key can be re-enabled at any time.",
     "disableConfirm": "Disable",

@@ -483,16 +483,22 @@ func main() {
 		log.Printf("会话存档已启用（保留 %d 天，0 表示永久）", cfg.ConversationRetentionDays)
 	}
 
-	// 内部调用通道（lechun-tools/AI）：HMAC 共享密钥，未配置时不注册路由。
-	if secret := strings.TrimSpace(os.Getenv("CODEX_INTERNAL_CONVERSATION_SECRET")); secret != "" {
-		maxSkew := 5 * time.Minute
-		if raw := strings.TrimSpace(os.Getenv("CODEX_INTERNAL_CONVERSATION_MAX_SKEW_SECONDS")); raw != "" {
-			if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
-				maxSkew = time.Duration(seconds) * time.Second
+	// 内部调用通道（lechun-tools/AI）：与 sub2api 的 internal_identity 共用同一套头
+	// 与共享密钥，未启用或密钥为空时不注册路由。
+	if enabled, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("INTERNAL_IDENTITY_ENABLED"))); enabled {
+		secret := strings.TrimSpace(os.Getenv("INTERNAL_IDENTITY_SECRET"))
+		if secret == "" {
+			log.Printf("INTERNAL_IDENTITY_ENABLED=true 但未配置 INTERNAL_IDENTITY_SECRET，内部接口不启用")
+		} else {
+			maxSkew := 5 * time.Minute
+			if raw := strings.TrimSpace(os.Getenv("INTERNAL_IDENTITY_MAX_SKEW_SECONDS")); raw != "" {
+				if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+					maxSkew = time.Duration(seconds) * time.Second
+				}
 			}
+			adminHandler.SetInternalIdentity(true, secret, maxSkew)
+			log.Printf("会话存档内部接口已启用（/api/v1/internal/conversation-archives）")
 		}
-		adminHandler.SetInternalConversationArchive(secret, maxSkew)
-		log.Printf("会话存档内部接口已启用（/api/internal/conversation-archives）")
 	}
 
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)

@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,18 +22,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const internalConversationMaxBodyBytes = 1 << 20
+const (
+	// 与 sub2api 内部身份断言完全一致的请求头与签名串，两边共用同一个共享密钥。
+	internalIdentityEmailHeader     = "X-Lechun-Email"
+	internalIdentityTimestampHeader = "X-Lechun-Timestamp"
+	internalIdentitySignatureHeader = "X-Lechun-Signature"
 
-// SetInternalConversationArchive 配置内部 HMAC 通道；secret 为空表示不开启（路由不注册）。
-func (h *Handler) SetInternalConversationArchive(secret string, maxSkew time.Duration) {
+	internalIdentityDefaultMaxSkew = 300 * time.Second
+)
+
+// SetInternalIdentity 配置内部签名身份断言（与 sub2api 的 internal_identity 对齐）。
+// enabled=false 或 secret 为空时不注册路由，对外表现为 404。
+func (h *Handler) SetInternalIdentity(enabled bool, secret string, maxSkew time.Duration) {
 	if h == nil {
 		return
 	}
-	h.internalConversationSecret = strings.TrimSpace(secret)
+	h.internalIdentityEnabled = enabled
+	h.internalIdentitySecret = strings.TrimSpace(secret)
 	if maxSkew <= 0 {
-		maxSkew = 5 * time.Minute
+		maxSkew = internalIdentityDefaultMaxSkew
 	}
-	h.internalConversationMaxSkew = maxSkew
+	h.internalIdentityMaxSkew = maxSkew
 }
 
 func (h *Handler) registerConversationArchiveRoutes(api *gin.RouterGroup) {
@@ -44,61 +52,60 @@ func (h *Handler) registerConversationArchiveRoutes(api *gin.RouterGroup) {
 }
 
 func (h *Handler) registerInternalConversationArchiveRoutes(r *gin.Engine) {
-	if h == nil || h.internalConversationSecret == "" {
+	if h == nil || !h.internalIdentityEnabled || h.internalIdentitySecret == "" {
 		return
 	}
-	internal := r.Group("/api/internal/conversation-archives")
-	internal.Use(h.internalConversationAuth())
+	internal := r.Group("/api/v1/internal/conversation-archives")
+	internal.Use(h.internalIdentityAuth())
 	internal.GET("", h.ListConversationArchives)
 	internal.GET("/:id", h.GetConversationArchive)
 }
 
-// internalConversationAuth 校验 HMAC-SHA256 签名：
+// internalIdentityAuth 校验内部系统的签名身份断言：
 //
-//	canonical = METHOD \n PATH \n QUERY \n TIMESTAMP \n SHA256(body)
-//	X-Internal-Signature = hex(HMAC-SHA256(secret, canonical))
+//	canonical = email + "\n" + timestamp + "\n" + method + "\n" + path
+//	X-Lechun-Signature = hex(HMAC-SHA256(secret, canonical))
 //
-// 时间戳超出 maxSkew 直接拒绝，防止重放。
-func (h *Handler) internalConversationAuth() gin.HandlerFunc {
+// 头名、签名串、时钟窗口与 sub2api 的 internal_identity 完全一致，两边共用一个
+// 共享密钥即可。codex2api 没有用户表，所以邮箱只作为“调用方声明的身份”落审计，
+// 不再做“按邮箱查用户 + 管理员校验”这一跳。
+func (h *Handler) internalIdentityAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		timestamp := strings.TrimSpace(c.GetHeader("X-Internal-Timestamp"))
-		signature := strings.ToLower(strings.TrimSpace(c.GetHeader("X-Internal-Signature")))
-		if timestamp == "" || signature == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "缺少内部签名头"})
+		if !h.internalIdentityEnabled || h.internalIdentitySecret == "" {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Not found"})
 			return
 		}
-		ts, err := strconv.ParseInt(timestamp, 10, 64)
+		email := strings.TrimSpace(c.GetHeader(internalIdentityEmailHeader))
+		timestamp := strings.TrimSpace(c.GetHeader(internalIdentityTimestampHeader))
+		signature := strings.ToLower(strings.TrimSpace(c.GetHeader(internalIdentitySignatureHeader)))
+		if email == "" || timestamp == "" || signature == "" {
+			security.SecurityAuditLog("INTERNAL_IDENTITY_REJECTED", "reason=missing_header path="+c.Request.URL.Path)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid internal identity signature"})
+			return
+		}
+		unix, err := strconv.ParseInt(timestamp, 10, 64)
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "时间戳无效"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid internal identity signature"})
 			return
 		}
-		if skew := time.Since(time.Unix(ts, 0)); skew > h.internalConversationMaxSkew || skew < -h.internalConversationMaxSkew {
-			security.SecurityAuditLog("INTERNAL_ARCHIVE_REJECTED", "reason=timestamp_skew path="+c.Request.URL.Path)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "时间戳超出允许范围"})
+		skew := int64(h.internalIdentityMaxSkew / time.Second)
+		now := time.Now().Unix()
+		if unix < now-skew || unix > now+skew {
+			security.SecurityAuditLog("INTERNAL_IDENTITY_REJECTED", "reason=expired email="+email+" path="+c.Request.URL.Path)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Internal identity signature expired"})
 			return
 		}
-		var body []byte
-		if c.Request.Body != nil {
-			body, _ = io.ReadAll(io.LimitReader(c.Request.Body, internalConversationMaxBodyBytes))
-			c.Request.Body = io.NopCloser(strings.NewReader(string(body)))
-		}
-		sum := sha256.Sum256(body)
-		canonical := strings.Join([]string{
-			c.Request.Method,
-			c.Request.URL.Path,
-			c.Request.URL.RawQuery,
-			timestamp,
-			hex.EncodeToString(sum[:]),
-		}, "\n")
-		mac := hmac.New(sha256.New, []byte(h.internalConversationSecret))
-		mac.Write([]byte(canonical))
+		canonical := email + "\n" + timestamp + "\n" + c.Request.Method + "\n" + c.Request.URL.Path
+		mac := hmac.New(sha256.New, []byte(h.internalIdentitySecret))
+		_, _ = mac.Write([]byte(canonical))
 		expected := hex.EncodeToString(mac.Sum(nil))
 		if subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) != 1 {
-			security.SecurityAuditLog("INTERNAL_ARCHIVE_REJECTED", "reason=bad_signature path="+c.Request.URL.Path)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "签名校验失败"})
+			security.SecurityAuditLog("INTERNAL_IDENTITY_REJECTED", "reason=bad_signature email="+email+" path="+c.Request.URL.Path)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid internal identity signature"})
 			return
 		}
-		security.SecurityAuditLog("INTERNAL_ARCHIVE_ACCESS", "path="+c.Request.URL.Path+" query="+c.Request.URL.RawQuery)
+		security.SecurityAuditLog("INTERNAL_IDENTITY_ACCESS", "email="+email+" path="+c.Request.URL.Path+" query="+c.Request.URL.RawQuery)
+		c.Set("internal_identity_email", email)
 		c.Next()
 	}
 }

@@ -25,9 +25,10 @@
 CODEX_CONVERSATION_RECORDING_ENABLED=true
 # 保留天数，0 = 永久
 CODEX_CONVERSATION_RETENTION_DAYS=90
-# 给 AI/lechun-tools 的内部接口（不配置则不注册该路由）
-CODEX_INTERNAL_CONVERSATION_SECRET=请换成随机长密钥
-CODEX_INTERNAL_CONVERSATION_MAX_SKEW_SECONDS=300
+# 给 AI/lechun-tools 的内部接口：与 sub2api 共用同一套签名头与共享密钥
+INTERNAL_IDENTITY_ENABLED=true
+INTERNAL_IDENTITY_SECRET=请换成与 sub2api 相同的随机长密钥
+INTERNAL_IDENTITY_MAX_SKEW_SECONDS=300
 ```
 
 启动时会自动建表/补列（`conversation_records.stream/truncated`、`api_keys.owner_email`），可重复执行。
@@ -115,29 +116,38 @@ UPDATE api_keys SET owner_email='alice@lechun.cc' WHERE id=12;
 ## 6. 内部接口（给 AI / lechun-tools）
 
 ```
-GET /api/internal/conversation-archives
-GET /api/internal/conversation-archives/:id
+GET /api/v1/internal/conversation-archives
+GET /api/v1/internal/conversation-archives/:id
 ```
 
-过滤器同管理端。鉴权用 **HMAC-SHA256 共享密钥**，不需要管理密钥：
+鉴权**完全复用 sub2api 的内部身份断言**，两边配同一个共享密钥即可：
 
-```
-canonical = METHOD \n PATH \n QUERY \n TIMESTAMP \n SHA256(body_hex)
-X-Internal-Timestamp: <unix 秒>
-X-Internal-Signature: hex(HMAC-SHA256(secret, canonical))
-```
+| 项 | 值 |
+| --- | --- |
+| 头 | `X-Lechun-Email`、`X-Lechun-Timestamp`（unix 秒）、`X-Lechun-Signature` |
+| 签名串 | `email + "\n" + timestamp + "\n" + method + "\n" + path` |
+| 签名 | `hex(HMAC-SHA256(secret, 签名串))` |
+| 时钟窗口 | `INTERNAL_IDENTITY_MAX_SKEW_SECONDS`（默认 300s） |
+| 开关 | `INTERNAL_IDENTITY_ENABLED=true` 且密钥非空，否则路由不存在（404） |
 
-时间戳与服务器时间偏差超过 `CODEX_INTERNAL_CONVERSATION_MAX_SKEW_SECONDS`（默认 300s）直接拒绝。
+与 sub2api 的唯一差异：codex2api 没有用户表，所以 `X-Lechun-Email` 只作为调用方声明的
+身份写入审计日志，不再做「按邮箱查用户 → 校验管理员」这一跳；能签名就代表持有共享密钥。
 
 ```bash
-SECRET=...; TS=$(date +%s); PATH_ONLY=/api/internal/conversation-archives; Q='owner_email=a@b.c&limit=5'
-SIG=$(printf 'GET\n%s\n%s\n%s\n%s' "$PATH_ONLY" "$Q" "$TS" "$(printf '' | shasum -a 256 | cut -d' ' -f1)" \
+EMAIL=alice@lechun.cc
+SECRET=...                       # 与 sub2api 相同的密钥
+TS=$(date +%s)
+PATH_ONLY=/api/v1/internal/conversation-archives
+SIG=$(printf '%s\n%s\n%s\n%s' "$EMAIL" "$TS" "GET" "$PATH_ONLY" \
   | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1)
-curl -s "http://127.0.0.1:8080${PATH_ONLY}?${Q}" \
-  -H "X-Internal-Timestamp: ${TS}" -H "X-Internal-Signature: ${SIG}"
+curl -s "http://127.0.0.1:8080${PATH_ONLY}?owner_email=alice@lechun.cc" \
+  -H "X-Lechun-Email: ${EMAIL}" \
+  -H "X-Lechun-Timestamp: ${TS}" \
+  -H "X-Lechun-Signature: ${SIG}"
 ```
 
-未配置 `CODEX_INTERNAL_CONVERSATION_SECRET` 时该路由**不存在**（404）。
+过滤参数与管理端一致（`owner_email`/`api_key_id`/`session_id`/`keyword`/`from`/`to`/`limit` 等），
+列表默认不返回正文。
 
 ## 7. MySQL 5.6 注意
 

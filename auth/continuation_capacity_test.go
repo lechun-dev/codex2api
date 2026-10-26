@@ -26,7 +26,7 @@ func TestReplayableContinuationOnlyBorrowsForCapacity(t *testing.T) {
 				return !(mode == "filtered" && a.ID() == 1) && !(mode == "fallback_filtered" && a.ID() == 2)
 			}
 			excluded := map[int64]bool{}
-			got, _, _, borrowed := s.NextReplayableContinuationWithDispatch("turn", 0, excluded, filter, DispatchPolicyStandard)
+			got, _, _, borrowed := s.NextReplayableContinuationWithDispatch("turn", 0, excluded, filter, SelectionOptions{Policy: DispatchPolicyStandard})
 			if len(excluded) != 0 {
 				t.Fatal("mutated caller exclusions")
 			}

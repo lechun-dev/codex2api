@@ -947,33 +947,36 @@ func (db *DB) updateAccountCredentialsCAS(ctx context.Context, accountID, expect
 			return nil
 		}
 		existing := decodeCredentials(raw)
-		if !replaceFamily && strings.TrimSpace(currentFamilyID) == "" {
-			currentFamilyID = credentialFamilyCandidate(existing)
-		}
 		merged := mergeCredentialMaps(existing, updates)
-		familyToPersist := familyID
-		if !replaceFamily {
-			familyToPersist = currentFamilyID
+		// 身份替代（replaceFamily=true）以调用方已验证的 family 为准；例行换票沿用
+		// 库里已有的 family，避免旧代码路径把 family 洗成空值。两边都为空时依次回退到
+		// 凭据候选与随机 cf_，保证 family 列与 credentials JSON 始终同步（上游语义）。
+		persistFamily := strings.TrimSpace(familyID)
+		if !replaceFamily || persistFamily == "" {
+			persistFamily = strings.TrimSpace(currentFamilyID)
 		}
-		if strings.TrimSpace(familyToPersist) != "" {
-			merged["credential_family_id"] = strings.TrimSpace(familyToPersist)
+		if persistFamily == "" {
+			persistFamily = credentialFamilyCandidate(merged)
 		}
+		if persistFamily == "" {
+			persistFamily = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+		// Keep the compatibility JSON field synchronized with the canonical
+		// column in the same write that publishes the rotated credential.
+		merged["credential_family_id"] = persistFamily
+		// Antigravity 受控 carryforward（Spec §4.1 代际变迁规则 #1）：例行同身份换票
+		// 不得把已落库的配额事实洗新，也不得递增 antigravity_quota_epoch。该逻辑按
+		// credentials 的 upstream_type 条件化，Grok/Codex 的既有语义完全不受影响；
+		// ReplaceAccountCredentialsCAS（身份替换）不调用本函数，其失效栅栏依旧生效。
+		ApplyAntigravityCarryforwardOnUpdateCAS(merged, string(bytesFromDBValue(raw)))
 		encoded, marshalErr := marshalCredentialsForStorage(merged)
 		if marshalErr != nil {
 			return marshalErr
 		}
-		updateQuery := `UPDATE accounts SET credentials=$1, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND credential_generation=$3`
-		args := []any{encoded, accountID, expectedGeneration}
-		if replaceFamily {
-			updateQuery = `UPDATE accounts SET credentials=$1, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND credential_generation=$4`
-			args = []any{encoded, familyID, accountID, expectedGeneration}
-		}
+		updateQuery := `UPDATE accounts SET credentials=$1, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND credential_generation=$4`
+		args := []any{encoded, persistFamily, accountID, expectedGeneration}
 		if !db.isSQLite() && !db.isMySQL() {
-			if replaceFamily {
-				updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$3 AND credential_generation=$4`
-			} else {
-				updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$2 AND credential_generation=$3`
-			}
+			updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_family_id=$2, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$3 AND credential_generation=$4`
 		}
 		res, execErr := tx.ExecContext(ctx, updateQuery, args...)
 		if execErr != nil {

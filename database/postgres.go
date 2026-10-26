@@ -546,6 +546,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		if err := db.ensureCodexRefreshSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化 Codex 刷新保护表失败: %w", err)
 		}
+		if err := db.ensureIntelligenceCheckSchema(ctx); err != nil {
+			return nil, fmt.Errorf("initialize intelligence checks: %w", err)
+		}
 		if err := db.ensureChannelMonitorSchema(ctx); err != nil {
 			return nil, fmt.Errorf("初始化渠道监控表失败: %w", err)
 		}
@@ -1642,8 +1645,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	SET test_model = 'gpt-5.5'
 	WHERE LOWER(COALESCE(test_model, '')) IN ('gpt-5.4', 'gpt-5.4-mini');
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.153.3';
-	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.153.3';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.160.0';
+	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.160.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_telemetry_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_turn_state_template_cache_enabled BOOLEAN DEFAULT FALSE;
@@ -1728,6 +1731,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_backoff_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_unsupported_model_cooldown_seconds INT NOT NULL DEFAULT 1800;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -2029,7 +2033,7 @@ type APIKeyLimits struct {
 	// 而不是直接把 400 透传给下游。默认关闭。
 	AutoCompactOnOverflow bool `json:"auto_compact_overflow,omitempty"`
 	// AllowLive 为 true 时，该 Key 可以使用 ChatGPT Live（/v1/live 与
-	// /backend-api/codex/realtime/calls）。默认关闭。
+	// /backend-api/codex/realtime/calls）。管理端新建 auto/codex Key 时默认开启。
 	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
@@ -2762,11 +2766,14 @@ type SystemSettings struct {
 	OAuthModelCooldownMode           string
 	OAuthModelCooldownSeconds        int
 	OAuthModelCooldownBackoffEnabled bool
-	ContinuousRetryPolicy            string
-	SessionSlotBufferEnabled         bool
-	SessionSlotBufferSeconds         int
-	ModelsListReadMaxBytes           int64
-	AutoActivate5hWindowEnabled      bool
+	// Zero values keep the unsupported-model cooldown enabled at its default.
+	OAuthUnsupportedModelCooldownDisabled bool
+	OAuthUnsupportedModelCooldownSeconds  int
+	ContinuousRetryPolicy                 string
+	SessionSlotBufferEnabled              bool
+	SessionSlotBufferSeconds              int
+	ModelsListReadMaxBytes                int64
+	AutoActivate5hWindowEnabled           bool
 
 	// PreservePromptFilterCustomPatterns is an update-only concurrency guard.
 	// When true, an existing row keeps its current custom-pattern value instead
@@ -2890,7 +2897,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
-		       COALESCE(codex_min_cli_version, '0.153.3'),
+		       COALESCE(codex_min_cli_version, '0.160.0'),
 		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
@@ -7959,6 +7966,12 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 		}
 		defer tx.Rollback()
 
+		if groupIDs.Set {
+			if err := db.intelligenceManualMutationTx(ctx, tx, []int64{id}, false); err != nil {
+				return err
+			}
+		}
+
 		query := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 		if db.isSQLite() {
 			query = `SELECT credentials FROM accounts WHERE id = ? AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
@@ -8084,6 +8097,12 @@ func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, updat
 			return err
 		}
 		defer tx.Rollback()
+
+		if update.Enabled.Set || update.GroupIDs.Set {
+			if err := db.intelligenceManualMutationTx(ctx, tx, ids, update.Enabled.Set); err != nil {
+				return err
+			}
+		}
 
 		credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
 		if update.AllowedAPIKeyIDs.Set {
@@ -8319,18 +8338,23 @@ func nullableInt64Value(v sql.NullInt64) interface{} {
 
 // SetAccountEnabled 设置账号是否参与调度选择
 func (db *DB) SetAccountEnabled(ctx context.Context, id int64, enabled bool) error {
-	res, err := db.conn.ExecContext(ctx, `UPDATE accounts SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, enabled, id)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := db.intelligenceManualMutationTx(ctx, tx, []int64{id}, true); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE accounts SET enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, enabled, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 
 // SetAccountLocked 设置账号的锁定状态
@@ -9165,6 +9189,24 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
 		credentials,
 		name, credJSON, proxyURL,
+	)
+}
+
+// InsertPendingAccountWithCredentials atomically saves a disabled account and
+// its review metadata together with the credential family.
+func (db *DB) InsertPendingAccountWithCredentials(ctx context.Context, name string, credentials map[string]interface{}, proxyURL, note string, tags []string) (int64, error) {
+	if credentials == nil {
+		credentials = map[string]interface{}{}
+	}
+	credJSON, err := json.Marshal(encryptSensitiveCredentials(credentials))
+	if err != nil {
+		return 0, err
+	}
+	return db.insertAccountRowWithFamily(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES ($1, $2, $3, FALSE, $4, $5::jsonb) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url, enabled, note, tags) VALUES ($1, $2, $3, FALSE, $4, $5)`,
+		credentials,
+		name, credJSON, proxyURL, note, encodeTagsJSON(tags),
 	)
 }
 

@@ -7,7 +7,7 @@ import (
 
 // 2026-09-08 coder(lq): Only borrow capacity after the bound account passes all
 // eligibility checks; callers must first validate that the request is replayable.
-func (s *Store) NextReplayableContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard, bool) {
+func (s *Store) NextReplayableContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, opts SelectionOptions) (*Account, string, SessionAffinityGuard, bool) {
 	if s == nil {
 		return nil, "", SessionAffinityGuard{}, false
 	}
@@ -22,7 +22,7 @@ func (s *Store) NextReplayableContinuationWithDispatch(key string, apiKeyID int6
 		return nil, "", SessionAffinityGuard{}, false
 	}
 	id := binding.accountID
-	account, full := s.takeByIDModeWithCapacity(id, apiKeyID, exclude, filter, true, key, policy)
+	account, full := s.takeByIDModeWithCapacity(id, apiKeyID, exclude, filter, true, key, opts.Policy)
 	if account != nil {
 		s.sessionMu.Lock()
 		if current, exists := s.sessionBindings[key]; exists && current.accountID == id {
@@ -41,7 +41,7 @@ func (s *Store) NextReplayableContinuationWithDispatch(key string, apiKeyID int6
 		borrowExclude[k] = v
 	}
 	borrowExclude[id] = true
-	account = s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, borrowExclude, filter, policy)
+	account = s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, borrowExclude, filter, opts)
 	if account == nil {
 		return nil, "", SessionAffinityGuard{}, false
 	}

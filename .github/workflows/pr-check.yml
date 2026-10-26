@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  # push 事件在本仓库当前不触发（tag 事件正常），保留手动触发作为兜底。
+  workflow_dispatch:
   pull_request:
     paths-ignore:
       - 'docs/**'

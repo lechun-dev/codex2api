@@ -200,10 +200,15 @@ func (db *DB) migrateConversationRecords(ctx context.Context) error {
 	return err
 }
 
-// EnsureConversationRecords creates the optional conversation-recording table.
+// EnsureConversationRecords creates the optional conversation-recording table and
+// brings existing tables to the current shape (stream/truncated).
 // Callers invoke it only when plaintext conversation recording is enabled.
 func (db *DB) EnsureConversationRecords(ctx context.Context) error {
-	return db.migrateConversationRecords(ctx)
+	if err := db.migrateConversationRecords(ctx); err != nil {
+		return err
+	}
+	// CREATE TABLE IF NOT EXISTS 不会给存量表补列，这里显式补齐。
+	return db.EnsureConversationArchiveSchema(ctx)
 }
 
 func normalizeConversationStatus(status string) string {

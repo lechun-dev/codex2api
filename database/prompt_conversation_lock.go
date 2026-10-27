@@ -175,10 +175,18 @@ func (db *DB) ensurePromptConversationLocksTable(ctx context.Context) error {
 	}
 	// 滚动升级:已存在的锁表缺少 identity_kind 列。旧数据全部来自 NewAPI 签名
 	// 路径,因此默认值保持 newapi,语义与升级前完全一致。
-	if db.isSQLite() {
+	// 2026-10-27 coder(lq): PostgreSQL 之前也落到 ensureMySQLColumn，它用 ? 占位符与
+	// 反引号，PG 会直接语法报错（near "AND"）。这里按方言分开处理。
+	switch {
+	case db.isSQLite():
 		return db.ensureSQLiteColumn(ctx, "prompt_conversation_locks", "identity_kind", "TEXT NOT NULL DEFAULT 'newapi'")
+	case db.isMySQL():
+		return db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) NOT NULL DEFAULT 'newapi'")
+	default:
+		_, err := db.conn.ExecContext(ctx,
+			`ALTER TABLE prompt_conversation_locks ADD COLUMN IF NOT EXISTS identity_kind VARCHAR(24) NOT NULL DEFAULT 'newapi'`)
+		return err
 	}
-	return db.ensureMySQLColumn(ctx, "prompt_conversation_locks", "identity_kind", "VARCHAR(24) NOT NULL DEFAULT 'newapi'")
 }
 
 const promptConversationLockSelect = `SELECT id, lock_key, status, identity_kind, platform, newapi_user_id,

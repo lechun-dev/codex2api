@@ -1322,6 +1322,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_skip_usage_window BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS note TEXT DEFAULT '';
+	-- 2026-10-27 coder(lq): 这两列原来只在 ensureGrokStateSchema 里补，但那里的执行顺序
+	-- 在 data migration 之后；全新库跑 Claude provider 回填会报 credential_generation
+	-- 不存在。放到主迁移里，保证任何依赖它的迁移/查询之前列已存在。
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 1;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_family_id TEXT NOT NULL DEFAULT '';
 
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id                        SERIAL PRIMARY KEY,
@@ -1368,6 +1373,29 @@ func (db *DB) migrate(ctx context.Context) error {
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted';
 	CREATE INDEX IF NOT EXISTS idx_accounts_created_id ON accounts(created_at, id);
 	CREATE INDEX IF NOT EXISTS idx_accounts_updated_id ON accounts(updated_at, id);
+
+	-- 2026-10-27 coder(lq): scheduler_outbox / maintenance_jobs 之前只在 SQLite、MySQL
+	-- 的建表语句里，PostgreSQL 全新库缺少这两张表，调度类功能（智能检查、Grok 维护、
+	-- Antigravity 配额定时器）会直接报表不存在。
+	CREATE TABLE IF NOT EXISTS scheduler_outbox (
+		id BIGSERIAL PRIMARY KEY,
+		entity_type VARCHAR(32) NOT NULL,
+		entity_id BIGINT NOT NULL DEFAULT 0,
+		event_type VARCHAR(64) NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_scheduler_outbox_created ON scheduler_outbox(created_at, id);
+	CREATE TABLE IF NOT EXISTS maintenance_jobs (
+		entity_id BIGINT NOT NULL,
+		job_kind VARCHAR(64) NOT NULL,
+		due_at TIMESTAMPTZ NOT NULL,
+		lease_owner VARCHAR(255) NOT NULL DEFAULT '',
+		lease_until TIMESTAMPTZ NULL,
+		attempts BIGINT NOT NULL DEFAULT 0,
+		last_error VARCHAR(2048) NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (entity_id, job_kind)
+	);
 
 
 	CREATE TABLE IF NOT EXISTS usage_logs (
@@ -1739,6 +1767,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_backoff_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_unsupported_model_cooldown_seconds INT NOT NULL DEFAULT 1800;
+	-- 2026-10-27 coder(lq): 该列是 fork 侧设置项，MySQL/SQLite 都有，PG 之前漏了，
+	-- 全新 PG 库读取系统设置会因为列不存在直接失败。
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;

@@ -496,11 +496,7 @@ func main() {
 					maxSkew = time.Duration(seconds) * time.Second
 				}
 			}
-			var allowedEmails []string
-			if raw := strings.TrimSpace(os.Getenv("INTERNAL_IDENTITY_ALLOWED_EMAILS")); raw != "" {
-				allowedEmails = strings.Split(raw, ",")
-			}
-			adminHandler.SetInternalIdentity(true, secret, maxSkew, allowedEmails)
+			adminHandler.SetInternalIdentity(true, secret, maxSkew)
 			log.Printf("会话存档内部接口已启用（/api/v1/internal/conversation-archives）")
 		}
 	}

@@ -33,9 +33,10 @@ const (
 
 // SetInternalIdentity 配置内部签名身份断言（与 sub2api 的 internal_identity 对齐）。
 // enabled=false 或 secret 为空时不注册路由，对外表现为 404。
-// allowedEmails 非空时只允许这些邮箱调用（codex2api 没有用户表，用它替代 sub2api 的
-// “按邮箱查用户并校验管理员”；为空表示不限制，能签名即可）。
-func (h *Handler) SetInternalIdentity(enabled bool, secret string, maxSkew time.Duration, allowedEmails []string) {
+//
+// 权限模型：codex2api 没有用户/角色体系，这里只验证“调用方持有共享密钥”，
+// 谁能查全部存档由调用方（tools）按自己的角色判断；声明的邮箱只用于审计。
+func (h *Handler) SetInternalIdentity(enabled bool, secret string, maxSkew time.Duration) {
 	if h == nil {
 		return
 	}
@@ -45,17 +46,6 @@ func (h *Handler) SetInternalIdentity(enabled bool, secret string, maxSkew time.
 		maxSkew = internalIdentityDefaultMaxSkew
 	}
 	h.internalIdentityMaxSkew = maxSkew
-	if len(allowedEmails) == 0 {
-		h.internalIdentityAllowedEmail = nil
-		return
-	}
-	allowed := make(map[string]struct{}, len(allowedEmails))
-	for _, email := range allowedEmails {
-		if email = strings.ToLower(strings.TrimSpace(email)); email != "" {
-			allowed[email] = struct{}{}
-		}
-	}
-	h.internalIdentityAllowedEmail = allowed
 }
 
 func (h *Handler) registerConversationArchiveRoutes(api *gin.RouterGroup) {
@@ -123,13 +113,6 @@ func (h *Handler) internalIdentityAuth() gin.HandlerFunc {
 			security.SecurityAuditLog("INTERNAL_IDENTITY_REJECTED", "reason=bad_signature email="+email+" path="+c.Request.URL.Path)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid internal identity signature"})
 			return
-		}
-		if len(h.internalIdentityAllowedEmail) > 0 {
-			if _, ok := h.internalIdentityAllowedEmail[strings.ToLower(email)]; !ok {
-				security.SecurityAuditLog("INTERNAL_IDENTITY_REJECTED", "reason=email_not_allowed email="+email+" path="+c.Request.URL.Path)
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Internal identity is not allowed"})
-				return
-			}
 		}
 		security.SecurityAuditLog("INTERNAL_IDENTITY_ACCESS", "email="+email+" path="+c.Request.URL.Path+" query="+c.Request.URL.RawQuery)
 		c.Set("internal_identity_email", email)

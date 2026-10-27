@@ -28,7 +28,7 @@ func TestInternalIdentityAuth(t *testing.T) {
 	const secret = "s3cr3t-shared-key"
 	const path = "/api/v1/internal/conversation-archives"
 	h := &Handler{}
-	h.SetInternalIdentity(true, secret, time.Minute, nil)
+	h.SetInternalIdentity(true, secret, time.Minute)
 
 	router := gin.New()
 	router.GET(path, h.internalIdentityAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -74,8 +74,8 @@ func TestInternalRoutesNotRegisteredWithoutSecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, setup := range []func(*Handler){
 		func(h *Handler) {},
-		func(h *Handler) { h.SetInternalIdentity(false, "secret", time.Minute, nil) },
-		func(h *Handler) { h.SetInternalIdentity(true, "", time.Minute, nil) },
+		func(h *Handler) { h.SetInternalIdentity(false, "secret", time.Minute) },
+		func(h *Handler) { h.SetInternalIdentity(true, "", time.Minute) },
 	} {
 		h := &Handler{}
 		setup(h)
@@ -208,33 +208,5 @@ func TestConversationArchiveStatsHandler(t *testing.T) {
 	}
 	if payload.Items[0].Key != "gpt-6-astra" || payload.Items[0].Requests != 2 {
 		t.Fatalf("top group = %+v", payload.Items[0])
-	}
-}
-
-func TestInternalIdentityAllowlist(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	const secret = "s3cr3t-shared-key"
-	const path = "/api/v1/internal/conversation-archives"
-	h := &Handler{}
-	h.SetInternalIdentity(true, secret, time.Minute, []string{"Admin@Lechun.cc"})
-
-	router := gin.New()
-	router.GET(path, h.internalIdentityAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
-
-	now := strconv.FormatInt(time.Now().Unix(), 10)
-	call := func(email string) int {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		req.Header.Set("X-Lechun-Email", email)
-		req.Header.Set("X-Lechun-Timestamp", now)
-		req.Header.Set("X-Lechun-Signature", signInternalIdentity(secret, email, now, http.MethodGet, path))
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		return rec.Code
-	}
-	if code := call("admin@lechun.cc"); code != http.StatusOK {
-		t.Fatalf("白名单邮箱（大小写不敏感）应放行, got %d", code)
-	}
-	if code := call("random@lechun.cc"); code != http.StatusForbidden {
-		t.Fatalf("非白名单邮箱应 403, got %d", code)
 	}
 }

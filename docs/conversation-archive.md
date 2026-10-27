@@ -135,11 +135,10 @@ GET /api/v1/internal/usage/stats                      # usage_logs 用量聚合
 | 签名 | `hex(HMAC-SHA256(secret, 签名串))` |
 | 时钟窗口 | `INTERNAL_IDENTITY_MAX_SKEW_SECONDS`（默认 300s） |
 | 开关 | `INTERNAL_IDENTITY_ENABLED=true` 且密钥非空，否则路由不存在（404） |
-| 可选白名单 | `INTERNAL_IDENTITY_ALLOWED_EMAILS=a@b.c,c@d.e`；配置后非白名单邮箱返回 403 |
 
-与 sub2api 的差异：codex2api 没有用户表，所以 `X-Lechun-Email` 不做「按邮箱查用户」，
-只作为调用方声明的身份写审计日志。要保留 sub2api 的「仅管理员」语义，配
-`INTERNAL_IDENTITY_ALLOWED_EMAILS`（管理员邮箱列表）即可；不配则表示持密钥即可调用。
+与 sub2api 的差异：codex2api 没有用户/角色体系，**这里只验证“调用方持有共享密钥”**，
+`X-Lechun-Email` 仅作为调用方声明的身份写审计日志。谁能查全部存档由调用方
+（tools）按自己的角色体系判断，codex2api 不重复实现权限模型。
 
 > 建议 codex2api 与 sub2api 使用**两个不同的共享密钥**，任一侧泄露不会波及其它系统。
 

@@ -132,12 +132,11 @@ type Config struct {
 	RequestMemoryBudgetBytes  int64 // Process-local retained HTTP/WS request body budget.
 	SchedulerMaxWaiters       int   // Process-local waiting request budget.
 	SchedulerMaxWaitersPerKey int
-	UsageLogCaptureContent    bool     // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
-	UsageLogMasterKey         []byte   // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
-	ConversationRecording     bool     // 是否把用户消息与 AI 回复的纯文本归档到 conversation_records；默认 false（存的是用户原文，必须显式开启）
-	ConversationRetentionDays int      // 会话存档保留天数；0 表示永久保留；默认 90
-	UsageLogExtraTables       []string // 并入用量统计的历史备份表（如 usage_logs_openclaw），只读
-	DownloadsDir              string   // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
+	UsageLogCaptureContent    bool   // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
+	UsageLogMasterKey         []byte // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
+	ConversationRecording     bool   // 是否把用户消息与 AI 回复的纯文本归档到 conversation_records；默认 false（存的是用户原文，必须显式开启）
+	ConversationRetentionDays int    // 会话存档保留天数；0 表示永久保留；默认 90
+	DownloadsDir              string // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
 	Database                  DatabaseConfig
 	Cache                     CacheConfig
 	UseWebsocket              bool     // 是否启用 WebSocket 传输
@@ -176,7 +175,6 @@ func Load(envPath string) (*Config, error) {
 		MaxRequestBodySize:        48 * 1024 * 1024,
 		ConversationRecording:     false,
 		ConversationRetentionDays: 90,
-		UsageLogExtraTables:       []string{"usage_logs_openclaw"},
 	}
 
 	// Web服务端口
@@ -208,15 +206,6 @@ func Load(envPath string) (*Config, error) {
 		}
 	}
 	cfg.UsageLogCaptureContent = parseBoolEnv(os.Getenv("CODEX_USAGE_LOG_CAPTURE_REQUEST_CONTENT"))
-	if raw := strings.TrimSpace(os.Getenv("USAGE_LOG_EXTRA_TABLES")); raw != "" {
-		tables := make([]string, 0, 2)
-		for _, item := range strings.Split(raw, ",") {
-			if item = strings.TrimSpace(item); item != "" {
-				tables = append(tables, item)
-			}
-		}
-		cfg.UsageLogExtraTables = tables
-	}
 	if value, exists := os.LookupEnv("CODEX_CONVERSATION_RECORDING_ENABLED"); exists && strings.TrimSpace(value) != "" {
 		cfg.ConversationRecording = parseBoolEnv(value)
 	}

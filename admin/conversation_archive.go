@@ -305,57 +305,21 @@ func (h *Handler) ConversationArchiveStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
-// InternalUsageStats 返回 usage_logs 的用量汇总，供 tools 的 token 统计卡片使用。
-// group_by 复用 tools 的取值：none|user|date|model|protocol|group|api_key。
-// codex2api 没有用户/分组维度：user 与 api_key 都映射到 API Key 维度，date 暂不支持。
+// InternalUsageStats 返回用量汇总，供 tools 的 token 统计卡片使用。
+// 数据来自小时汇总表 usage_log_hourly（覆盖全部历史，含已并入 usage_logs 的备份数据）。
+// group_by 支持 none|model|protocol|user|api_key|date；user 与 api_key 都按 API Key 维度，
+// date 按自然日输出时间序列。
 func (h *Handler) InternalUsageStats(c *gin.Context) {
 	from := parseArchiveTime(firstNonEmpty(c.Query("from"), c.Query("start_time")))
 	to := parseArchiveTime(firstNonEmpty(c.Query("to"), c.Query("end_time")))
-	stats, err := h.db.GetUsageStatsFiltered(c.Request.Context(), from, to, "", database.UsageLogFilter{}, true)
+	groupBy := strings.ToLower(strings.TrimSpace(firstNonEmpty(c.Query("group_by"), "none")))
+	limit, _ := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
+	// 读小时汇总表：覆盖全部历史（含已合并进来的备份数据），且只有几万行，毫秒级。
+	stats, err := h.db.GetUsageStatsFromRollup(c.Request.Context(), from, to, groupBy, limit, c.Query("order"))
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
-	groupBy := strings.ToLower(strings.TrimSpace(firstNonEmpty(c.Query("group_by"), "none")))
-	type item struct {
-		Key          string  `json:"key"`
-		Label        string  `json:"label,omitempty"`
-		Requests     int64   `json:"requests"`
-		Tokens       int64   `json:"tokens"`
-		InputTokens  int64   `json:"input_tokens"`
-		OutputTokens int64   `json:"output_tokens"`
-		UserBilled   float64 `json:"user_billed"`
-	}
-	items := []item{}
-	switch groupBy {
-	case "model":
-		for _, row := range stats.ModelStats {
-			items = append(items, item{Key: row.Model, Requests: row.Requests, Tokens: row.Tokens,
-				InputTokens: row.InputTokens, OutputTokens: row.OutputTokens, UserBilled: row.UserBilled})
-		}
-	case "protocol", "endpoint":
-		for _, row := range stats.EndpointStats {
-			items = append(items, item{Key: row.Endpoint, Requests: row.Requests, Tokens: row.Tokens, UserBilled: row.UserBilled})
-		}
-	case "user", "api_key", "group":
-		for _, row := range stats.APIKeyStats {
-			items = append(items, item{Key: strconv.FormatInt(row.APIKeyID, 10), Label: row.Label,
-				Requests: row.Requests, Tokens: row.Tokens, UserBilled: row.UserBilled})
-		}
-	case "date":
-		// 直方图维度暂未实现，返回空 items，调用方回退到总计。
-	default:
-		groupBy = "none"
-	}
-	security.SecurityAuditLog("INTERNAL_USAGE_STATS", "path="+c.Request.URL.Path+" group_by="+groupBy)
-	c.JSON(http.StatusOK, gin.H{
-		"group_by":       groupBy,
-		"total_requests": stats.TotalRequests,
-		"total_tokens":   stats.TotalTokens,
-		"input_tokens":   stats.TotalPrompt,
-		"output_tokens":  stats.TotalCompletion,
-		"user_billed":    stats.TotalUserBilled,
-		"account_billed": stats.TotalAccountBilled,
-		"items":          items,
-	})
+	security.SecurityAuditLog("INTERNAL_USAGE_STATS", "path="+c.Request.URL.Path+" group_by="+stats.GroupBy)
+	c.JSON(http.StatusOK, stats)
 }

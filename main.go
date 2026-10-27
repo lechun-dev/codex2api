@@ -68,6 +68,11 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	// 用量统计读取 usage_logs 时并入历史备份表（默认 usage_logs_openclaw；表不存在会自动跳过）。
+	db.SetUsageLogExtraTables(cfg.UsageLogExtraTables)
+	if len(cfg.UsageLogExtraTables) > 0 {
+		log.Printf("用量统计将合并历史备份表: %s", strings.Join(cfg.UsageLogExtraTables, ","))
+	}
 	if cfg.ConversationRecording {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := db.EnsureConversationRecords(ctx)

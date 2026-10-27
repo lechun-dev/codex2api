@@ -311,7 +311,8 @@ func (h *Handler) ConversationArchiveStats(c *gin.Context) {
 func (h *Handler) InternalUsageStats(c *gin.Context) {
 	from := parseArchiveTime(firstNonEmpty(c.Query("from"), c.Query("start_time")))
 	to := parseArchiveTime(firstNonEmpty(c.Query("to"), c.Query("end_time")))
-	stats, err := h.db.GetUsageStatsFiltered(c.Request.Context(), from, to, "", database.UsageLogFilter{}, true)
+	// 用量统计要包含历史备份表（如 usage_logs_openclaw），见 database.GetUsageStatsIncludingBackup。
+	stats, err := h.db.GetUsageStatsIncludingBackup(c.Request.Context(), from, to)
 	if err != nil {
 		writeInternalError(c, err)
 		return

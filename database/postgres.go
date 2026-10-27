@@ -219,6 +219,9 @@ type DB struct {
 	backgroundTaskCtx     context.Context
 	backgroundTaskCancel  context.CancelFunc
 
+	// 需要并入用量统计的历史备份表（如 usage_logs_openclaw），只读
+	usageLogExtraTables []string
+
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
 	logMu   sync.Mutex

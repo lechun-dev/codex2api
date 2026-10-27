@@ -122,6 +122,10 @@ GET /api/v1/internal/conversation-archives/stats      # 存档 token 用量聚�
 GET /api/v1/internal/usage/stats                      # usage_logs 用量聚合
 ```
 
+`usage/stats` 会合并 `usage_logs` 与历史备份表（默认 `usage_logs_openclaw`，
+用 `USAGE_LOG_EXTRA_TABLES=a,b` 覆盖）。备份表与 `usage_logs` 同结构、只读参与统计，
+表不存在时自动跳过；写入永远只写 `usage_logs`。
+
 存档统计支持 `group_by=none|user|date|model|protocol|api_key`、`limit`、`order=asc|desc`；
 `usage/stats` 的 `group_by` 兼容 tools 的取值（`user`/`api_key` 都映射到 API Key 维度，
 `date` 暂不支持，返回空 items + 总计）。

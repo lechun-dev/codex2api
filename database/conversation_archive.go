@@ -19,23 +19,26 @@ import (
 
 // ConversationArchiveFilter 是存档列表查询条件。零值表示不过滤。
 type ConversationArchiveFilter struct {
-	APIKeyID   int64
-	OwnerEmail string
-	ClientID   string
-	SessionID  string
-	RequestID  string
-	Model      string
-	Endpoint   string
-	Status     string
-	StatusCode int
-	Stream     *bool
-	Truncated  *bool
-	Keyword    string
-	From       time.Time
-	To         time.Time
-	Order      string // "asc" | "desc"，默认 desc
-	Offset     int
-	Limit      int
+	APIKeyID       int64
+	OwnerEmail     string
+	OwnerEmailLike string
+	ClientID       string
+	SessionID      string
+	RequestID      string
+	Model          string
+	Endpoint       string
+	EndpointLike   string
+	EndpointIn     []string
+	Status         string
+	StatusCode     int
+	Stream         *bool
+	Truncated      *bool
+	Keyword        string
+	From           time.Time
+	To             time.Time
+	Order          string // "asc" | "desc"，默认 desc
+	Offset         int
+	Limit          int
 }
 
 func (f ConversationArchiveFilter) normalized() ConversationArchiveFilter {
@@ -59,6 +62,7 @@ func (f ConversationArchiveFilter) normalized() ConversationArchiveFilter {
 	f.RequestID = strings.TrimSpace(f.RequestID)
 	f.Model = strings.TrimSpace(f.Model)
 	f.Endpoint = strings.TrimSpace(f.Endpoint)
+	f.EndpointLike = strings.TrimSpace(f.EndpointLike)
 	f.Status = strings.TrimSpace(f.Status)
 	f.Keyword = strings.TrimSpace(f.Keyword)
 	return f
@@ -110,6 +114,9 @@ func (db *DB) conversationArchiveWhere(f ConversationArchiveFilter) (string, []i
 	if f.OwnerEmail != "" {
 		add("LOWER(COALESCE(k.owner_email,''))=LOWER(%s)", f.OwnerEmail)
 	}
+	if f.OwnerEmailLike != "" {
+		add("LOWER(COALESCE(k.owner_email,'')) LIKE LOWER(%s)", "%"+f.OwnerEmailLike+"%")
+	}
 	if f.ClientID != "" {
 		add("r.client_id=%s", f.ClientID)
 	}
@@ -124,6 +131,17 @@ func (db *DB) conversationArchiveWhere(f ConversationArchiveFilter) (string, []i
 	}
 	if f.Endpoint != "" {
 		add("r.endpoint=%s", f.Endpoint)
+	}
+	if f.EndpointLike != "" {
+		add("r.endpoint LIKE %s", f.EndpointLike+"%")
+	}
+	if len(f.EndpointIn) > 0 {
+		ph := make([]string, len(f.EndpointIn))
+		for i, endpoint := range f.EndpointIn {
+			args = append(args, endpoint)
+			ph[i] = "$" + fmt.Sprint(len(args))
+		}
+		clauses = append(clauses, "r.endpoint IN ("+strings.Join(ph, ",")+")")
 	}
 	if f.Status != "" {
 		add("r.status=%s", f.Status)
@@ -284,4 +302,94 @@ func scanConversationArchive(row interface{ Scan(...interface{}) error }, includ
 		record.CompletedAt = &completed.Time
 	}
 	return record, nil
+}
+
+// ConversationArchiveStatsItem 是分组统计的一行。
+type ConversationArchiveStatsItem struct {
+	Key          string `json:"key"`
+	Requests     int64  `json:"requests"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+}
+
+// ConversationArchiveStats 是存档的 token 用量聚合结果。
+type ConversationArchiveStats struct {
+	GroupBy       string                         `json:"group_by"`
+	TotalRequests int64                          `json:"total_requests"`
+	InputTokens   int64                          `json:"input_tokens"`
+	OutputTokens  int64                          `json:"output_tokens"`
+	Items         []ConversationArchiveStatsItem `json:"items"`
+}
+
+// ConversationArchiveStats 按 group_by 聚合存档用量。
+// 支持 none / user（归属邮箱）/ date / model / protocol（端点）/ api_key。
+func (db *DB) ConversationArchiveStats(ctx context.Context, f ConversationArchiveFilter, groupBy string, limit int, order string) (*ConversationArchiveStats, error) {
+	if db == nil || db.conn == nil {
+		return &ConversationArchiveStats{GroupBy: groupBy}, nil
+	}
+	f = f.normalized()
+	where, args := db.conversationArchiveWhere(f)
+	out := &ConversationArchiveStats{GroupBy: groupBy, Items: []ConversationArchiveStatsItem{}}
+	if err := db.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(r.input_tokens),0), COALESCE(SUM(r.output_tokens),0)`+
+			conversationArchiveFrom+` WHERE `+where, args...).
+		Scan(&out.TotalRequests, &out.InputTokens, &out.OutputTokens); err != nil {
+		return nil, err
+	}
+	expr := db.conversationArchiveGroupExpr(groupBy)
+	if expr == "" {
+		return out, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	direction := "DESC"
+	if strings.ToLower(strings.TrimSpace(order)) == "asc" {
+		direction = "ASC"
+	}
+	query := `SELECT ` + expr + ` AS k, COUNT(*), COALESCE(SUM(r.input_tokens),0), COALESCE(SUM(r.output_tokens),0)` +
+		conversationArchiveFrom + ` WHERE ` + where + ` GROUP BY ` + expr +
+		` ORDER BY COUNT(*) ` + direction + fmt.Sprintf(" LIMIT $%d", len(args)+1)
+	rows, err := db.conn.QueryContext(ctx, query, append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item ConversationArchiveStatsItem
+		if err := rows.Scan(&item.Key, &item.Requests, &item.InputTokens, &item.OutputTokens); err != nil {
+			return nil, err
+		}
+		out.Items = append(out.Items, item)
+	}
+	return out, rows.Err()
+}
+
+// conversationArchiveGroupExpr 把 group_by 翻译成各方言的分组表达式；
+// 不支持的分组返回空串（只返回总计）。
+func (db *DB) conversationArchiveGroupExpr(groupBy string) string {
+	switch strings.ToLower(strings.TrimSpace(groupBy)) {
+	case "user", "owner", "owner_email":
+		return "COALESCE(k.owner_email,'')"
+	case "api_key", "key":
+		return "CAST(r.api_key_id AS CHAR)"
+	case "model":
+		return "r.model"
+	case "protocol", "endpoint":
+		return "r.endpoint"
+	case "date", "day":
+		switch {
+		case db.isSQLite():
+			return "strftime('%Y-%m-%d', r.created_at)"
+		case db.isMySQL():
+			return "DATE_FORMAT(r.created_at,'%Y-%m-%d')"
+		default:
+			return "TO_CHAR(r.created_at,'YYYY-MM-DD')"
+		}
+	default:
+		return ""
+	}
 }

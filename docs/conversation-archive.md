@@ -116,9 +116,15 @@ UPDATE api_keys SET owner_email='alice@lechun.cc' WHERE id=12;
 ## 6. 内部接口（给 AI / lechun-tools）
 
 ```
-GET /api/v1/internal/conversation-archives
-GET /api/v1/internal/conversation-archives/:id
+GET /api/v1/internal/conversation-archives            # 列表
+GET /api/v1/internal/conversation-archives/:id        # 详情
+GET /api/v1/internal/conversation-archives/stats      # 存档 token 用量聚合
+GET /api/v1/internal/usage/stats                      # usage_logs 用量聚合
 ```
+
+存档统计支持 `group_by=none|user|date|model|protocol|api_key`、`limit`、`order=asc|desc`；
+`usage/stats` 的 `group_by` 兼容 tools 的取值（`user`/`api_key` 都映射到 API Key 维度，
+`date` 暂不支持，返回空 items + 总计）。
 
 鉴权**完全复用 sub2api 的内部身份断言**，两边配同一个共享密钥即可：
 
@@ -129,9 +135,13 @@ GET /api/v1/internal/conversation-archives/:id
 | 签名 | `hex(HMAC-SHA256(secret, 签名串))` |
 | 时钟窗口 | `INTERNAL_IDENTITY_MAX_SKEW_SECONDS`（默认 300s） |
 | 开关 | `INTERNAL_IDENTITY_ENABLED=true` 且密钥非空，否则路由不存在（404） |
+| 可选白名单 | `INTERNAL_IDENTITY_ALLOWED_EMAILS=a@b.c,c@d.e`；配置后非白名单邮箱返回 403 |
 
-与 sub2api 的唯一差异：codex2api 没有用户表，所以 `X-Lechun-Email` 只作为调用方声明的
-身份写入审计日志，不再做「按邮箱查用户 → 校验管理员」这一跳；能签名就代表持有共享密钥。
+与 sub2api 的差异：codex2api 没有用户表，所以 `X-Lechun-Email` 不做「按邮箱查用户」，
+只作为调用方声明的身份写审计日志。要保留 sub2api 的「仅管理员」语义，配
+`INTERNAL_IDENTITY_ALLOWED_EMAILS`（管理员邮箱列表）即可；不配则表示持密钥即可调用。
+
+> 建议 codex2api 与 sub2api 使用**两个不同的共享密钥**，任一侧泄露不会波及其它系统。
 
 ```bash
 EMAIL=alice@lechun.cc
@@ -148,6 +158,17 @@ curl -s "http://127.0.0.1:8080${PATH_ONLY}?owner_email=alice@lechun.cc" \
 
 过滤参数与管理端一致（`owner_email`/`api_key_id`/`session_id`/`keyword`/`from`/`to`/`limit` 等），
 列表默认不返回正文。
+
+同时兼容 tools 现有的 sub2api 参数契约（无需改 tools 的查询模型）：
+
+| tools 参数 | codex2api 映射 |
+| --- | --- |
+| `page` / `page_size` | `offset` / `limit` |
+| `user_id` | `api_key_id`（codex2api 没有用户体系） |
+| `username` | `owner_email` 模糊匹配 |
+| `session_key` | `session_id` |
+| `protocol` | `openai_chat` → `/v1/chat/completions`、`openai_responses` → `/v1/responses`、`anthropic_messages` → `/v1/messages`、`gemini` → `/v1beta/models/…` |
+| `start_time` / `end_time` | `from` / `to` |
 
 ## 7. MySQL 5.6 注意
 

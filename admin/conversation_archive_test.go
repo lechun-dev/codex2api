@@ -1,15 +1,18 @@
 package admin
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,7 +28,7 @@ func TestInternalIdentityAuth(t *testing.T) {
 	const secret = "s3cr3t-shared-key"
 	const path = "/api/v1/internal/conversation-archives"
 	h := &Handler{}
-	h.SetInternalIdentity(true, secret, time.Minute)
+	h.SetInternalIdentity(true, secret, time.Minute, nil)
 
 	router := gin.New()
 	router.GET(path, h.internalIdentityAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -71,8 +74,8 @@ func TestInternalRoutesNotRegisteredWithoutSecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, setup := range []func(*Handler){
 		func(h *Handler) {},
-		func(h *Handler) { h.SetInternalIdentity(false, "secret", time.Minute) },
-		func(h *Handler) { h.SetInternalIdentity(true, "", time.Minute) },
+		func(h *Handler) { h.SetInternalIdentity(false, "secret", time.Minute, nil) },
+		func(h *Handler) { h.SetInternalIdentity(true, "", time.Minute, nil) },
 	} {
 		h := &Handler{}
 		setup(h)
@@ -128,4 +131,110 @@ type filterProbe struct {
 	statusCode int
 	ownerEmail string
 	keyword    string
+}
+
+func TestParseArchiveFilterAcceptsToolsContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var got database.ConversationArchiveFilter
+	router.GET("/probe", func(c *gin.Context) {
+		got = parseConversationArchiveFilter(c)
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet,
+		"/probe?page=3&page_size=20&user_id=7&username=alice&session_key=sess-1&protocol=openai_chat&start_time=2026-10-01&end_time=2026-10-31", nil)
+	router.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got.APIKeyID != 7 {
+		t.Fatalf("user_id 应映射到 api_key_id, got %d", got.APIKeyID)
+	}
+	if got.OwnerEmailLike != "alice" {
+		t.Fatalf("username 应映射到归属邮箱模糊匹配, got %q", got.OwnerEmailLike)
+	}
+	if got.SessionID != "sess-1" {
+		t.Fatalf("session_key 应映射到 session_id, got %q", got.SessionID)
+	}
+	if got.Limit != 20 || got.Offset != 40 {
+		t.Fatalf("page/page_size 映射错误: limit=%d offset=%d", got.Limit, got.Offset)
+	}
+	if len(got.EndpointIn) != 2 || got.EndpointIn[0] != "/v1/chat/completions" {
+		t.Fatalf("protocol 映射错误: %+v", got.EndpointIn)
+	}
+	if got.From.IsZero() || got.To.IsZero() {
+		t.Fatalf("start_time/end_time 未解析: %v %v", got.From, got.To)
+	}
+}
+
+func TestConversationArchiveStatsHandler(t *testing.T) {
+	handler, db := newAPIKeyOwnerTestHandler(t)
+	ctx := context.Background()
+	if err := db.EnsureConversationRecords(ctx); err != nil {
+		t.Fatalf("EnsureConversationRecords: %v", err)
+	}
+	if err := db.EnsureConversationArchiveSchema(ctx); err != nil {
+		t.Fatalf("EnsureConversationArchiveSchema: %v", err)
+	}
+	now := time.Now().UTC()
+	for i, model := range []string{"gpt-6-astra", "gpt-6-astra", "claude-sonnet-4-6"} {
+		if err := db.SaveConversationRecord(ctx, database.ConversationRecordInput{
+			RequestID: "stats-" + strconv.Itoa(i), SessionID: "stats-sess", Model: model,
+			Endpoint: "/v1/chat/completions", Status: database.ConversationStatusCompleted, StatusCode: 200,
+			InputTokens: 10, OutputTokens: 4, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("SaveConversationRecord: %v", err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/internal/conversation-archives/stats?group_by=model&limit=10", nil)
+	handler.ConversationArchiveStats(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		GroupBy       string `json:"group_by"`
+		TotalRequests int64  `json:"total_requests"`
+		Items         []struct {
+			Key      string `json:"key"`
+			Requests int64  `json:"requests"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.GroupBy != "model" || payload.TotalRequests != 3 || len(payload.Items) != 2 {
+		t.Fatalf("stats payload = %+v", payload)
+	}
+	if payload.Items[0].Key != "gpt-6-astra" || payload.Items[0].Requests != 2 {
+		t.Fatalf("top group = %+v", payload.Items[0])
+	}
+}
+
+func TestInternalIdentityAllowlist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "s3cr3t-shared-key"
+	const path = "/api/v1/internal/conversation-archives"
+	h := &Handler{}
+	h.SetInternalIdentity(true, secret, time.Minute, []string{"Admin@Lechun.cc"})
+
+	router := gin.New()
+	router.GET(path, h.internalIdentityAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	call := func(email string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Lechun-Email", email)
+		req.Header.Set("X-Lechun-Timestamp", now)
+		req.Header.Set("X-Lechun-Signature", signInternalIdentity(secret, email, now, http.MethodGet, path))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := call("admin@lechun.cc"); code != http.StatusOK {
+		t.Fatalf("白名单邮箱（大小写不敏感）应放行, got %d", code)
+	}
+	if code := call("random@lechun.cc"); code != http.StatusForbidden {
+		t.Fatalf("非白名单邮箱应 403, got %d", code)
+	}
 }

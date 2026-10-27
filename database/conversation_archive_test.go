@@ -147,3 +147,84 @@ func TestConversationArchiveSchemaIsIdempotent(t *testing.T) {
 		t.Fatalf("second EnsureAPIKeyOwnerEmail: %v", err)
 	}
 }
+
+func TestConversationArchiveStatsGrouping(t *testing.T) {
+	db := newConversationArchiveTestDB(t)
+	now := time.Date(2026, 10, 20, 8, 0, 0, 0, time.UTC)
+	keyA, err := db.InsertAPIKey(context.Background(), "team-a", "sk-stats-owner-a")
+	if err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	if err := db.SetAPIKeyOwnerEmail(context.Background(), keyA, "alice@lechun.cc"); err != nil {
+		t.Fatalf("SetAPIKeyOwnerEmail: %v", err)
+	}
+	keyB, err := db.InsertAPIKey(context.Background(), "team-b", "sk-stats-owner-b")
+	if err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	rows := []struct {
+		id       string
+		email    string
+		model    string
+		endpoint string
+		day      time.Time
+		in, out  int
+	}{
+		{"s1", "alice@lechun.cc", "gpt-6-astra", "/v1/chat/completions", now, 10, 5},
+		{"s2", "alice@lechun.cc", "gpt-6-astra", "/v1/responses", now, 20, 8},
+		{"s3", "", "claude-sonnet-4-6", "/v1/messages", now.AddDate(0, 0, -1), 30, 12},
+	}
+	for _, row := range rows {
+		keyID := keyB
+		if row.email != "" {
+			keyID = keyA
+		}
+		_ = keyID
+		saveArchiveRow(t, db, ConversationRecordInput{
+			RequestID: row.id, SessionID: "sess-" + row.id, APIKeyID: keyID,
+			Endpoint: row.endpoint, Model: row.model, Status: ConversationStatusCompleted, StatusCode: 200,
+			InputTokens: row.in, OutputTokens: row.out, CreatedAt: row.day, UpdatedAt: row.day,
+		})
+	}
+
+	stats, err := db.ConversationArchiveStats(context.Background(), ConversationArchiveFilter{}, "none", 10, "desc")
+	if err != nil {
+		t.Fatalf("stats none: %v", err)
+	}
+	if stats.TotalRequests != 3 || stats.InputTokens != 60 || stats.OutputTokens != 25 || len(stats.Items) != 0 {
+		t.Fatalf("totals = %+v", stats)
+	}
+
+	byModel, err := db.ConversationArchiveStats(context.Background(), ConversationArchiveFilter{}, "model", 10, "desc")
+	if err != nil || len(byModel.Items) != 2 {
+		t.Fatalf("by model: %+v err=%v", byModel, err)
+	}
+	if byModel.Items[0].Key != "gpt-6-astra" || byModel.Items[0].Requests != 2 || byModel.Items[0].InputTokens != 30 {
+		t.Fatalf("by model first = %+v", byModel.Items[0])
+	}
+
+	byOwner, err := db.ConversationArchiveStats(context.Background(), ConversationArchiveFilter{}, "user", 10, "desc")
+	if err != nil {
+		t.Fatalf("by owner: %v", err)
+	}
+	owners := map[string]int64{}
+	for _, item := range byOwner.Items {
+		owners[item.Key] = item.Requests
+	}
+	if owners["alice@lechun.cc"] != 2 || owners[""] != 1 {
+		t.Fatalf("by owner = %+v", byOwner.Items)
+	}
+
+	byDate, err := db.ConversationArchiveStats(context.Background(), ConversationArchiveFilter{}, "date", 10, "asc")
+	if err != nil || len(byDate.Items) != 2 {
+		t.Fatalf("by date: %+v err=%v", byDate, err)
+	}
+	if byDate.Items[0].Key != "2026-10-19" || byDate.Items[1].Key != "2026-10-20" {
+		t.Fatalf("by date order = %+v", byDate.Items)
+	}
+
+	filtered, err := db.ConversationArchiveStats(context.Background(), ConversationArchiveFilter{EndpointIn: []string{"/v1/messages"}}, "none", 10, "desc")
+	if err != nil || filtered.TotalRequests != 1 {
+		t.Fatalf("filtered stats: %+v err=%v", filtered, err)
+	}
+}

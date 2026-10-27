@@ -11,7 +11,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -251,6 +253,10 @@ func (h *Handler) GetConversationArchive(c *gin.Context) {
 	}
 	record, getErr := h.db.GetConversationArchive(c.Request.Context(), id)
 	if getErr != nil {
+		if errors.Is(getErr, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "存档不存在"})
+			return
+		}
 		writeInternalError(c, getErr)
 		return
 	}

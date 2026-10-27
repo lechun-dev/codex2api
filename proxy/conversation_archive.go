@@ -149,6 +149,12 @@ func (h *Handler) ConversationArchiveMiddleware() gin.HandlerFunc {
 
 		c.Next()
 
+		// 鉴权失败的请求不归档：内容没有归属人，存下来既没有分析价值，
+		// 也会把未认证的原文写进库。
+		if c.Writer.Status() == http.StatusUnauthorized || c.Writer.Status() == http.StatusForbidden {
+			return
+		}
+
 		if writer.buf.Len() == 0 && requestText == "" {
 			return
 		}

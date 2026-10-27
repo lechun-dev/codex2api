@@ -140,3 +140,27 @@ func TestConversationArchiveSkipsNonTextEndpoints(t *testing.T) {
 		t.Fatalf("图片端点不应归档: total=%d", total)
 	}
 }
+
+// 鉴权失败（401/403）的请求不应归档：内容没有归属人，也不该把未认证原文写库。
+func TestConversationArchiveSkipsUnauthorizedRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h, db := newArchiveE2EHandler(t)
+
+	router := gin.New()
+	router.Use(withCachedBody())
+	router.Use(h.ConversationArchiveMiddleware())
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewReader([]byte(`{"messages":[{"role":"user","content":"未认证内容"}]}`))))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if _, total, _ := db.ListConversationArchives(context.Background(), database.ConversationArchiveFilter{}, true); total != 0 {
+		t.Fatalf("401 请求不应归档，实际 %d 条", total)
+	}
+}

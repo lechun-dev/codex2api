@@ -47,29 +47,28 @@ import (
 // Handler 管理后台 API 处理器
 type Handler struct {
 	// 内部签名身份断言（与 sub2api 共用同一套头与共享密钥）；未启用时路由不注册。
-	internalIdentityEnabled      bool
-	internalIdentitySecret       string
-	internalIdentityMaxSkew      time.Duration
-	internalIdentityAllowedEmail map[string]struct{}
-	intelligenceDeviceConfig     *proxy.DeviceProfileConfig
-	intelligenceOnce             sync.Once
-	intelligenceWG               sync.WaitGroup
-	imageQueue                   *imageJobQueue
-	qualityTestContext           context.Context
-	qualityTestWG                sync.WaitGroup
-	store                        *auth.Store
-	modelRefreshFuncs            map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
-	proxyRiskJobsMu              sync.RWMutex
-	proxyRiskJobs                map[string]*proxyRiskScoringJob
-	cache                        cache.TokenCache
-	authCacheProxy               *proxy.Handler
-	db                           *database.DB
-	cacheCfgStore                responseCacheSettingsStore
-	rateLimiter                  *proxy.RateLimiter
-	systemUpdate                 *systemUpdater
-	systemUpdateOnce             sync.Once
-	refreshAccount               func(context.Context, int64) error
-	probeUsage                   func(context.Context, *auth.Account) error
+	internalIdentityEnabled  bool
+	internalIdentitySecret   string
+	internalIdentityMaxSkew  time.Duration
+	intelligenceDeviceConfig *proxy.DeviceProfileConfig
+	intelligenceOnce         sync.Once
+	intelligenceWG           sync.WaitGroup
+	imageQueue               *imageJobQueue
+	qualityTestContext       context.Context
+	qualityTestWG            sync.WaitGroup
+	store                    *auth.Store
+	modelRefreshFuncs        map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu          sync.RWMutex
+	proxyRiskJobs            map[string]*proxyRiskScoringJob
+	cache                    cache.TokenCache
+	authCacheProxy           *proxy.Handler
+	db                       *database.DB
+	cacheCfgStore            responseCacheSettingsStore
+	rateLimiter              *proxy.RateLimiter
+	systemUpdate             *systemUpdater
+	systemUpdateOnce         sync.Once
+	refreshAccount           func(context.Context, int64) error
+	probeUsage               func(context.Context, *auth.Account) error
 
 	codexUsageRefreshRunning atomic.Bool
 

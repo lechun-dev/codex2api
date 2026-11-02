@@ -11,25 +11,41 @@
 
 ## 1. API Key 最近使用时间
 
-- 仅 MySQL 改用固定 Key 参数的独立子查询，每批最多 32 个 Key，
-  使用 UNION ALL 合并往返，避免关联子查询 ORDER BY 的 filesort。
-- 复用现有 (api_key_id, created_at) 索引，不要求新索引或 FORCE INDEX。
-- 仅包含仍存在的正数 Key ID；保留 status_code <> 499，不缩窄为成功请求。
-- 时间仍取 created_at 最大值，不能假定更大的日志 ID 一定时间更晚。
-- SQLite/PostgreSQL 查询不变。
+2026-11-02 根据用户补充方案重新验证，采用更小的 SQL 修改，
+替代首轮的 MySQL 固定 Key 分批 UNION ALL 查询；对应辅助方法已删除。
 
-本地隔离 MySQL 8.4.0，64 个 Key、262144 条模拟日志，包含最新端连续 499。
-同一数据集、同一进程交替执行原查询和新查询，并核对每个 Key 的时间完全一致：
+- MySQL 保留一次关联查询，只将子查询排序调整为
+  `ORDER BY u.api_key_id DESC, u.created_at DESC`。
+- `WHERE u.api_key_id = k.id` 已限定同一个 Key，增加首排序字段不改变
+  最大 created_at 的含义；不改为按日志 ID 判断时间先后。
+- 仍排除 499，保留失败请求；无有效日志的 Key 不进入返回映射。
+- 复用现有索引，不增加生产 DDL，不使用 FORCE INDEX；
+  SQLite/PostgreSQL 排序保持原样，展示缓存继续保留。
 
-| 轮次（第一次运行） | 原关联查询 | 固定 Key 分批查询 |
+本地隔离 MySQL 8.4.0，64 个 Key、262144 条模拟日志，最新端连续 499。
+分别验证默认双列索引与报告实例已存在的三列覆盖索引，并先执行
+ANALYZE TABLE 更新本地测试统计信息；每组原查询/新查询交替运行 3 轮，
+逐个 Key 核对时间完全一致。两组均保留项目其他既有索引。
+
+| 索引配置 | 原查询范围（3 轮） | 索引顺序排序（3 轮） |
 |---|---:|---:|
-| 首轮，包含预热影响 | 334.77 ms | 9.41 ms |
-| 热缓存 1 | 29.81 ms | 8.04 ms |
-| 热缓存 2 | 29.75 ms | 7.07 ms |
+| 双列 (api_key_id, created_at) | 32.74–38.59 ms | 1.88–2.95 ms |
+| 再加三列 (api_key_id, created_at, status_code) | 70.71–81.94 ms | 0.90–9.44 ms |
 
-另一次与 Go 全量/竞态检查同时运行，热缓存结果为 92.07→31.39 ms、
-57.66→9.99 ms，说明共享主机负载会影响数值，不能将上述倍数外推到生产。
-未声称生产原来的 12.5 秒慢样本已经缩短到本地毫秒水平。
+EXPLAIN 显示：
+- 三列覆盖索引环境中，原关联子查询出现 Using filesort；新查询沿该索引
+  Backward index scan，没有 filesort。
+- 仅双列复合索引环境中，新查询沿该复合索引反向扫描；原查询在本次统计信息下
+  选用全局 created_at 索引反扫并过滤 Key，而不是 filesort，仍明显更慢。
+- 因此不能将原查询的所有慢计划都归结为 filesort，也不能将本地毫秒结果
+  当成生产原 12.5 秒慢样本已经修复后的实测耗时。
+
+首轮未 ANALYZE 的同一数据集比较也显示：原关联查询热缓存约 34.7–36.7 ms，
+本次索引顺序约 1.8–1.9 ms，原分批方案约 7.1–7.2 ms。
+这些本地数据说明可以删除额外分批实现，不代表生产收益承诺。
+加入执行计划断言后的复测与 Go 全量测试并行运行，原查询约 280–469 ms，
+新查询约 1.9–101.4 ms，仍全部逐 Key 对账一致且无 filesort；
+说明共享主机负载会显著影响数字，不能把上述低负载耗时视为稳定 SLA。
 
 手工核对单个 Key 的只读 SQL（替换绑定参数；先在测试/受限环境验证）：
 
@@ -39,16 +55,22 @@ FROM usage_logs
 WHERE api_key_id = ? AND status_code <> 499;
 
 EXPLAIN
-SELECT created_at
-FROM usage_logs
-WHERE api_key_id = ? AND status_code <> 499
-ORDER BY created_at DESC
-LIMIT 1;
+SELECT k.id, (
+    SELECT u.created_at
+    FROM usage_logs u
+    WHERE u.api_key_id = k.id AND u.status_code <> 499
+    ORDER BY u.api_key_id DESC, u.created_at DESC
+    LIMIT 1
+)
+FROM api_keys k
+WHERE k.id > 0;
 ~~~
 
-性能对比测试仅在显式设置 CODEX2API_MYSQL_PERF_TEST=1 时执行，
-还需设置 CODEX2API_MYSQL_TEST_DSN 指向隔离实例。
-测试创建并删除自己的临时数据库，禁止使用生产 DSN。
+性能对比测试 TestMySQLLastUsedIndexOrderPerformance 仅在显式设置
+CODEX2API_MYSQL_PERF_TEST=1 时执行，还需设置 CODEX2API_MYSQL_TEST_DSN
+指向隔离实例。测试创建并删除自己的临时数据库，禁止使用生产 DSN。
+测试分别记录两组索引的执行计划，并检查新排序不出现 filesort。
+未进行真实 MySQL 5.6 实机验证，不能将语法兼容审查等同于 5.6 执行计划验证。
 
 ## 2. 管理页展示缓存
 
@@ -98,7 +120,7 @@ LIMIT 1;
 
 ## 验证与上线后验收
 
-回归覆盖：非 499 时间、乱序插入、跨批次、并发缓存去重、取消与超时、
+回归覆盖：非 499 时间、乱序插入、单查询及索引顺序、并发缓存去重、取消与超时、
 失败保留旧值、最大陈旧期、条目上限、清空/账号变更失效、
 官方账单回补、领取失败/提交死锁不泄漏任务、候选重新校验、
 完成与失败的限定重试，以及真实 MySQL 并发领取/完成。

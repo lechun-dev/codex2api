@@ -548,25 +548,24 @@ func emailFromCredentialsJSON(raw string) string {
 }
 
 // ListAPIKeyLastUsedAt returns each existing positive key's latest non-499 request.
-// 2026-11-02 coder(lq): MySQL can filesort a correlated ORDER BY despite a covering index;
-// use bounded constant-key probes there instead of sorting every key's entire history.
 func (db *DB) ListAPIKeyLastUsedAt(ctx context.Context) (map[int64]time.Time, error) {
+	orderBy := "u.created_at DESC"
 	if db.isMySQL() {
-		return db.listAPIKeyLastUsedAtMySQL(ctx)
+		// 2026-11-02 coder(lq): Include the correlated key in index order so MySQL can scan backwards and stop at the first non-499 row instead of filesorting its history.
+		orderBy = "u.api_key_id DESC, u.created_at DESC"
 	}
-
-	query := `
+	query := fmt.Sprintf(`
 		SELECT k.id, (
 			SELECT u.created_at
 			FROM usage_logs u
 			WHERE u.api_key_id = k.id
 			  AND u.status_code <> 499
-			ORDER BY u.created_at DESC
+			ORDER BY %s
 			LIMIT 1
 		)
 		FROM api_keys k
 		WHERE k.id > 0
-	`
+	`, orderBy)
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -592,71 +591,6 @@ func (db *DB) ListAPIKeyLastUsedAt(ctx context.Context) (map[int64]time.Time, er
 		return nil, err
 	}
 	return result, nil
-}
-
-// 2026-11-02 coder(lq): Batch independent probes to avoid both a dependent-subquery filesort and one network round trip per key.
-func (db *DB) listAPIKeyLastUsedAtMySQL(ctx context.Context) (map[int64]time.Time, error) {
-	rows, err := db.conn.QueryContext(ctx, "SELECT id FROM api_keys WHERE id > 0 ORDER BY id")
-	if err != nil {
-		return nil, err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[int64]time.Time, len(ids))
-	const batchSize = 32
-	for start := 0; start < len(ids); start += batchSize {
-		batch := ids[start:min(start+batchSize, len(ids))]
-		query, args := apiKeyLastUsedMySQLBatch(batch)
-		rows, err := db.conn.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id int64
-			var raw interface{}
-			if err := rows.Scan(&id, &raw); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			at, err := parseDBTimeValue(raw)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			if !at.IsZero() {
-				result[id] = at
-			}
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
-}
-
-func apiKeyLastUsedMySQLBatch(ids []int64) (string, []interface{}) {
-	parts := make([]string, 0, len(ids))
-	args := make([]interface{}, 0, len(ids))
-	for _, id := range ids {
-		args = append(args, id)
-		placeholder := fmt.Sprintf("$%d", len(args))
-		parts = append(parts, "SELECT "+placeholder+" AS id, (SELECT created_at FROM usage_logs WHERE api_key_id = "+placeholder+" AND status_code <> 499 ORDER BY created_at DESC LIMIT 1) AS last_used_at")
-	}
-	return strings.Join(parts, " UNION ALL "), args
 }
 
 // GetAllAPIKeysWindowCost 批量聚合所有 API Key 在 [now-window, now] 窗口内的 user_billed。

@@ -1035,6 +1035,10 @@ type mysqlCaptureDriver struct {
 	queryRows           [][]driver.Value
 	queryRowPos         int
 	execCount           int
+	execErrors          map[int]error
+	commitErrors        []error
+	commits             int
+	rollbacks           int
 }
 
 func (d *mysqlCaptureDriver) Open(string) (driver.Conn, error) {
@@ -1052,7 +1056,7 @@ func (c *mysqlCaptureConn) Prepare(string) (driver.Stmt, error) {
 func (c *mysqlCaptureConn) Close() error { return nil }
 
 func (c *mysqlCaptureConn) Begin() (driver.Tx, error) {
-	return mysqlCaptureTx{}, nil
+	return mysqlCaptureTx{capture: c.capture}, nil
 }
 
 func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -1060,6 +1064,9 @@ func (c *mysqlCaptureConn) ExecContext(_ context.Context, query string, args []d
 	c.capture.queries = append(c.capture.queries, query)
 	c.capture.args = append([]driver.NamedValue(nil), args...)
 	c.capture.execCount++
+	if err := c.capture.execErrors[c.capture.execCount]; err != nil {
+		return nil, err
+	}
 	affected := int64(1)
 	if c.capture.execRowsAffectedSet {
 		affected = c.capture.execRowsAffected
@@ -1111,10 +1118,20 @@ type mysqlCaptureResult struct {
 func (r mysqlCaptureResult) LastInsertId() (int64, error) { return r.lastInsertID, nil }
 func (r mysqlCaptureResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-type mysqlCaptureTx struct{}
+type mysqlCaptureTx struct{ capture *mysqlCaptureDriver }
 
-func (mysqlCaptureTx) Commit() error   { return nil }
-func (mysqlCaptureTx) Rollback() error { return nil }
+func (tx mysqlCaptureTx) Commit() error {
+	i := tx.capture.commits
+	tx.capture.commits++
+	if i < len(tx.capture.commitErrors) {
+		return tx.capture.commitErrors[i]
+	}
+	return nil
+}
+func (tx mysqlCaptureTx) Rollback() error {
+	tx.capture.rollbacks++
+	return nil
+}
 
 func containsAll(value string, needles ...string) bool {
 	for _, needle := range needles {

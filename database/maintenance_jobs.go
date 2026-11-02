@@ -4,8 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
+
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 const MaintenanceJobGrokFreshness = "grok_freshness"
@@ -84,7 +89,7 @@ func scanMaintenanceJob(scanner interface{ Scan(...interface{}) error }) (Mainte
 }
 
 // ClaimMaintenanceJobs leases due rows. PostgreSQL uses SKIP LOCKED; MySQL 5.6
-// falls back to a single select-for-update transaction; SQLite serializes the
+// rechecks unlocked candidates under primary-key locks; SQLite serializes the
 // short select/update transaction through its existing write gate.
 func (db *DB) ClaimMaintenanceJobs(ctx context.Context, jobKind, owner string, now time.Time, lease time.Duration, limit int) ([]MaintenanceJob, error) {
 	jobKind = strings.TrimSpace(jobKind)
@@ -103,51 +108,7 @@ func (db *DB) ClaimMaintenanceJobs(ctx context.Context, jobKind, owner string, n
 	}
 	leaseUntil := now.Add(lease)
 	if db.isMySQL() {
-		var jobs []MaintenanceJob
-		err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
-			rows, err := tx.QueryContext(ctx, `
-				SELECT entity_id,job_kind,due_at,lease_owner,lease_until,attempts,last_error
-				FROM maintenance_jobs
-				WHERE job_kind=$1 AND due_at<=$2 AND (lease_until IS NULL OR lease_until<=$2)
-				ORDER BY due_at,entity_id
-				LIMIT $3 FOR UPDATE`,
-				jobKind, db.timeArg(now), limit)
-			if err != nil {
-				return err
-			}
-			candidates := make([]MaintenanceJob, 0, limit)
-			for rows.Next() {
-				job, err := scanMaintenanceJob(rows)
-				if err != nil {
-					rows.Close()
-					return err
-				}
-				candidates = append(candidates, job)
-			}
-			if err := rows.Close(); err != nil {
-				return err
-			}
-			if err := rows.Err(); err != nil {
-				return err
-			}
-			for _, candidate := range candidates {
-				result, err := tx.ExecContext(ctx, `UPDATE maintenance_jobs
-					SET lease_owner=$1,lease_until=$2,attempts=attempts+1,updated_at=CURRENT_TIMESTAMP
-					WHERE entity_id=$3 AND job_kind=$4 AND (lease_until IS NULL OR lease_until<=$5)`,
-					owner, db.timeArg(leaseUntil), candidate.EntityID, candidate.JobKind, db.timeArg(now))
-				if err != nil {
-					return err
-				}
-				if changed, _ := result.RowsAffected(); changed == 1 {
-					candidate.LeaseOwner = owner
-					candidate.LeaseUntil = sql.NullTime{Time: leaseUntil, Valid: true}
-					candidate.Attempts++
-					jobs = append(jobs, candidate)
-				}
-			}
-			return nil
-		})
-		return jobs, err
+		return db.claimMaintenanceJobsMySQL(ctx, jobKind, owner, now, leaseUntil, min(limit, 32))
 	}
 	if !db.isSQLite() {
 		rows, err := db.conn.QueryContext(ctx, `
@@ -224,19 +185,21 @@ func (db *DB) CompleteMaintenanceJob(ctx context.Context, entityID int64, jobKin
 	if nextDue.IsZero() {
 		nextDue = time.Now().Add(time.Minute)
 	}
-	result, err := db.conn.ExecContext(ctx, `UPDATE maintenance_jobs SET due_at=$1,lease_owner='',lease_until=NULL,attempts=0,last_error='',updated_at=CURRENT_TIMESTAMP
-		WHERE entity_id=$2 AND job_kind=$3 AND lease_owner=$4`, db.timeArg(nextDue), entityID, jobKind, owner)
-	if err != nil {
-		return err
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if changed == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return db.retryMaintenanceWrite(ctx, "complete", func() error {
+		result, err := db.conn.ExecContext(ctx, `UPDATE maintenance_jobs SET due_at=$1,lease_owner='',lease_until=NULL,attempts=0,last_error='',updated_at=CURRENT_TIMESTAMP
+			WHERE entity_id=$2 AND job_kind=$3 AND lease_owner=$4`, db.timeArg(nextDue), entityID, jobKind, owner)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 
 func (db *DB) FailMaintenanceJob(ctx context.Context, entityID int64, jobKind, owner string, retryAt time.Time, failure error) error {
@@ -251,12 +214,104 @@ func (db *DB) FailMaintenanceJob(ctx context.Context, entityID int64, jobKind, o
 			message = strings.ToValidUTF8(message[:500], "")
 		}
 	}
-	_, err := db.conn.ExecContext(ctx, `UPDATE maintenance_jobs SET due_at=$1,lease_owner='',lease_until=NULL,last_error=$2,updated_at=CURRENT_TIMESTAMP
-		WHERE entity_id=$3 AND job_kind=$4 AND lease_owner=$5`, db.timeArg(retryAt), message, entityID, jobKind, owner)
-	return err
+	return db.retryMaintenanceWrite(ctx, "fail", func() error {
+		_, err := db.conn.ExecContext(ctx, `UPDATE maintenance_jobs SET due_at=$1,lease_owner='',lease_until=NULL,last_error=$2,updated_at=CURRENT_TIMESTAMP
+			WHERE entity_id=$3 AND job_kind=$4 AND lease_owner=$5`, db.timeArg(retryAt), message, entityID, jobKind, owner)
+		return err
+	})
 }
 
 func (db *DB) DeleteMaintenanceJob(ctx context.Context, entityID int64, jobKind string) error {
 	_, err := db.conn.ExecContext(ctx, `DELETE FROM maintenance_jobs WHERE entity_id=$1 AND job_kind=$2`, entityID, jobKind)
 	return err
+}
+
+// 2026-11-02 coder(lq): Do not lock the due secondary-index range. Discover candidates without locks,
+// then acquire current primary-key rows in a consistent order, matching completion/failure updates.
+func (db *DB) claimMaintenanceJobsMySQL(ctx context.Context, kind, owner string, now, leaseUntil time.Time, limit int) ([]MaintenanceJob, error) {
+	var jobs []MaintenanceJob
+	err := db.retryMaintenanceWrite(ctx, "claim", func() error {
+		// 2026-11-02 coder(lq): Every retry re-discovers candidates and starts with an empty result; rolled-back leases must never escape.
+		jobs = nil
+		rows, err := db.conn.QueryContext(ctx, `SELECT entity_id FROM maintenance_jobs
+			WHERE job_kind=$1 AND due_at<=$2 AND (lease_until IS NULL OR lease_until<=$2)
+			ORDER BY due_at,entity_id LIMIT $3`, kind, db.timeArg(now), limit)
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil || len(ids) == 0 {
+			return err
+		}
+		slices.Sort(ids)
+		claimed := make([]MaintenanceJob, 0, len(ids))
+		err = db.withWriteTx(ctx, func(tx *sql.Tx) error {
+			for _, id := range ids {
+				job, err := scanMaintenanceJob(tx.QueryRowContext(ctx, `SELECT entity_id,job_kind,due_at,lease_owner,lease_until,attempts,last_error
+					FROM maintenance_jobs WHERE entity_id=$1 AND job_kind=$2 FOR UPDATE`, id, kind))
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				// 2026-11-02 coder(lq): Locking reads see the current committed row, not the unlocked discovery snapshot.
+				if job.DueAt.After(now) || job.LeaseUntil.Valid && job.LeaseUntil.Time.After(now) {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE maintenance_jobs
+					SET lease_owner=$1,lease_until=$2,attempts=attempts+1,updated_at=CURRENT_TIMESTAMP
+					WHERE entity_id=$3 AND job_kind=$4`, owner, db.timeArg(leaseUntil), id, kind); err != nil {
+					return err
+				}
+				job.LeaseOwner = owner
+				job.LeaseUntil = sql.NullTime{Time: leaseUntil, Valid: true}
+				job.Attempts++
+				claimed = append(claimed, job)
+			}
+			return nil
+		})
+		if err == nil {
+			jobs = claimed
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+// 2026-11-02 coder(lq): Only retry MySQL's explicit deadlock victim (1213), whose transaction was rolled back.
+// Do not replay user requests, unknown commit outcomes, lock timeouts, or arbitrary connection errors.
+func (db *DB) retryMaintenanceWrite(ctx context.Context, operation string, run func() error) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := run()
+		var mysqlErr *mysql.MySQLError
+		if !db.isMySQL() || attempt >= 3 || !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 {
+			return err
+		}
+		log.Printf("[grok-maintenance] %s deadlock retry=%d", operation, attempt+1)
+		delay := time.Duration(10*(1<<attempt)+rand.IntN(10)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

@@ -39,12 +39,13 @@ func grokSyncErrors(failures map[string]string) error {
 // Refill free slots without waiting for the slowest account in a batch.
 // Claimed rows start immediately, so no local waiting queue consumes leases.
 func (h *Handler) runGrokMaintenanceQueue(ctx context.Context, kind string, limit int) {
-	owner := "grok-" + uuid.NewString()
 	runGrokQueueLoop(ctx, kind, limit,
 		func(ctx context.Context, slots int) ([]database.MaintenanceJob, error) {
-			return h.db.ClaimMaintenanceJobs(ctx, kind, owner, time.Now(), grokMaintenanceLease, slots)
+			// 2026-11-02 coder(lq): A fresh owner per lease batch fences late completion from an expired lease in this same worker process.
+			return h.db.ClaimMaintenanceJobs(ctx, kind, "grok-"+uuid.NewString(), time.Now(), grokMaintenanceLease, slots)
 		},
 		func(ctx context.Context, job database.MaintenanceJob) error {
+			owner := job.LeaseOwner
 			var err error
 			if kind == database.MaintenanceJobGrokCapability {
 				err = h.runOneGrokCapabilityJob(ctx, owner, job)

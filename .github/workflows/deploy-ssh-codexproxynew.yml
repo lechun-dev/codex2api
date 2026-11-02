@@ -225,6 +225,7 @@ jobs:
         env:
           DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.CODEXPROXYNEW_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           test -n "$DEPLOY_SSH_KEY"
@@ -233,7 +234,13 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -T 10 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
+            sleep 2
+          fi
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Roll back release
         timeout-minutes: 10

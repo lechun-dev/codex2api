@@ -111,6 +111,7 @@ jobs:
         env:
           DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.CODEXPROXYNEW_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           test -n "$DEPLOY_SSH_KEY"
@@ -119,7 +120,16 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          # ssh-keyscan 会在 1 秒内并发 5~6 次连接，足以触发 fail2ban / 云防火墙的
+          # 暴力破解防护，导致紧接着的 ssh/scp 被丢弃（表现为 ConnectTimeout）。
+          # 改为使用预置的 known_hosts（与 sshd 主机密钥一致），全程只建立一次连接。
+          if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -T 10 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
+            sleep 2
+          fi
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy binary
         timeout-minutes: 30
@@ -139,10 +149,14 @@ jobs:
           ssh_opts=(
             -i ~/.ssh/deploy_key
             -o BatchMode=yes
-            -o ConnectTimeout=15
+            -o ConnectTimeout=20
+            -o ConnectionAttempts=3
             -o ServerAliveInterval=15
             -o ServerAliveCountMax=3
             -o StrictHostKeyChecking=yes
+            -o ControlMaster=auto
+            -o ControlPath=~/.ssh/cm-%r@%h:%p
+            -o ControlPersist=10m
           )
 
           echo "::group::Prepare remote release directory"
@@ -238,10 +252,14 @@ jobs:
           ssh_opts=(
             -i ~/.ssh/deploy_key
             -o BatchMode=yes
-            -o ConnectTimeout=15
+            -o ConnectTimeout=20
+            -o ConnectionAttempts=3
             -o ServerAliveInterval=15
             -o ServerAliveCountMax=3
             -o StrictHostKeyChecking=yes
+            -o ControlMaster=auto
+            -o ControlPath=~/.ssh/cm-%r@%h:%p
+            -o ControlPersist=10m
           )
 
           ssh "${ssh_opts[@]}" "$remote" "

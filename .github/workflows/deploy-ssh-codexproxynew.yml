@@ -39,6 +39,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Public host key read through a verified SSH connection to codexProxyNew.
+  # Rotate this pin if the server is rebuilt; never replace it with ssh-keyscan:
+  # its unauthenticated algorithm probes trigger this server's Fail2ban rules.
+  DEPLOY_HOST_PUBLIC_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTi8KskrvQPQdWYslNorfLxpEZzmbJ7NFvv7HsJRpN7
+
 concurrency:
   group: deploy-ssh-codexproxynew-${{ github.ref }}
   cancel-in-progress: false
@@ -116,18 +122,17 @@ jobs:
           set -euo pipefail
           test -n "$DEPLOY_SSH_KEY"
           test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_HOST_PUBLIC_KEY"
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          # ssh-keyscan 会在 1 秒内并发 5~6 次连接，足以触发 fail2ban / 云防火墙的
-          # 暴力破解防护，导致紧接着的 ssh/scp 被丢弃（表现为 ConnectTimeout）。
-          # 改为使用预置的 known_hosts（与 sshd 主机密钥一致），全程只建立一次连接。
+          # Prefer configured known_hosts; otherwise use the verified public key.
+          # Never probe with ssh-keyscan: its preauth connections trigger Fail2ban.
           if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
-            ssh-keyscan -T 10 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
-            sleep 2
+            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" > ~/.ssh/known_hosts
           fi
           chmod 600 ~/.ssh/known_hosts
 
@@ -149,8 +154,9 @@ jobs:
           ssh_opts=(
             -i ~/.ssh/deploy_key
             -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o ConnectionAttempts=1
             -o ConnectTimeout=20
-            -o ConnectionAttempts=3
             -o ServerAliveInterval=15
             -o ServerAliveCountMax=3
             -o StrictHostKeyChecking=yes
@@ -230,15 +236,17 @@ jobs:
           set -euo pipefail
           test -n "$DEPLOY_SSH_KEY"
           test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_HOST_PUBLIC_KEY"
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          # Prefer configured known_hosts; otherwise use the verified public key.
+          # Never probe with ssh-keyscan: its preauth connections trigger Fail2ban.
           if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           else
-            ssh-keyscan -T 10 -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
-            sleep 2
+            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" > ~/.ssh/known_hosts
           fi
           chmod 600 ~/.ssh/known_hosts
 
@@ -259,8 +267,9 @@ jobs:
           ssh_opts=(
             -i ~/.ssh/deploy_key
             -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o ConnectionAttempts=1
             -o ConnectTimeout=20
-            -o ConnectionAttempts=3
             -o ServerAliveInterval=15
             -o ServerAliveCountMax=3
             -o StrictHostKeyChecking=yes

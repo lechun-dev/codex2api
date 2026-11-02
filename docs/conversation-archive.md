@@ -25,6 +25,8 @@
 CODEX_CONVERSATION_RECORDING_ENABLED=true
 # 保留天数，0 = 永久
 CODEX_CONVERSATION_RETENTION_DAYS=90
+# 排除项：命中的请求完全不采集（可留空）
+CODEX_CONVERSATION_EXCLUDE=machine:92217c0d-827d-4af6-845e-dbe2d49b693e
 # 给 AI/lechun-tools 的内部接口：与 sub2api 共用同一套签名头与共享密钥
 INTERNAL_IDENTITY_ENABLED=true
 INTERNAL_IDENTITY_SECRET=请换成与 sub2api 相同的随机长密钥
@@ -32,6 +34,36 @@ INTERNAL_IDENTITY_MAX_SKEW_SECONDS=300
 ```
 
 启动时会自动建表/补列（`conversation_records.stream/truncated`、`api_keys.owner_email`），可重复执行。
+
+## 2.1 排除项（`CODEX_CONVERSATION_EXCLUDE`）
+
+用于把「某些来源的对话不归档」白名单化，典型场景是运维/开发自己在用的机器。
+命中排除项的请求**完全不采集**：不解析正文、不旁路复制响应、不落库，也不写客户端统计。
+
+格式：逗号 / 分号 / 空白分隔，四种前缀可混用；不带前缀的取值按机器码处理（本身是合法 IP 时按 IP 处理）。
+
+| 前缀 | 匹配对象 | 取值来源 | 稳定性 |
+| --- | --- | --- | --- |
+| `machine:` | 机器码 | `X-Codex-Turn-Metadata` 的 `installation_id`，其次 `X-Codex-Installation-Id` 头、请求体 `client_metadata.x-codex-installation-id` / `client_metadata.installation_id` | 同一客户端安装不变，换网络/换 Key 都不变 |
+| `client:` | 客户端标识 | `X-Client-Id` 头（客户端显式声明）；派生指纹（`auto:…`）也参与匹配，但它含来源 IP，换网络就变 | 显式声明时稳定 |
+| `ip:` | 来源 IP / 网段 | 按可信代理规则解析出的 `ClientIP`，支持单地址与 CIDR | 固定出口 IP 时稳定，动态 IP / NAT 会漂移 |
+| `key:` | API Key ID | 鉴权结果，只有鉴权之后才知道 | 专用 Key 时最稳、最不易误伤 |
+
+```dotenv
+# 只排除本机（Codex 机器码）+ 一个网段 + 某个专用 Key
+CODEX_CONVERSATION_EXCLUDE=machine:92217c0d-827d-4af6-845e-dbe2d49b693e, ip:203.0.113.0/24, key:12
+```
+
+要点：
+
+- 机器码 / 显式 `X-Client-Id` / 来源 IP 在鉴权**之前**就能判定，命中后直接放行，零额外开销；
+  `key:` 与派生 `client_id` 必须等鉴权完成，属后置判定
+- 配置项非法（如 `key:abc`、`ip:not-an-ip`）会让进程启动失败，避免排除项静默失效
+- 命中日志限流为每分钟最多一条：`[conversation-archive] 命中排除项（machine），本次请求不归档`
+- 排除项只影响**新请求**，已落库的历史存档不会删除；需要清理请走管理端/保留策略
+- 如何拿到本机机器码：`~/.codex/.codex-global-state.json` 里的
+  `…-installation-id`（Codex Desktop），或抓一次请求看 `X-Codex-Turn-Metadata` 的 `installation_id`
+
 
 ## 3. 表结构
 

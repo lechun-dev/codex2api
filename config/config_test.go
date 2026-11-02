@@ -608,3 +608,41 @@ func TestApplyTimezoneKeepsLocalOnInvalidTZ(t *testing.T) {
 		t.Fatalf("非法 TZ 不应改动 time.Local, got %q", time.Local)
 	}
 }
+
+func TestLoadParsesConversationArchiveExclude(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_CONVERSATION_EXCLUDE",
+		"machine:92217C0D-827D-4AF6-845E-DBE2D49B693E, client:lq-macbook; ip:192.0.2.0/24 10.1.2.3, key:12")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	got := cfg.ConversationArchiveExclude
+	if len(got.Machines) != 1 || got.Machines[0] != "92217c0d-827d-4af6-845e-dbe2d49b693e" {
+		t.Fatalf("Machines = %v, want 单个小写机器码", got.Machines)
+	}
+	if len(got.Clients) != 1 || got.Clients[0] != "lq-macbook" {
+		t.Fatalf("Clients = %v", got.Clients)
+	}
+	if len(got.IPs) != 2 {
+		t.Fatalf("IPs = %v, want 网段 + 单地址", got.IPs)
+	}
+	if len(got.APIKeys) != 1 || got.APIKeys[0] != 12 {
+		t.Fatalf("APIKeys = %v", got.APIKeys)
+	}
+}
+
+func TestParseConversationArchiveExcludeRejectsInvalidTokens(t *testing.T) {
+	for _, raw := range []string{"key:abc", "key:0", "ip:not-an-ip", "machine:"} {
+		if _, err := ParseConversationArchiveExclude(raw); err == nil {
+			t.Fatalf("ParseConversationArchiveExclude(%q) 应返回错误", raw)
+		}
+	}
+	if got, err := ParseConversationArchiveExclude("   "); err != nil || !got.Empty() {
+		t.Fatalf("空配置应为空集合且无错误: %+v %v", got, err)
+	}
+}

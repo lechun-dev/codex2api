@@ -7,14 +7,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
 func newArchiveE2EHandler(t *testing.T) (*Handler, *database.DB) {
+	t.Helper()
+	return newArchiveE2EHandlerWithExclude(t, config.ConversationArchiveExclude{})
+}
+
+func newArchiveE2EHandlerWithExclude(t *testing.T, exclude config.ConversationArchiveExclude) (*Handler, *database.DB) {
 	t.Helper()
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "archive-e2e.db"))
 	if err != nil {
@@ -31,7 +38,7 @@ func newArchiveE2EHandler(t *testing.T) (*Handler, *database.DB) {
 	if err := db.EnsureAPIKeyOwnerEmail(ctx); err != nil {
 		t.Fatalf("EnsureAPIKeyOwnerEmail: %v", err)
 	}
-	archiver := newConversationArchiver(db)
+	archiver := newConversationArchiver(db, exclude)
 	t.Cleanup(archiver.Close)
 	return &Handler{db: db, convArchiver: archiver}, db
 }
@@ -162,5 +169,160 @@ func TestConversationArchiveSkipsUnauthorizedRequests(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if _, total, _ := db.ListConversationArchives(context.Background(), database.ConversationArchiveFilter{}, true); total != 0 {
 		t.Fatalf("401 请求不应归档，实际 %d 条", total)
+	}
+}
+
+func newArchiveChatRouter(h *Handler) *gin.Engine {
+	router := gin.New()
+	router.Use(withCachedBody())
+	router.Use(h.ConversationArchiveMiddleware())
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		_, _ = c.Writer.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}]}\n\n")
+		c.Status(http.StatusOK)
+	})
+	return router
+}
+
+func sendArchiveChat(t *testing.T, router *gin.Engine, requestID string, decorate func(*http.Request)) {
+	t.Helper()
+	body := []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"本机调试内容"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("X-Request-ID", requestID)
+	if decorate != nil {
+		decorate(req)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// 等异步队列落库，确认「没有写入」时也要给它同样的时间窗。
+	time.Sleep(200 * time.Millisecond)
+}
+
+func archiveTotal(t *testing.T, db *database.DB) int {
+	t.Helper()
+	_, total, err := db.ListConversationArchives(context.Background(), database.ConversationArchiveFilter{}, true)
+	if err != nil {
+		t.Fatalf("ListConversationArchives: %v", err)
+	}
+	return total
+}
+
+// 机器码（Codex installation_id）命中的请求不归档，其它机器照常归档。
+func TestConversationArchiveExcludesMachine(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const machineID = "92217c0d-827d-4af6-845e-dbe2d49b693e"
+	exclude, err := config.ParseConversationArchiveExclude("machine:" + strings.ToUpper(machineID))
+	if err != nil {
+		t.Fatalf("ParseConversationArchiveExclude: %v", err)
+	}
+	h, db := newArchiveE2EHandlerWithExclude(t, exclude)
+	router := newArchiveChatRouter(h)
+
+	sendArchiveChat(t, router, "req-machine-excluded", func(req *http.Request) {
+		req.Header.Set("X-Codex-Turn-Metadata", `{"installation_id":"`+machineID+`","session_id":"s-1"}`)
+	})
+	if total := archiveTotal(t, db); total != 0 {
+		t.Fatalf("命中排除机器码的请求不应归档，实际 %d 条", total)
+	}
+
+	sendArchiveChat(t, router, "req-machine-kept", func(req *http.Request) {
+		req.Header.Set("X-Codex-Turn-Metadata", `{"installation_id":"11111111-2222-3333-4444-555555555555","session_id":"s-2"}`)
+	})
+	if total := archiveTotal(t, db); total != 1 {
+		t.Fatalf("未命中排除项的机器应照常归档，实际 %d 条", total)
+	}
+}
+
+// 请求体 client_metadata 里的机器码同样生效。
+func TestConversationArchiveExcludesMachineFromBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const machineID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	exclude, err := config.ParseConversationArchiveExclude(machineID)
+	if err != nil {
+		t.Fatalf("ParseConversationArchiveExclude: %v", err)
+	}
+	h, db := newArchiveE2EHandlerWithExclude(t, exclude)
+
+	router := gin.New()
+	router.Use(withCachedBody())
+	router.Use(h.ConversationArchiveMiddleware())
+	router.POST("/v1/responses", func(c *gin.Context) {
+		_, _ = c.Writer.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"收到\"}\n\n")
+		c.Status(http.StatusOK)
+	})
+	body := []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"私聊内容"}],` +
+		`"client_metadata":{"x-codex-installation-id":"` + machineID + `"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("X-Request-ID", "req-machine-body")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if total := archiveTotal(t, db); total != 0 {
+		t.Fatalf("请求体机器码命中排除项时不应归档，实际 %d 条", total)
+	}
+}
+
+// 来源 IP / 网段排除。
+func TestConversationArchiveExcludesClientIP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exclude, err := config.ParseConversationArchiveExclude("ip:192.0.2.0/24")
+	if err != nil {
+		t.Fatalf("ParseConversationArchiveExclude: %v", err)
+	}
+	h, db := newArchiveE2EHandlerWithExclude(t, exclude)
+	router := newArchiveChatRouter(h)
+
+	sendArchiveChat(t, router, "req-ip-excluded", func(req *http.Request) {
+		req.RemoteAddr = "192.0.2.7:51000"
+	})
+	if total := archiveTotal(t, db); total != 0 {
+		t.Fatalf("命中排除网段的请求不应归档，实际 %d 条", total)
+	}
+
+	sendArchiveChat(t, router, "req-ip-kept", func(req *http.Request) {
+		req.RemoteAddr = "198.51.100.7:51000"
+	})
+	if total := archiveTotal(t, db); total != 1 {
+		t.Fatalf("网段外的请求应照常归档，实际 %d 条", total)
+	}
+}
+
+// API Key 维度的排除发生在鉴权之后。
+func TestConversationArchiveExcludesAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exclude, err := config.ParseConversationArchiveExclude("key:7")
+	if err != nil {
+		t.Fatalf("ParseConversationArchiveExclude: %v", err)
+	}
+	h, db := newArchiveE2EHandlerWithExclude(t, exclude)
+
+	newRouter := func(apiKeyID int64) *gin.Engine {
+		router := gin.New()
+		router.Use(withCachedBody())
+		router.Use(func(c *gin.Context) {
+			c.Set(contextAPIKeyID, apiKeyID)
+			c.Next()
+		})
+		router.Use(h.ConversationArchiveMiddleware())
+		router.POST("/v1/chat/completions", func(c *gin.Context) {
+			_, _ = c.Writer.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"收到\"}}]}\n\n")
+			c.Status(http.StatusOK)
+		})
+		return router
+	}
+
+	sendArchiveChat(t, newRouter(7), "req-key-excluded", nil)
+	if total := archiveTotal(t, db); total != 0 {
+		t.Fatalf("命中排除 API Key 的请求不应归档，实际 %d 条", total)
+	}
+
+	sendArchiveChat(t, newRouter(8), "req-key-kept", nil)
+	if total := archiveTotal(t, db); total != 1 {
+		t.Fatalf("其它 API Key 应照常归档，实际 %d 条", total)
 	}
 }

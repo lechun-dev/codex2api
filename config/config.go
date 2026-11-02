@@ -123,25 +123,26 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port                      int
-	BindAddress               string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
-	AdminSecret               string
-	AllowAnonymousV1          bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
-	APIKeyAuthCacheEnabled    bool
-	MaxRequestBodySize        int
-	RequestMemoryBudgetBytes  int64 // Process-local retained HTTP/WS request body budget.
-	SchedulerMaxWaiters       int   // Process-local waiting request budget.
-	SchedulerMaxWaitersPerKey int
-	UsageLogCaptureContent    bool   // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
-	UsageLogMasterKey         []byte // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
-	ConversationRecording     bool   // 是否把用户消息与 AI 回复的纯文本归档到 conversation_records；默认 false（存的是用户原文，必须显式开启）
-	ConversationRetentionDays int    // 会话存档保留天数；0 表示永久保留；默认 90
-	DownloadsDir              string // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
-	Database                  DatabaseConfig
-	Cache                     CacheConfig
-	UseWebsocket              bool     // 是否启用 WebSocket 传输
-	CodexUpstreamTransport    string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
-	TrustedProxies            []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	Port                       int
+	BindAddress                string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
+	AdminSecret                string
+	AllowAnonymousV1           bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
+	APIKeyAuthCacheEnabled     bool
+	MaxRequestBodySize         int
+	RequestMemoryBudgetBytes   int64 // Process-local retained HTTP/WS request body budget.
+	SchedulerMaxWaiters        int   // Process-local waiting request budget.
+	SchedulerMaxWaitersPerKey  int
+	UsageLogCaptureContent     bool                       // 是否从请求中提取会话/文本内容写入 usage_logs；默认 false
+	UsageLogMasterKey          []byte                     // usage_logs.request_text 加密主密钥；base64 编码的 32 字节密钥
+	ConversationRecording      bool                       // 是否把用户消息与 AI 回复的纯文本归档到 conversation_records；默认 false（存的是用户原文，必须显式开启）
+	ConversationRetentionDays  int                        // 会话存档保留天数；0 表示永久保留；默认 90
+	ConversationArchiveExclude ConversationArchiveExclude // 会话存档排除项（机器码/客户端/IP/API Key）；命中的请求完全不采集
+	DownloadsDir               string                     // 工具包物理目录；配置后 /downloads/* 优先从该目录读取，避免更新 zip 时必须重新构建二进制
+	Database                   DatabaseConfig
+	Cache                      CacheConfig
+	UseWebsocket               bool     // 是否启用 WebSocket 传输
+	CodexUpstreamTransport     string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
+	TrustedProxies             []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -213,6 +214,11 @@ func Load(envPath string) (*Config, error) {
 		if days, err := strconv.Atoi(v); err == nil && days >= 0 {
 			cfg.ConversationRetentionDays = days
 		}
+	}
+	if exclude, err := ParseConversationArchiveExclude(os.Getenv("CODEX_CONVERSATION_EXCLUDE")); err != nil {
+		return nil, err
+	} else {
+		cfg.ConversationArchiveExclude = exclude
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_USAGE_LOG_MASTER_KEY")); v != "" {
 		key, err := parseUsageLogMasterKeyEnv(v)

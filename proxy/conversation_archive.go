@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -38,17 +39,23 @@ const (
 // conversationArchiver 负责异步落库。
 type conversationArchiver struct {
 	db      *database.DB
+	exclude *archiveExclusion
 	jobs    chan database.ConversationRecordInput
 	done    chan struct{}
 	once    sync.Once
 	dropped atomic.Int64
 }
 
-func newConversationArchiver(db *database.DB) *conversationArchiver {
+func newConversationArchiver(db *database.DB, exclude config.ConversationArchiveExclude) *conversationArchiver {
 	if db == nil {
 		return nil
 	}
-	a := &conversationArchiver{db: db, jobs: make(chan database.ConversationRecordInput, archiveQueueSize), done: make(chan struct{})}
+	a := &conversationArchiver{
+		db:      db,
+		exclude: newArchiveExclusion(exclude),
+		jobs:    make(chan database.ConversationRecordInput, archiveQueueSize),
+		done:    make(chan struct{}),
+	}
 	go a.run()
 	return a
 }
@@ -139,6 +146,21 @@ func (h *Handler) ConversationArchiveMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		machineID := ""
+		if archiver.exclude.needsMachineID() {
+			machineID = archiveRequestMachineID(c, body)
+		}
+		// 排除项优先判定：机器码 / 显式客户端标识 / 来源 IP 在鉴权之前就能确定，
+		// 命中后连响应都不旁路复制，避免为不落库的请求白拷贝一份字节。
+		if dimension := archiver.exclude.match(archiveIdentity{
+			MachineID: machineID,
+			ClientID:  strings.TrimSpace(c.GetHeader("X-Client-Id")),
+			ClientIP:  archiveExclusionClientIP(c),
+		}); dimension != "" {
+			archiver.exclude.logHit(dimension)
+			c.Next()
+			return
+		}
 		requestText, requestTruncated := archiveRequestText(body, protocol)
 		if len(body) > archiveMaxRequestBytes {
 			requestTruncated = true
@@ -166,6 +188,17 @@ func (h *Handler) ConversationArchiveMiddleware() gin.HandlerFunc {
 
 		row := apiKeyRowFromContext(c)
 		apiKeyID := requestAPIKeyID(c)
+		clientID, _ := resolveAPIKeyClientID(c, row)
+		// 排除项后置判定：API Key 与派生出来的 client_id 只有鉴权之后才知道。
+		if dimension := archiver.exclude.match(archiveIdentity{
+			MachineID: machineID,
+			ClientID:  clientID,
+			ClientIP:  archiveExclusionClientIP(c),
+			APIKeyID:  apiKeyID,
+		}); dimension != "" {
+			archiver.exclude.logHit(dimension)
+			return
+		}
 		apiKeyName := ""
 		if row != nil {
 			apiKeyName = strings.TrimSpace(row.Name)
@@ -184,7 +217,6 @@ func (h *Handler) ConversationArchiveMiddleware() gin.HandlerFunc {
 		if requestID == "" {
 			requestID = sessionID
 		}
-		clientID, _ := resolveAPIKeyClientID(c, row)
 		completedAt := time.Now().UTC()
 		archiver.enqueue(database.ConversationRecordInput{
 			RequestID:        requestID,

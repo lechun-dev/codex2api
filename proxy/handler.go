@@ -1472,7 +1472,7 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 		apiKeyGate:   newAPIKeyConcurrencyLimiter(),
 	}
 	if cfg != nil && cfg.ConversationRecording {
-		handler.convArchiver = newConversationArchiver(db)
+		handler.convArchiver = newConversationArchiver(db, cfg.ConversationArchiveExclude)
 	}
 	handler.liveStore = newLiveCallStore(handler)
 	return handler

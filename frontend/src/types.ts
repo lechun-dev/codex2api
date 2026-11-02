@@ -640,6 +640,9 @@ export interface AccountPageStatsItem {
 }
 
 export interface AccountPageStatsResponse {
+  // 2026-11-02 coder(lq): Display-only snapshot freshness, not a billing or quota enforcement source.
+  stats_updated_at?: string
+  stats_state?: 'ready' | 'stale' | 'partial'
   stats: Record<string, AccountPageStatsItem>
 }
 
@@ -3975,7 +3978,10 @@ export interface APIKeyRow {
   created_at: ISODateString
 }
 
-export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
+export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow> & {
+  last_used_stats_at?: string
+  last_used_stats_state?: 'ready' | 'stale' | 'unavailable'
+}
 
 export type PromptFilterScope = 'inherit' | 'local_only' | 'off'
 

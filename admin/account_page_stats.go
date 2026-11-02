@@ -2,8 +2,11 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/codex2api/database"
@@ -33,6 +36,11 @@ type accountPageStatsItem struct {
 	OfficialUsageSynced bool `json:"official_usage_synced,omitempty"`
 }
 
+type accountUsageWindowStats struct {
+	Short map[int64]*database.AccountTimeRangeUsage
+	Long  map[int64]*database.AccountTimeRangeUsage
+}
+
 // GetAccountPageStats loads log-derived usage and billing values after the
 // visible account page has rendered. The request is strictly bounded to one
 // page, avoiding any pool-wide aggregation on the first-screen path.
@@ -53,24 +61,59 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+
 	now := time.Now()
-	usage5h, usage7d, err := h.db.GetAccountUsageWindowsByIDs(ctx, ids, now.Add(-5*time.Hour), now.AddDate(0, 0, -7))
+	todaySince := database.StartOfDay(now)
+	// 2026-11-02 coder(lq): Normalize page identity and invalidate at local midnight, account mutations or credential replacement; never cache official-sync state.
+	slices.Sort(ids)
+	key := fmt.Sprintf("account-page:%d:%d:%v", h.accountCachesGen.Load(), todaySince.Unix(), ids)
+	if h.store != nil {
+		var generations strings.Builder
+		for _, id := range ids {
+			if account := h.store.FindByID(id); account != nil {
+				fmt.Fprintf(&generations, ":%d=%d", id, account.GetCredentialGeneration())
+			}
+		}
+		key += generations.String()
+	}
+	windows, windowsAt, windowsStale, err := loadDisplayStats(&h.displayStats, ctx, key+":windows", 8*time.Second, func(loadCtx context.Context) (accountUsageWindowStats, error) {
+		short, long, loadErr := h.db.GetAccountUsageWindowsByIDs(loadCtx, ids, now.Add(-5*time.Hour), now.AddDate(0, 0, -7))
+		return accountUsageWindowStats{Short: short, Long: long}, loadErr
+	})
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
+	usage5h, usage7d := windows.Short, windows.Long
+	statsAt, statsState := windowsAt, "ready"
+	recordState := func(at time.Time, stale bool, loadErr error) {
+		if loadErr != nil {
+			statsState = "partial"
+			return
+		}
+		if at.Before(statsAt) {
+			statsAt = at
+		}
+		if stale && statsState == "ready" {
+			statsState = "stale"
+		}
+	}
+	recordState(windowsAt, windowsStale, nil)
 
-	// 今日口径与全局统计一致:服务器时区(TZ 配置,默认宿主时区)当天 0 点起。
-	// 失败时整列不下发,让前端保持占位,避免把"查询失败"显示成 0。
-	todaySince := database.StartOfDay(now)
-	usageToday, todayErr := h.db.GetAccountUsageSinceByIDs(ctx, ids, todaySince)
+	// 2026-11-02 coder(lq): 今日/模型统计各自失败不缓存零值，也不覆盖其他统计的旧值。
+	usageToday, todayAt, todayStale, todayErr := loadDisplayStats(&h.displayStats, ctx, key+":today", 4*time.Second, func(loadCtx context.Context) (map[int64]*database.AccountTimeRangeUsage, error) {
+		return h.db.GetAccountUsageSinceByIDs(loadCtx, ids, todaySince)
+	})
+	recordState(todayAt, todayStale, todayErr)
 	if todayErr != nil {
 		log.Printf("获取当前页账号今日用量失败: %v", todayErr)
 	}
-	todayModels, todayModelErr := h.db.GetAccountModelCountsSinceByIDs(ctx, ids, todaySince)
+	todayModels, modelsAt, modelsStale, todayModelErr := loadDisplayStats(&h.displayStats, ctx, key+":models", 4*time.Second, func(loadCtx context.Context) (map[int64]map[string]database.AccountModelCount, error) {
+		return h.db.GetAccountModelCountsSinceByIDs(loadCtx, ids, todaySince)
+	})
+	recordState(modelsAt, modelsStale, todayModelErr)
 	if todayModelErr != nil {
 		log.Printf("获取当前页账号今日模型分布失败: %v", todayModelErr)
-		todayModels = map[int64]map[string]database.AccountModelCount{}
 	}
 
 	billing5hWindows, billing7dWindows := h.accountBillingWindows(ids)
@@ -154,7 +197,7 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 		stats[id] = item
 	}
 	h.enqueueWhamDailyUsageBackfill(missingOfficial)
-	c.JSON(http.StatusOK, gin.H{"stats": stats})
+	c.JSON(http.StatusOK, gin.H{"stats": stats, "stats_updated_at": statsAt, "stats_state": statsState})
 }
 
 func (h *Handler) accountBillingWindows(ids []int64) (map[int64]time.Time, map[int64]time.Time) {

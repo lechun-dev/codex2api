@@ -59,7 +59,9 @@ type usageLogsResponse struct {
 }
 
 type apiKeysResponse struct {
-	Keys []*MaskedAPIKeyRow `json:"keys"`
+	Keys               []*MaskedAPIKeyRow `json:"keys"`
+	LastUsedStatsAt    *time.Time         `json:"last_used_stats_at,omitempty"`
+	LastUsedStatsState string             `json:"last_used_stats_state,omitempty"`
 }
 
 // MaskedAPIKeyRow API Key 响应（含脱敏和完整 key）

@@ -541,3 +541,53 @@ func TestGetAccountPageStatsIncludesTodayModelCounts(t *testing.T) {
 		t.Fatalf("today model first-token averages = %#v, want gpt-5.4=1500 gpt-5.2=500", today.ModelAvgFirstTokenMs)
 	}
 }
+
+// 2026-11-02 coder(lq): Repeated page reads reuse log aggregates; account mutation and log clearing invalidate them without changing official-sync behavior.
+func TestGetAccountPageStatsCachesOnlyLogAggregates(t *testing.T) {
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "cached-stats", "rt-cached-stats", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handler{db: db}
+	add := func(status int, retry bool) {
+		t.Helper()
+		if err := db.InsertUsageLog(ctx, &database.UsageLogInput{
+			AccountID: id, Endpoint: "/v1/responses", Model: "test-model",
+			StatusCode: status, TotalTokens: 10, IsRetryAttempt: retry,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		db.FlushUsageLogs()
+	}
+	add(200, false)
+	key := strconv.FormatInt(id, 10)
+	first := invokeAccountPageStats(t, handler, []int64{id})[key]
+	if first.Usage5hDetail == nil || first.Usage5hDetail.Requests != 1 {
+		t.Fatalf("first=%+v", first)
+	}
+	add(200, false)
+	add(499, false)
+	add(500, true)
+	second := invokeAccountPageStats(t, handler, []int64{id})[key]
+	if second.Usage5hDetail.Requests != 1 || second.UsageTodayDetail.Requests != 1 {
+		t.Fatal("fresh log aggregates were not reused")
+	}
+	handler.invalidateAccountSnapshotCaches()
+	third := invokeAccountPageStats(t, handler, []int64{id})[key]
+	if third.Usage5hDetail.Requests != 2 || third.UsageTodayDetail.Requests != 2 {
+		t.Fatalf("invalidated result lost filtering semantics: %+v", third)
+	}
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequest(http.MethodDelete, "/api/admin/usage-logs", nil)
+	handler.ClearUsageLogs(ginContext)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("clear: %d %s", recorder.Code, recorder.Body.String())
+	}
+	fourth := invokeAccountPageStats(t, handler, []int64{id})[key]
+	if fourth.UsageTodayDetail == nil || fourth.UsageTodayDetail.Requests != 0 || fourth.Usage5hDetail != nil {
+		t.Fatalf("cleared logs still cached: %+v", fourth)
+	}
+}

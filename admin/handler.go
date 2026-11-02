@@ -140,6 +140,8 @@ type Handler struct {
 	importLoadNow      func() time.Time
 	importLoadSnapshot func() importRuntimeLoadSnapshot
 
+	// 2026-11-02 coder(lq): Bound and coalesce expensive display-only statistics, separate from auth/quota caches.
+	displayStats displayStatsCache
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
@@ -8681,6 +8683,7 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 		return
 	}
 	h.deleteRuntimeCache(ctx, adminUsageStatsCacheNamespace, "global")
+	h.displayStats.clear()
 	h.chartCacheMu.Lock()
 	h.chartCacheData = make(map[string]*chartCacheEntry)
 	h.chartCacheMu.Unlock()
@@ -8742,8 +8745,15 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		costToday, _ = h.db.GetAllAPIKeysCostSince(ctx, database.StartOfDay(time.Now()))
 	}
 
-	// 最近使用时间：一次聚合，失败不阻断列表
-	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
+	// 2026-11-02 coder(lq): Last-use timestamps are optional display data; bound cold loads and coalesce simultaneous admin refreshes.
+	lastUsedByID, lastUsedAt, lastUsedStale, lastUsedErr := loadDisplayStats(&h.displayStats, ctx, "api-key-last-used", 2*time.Second, h.db.ListAPIKeyLastUsedAt)
+	lastUsedState := "ready"
+	if lastUsedErr != nil {
+		lastUsedState = "unavailable"
+		log.Printf("获取 API Key 最近使用时间失败: %v", lastUsedErr)
+	} else if lastUsedStale {
+		lastUsedState = "stale"
+	}
 
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
@@ -8774,7 +8784,11 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		maskedKeys = append(maskedKeys, mk)
 	}
 
-	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
+	var lastUsedStatsAt *time.Time
+	if !lastUsedAt.IsZero() {
+		lastUsedStatsAt = &lastUsedAt
+	}
+	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys, LastUsedStatsAt: lastUsedStatsAt, LastUsedStatsState: lastUsedState})
 }
 
 type createKeyReq struct {

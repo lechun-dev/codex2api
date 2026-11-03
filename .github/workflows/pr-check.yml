@@ -97,6 +97,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # 本地自定义功能守护：会话存档排除（CODEX_CONVERSATION_EXCLUDE）。
+      # 上游合并覆盖该功能时，这里直接红，详见 docs/UPSTREAM-MERGE-PROTECTION.md。
+      - name: Check local-only conversation archive exclusion
+        run: bash .github/scripts/check-conversation-archive.sh
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:

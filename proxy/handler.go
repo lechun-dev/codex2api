@@ -2191,10 +2191,13 @@ func responseCachePreparationFailure(prepared responsesBodyPreparation) (status 
 	return 0, "", false
 }
 
-func sendResponseContextUnavailable(c *gin.Context, status int, reason string) {
+// sendResponseContextUnavailable rejects a continuation whose parent context
+// cannot be proven. The 409 uses OpenAI's previous_response_not_found code so a
+// client resends the full conversation instead of retrying the same parent.
+func sendResponseContextUnavailable(c *gin.Context, status int, reason string, prepared responsesBodyPreparation) {
 	code := api.ErrCodeResponseContextUnavailable
 	errType := api.ErrorTypeInvalidRequest
-	message := "Previous response context is unavailable"
+	message := responseContextUnavailableMessage
 	if status == http.StatusServiceUnavailable {
 		code = api.ErrCodeServiceUnavailable
 		errType = api.ErrorTypeServer
@@ -2203,6 +2206,7 @@ func sendResponseContextUnavailable(c *gin.Context, status int, reason string) {
 	if status == http.StatusConflict {
 		recordResponseCacheKnownUnavailableError()
 	}
+	logResponseContextUnavailable(c, status, reason, prepared)
 	api.SendErrorWithStatus(c, api.NewAPIErrorWithDetails(
 		code,
 		message,
@@ -4200,8 +4204,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
-	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
-	turnContinuationPinned := turnContinuation && turnHasBinding
+	var turnAccountID int64
+	var turnContinuationPinned bool
+	if turnContinuation && pin == nil {
+		turnAccountID, turnContinuationPinned = h.store.SessionAffinityAccountID(affinityKey)
+	}
+	quotaFailover := false
 	replayableTurn := turnContinuationPinned && canReplayTextContinuation(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -4341,6 +4349,30 @@ func (h *Handler) Responses(c *gin.Context) {
 			account = pin.next(c, h.store, accountFilter, retryExclusions)
 		} else if !retainedHTTPFallback {
 			borrowedContinuation = false
+			quotaAffinityReleased := false
+			if turnContinuationPinned {
+				if limited := h.quotaBlockedContinuationAccount(turnAccountID); limited != nil {
+					if continuationUnavailable {
+						sendResponseContextUnavailable(c, continuationStatus, continuationReason, bodyPreparation)
+						return
+					}
+					replayRaw, contextErr := responsesQuotaReplayBody(rawBody, codexBody)
+					if contextErr != nil {
+						logQuotaFailoverRejected(c, "http", limited.ID(), attempt+1, rawBody, contextErr)
+						api.SendError(c, contextErr)
+						return
+					}
+					rawBody = replayRaw
+					codexBody, _ = sjson.DeleteBytes(codexBody, "client_metadata.x-codex-turn-state")
+					resetOpenAIResponsesBody()
+					turnContinuationPinned = false
+					quotaFailover = true
+					quotaAffinityReleased = true
+					h.store.UnbindSessionAffinity(affinityKey, limited.ID())
+					log.Printf("[quota-failover] complete HTTP context admitted; releasing exhausted account affinity (account=%d, attempt=%d, encrypted_reasoning=%d)", limited.ID(), attempt+1, quotaFailoverEncryptedReasoning(rawBody))
+				}
+			}
+			affinityGuard = auth.SessionAffinityGuard{}
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
 				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			}
@@ -4357,7 +4389,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 续链重试同样传 SelectionOptions，避免重试把选号上下文丢掉。
 					account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithSelection(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 				}
-			} else {
+			} else if !quotaAffinityReleased || h.quotaFailoverHasCandidate(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
 		}
@@ -4414,7 +4446,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if isStream && writeCommittedResponsesRetryError(c, "Previous response context is unavailable") {
 					return
 				}
-				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
+				sendResponseContextUnavailable(c, continuationStatus, continuationReason, bodyPreparation)
 				return
 			}
 			h.store.LogUnavailablePool(c.Writer.Header().Get("X-Request-ID"), effectiveModel, apiKeyID, retryExclusions.ForSelection(), dispatchPolicy, func() any {
@@ -4524,6 +4556,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			codexBody, _ = sjson.DeleteBytes(codexBody, "client_metadata.x-codex-turn-state")
 			resetOpenAIResponsesBody()
 			log.Printf("[continuation_capacity_borrowed] api_key_id=%d account_id=%d", apiKeyID, account.ID())
+		}
+		if quotaFailover {
+			downstreamHeaders.Del(codexTurnStateHeader)
 		}
 
 		if account.IsRelayStyle() {
@@ -6425,7 +6460,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					return
 				}
-				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
+				sendResponseContextUnavailable(c, continuationStatus, continuationReason, bodyPreparation)
 				return
 			}
 			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)

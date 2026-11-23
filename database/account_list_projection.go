@@ -24,12 +24,14 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelGrok)
 		case UpstreamChannelAntigravity:
 			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity)
+		case UpstreamChannelKiro:
+			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelKiro)
 		case UpstreamChannelClaude:
 			where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude)
 		case UpstreamChannelCodex:
 			where += ` AND NOT (` + db.accountUpstreamTypePredicate(UpstreamChannelGrok) +
 				` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity) +
-				` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + `)`
+				` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + ` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelKiro) + `)`
 		}
 		query = `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 			COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
@@ -47,7 +49,7 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			antigravity_sync_error text, antigravity_sync_warning text,
 			antigravity_permissions text, antigravity_entitlements text, antigravity_quota text,
 			claude_usage_probe_at text, claude_usage_probe_error text,
-			claude_auth_kind text,
+			claude_auth_kind text, kiro_auth_kind text, kiro_login_source text, kiro_usage text,
 			subscription_expires_at text, subscription_sync_state text, subscription_grace_until text
 		)`
 	credentialColumns := `
@@ -69,6 +71,9 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(account_public.claude_usage_probe_at, ''),
 		COALESCE(account_public.claude_usage_probe_error, ''),
 		COALESCE(account_public.claude_auth_kind, ''),
+		COALESCE(account_public.kiro_auth_kind, ''),
+		COALESCE(account_public.kiro_login_source, ''),
+		COALESCE(account_public.kiro_usage, ''),
 		COALESCE(account_public.subscription_expires_at, ''),
 		COALESCE(account_public.subscription_sync_state, ''),
 		COALESCE(account_public.subscription_grace_until, '')`
@@ -94,20 +99,14 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			COALESCE(json_extract(credentials, '$.claude_usage_probe_at'), ''),
 			COALESCE(json_extract(credentials, '$.claude_usage_probe_error'), ''),
 			COALESCE(json_extract(credentials, '$.claude_auth_kind'), ''),
+			COALESCE(json_extract(credentials, '$.kiro_auth_kind'), ''),
+			COALESCE(json_extract(credentials, '$.kiro_login_source'), ''),
+			COALESCE(json_extract(credentials, '$.kiro_usage'), ''),
 			COALESCE(json_extract(credentials, '$.subscription_expires_at'), ''),
 			COALESCE(json_extract(credentials, '$.subscription_sync_state'), ''),
 			COALESCE(json_extract(credentials, '$.subscription_grace_until'), '')`
 	}
-	switch channel {
-	case UpstreamChannelGrok:
-		where += ` AND ` + upstreamExpr + ` = 'grok'`
-	case UpstreamChannelAntigravity:
-		where += ` AND ` + upstreamExpr + ` = 'antigravity'`
-	case UpstreamChannelClaude:
-		where += ` AND ` + upstreamExpr + ` = 'claude'`
-	case UpstreamChannelCodex:
-		where += ` AND ` + upstreamExpr + ` NOT IN ('grok', 'antigravity', 'claude')`
-	}
+	where += accountChannelFilterSQL(channel, upstreamExpr)
 	query := `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 		COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
 		score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at,
@@ -175,6 +174,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	var avatarURL, projectID string
 	var antigravitySyncError, antigravitySyncWarning, antigravityPermissions, antigravityQuota string
 	var claudeUsageProbeAt, claudeUsageProbeError, claudeAuthKind string
+	var kiroAuthKind, kiroLoginSource, kiroUsage string
 	var subscriptionExpiresAt, subscriptionSyncState, subscriptionGraceUntil string
 	var modelsRaw interface{}
 	var hasAPIKey, hasRefreshToken, verifiedEmail bool
@@ -187,6 +187,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		&avatarURL, &verifiedEmail, &projectID,
 		&antigravitySyncError, &antigravitySyncWarning, &antigravityPermissions, &antigravityQuota,
 		&claudeUsageProbeAt, &claudeUsageProbeError, &claudeAuthKind,
+		&kiroAuthKind, &kiroLoginSource, &kiroUsage,
 		&subscriptionExpiresAt, &subscriptionSyncState, &subscriptionGraceUntil,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
@@ -214,6 +215,7 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		"claude_usage_probe_at":    claudeUsageProbeAt,
 		"claude_usage_probe_error": claudeUsageProbeError,
 		"claude_auth_kind":         claudeAuthKind,
+		"kiro_auth_kind":           kiroAuthKind, "kiro_login_source": kiroLoginSource, "kiro_usage": kiroUsage,
 		"subscription_expires_at":  subscriptionExpiresAt,
 		"subscription_sync_state":  subscriptionSyncState,
 		"subscription_grace_until": subscriptionGraceUntil,
@@ -260,7 +262,7 @@ func projectAccountCredentials(credentials map[string]interface{}) map[string]in
 	for _, key := range []string{
 		"avatar_url", "project_id", "antigravity_sync_error", "antigravity_sync_warning",
 		"antigravity_permissions", "antigravity_quota", "claude_usage_probe_at", "claude_usage_probe_error",
-		"claude_auth_kind", "subscription_expires_at", "subscription_sync_state", "subscription_grace_until",
+		"kiro_auth_kind", "kiro_login_source", "kiro_usage", "claude_auth_kind", "subscription_expires_at", "subscription_sync_state", "subscription_grace_until",
 	} {
 		if value := credentials[key]; value != nil && strings.TrimSpace(projectionStringValue(value)) != "" {
 			projected[key] = value

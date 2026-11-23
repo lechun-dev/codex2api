@@ -22,6 +22,16 @@ const (
 )
 
 var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
+	// 2026-11-23 coder(lq): Keep upstream settings available on fresh and upgraded MySQL 5.6/8.0 schemas; JSON defaults stay in Go.
+	{table: "system_settings", name: "kiro_config", def: "TEXT NULL"},
+	{table: "system_settings", name: "background_quiet_hours", def: "TEXT NULL"},
+	{table: "system_settings", name: "output_guard_enabled", def: "TINYINT(1) DEFAULT 0"},
+	{table: "system_settings", name: "output_guard_max_tool_argument_bytes", def: "BIGINT NOT NULL DEFAULT 262144"},
+	{table: "system_settings", name: "output_guard_max_tool_argument_deltas", def: "INT NOT NULL DEFAULT 4096"},
+	{table: "system_settings", name: "output_guard_max_channel_bytes", def: "BIGINT NOT NULL DEFAULT 2097152"},
+	{table: "system_settings", name: "output_guard_max_request_bytes", def: "BIGINT NOT NULL DEFAULT 4194304"},
+	{table: "system_settings", name: "output_guard_config_generation", def: "BIGINT NOT NULL DEFAULT 1"},
+
 	// 2026-09-09 coder(lq): Use VARCHAR so MySQL 5.6 supports the empty deployment-default value.
 	{table: "system_settings", name: "codex_images_main_model", def: "VARCHAR(128) DEFAULT ''"},
 	// 2026-09-09 coder(lq): New upstream JSON settings use reader fallbacks instead of unsupported TEXT defaults.
@@ -73,7 +83,7 @@ var mysql56SystemSettingsColumns = []mysqlColumnDefinition{
 	{table: "system_settings", name: "oauth_model_cooldown_backoff_enabled", def: "TINYINT(1) NOT NULL DEFAULT 1"},
 	// 2026-10-26 coder(lq): 上游 v3.1.1 新增的不支持模型冷却时长，默认 1800s。
 	{table: "system_settings", name: "oauth_unsupported_model_cooldown_seconds", def: "INT NOT NULL DEFAULT 1800"},
-	{table: "system_settings", name: "codex_min_cli_version", def: "VARCHAR(32) DEFAULT '0.160.0'"},
+	{table: "system_settings", name: "codex_min_cli_version", def: "VARCHAR(32) DEFAULT '0.170.0'"},
 	{table: "system_settings", name: "codex_ws_stateless_slots", def: "INT DEFAULT 8"},
 	// 2026-10-10 coder(lq): Add the independent chat retention budget to both upgraded and fresh MySQL schemas.
 	{table: "system_settings", name: "codex_ws_downstream_keepalive_slots", def: "INT DEFAULT 8"},
@@ -130,8 +140,18 @@ var mysql56AccountGroupColumns = []mysqlColumnDefinition{
 	{table: "account_groups", name: "channel", def: "VARCHAR(16) NOT NULL DEFAULT 'codex'"},
 }
 
+// 2026-11-23 coder(lq): Portal reset identifiers are ASCII UUIDs/scopes; bounded binary keys fit MySQL 5.6's 767-byte index limit.
+func keyUsageAccountMySQLDDL() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS key_usage_account_permissions (key_id BIGINT NOT NULL PRIMARY KEY, view_enabled TINYINT(1) NOT NULL DEFAULT 0, reset_enabled TINYINT(1) NOT NULL DEFAULT 0) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_attempts (request_id VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, key_id BIGINT NOT NULL, account_id BIGINT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_leases (scope VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, owner VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, expires_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_cooldowns (scope VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, expires_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
+	}
+}
+
 func (db *DB) migrateMySQL(ctx context.Context) error {
-	statements := []string{
+	statements := append(keyUsageAccountMySQLDDL(), []string{
 		`CREATE TABLE IF NOT EXISTS accounts (
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(255) DEFAULT '',
@@ -381,7 +401,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8`,
 		promptFilterLogsMySQLDDL(),
 		`DROP TABLE IF EXISTS prompt_filter_secrets`,
-	}
+	}...)
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
 			return err
@@ -540,7 +560,7 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		{"system_settings", "scheduler_mode", "VARCHAR(20) DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "VARCHAR(16) DEFAULT 'bounded'"},
 		{"system_settings", "client_compat_mode", "VARCHAR(20) DEFAULT 'preserve'"},
-		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.160.0'"},
+		{"system_settings", "codex_min_cli_version", "VARCHAR(32) DEFAULT '0.170.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT NULL"},
 		{"system_settings", "usage_log_mode", "VARCHAR(20) DEFAULT 'full'"},
 		{"system_settings", "usage_log_batch_size", "INT DEFAULT 200"},
@@ -592,8 +612,8 @@ func (db *DB) migrateMySQL(ctx context.Context) error {
 		ctx,
 		"system_settings",
 		"codex_min_cli_version",
-		"0.160.0",
-		"VARCHAR(32) DEFAULT '0.160.0'",
+		"0.170.0",
+		"VARCHAR(32) DEFAULT '0.170.0'",
 	); err != nil {
 		return err
 	}
@@ -824,6 +844,15 @@ func promptFilterLogsMySQLDDL() string {
 // 运行时再由读取逻辑做 COALESCE/兜底。
 func systemSettingsMySQLDDL() string {
 	return `CREATE TABLE IF NOT EXISTS system_settings (
+		kiro_config TEXT NULL,
+		background_quiet_hours TEXT NULL,
+		output_guard_enabled TINYINT(1) DEFAULT 0,
+		output_guard_max_tool_argument_bytes BIGINT NOT NULL DEFAULT 262144,
+		output_guard_max_tool_argument_deltas INT NOT NULL DEFAULT 4096,
+		output_guard_max_channel_bytes BIGINT NOT NULL DEFAULT 2097152,
+		output_guard_max_request_bytes BIGINT NOT NULL DEFAULT 4194304,
+		output_guard_config_generation BIGINT NOT NULL DEFAULT 1,
+
 		id INT NOT NULL PRIMARY KEY,
 		site_name VARCHAR(255) DEFAULT 'CodexProxy',
 		site_logo VARCHAR(1024) DEFAULT '',
@@ -878,7 +907,7 @@ func systemSettingsMySQLDDL() string {
 		prompt_filter_review_timeout_seconds INT DEFAULT 10,
 		prompt_filter_review_fail_closed TINYINT(1) DEFAULT 1,
 		client_compat_mode VARCHAR(20) DEFAULT 'preserve',
-		codex_min_cli_version VARCHAR(32) DEFAULT '0.160.0',
+		codex_min_cli_version VARCHAR(32) DEFAULT '0.170.0',
 		codex_user_agent_config TEXT NULL,
 		codex_images_main_model VARCHAR(128) DEFAULT '',
 		usage_log_mode VARCHAR(20) DEFAULT 'full',

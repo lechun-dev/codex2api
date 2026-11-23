@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/codex2api/security"
 )
 
 // APIKeyWindowUsage 表示一个 API Key 在某时间窗口内的累计使用量。
@@ -261,6 +263,79 @@ func (db *DB) GetAPIKeysAccountWindowUsage(ctx context.Context, apiKeyIDs []int6
 	return out, rows.Err()
 }
 
+// usageAPIKeyIdentity keeps snapshot labels for requests without a persisted key ID.
+type usageAPIKeyIdentity struct {
+	id     int64
+	name   string
+	masked string
+}
+
+func (key usageAPIKeyIdentity) label() string {
+	if key.name != "" {
+		return key.name
+	}
+	if key.masked != "" {
+		return key.masked
+	}
+	return "unknown"
+}
+
+// usageAPIKeyMetadata resolves display fields after aggregation. A deleted key
+// uses its most recent available log snapshot so its history remains identifiable.
+func (db *DB) usageAPIKeyMetadata(ctx context.Context, ids []int64) (map[int64]usageAPIKeyIdentity, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	selectIDs := `SELECT CAST(value AS BIGINT) AS id FROM jsonb_array_elements_text($1::jsonb)`
+	if db.isSQLite() {
+		selectIDs = `SELECT CAST(value AS INTEGER) AS id FROM json_each($1)`
+	}
+	args := []interface{}{encodeInt64SliceJSON(ids)}
+	prefix, table := "WITH wanted AS ("+selectIDs+")", "wanted w"
+	if db.isMySQL() {
+		// 2026-11-23 coder(lq): Keep deleted-key labels without CTE/JSON SQL; IDs remain bound parameters on MySQL 5.6.
+		ids = positiveUniqueIDs(ids)
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		selects := make([]string, len(ids))
+		for i, placeholder := range dbPlaceholders(false, 1, len(ids)) {
+			selects[i] = "SELECT " + placeholder + " AS id"
+		}
+		prefix, table, args = "", "("+strings.Join(selects, " UNION ALL ")+") w", argsFromInt64s(ids)
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+`+prefix+`
+		SELECT w.id, COALESCE(k.name, h.api_key_name, ''), COALESCE(k.key, ''), COALESCE(h.api_key_masked, '')
+		FROM `+table+`
+		LEFT JOIN api_keys k ON k.id = w.id
+		LEFT JOIN usage_logs h ON k.id IS NULL AND h.id = (
+			SELECT l.id FROM usage_logs l
+			WHERE l.api_key_id = w.id AND l.status_code <> 499
+			  AND (NULLIF(l.api_key_name, '') IS NOT NULL OR NULLIF(l.api_key_masked, '') IS NOT NULL)
+			ORDER BY l.created_at DESC, l.id DESC
+			LIMIT 1
+		)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	metadata := make(map[int64]usageAPIKeyIdentity, len(ids))
+	for rows.Next() {
+		var item usageAPIKeyIdentity
+		var key string
+		if err := rows.Scan(&item.id, &item.name, &key, &item.masked); err != nil {
+			return nil, err
+		}
+		if key != "" {
+			item.masked = security.MaskAPIKey(key)
+		}
+		metadata[item.id] = item
+	}
+	return metadata, rows.Err()
+}
+
 // APIKeyTokenStat 是 API Key 在某时间区间内的 token 使用排行项。
 // 比 UsageAPIKeyStat 更细——分列 input / output / cached token，便于 UI 单独排序。
 type APIKeyTokenStat struct {
@@ -289,8 +364,8 @@ func (db *DB) ListAPIKeyTokenStats(ctx context.Context, rangeStart, rangeEnd tim
 	query := `
 		SELECT
 			COALESCE(api_key_id, 0) AS api_key_id,
-			COALESCE(api_key_name, '') AS api_key_name,
-			COALESCE(api_key_masked, '') AS api_key_masked,
+			CASE WHEN api_key_id > 0 THEN '' ELSE COALESCE(api_key_name, '') END AS api_key_name,
+			CASE WHEN api_key_id > 0 THEN '' ELSE COALESCE(api_key_masked, '') END AS api_key_masked,
 			COUNT(*) AS requests,
 			COALESCE(SUM(input_tokens), 0) AS input_tokens,
 			COALESCE(SUM(output_tokens), 0) AS output_tokens,
@@ -316,6 +391,7 @@ func (db *DB) ListAPIKeyTokenStats(ctx context.Context, rangeStart, rangeEnd tim
 	defer rows.Close()
 
 	items := make([]APIKeyTokenStat, 0, 16)
+	var keyIDs []int64
 	for rows.Next() {
 		var item APIKeyTokenStat
 		if err := rows.Scan(
@@ -332,19 +408,26 @@ func (db *DB) ListAPIKeyTokenStats(ctx context.Context, rangeStart, rangeEnd tim
 		); err != nil {
 			return nil, err
 		}
-		// 计算 label（前端可直接展示）：优先 name，其次 masked，否则 "unknown"
-		switch {
-		case item.APIKeyName != "":
-			item.Label = item.APIKeyName
-		case item.APIKeyMasked != "":
-			item.Label = item.APIKeyMasked
-		default:
-			item.Label = "unknown"
+		if item.APIKeyID > 0 {
+			keyIDs = append(keyIDs, item.APIKeyID)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	metadata, err := db.usageAPIKeyMetadata(ctx, keyIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		item := &items[i]
+		key := usageAPIKeyIdentity{name: item.APIKeyName, masked: item.APIKeyMasked}
+		if item.APIKeyID > 0 {
+			key = metadata[item.APIKeyID]
+			item.APIKeyName, item.APIKeyMasked = key.name, key.masked
+		}
+		item.Label = key.label()
 	}
 	return items, nil
 }
@@ -654,7 +737,8 @@ func (db *DB) getAllAPIKeysCostSince(ctx context.Context, since time.Time, honor
 }
 
 // APIKeySelfUsageReport 是 API Key 自助统计页使用的只读聚合结果。
-// 只包含当前 key 自己的 usage_logs 数据,不返回账号池、客户端 IP、raw key 等后台字段。
+// 只包含当前 key 自己的 usage_logs 数据(含经该 key 发起请求的客户端 IP 与 User-Agent,
+// 共享同一 key 的持有者可互相看到),不返回其他 key 的日志、账号池、raw key 等后台字段。
 type APIKeySelfUsageReport struct {
 	Summary            APIKeySelfUsageSummary     `json:"summary"`
 	Windows            APIKeySelfUsageWindows     `json:"windows"`
@@ -735,6 +819,8 @@ type APIKeySelfUsageLog struct {
 	UserBilling
 	ID                     int64     `json:"id"`
 	Channel                string    `json:"channel"`
+	ClientIP               string    `json:"client_ip"`
+	ClientUserAgent        string    `json:"client_user_agent"`
 	Endpoint               string    `json:"endpoint"`
 	Model                  string    `json:"model"`
 	EffectiveModel         string    `json:"effective_model"`
@@ -744,7 +830,11 @@ type APIKeySelfUsageLog struct {
 	FirstTokenMS           int       `json:"first_token_ms"`
 	InputTokens            int       `json:"input_tokens"`
 	OutputTokens           int       `json:"output_tokens"`
+	ReasoningTokens        int       `json:"reasoning_tokens"`
+	ReasoningEffort        string    `json:"reasoning_effort"`
 	CachedTokens           int       `json:"cached_tokens"`
+	CacheWrite5mTokens     int       `json:"cache_write_5m_tokens"`
+	CacheWrite1hTokens     int       `json:"cache_write_1h_tokens"`
 	ImageInputTokens       int       `json:"image_input_tokens"`
 	ImageOutputTokens      int       `json:"image_output_tokens"`
 	CachedImageInputTokens int       `json:"cached_image_input_tokens"`
@@ -783,7 +873,7 @@ func (l *APIKeySelfUsageLog) populateBillingBreakdown() {
 		l.TotalCost = l.UserBilled
 		return
 	}
-	breakdown := UsageLogCostBreakdown(&UsageLogInput{Model: billingModel, DaybreakProgram: l.DaybreakProgram, ServiceTier: l.ServiceTier, InputTokens: l.InputTokens, OutputTokens: l.OutputTokens, CachedTokens: l.CachedTokens, ImageInputTokens: l.ImageInputTokens, ImageOutputTokens: l.ImageOutputTokens, CachedImageInputTokens: l.CachedImageInputTokens})
+	breakdown := UsageLogCostBreakdown(&UsageLogInput{Model: billingModel, DaybreakProgram: l.DaybreakProgram, ServiceTier: l.ServiceTier, InputTokens: l.InputTokens, OutputTokens: l.OutputTokens, CachedTokens: l.CachedTokens, ImageInputTokens: l.ImageInputTokens, ImageOutputTokens: l.ImageOutputTokens, CachedImageInputTokens: l.CachedImageInputTokens, CreatedAt: l.CreatedAt})
 	l.InputCost = breakdown.InputCost
 	l.OutputCost = breakdown.OutputCost
 	l.CacheReadCost = breakdown.CacheReadCost
@@ -1268,6 +1358,7 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 		SELECT
 			id,
 			COALESCE(channel, ''),
+			COALESCE(client_ip, ''), COALESCE(client_user_agent, ''),
 			` + apiKeySelfEndpointExpr + ` AS endpoint_name,
 			COALESCE(model, ''),
 			COALESCE(effective_model, ''),
@@ -1277,7 +1368,10 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 			COALESCE(first_token_ms, 0),
 			COALESCE(input_tokens, 0),
 			COALESCE(output_tokens, 0),
+			COALESCE(reasoning_tokens, 0),
+			COALESCE(reasoning_effort, ''),
 			COALESCE(cached_tokens, 0),
+			COALESCE(cache_write_5m_tokens, 0), COALESCE(cache_write_1h_tokens, 0),
 			COALESCE(image_input_tokens, 0), COALESCE(image_output_tokens, 0), COALESCE(cached_image_input_tokens, 0),
 			COALESCE(total_tokens, 0),
 			COALESCE(user_billed, 0),
@@ -1306,6 +1400,7 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 		if err := rows.Scan(
 			&item.ID,
 			&item.Channel,
+			&item.ClientIP, &item.ClientUserAgent,
 			&item.Endpoint,
 			&item.Model,
 			&item.EffectiveModel,
@@ -1315,7 +1410,10 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 			&item.FirstTokenMS,
 			&item.InputTokens,
 			&item.OutputTokens,
-			&item.CachedTokens, &item.ImageInputTokens, &item.ImageOutputTokens, &item.CachedImageInputTokens,
+			&item.ReasoningTokens,
+			&item.ReasoningEffort,
+			&item.CachedTokens, &item.CacheWrite5mTokens, &item.CacheWrite1hTokens,
+			&item.ImageInputTokens, &item.ImageOutputTokens, &item.CachedImageInputTokens,
 			&item.TotalTokens,
 			&item.UserBilled, &item.UserBillingMode, &item.ImageUnitPrice, &item.BilledImageCount,
 			&item.ServiceTier,

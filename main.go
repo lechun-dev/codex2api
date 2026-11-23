@@ -57,6 +57,13 @@ func main() {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
 	proxy.ConfigureDownstreamKeepaliveFromEnv()
+	if err := proxy.ConfigureCodexIdentityTimeFromEnv(); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Codex identity UUIDv7 time cutoff: %d (0 = legacy)", proxy.CodexIdentityV2FromUnixMilli())
+	if err := proxy.ValidateCodexInstallationPins(); err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 	if cfg.DownloadsDir != "" {
 		log.Printf("工具包目录覆盖已启用: %s", cfg.DownloadsDir)
@@ -132,7 +139,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.160.0",
+			CodexMinCLIVersion:                "0.170.0",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -187,7 +194,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.160.0",
+			CodexMinCLIVersion:                "0.170.0",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -268,6 +275,13 @@ func main() {
 		}
 	}
 	antigravityCfgCancel()
+	kiroCfgCtx, kiroCfgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if kiroSettings, err := db.LoadKiroSettings(kiroCfgCtx); err != nil {
+		log.Printf("加载 Kiro 渠道设置失败(按默认值运行): %v", err)
+	} else {
+		admin.ApplyKiroSettings(kiroSettings)
+	}
+	kiroCfgCancel()
 
 	appliedResponseCache := proxy.GetResponseCacheAppliedConfig()
 	log.Printf(
@@ -277,6 +291,23 @@ func main() {
 		appliedResponseCache.LocalMaxEntryBytes,
 		appliedResponseCache.ReconstructMaxBytes,
 	)
+
+	// 模型输出失控防护设置：冷启动读取失败不致命，由后台 5 秒轮询器恢复；
+	// 未就绪期间 HTTP/WS/Stream 门禁统一返回 503 service_unavailable。
+	outputGuardCtx, outputGuardCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := proxy.LoadOutputGuardSettings(outputGuardCtx, db); err != nil {
+		outputGuardCancel()
+		log.Printf("警告: 加载模型输出失控防护设置失败（冷启动门禁将返回 503 直至 DB 轮询恢复）: %v", err)
+	} else {
+		outputGuardCancel()
+		appliedGuard := proxy.CurrentOutputGuardConfig()
+		log.Printf(
+			"模型输出失控防护设置已加载: generation=%d enabled=%t tool_bytes=%d tool_deltas=%d channel_bytes=%d request_bytes=%d",
+			appliedGuard.Generation, appliedGuard.Enabled, appliedGuard.MaxToolArgumentBytes,
+			appliedGuard.MaxToolArgumentDeltas, appliedGuard.MaxChannelBytes, appliedGuard.MaxRequestBytes,
+		)
+	}
+	proxy.StartOutputGuardConfigPoller(context.Background(), db)
 
 	// 4. 初始化缓存（使用数据库中保存的连接池大小）
 	redisPoolSize := 30
@@ -395,6 +426,7 @@ func main() {
 	claudeCLIVersionCancel()
 
 	// 5. 初始化账号管理器
+	auth.CodexOAuthIdentityHeaders = proxy.CodexOAuthIdentityHeaders
 	store := auth.NewStore(db, tc, settings)
 	store.SetSchedulerWaitLimits(cfg.SchedulerMaxWaiters, cfg.SchedulerMaxWaitersPerKey)
 
@@ -430,6 +462,7 @@ func main() {
 	adminHandler.StartAutoResetCredits(backgroundCtx)
 	adminHandler.StartAutoActivate5hWindow(backgroundCtx)
 	adminHandler.StartScheduledConnectionTests(backgroundCtx)
+	adminHandler.StartKiroSync(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
 	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
@@ -745,11 +778,12 @@ func main() {
 			return
 		}
 		c.JSON(200, gin.H{
-			"status":          "ok",
-			"build_version":   version.Current(),
-			"available":       available,
-			"total":           total,
-			"counts_complete": countsComplete,
+			"status":                         "ok",
+			"build_version":                  version.Current(),
+			"codex_identity_v2_from_unix_ms": proxy.CodexIdentityV2FromUnixMilli(),
+			"available":                      available,
+			"total":                          total,
+			"counts_complete":                countsComplete,
 		})
 	})
 

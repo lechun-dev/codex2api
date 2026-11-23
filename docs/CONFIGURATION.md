@@ -298,6 +298,20 @@ API Key 启用多个 RPM/RPD/费用/Token 窗口时，Redis 会通过一次 `MGE
 
 系统设置存储在数据库的 `SystemSettings` 表中，可通过管理后台 `/admin/settings` 实时修改。
 
+### Codex Responses 请求的默认国家码
+
+Codex 默认按客户端请求转发顶层 `request_country`。如果部署需要为省略该字段的请求指定国家，可在管理后台「请求体重写 → JSON」的 `default` 数组中添加规则。下面是尚未配置规则时的完整示例，已有规则时只需追加数组中的条目。
+
+```json
+{
+  "default": [
+    { "params": { "request_country": "JP" } }
+  ]
+}
+```
+
+保存后，省略字段的请求会带上 `"request_country": "JP"`。客户端显式发送的 `null` 或其他国家码优先于这条默认规则。示例适用于普通 Codex Responses 的 HTTP 和 WebSocket 出站。生图、内部探测、独立的 `/v1/responses/compact` 和 Responses 中转账号会跳过这套规则。
+
 ### Codex 生图设置
 
 管理后台「系统设置 → Codex → 生图设置」可选择生图使用的文本驱动模型。选择后自动保存，对本实例之后构造的生图请求立即生效，重启后从数据库恢复。
@@ -751,3 +765,7 @@ curl -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/ops/overview
 管理设置 `codex_oauth_keepalive_enabled`（默认 `false`）允许惰性模式单独运行 Codex Token 续期。它使用现有 `background_refresh_interval_minutes` 巡检间隔和 AT 到期前 5 分钟的阈值，不改变额度冷却、不启用生成探针，也不影响 Claude、Grok 或 Antigravity 的刷新策略。普通模式本来就运行 Codex 续期，不依赖此开关。
 
 Codex 刷新新增 `codex_oauth_refresh_attempts` 保护表，启动时自动创建，兼容 PostgreSQL 与 SQLite。表内只保存旧 RT 的 SHA-256 指纹、刷新操作 ID 和开始时间，不保存明文 Token。成功保存全部相关凭据后删除记录；结果不确定的记录保留，防止跨实例或重启后重复消费旧 RT。已有凭据无需重新导入；已经失效的授权需重新登录恢复。
+
+## 自适应降智检测
+
+降智检测支持可配置上限的指数退避、恢复加速与复发记忆。默认关闭，配置与状态迁移规则见 [自适应降智检测](INTELLIGENCE_BACKOFF.md)。

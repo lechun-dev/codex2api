@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 
 	ic "github.com/codex2api/internal/intelligencecheck"
@@ -184,17 +185,45 @@ func (db *DB) backfillIntelligenceRunSummariesMySQL(ctx context.Context) error {
 // 5.6 没有 JSON 函数，沿用本仓库 accountUpstreamTypePredicate 的既有做法。
 func (db *DB) intelligenceUpstreamExprMySQL(upstreamType string) string {
 	// 生成：... REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"claude"'
-	return `LOWER(COALESCE(CAST(a.credentials AS CHAR),'')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"` + upstreamType + `"'`
+	return `LOWER(COALESCE(CAST(a.credentials AS CHAR),'')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"[[:space:]]*` + upstreamType + `[[:space:]]*"'`
 }
 
+// 2026-11-23 coder(lq): Explicit source metadata wins over legacy platform labels, including Kiro; a different explicit source must not fall back to Claude.
 func (db *DB) intelligenceChannelExprMySQL() string {
-	return `CASE WHEN (` + db.intelligenceUpstreamExprMySQL(UpstreamChannelClaude) + `) OR LOWER(COALESCE(a.platform,'')) IN ('anthropic','claude') THEN 'claude' ELSE 'codex' END`
+	query := "CASE"
+	for _, source := range []string{"antigravity", "grok", "claude", "kiro"} {
+		query += " WHEN (" + db.intelligenceUpstreamExprMySQL(source) + ") THEN '" + source + "'"
+	}
+	query += ` WHEN LOWER(COALESCE(CAST(a.credentials AS CHAR),'')) REGEXP '"upstream_type"[[:space:]]*:[[:space:]]*"[[:space:]]*[^"[:space:]]' THEN 'codex'`
+	return query + ` WHEN LOWER(COALESCE(a.platform,'')) IN ('antigravity','google') THEN 'antigravity' WHEN LOWER(COALESCE(a.platform,'')) IN ('grok','xai') THEN 'grok' WHEN LOWER(COALESCE(a.platform,'')) IN ('anthropic','claude') THEN 'claude' WHEN LOWER(COALESCE(a.platform,''))='kiro' THEN 'kiro' ELSE 'codex' END`
 }
 
 func (db *DB) intelligenceEligibleSQLMySQL() string {
-	return `a.status<>'deleted' AND COALESCE(a.error_message,'')<>'deleted' AND NOT (` +
-		db.intelligenceUpstreamExprMySQL(UpstreamChannelGrok) + ` OR ` + db.intelligenceUpstreamExprMySQL(UpstreamChannelAntigravity) +
-		`) AND LOWER(COALESCE(a.platform,'openai')) NOT IN ('xai','grok','antigravity','google')`
+	return db.intelligenceEligibleSQL()
+}
+
+// 2026-11-23 coder(lq): Mirror the upstream creation trigger in the account insert transaction, including opt-out rows; otherwise newly created accounts cannot be enabled manually until a scheduler tick.
+func (db *DB) enrollNewIntelligenceAccountMySQLTx(ctx context.Context, tx *sql.Tx, id int64) error {
+	s, err := db.intelligenceSettingsTx(ctx, tx)
+	if errors.Is(err, sql.ErrNoRows) {
+		s = ic.DefaultSettings()
+	} else if err != nil {
+		return err
+	}
+	var channel string
+	if err := tx.QueryRowContext(ctx, `SELECT `+db.intelligenceChannelExpr()+` FROM accounts a WHERE a.id=$1`, id).Scan(&channel); err != nil {
+		return err
+	}
+	enabled := s.NewAccountsEnabled && s.ChannelEnabled(channel)
+	if enabled && s.Action == "switch_group" {
+		target, err := intelligenceTargetGroupChannel(ctx, tx, s)
+		if err != nil && !errors.Is(err, ErrIntelligenceCheckTargetGroup) {
+			return err
+		}
+		enabled = err == nil && channel == target
+	}
+	_, err = tx.ExecContext(ctx, `INSERT IGNORE INTO intelligence_check_accounts(account_id,enabled,state_json) VALUES($1,$2,'{}')`, id, enabled)
+	return err
 }
 
 // enrollIntelligenceCheckAccountsMySQLTx 等价于上游的 AFTER INSERT 触发器：
@@ -203,7 +232,7 @@ func (db *DB) enrollIntelligenceCheckAccountsMySQLTx(ctx context.Context, tx *sq
 	if !s.NewAccountsEnabled {
 		return nil
 	}
-	where := db.intelligenceEligibleSQLMySQL() + ` AND st.account_id IS NULL`
+	where := db.intelligenceEligibleSQLMySQL() + ` AND ` + db.intelligenceEnabledChannelsSQL(s) + ` AND st.account_id IS NULL`
 	if s.Action == "switch_group" {
 		if strings.TrimSpace(targetChannel) == "" {
 			return nil

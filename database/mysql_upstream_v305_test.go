@@ -89,7 +89,7 @@ func TestMySQL305SettingsAndUsageSQL(t *testing.T) {
 	if _, err := db.batchInsertLogsChunk(context.Background(), db.conn, []usageLogEntry{{AccountID: 1, StoreUsageLog: true}}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(capture.query, "?") != 75 || len(capture.args) != 75 {
+	if strings.Count(capture.query, "?") != usageLogInsertColumnCount || len(capture.args) != usageLogInsertColumnCount {
 		t.Fatalf("usage insert columns/args: %d/%d", strings.Count(capture.query, "?"), len(capture.args))
 	}
 	for _, name := range []string{"request_text", "session_id", "upstream_response_model", "upstream_model_mismatch", "turn_state_overridden", "turn_state_rewrite_note", "injected_turn_state", "upstream_turn_state", "daybreak_program", "video_seconds"} {

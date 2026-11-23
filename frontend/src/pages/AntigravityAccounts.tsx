@@ -34,6 +34,7 @@ import type {
   AccountGroup,
   AccountHealthBucket,
   AccountListSummary,
+  AccountLiveStateResponse,
   AccountOperationSelector,
   AccountPageStatsItem,
   AccountRow,
@@ -87,6 +88,8 @@ import {
   buildProxyBindingContext,
   type ProxyBindingContext,
 } from "../lib/accountProxyBinding";
+import { shouldDeferAccountListFetch } from "../lib/accountListFetch";
+import { scheduleAccountStatsPoll } from "../lib/accountStatsPoll";
 import {
   isLargePoolSortDisabled,
   resolveDisabledAccountSorts,
@@ -179,6 +182,7 @@ function AntigravityAccounts({
     closeOperationResults,
   } = useOperationProgress(showOperationResults);
   const requestAbortRef = useRef<AbortController | null>(null);
+  const requestGenerationRef = useRef(0);
 
   // ---------- 列表数据 ----------
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
@@ -190,6 +194,7 @@ function AntigravityAccounts({
   const [serverSummary, setServerSummary] = useState<AccountListSummary | null>(null);
   const [totalAccounts, setTotalAccounts] = useState(0);
   const [disabledSorts, setDisabledSorts] = useState<string[] | undefined>(undefined);
+  const [statsState, setStatsState] = useState<"ready" | "stale" | "warming">("warming");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
@@ -216,6 +221,7 @@ function AntigravityAccounts({
   }, [sortKey, sortDir]);
   const [showFilters, setShowFilters] = useState(false);
   const [pageStats, setPageStats] = useState<Record<string, AccountPageStatsItem>>({});
+  const [liveState, setLiveState] = useState<AccountLiveStateResponse["accounts"]>({});
   const [healthBars, setHealthBars] = useState<Record<string, AccountHealthBucket[]>>({});
   // 跨页勾选的账号只知道 id;这里记住见过的行,用来判断勾选里有没有 API Key 号。
   const knownAccountsRef = useRef<Map<number, AccountRow>>(new Map());
@@ -389,6 +395,7 @@ function AntigravityAccounts({
       requestAbortRef.current?.abort();
       const controller = new AbortController();
       requestAbortRef.current = controller;
+      const generation = ++requestGenerationRef.current;
       if (!options?.silent) setLoading(true);
       try {
         const response = await api.getAccountsPage(
@@ -407,7 +414,7 @@ function AntigravityAccounts({
           },
           controller.signal,
         );
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || generation !== requestGenerationRef.current) return;
         const rows = (response.accounts ?? []).filter(
           (account) => account.antigravity_api !== false,
         );
@@ -416,16 +423,22 @@ function AntigravityAccounts({
         setTotalAccounts(response.total ?? 0);
         setServerSummary(response.summary ?? null);
         setDisabledSorts(response.disabled_sorts);
+        setStatsState(response.stats_state ?? "ready");
         setLoadedPage(response.page ?? page);
         if (response.page && response.page !== page) setPage(response.page);
         setError(null);
       } catch (loadError) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || generation !== requestGenerationRef.current) return;
         const message = getErrorMessage(loadError);
         setError(message);
         showToast(message, "error");
       } finally {
-        if (requestAbortRef.current === controller) setLoading(false);
+        if (
+          requestAbortRef.current === controller &&
+          generation === requestGenerationRef.current
+        ) {
+          setLoading(false);
+        }
       }
     },
     [
@@ -443,9 +456,44 @@ function AntigravityAccounts({
     ],
   );
 
+  const listFilterKey = useMemo(
+    () =>
+      [
+        statusFilter,
+        authFilter,
+        sortKey,
+        sortDir,
+        groupFilter.include.join(","),
+        groupFilter.exclude.join(","),
+        groupFilter.ungrouped ? "1" : "0",
+        debouncedSearchQuery,
+      ].join("\0"),
+    [
+      authFilter,
+      debouncedSearchQuery,
+      groupFilter.exclude,
+      groupFilter.include,
+      groupFilter.ungrouped,
+      sortDir,
+      sortKey,
+      statusFilter,
+    ],
+  );
+  const appliedListFilterKeyRef = useRef(listFilterKey);
+  const statsFilterKeyRef = useRef(listFilterKey);
+  const statsStaleRetriesRef = useRef(0);
+
   useEffect(() => {
+    if (shouldDeferAccountListFetch(page, listFilterKey, appliedListFilterKeyRef.current)) {
+      appliedListFilterKeyRef.current = listFilterKey;
+      requestAbortRef.current?.abort();
+      requestGenerationRef.current += 1;
+      setPage(1);
+      return;
+    }
+    appliedListFilterKeyRef.current = listFilterKey;
     void reload();
-  }, [reload]);
+  }, [listFilterKey, page, reload]);
 
   useEffect(() => () => requestAbortRef.current?.abort(), []);
 
@@ -457,9 +505,29 @@ function AntigravityAccounts({
     return () => window.clearTimeout(timer);
   }, [searchQuery]);
 
+  // Request-count pills come from a detached usage_logs scan. Poll while
+  // stats_state is not ready so a slow scan cannot leave the pills at zero.
+  // A few hundred thousand log rows can take longer than a handful of tries.
+  // A hidden tab keeps the same delay and retry budget, then reloads once visible.
   useEffect(() => {
-    setPage(1);
-  }, [authFilter, groupFilter, sortDir, sortKey, statusFilter]);
+    if (statsFilterKeyRef.current !== listFilterKey) {
+      statsFilterKeyRef.current = listFilterKey;
+      statsStaleRetriesRef.current = 0;
+    }
+    if (loading) return undefined;
+    if (statsState === "ready") {
+      statsStaleRetriesRef.current = 0;
+      return undefined;
+    }
+    const maxStatsRetries = (disabledSorts ?? []).includes("requests") ? 60 : 20;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
+    // error is a dep so a failed silent reload re-runs this effect and rearms
+    // the one-shot poll; otherwise the pills stay stale until another action.
+    return scheduleAccountStatsPoll(3000, () => {
+      statsStaleRetriesRef.current += 1;
+      void reload({ silent: true });
+    });
+  }, [accounts, disabledSorts, error, listFilterKey, loading, reload, statsState]);
 
   // 当前页的网关侧用量明细(今日 / 5h / 7d)与健康条;失败不阻断列表。
   const accountIDsKey = useMemo(() => accounts.map((account) => account.id).join(","), [accounts]);
@@ -490,19 +558,59 @@ function AntigravityAccounts({
     };
   }, [accountIDsKey]);
 
+  // 并发徽章的实时计数,与 Codex/Kiro 页同一个 /accounts/live 接口;失败保留上一次快照。
+  useEffect(() => {
+    if (!accountIDsKey) {
+      setLiveState({});
+      return undefined;
+    }
+    const controller = new AbortController();
+    const ids = accountIDsKey.split(",").map(Number);
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const res = await api.getAccountLiveState(ids, controller.signal);
+        if (!controller.signal.aborted) setLiveState(res.accounts ?? {});
+      } catch {
+        /* 实时状态失败不阻断列表 */
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load();
+    }, 5000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [accountIDsKey]);
+
   // 渲染行 = 基础行 + page-stats 补齐(只补缺失字段,基础行已有的以基础行为准)。
   const displayRows = useMemo(
     () =>
       accounts.map((account) => {
         const stats = pageStats[String(account.id)];
-        if (!stats) return account;
+        const live = liveState[String(account.id)];
+        if (!stats && !live) return account;
         const merged = { ...account };
-        if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
-        if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
-        if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
+        if (live) {
+          merged.active_requests = live.active_requests;
+          merged.occupied_requests = live.occupied_requests;
+          if (typeof live.dynamic_concurrency_limit === "number") merged.dynamic_concurrency_limit = live.dynamic_concurrency_limit;
+          if (typeof live.base_concurrency_effective === "number") merged.base_concurrency_effective = live.base_concurrency_effective;
+        }
+        if (stats) {
+          if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
+          if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
+          if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
+        }
         return merged;
       }),
-    [accounts, pageStats],
+    [accounts, liveState, pageStats],
   );
 
   // 跨页切换详情时旧页行先消失、新页行随后到达;保留上一次解析到的行,避免抽屉闪关。

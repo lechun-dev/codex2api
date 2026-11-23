@@ -279,7 +279,7 @@ const (
 
 	postgresMaxBindParams = 65535
 	// Keep local conversation trace fields together with upstream turn-state, model audit and media billing fields.
-	usageLogInsertColumnCount = 75
+	usageLogInsertColumnCount = 76
 	// 2026-09-15 coder(lq): Derive the batch ceiling from the real column count so PostgreSQL never exceeds 65535 bind parameters.
 	maxUsageLogInsertRowsPerSQL = postgresMaxBindParams / usageLogInsertColumnCount
 	maxPostgresBindParams       = postgresMaxBindParams
@@ -402,6 +402,8 @@ type usageLogEntry struct {
 	UpstreamErrorKind      string
 	ErrorMessage           string
 	PromptPolicyIncidentID string
+	// CreatedAt 是请求完成、进缓冲的时刻,落库为 created_at。
+	CreatedAt time.Time
 }
 
 // New 创建数据库连接并自动建表。
@@ -1292,6 +1294,10 @@ func (db *DB) migrate(ctx context.Context) error {
 		return db.migrateMySQL(ctx)
 	}
 	query := codexClientVersionCacheSchema + `;
+	CREATE TABLE IF NOT EXISTS key_usage_account_permissions (key_id BIGINT PRIMARY KEY, view_enabled BOOLEAN NOT NULL DEFAULT FALSE, reset_enabled BOOLEAN NOT NULL DEFAULT FALSE);
+	CREATE TABLE IF NOT EXISTS key_usage_reset_attempts (request_id TEXT PRIMARY KEY, key_id BIGINT NOT NULL, account_id BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+	CREATE TABLE IF NOT EXISTS key_usage_reset_leases (scope TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at BIGINT NOT NULL);
+	CREATE TABLE IF NOT EXISTS key_usage_reset_cooldowns (scope TEXT PRIMARY KEY, expires_at BIGINT NOT NULL);
 	CREATE TABLE IF NOT EXISTS accounts (
 		id            SERIAL PRIMARY KEY,
 		name          VARCHAR(255) DEFAULT '',
@@ -1544,6 +1550,7 @@ func (db *DB) migrate(ctx context.Context) error {
 				visible_channels_config TEXT DEFAULT '{}',
 				channel_test_config TEXT DEFAULT '{}',
 				antigravity_config TEXT DEFAULT '{}',
+				kiro_config TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.5',
@@ -1563,7 +1570,13 @@ func (db *DB) migrate(ctx context.Context) error {
 			response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 			response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
 			response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
-			response_cache_config_generation BIGINT NOT NULL DEFAULT 1
+			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
+			output_guard_enabled BOOLEAN DEFAULT FALSE,
+			output_guard_max_tool_argument_bytes BIGINT NOT NULL DEFAULT 262144,
+			output_guard_max_tool_argument_deltas INT NOT NULL DEFAULT 4096,
+			output_guard_max_channel_bytes BIGINT NOT NULL DEFAULT 2097152,
+			output_guard_max_request_bytes BIGINT NOT NULL DEFAULT 4194304,
+			output_guard_config_generation BIGINT NOT NULL DEFAULT 1
 		);
 	CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
 		api_key_id BIGINT NOT NULL,
@@ -1612,6 +1625,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS visible_channels_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS channel_test_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS antigravity_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS kiro_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS test_content TEXT DEFAULT 'hi';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
@@ -1639,6 +1653,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_concurrency INT DEFAULT 16;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_quiet_hours TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_spread BOOLEAN DEFAULT FALSE;
@@ -1680,8 +1695,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	SET test_model = 'gpt-5.5'
 	WHERE LOWER(COALESCE(test_model, '')) IN ('gpt-5.4', 'gpt-5.4-mini');
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.160.0';
-	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.160.0';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.170.0';
+	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.170.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_telemetry_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_turn_state_template_cache_enabled BOOLEAN DEFAULT FALSE;
@@ -1750,7 +1765,6 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_on_exhaustion_enabled BOOLEAN DEFAULT FALSE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_unified_client_identity_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_activate_5h_window_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
@@ -1770,6 +1784,12 @@ func (db *DB) migrate(ctx context.Context) error {
 	-- 2026-10-27 coder(lq): 该列是 fork 侧设置项，MySQL/SQLite 都有，PG 之前漏了，
 	-- 全新 PG 库读取系统设置会因为列不存在直接失败。
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_max_tool_argument_bytes BIGINT NOT NULL DEFAULT 262144;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_max_tool_argument_deltas INT NOT NULL DEFAULT 4096;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_max_channel_bytes BIGINT NOT NULL DEFAULT 2097152;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_max_request_bytes BIGINT NOT NULL DEFAULT 4194304;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS output_guard_config_generation BIGINT NOT NULL DEFAULT 1;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -2103,6 +2123,7 @@ const (
 	UpstreamChannelGrok        = "grok"
 	UpstreamChannelAntigravity = "antigravity"
 	UpstreamChannelClaude      = "claude"
+	UpstreamChannelKiro        = "kiro"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -2116,8 +2137,30 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelAntigravity
 	case UpstreamChannelClaude:
 		return UpstreamChannelClaude
+	case UpstreamChannelKiro:
+		return UpstreamChannelKiro
 	}
 	return UpstreamChannelAuto
+}
+
+// accountChannelFilterSQL returns the shared account-provider predicate used by
+// both full account reads and the sanitized admin-list projection.
+func accountChannelFilterSQL(channel, upstreamTypeExpr string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case UpstreamChannelGrok:
+		return ` AND ` + upstreamTypeExpr + ` = 'grok'`
+	case UpstreamChannelAntigravity:
+		return ` AND ` + upstreamTypeExpr + ` = 'antigravity'`
+	case UpstreamChannelClaude:
+		return ` AND ` + upstreamTypeExpr + ` = 'claude'`
+	case UpstreamChannelKiro:
+		return ` AND ` + upstreamTypeExpr + ` = 'kiro'`
+	case UpstreamChannelCodex:
+		// Blank legacy rows and OpenAI Responses relays remain in the Codex view.
+		return ` AND ` + upstreamTypeExpr + ` NOT IN ('grok', 'antigravity', 'claude', 'kiro')`
+	default:
+		return ""
+	}
 }
 
 // ResolveImageGenerationPolicy 归一 Key 的图片工具策略，统一新旧两种配置来源：
@@ -2694,6 +2737,7 @@ type SystemSettings struct {
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
 	PayloadRules                       string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
 	ReasoningEffortModels              string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
+	BackgroundQuietHours               string
 	BackgroundRefreshIntervalMinutes   int
 	UsageProbeMaxAgeMinutes            int
 	UsageProbeConcurrency              int
@@ -2726,7 +2770,6 @@ type SystemSettings struct {
 	CodexUserAgentConfig               string
 	CodexTelemetryEnabled              bool
 	CodexTelemetryTimingDebug          bool
-	CodexUnifiedClientIdentityEnabled  bool   // 网关自发维护请求统一使用配置的客户端身份（默认关闭，issue #774）
 	CodexImagesMainModel               string // 空值沿用部署默认的生图文本驱动模型
 	UsageLogMode                       string
 	UsageLogBatchSize                  int
@@ -2947,7 +2990,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
-		       COALESCE(codex_min_cli_version, '0.160.0'),
+		       COALESCE(codex_min_cli_version, '0.170.0'),
 		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
@@ -3025,8 +3068,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_oauth_keepalive_enabled, false),
 		       COALESCE(codex_telemetry_timing_debug, false),
 		       COALESCE(auto_reset_credits_on_exhaustion_enabled, false),
-		       COALESCE(codex_unified_client_identity_enabled, false),
-		       COALESCE(codex_ws_downstream_keepalive_slots, 8)
+		       COALESCE(codex_ws_downstream_keepalive_slots, 8),
+		       COALESCE(background_quiet_hours, '[]')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -3117,8 +3160,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexOAuthKeepaliveEnabled,
 		&s.CodexTelemetryTimingDebug,
 		&s.AutoResetCreditsOnExhaustionEnabled,
-		&s.CodexUnifiedClientIdentityEnabled,
-		&s.CodexWSDownstreamKeepaliveSlots,
+		&s.CodexWSDownstreamKeepaliveSlots, &s.BackgroundQuietHours,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3180,10 +3222,26 @@ func NormalizeCodexFingerprintDefaultMode(mode string) string {
 	}
 }
 
+// systemSettingsExecer 让同一份 system_settings upsert 既能直接在连接上执行，
+// 也能在事务内执行，供需要原子提交多份设置的调用方复用。
+type systemSettingsExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
 // codex_synced_cli_version 与 model_pricing_* 由各自的窄更新独立维护；冲突更新时
 // 保留数据库当前值，避免管理员保存其他设置时回滚后台同步刚写入的数据。
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
+	return updateSystemSettingsWithExecer(ctx, db.conn, s)
+}
+
+// updateSystemSettingsWithExecer 执行全局设置 upsert。它不关心调用方是
+// *sql.DB 还是 *sql.Tx，由调用方决定是否与其他写入共享事务。
+func updateSystemSettingsWithExecer(ctx context.Context, execer systemSettingsExecer, s *SystemSettings) error {
+	quietHours, quietErr := NormalizeBackgroundQuietHours(s.BackgroundQuietHours)
+	if quietErr != nil {
+		return quietErr
+	}
 	reasoningEffortModels := strings.TrimSpace(s.ReasoningEffortModels)
 	if reasoningEffortModels == "" {
 		reasoningEffortModels = "[]"
@@ -3207,7 +3265,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	if testContent == "" {
 		testContent = "hi"
 	}
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := execer.ExecContext(ctx, `
 			INSERT INTO system_settings (
 				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_content, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
@@ -3285,7 +3343,6 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_window_minutes,
 					session_slot_buffer_enabled,
 					session_slot_buffer_seconds,
-					models_list_read_max_bytes,
 					auto_activate_5h_window_enabled,
 					scheduler_engine,
 					codex_request_compression,
@@ -3296,10 +3353,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug,
 					auto_reset_credits_on_exhaustion_enabled,
-					codex_unified_client_identity_enabled,
-					codex_ws_downstream_keepalive_slots
+					codex_ws_downstream_keepalive_slots, background_quiet_hours
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126, $127, $128, $129, $130, $133)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126, $127, $128, $131, $132)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -3339,10 +3395,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $131 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $129 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = CASE WHEN $132 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
+				prompt_filter_review_api_key = CASE WHEN $130 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -3417,7 +3473,6 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes,
 					session_slot_buffer_enabled = EXCLUDED.session_slot_buffer_enabled,
 					session_slot_buffer_seconds = EXCLUDED.session_slot_buffer_seconds,
-					models_list_read_max_bytes = EXCLUDED.models_list_read_max_bytes,
 					auto_activate_5h_window_enabled = EXCLUDED.auto_activate_5h_window_enabled,
 					scheduler_engine = EXCLUDED.scheduler_engine,
 					codex_request_compression = EXCLUDED.codex_request_compression,
@@ -3427,8 +3482,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_oauth_keepalive_enabled = EXCLUDED.codex_oauth_keepalive_enabled,
 					codex_telemetry_timing_debug = EXCLUDED.codex_telemetry_timing_debug,
 					auto_reset_credits_on_exhaustion_enabled = EXCLUDED.auto_reset_credits_on_exhaustion_enabled,
-					codex_unified_client_identity_enabled = EXCLUDED.codex_unified_client_identity_enabled,
-					codex_ws_downstream_keepalive_slots = EXCLUDED.codex_ws_downstream_keepalive_slots
+					codex_ws_downstream_keepalive_slots = EXCLUDED.codex_ws_downstream_keepalive_slots,
+					background_quiet_hours = EXCLUDED.background_quiet_hours
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -3475,7 +3530,6 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeCodexOverloadWindowMinutes(s.CodexOverloadWindowMinutes),
 		s.SessionSlotBufferEnabled,
 		NormalizeSessionSlotBufferSeconds(s.SessionSlotBufferSeconds),
-		NormalizeModelsListReadMaxBytes(s.ModelsListReadMaxBytes),
 		s.AutoActivate5hWindowEnabled,
 		schedulerEngine,
 		s.CodexRequestCompression,
@@ -3486,10 +3540,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexOAuthKeepaliveEnabled,
 		s.CodexTelemetryTimingDebug,
 		s.AutoResetCreditsOnExhaustionEnabled,
-		s.CodexUnifiedClientIdentityEnabled,
 		s.PreservePromptFilterCustomPatterns,
-		s.PreservePromptFilterReviewAPIKey,
-		NormalizeCodexWSDownstreamKeepaliveSlots(s.CodexWSDownstreamKeepaliveSlots))
+		s.PreservePromptFilterReviewAPIKey, NormalizeCodexWSDownstreamKeepaliveSlots(s.CodexWSDownstreamKeepaliveSlots), quietHours)
 	return err
 }
 
@@ -4761,6 +4813,11 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 		return nil
 	}
 
+	// 2026-11-23 coder(lq): Preserve request completion time across buffered flushes without bypassing local trace encryption.
+	createdAt := input.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	entry := usageLogEntry{
 		RequestID:              clampUsageLogText(input.RequestID, usageLogRequestIDMaxLen),
 		UpstreamRequestID:      clampUsageLogText(input.UpstreamRequestID, usageLogRequestIDMaxLen),
@@ -4836,6 +4893,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, input *UsageLogInput) error {
 		UpstreamErrorKind:      clampUsageLogText(input.UpstreamErrorKind, usageLogShortTextMaxLen),
 		ErrorMessage:           input.ErrorMessage,
 		PromptPolicyIncidentID: clampUsageLogText(input.PromptPolicyIncidentID, usageLogShortTextMaxLen),
+		CreatedAt:              createdAt,
 	}
 	if err := db.protectUsageLogEntryForStorage(&entry); err != nil {
 		log.Printf("usage log request_text encryption failed, clearing request_text: %v", err)
@@ -4981,6 +5039,8 @@ type UsageLogInput struct {
 	UpstreamErrorKind      string
 	ErrorMessage           string
 	PromptPolicyIncidentID string
+	// CreatedAt 是请求完成时刻,写入 usage_logs.created_at;零值取 InsertUsageLog 被调用的时刻。
+	CreatedAt time.Time
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -4992,7 +5052,7 @@ func (l *UsageLog) populateBillingBreakdown() {
 	if billingServiceTier == "" {
 		billingServiceTier = l.ServiceTier
 	}
-	breakdown := UsageLogCostBreakdown(&UsageLogInput{Model: billingModel, DaybreakProgram: l.DaybreakProgram, BillingServiceTier: billingServiceTier, InputTokens: l.InputTokens, OutputTokens: l.OutputTokens, CachedTokens: l.CachedTokens, CacheWrite5mTokens: l.CacheWrite5mTokens, CacheWrite1hTokens: l.CacheWrite1hTokens, ImageInputTokens: l.ImageInputTokens, ImageOutputTokens: l.ImageOutputTokens, CachedImageInputTokens: l.CachedImageInputTokens})
+	breakdown := UsageLogCostBreakdown(&UsageLogInput{Model: billingModel, DaybreakProgram: l.DaybreakProgram, BillingServiceTier: billingServiceTier, InputTokens: l.InputTokens, OutputTokens: l.OutputTokens, CachedTokens: l.CachedTokens, CacheWrite5mTokens: l.CacheWrite5mTokens, CacheWrite1hTokens: l.CacheWrite1hTokens, ImageInputTokens: l.ImageInputTokens, ImageOutputTokens: l.ImageOutputTokens, CachedImageInputTokens: l.CachedImageInputTokens, CreatedAt: l.CreatedAt})
 	l.ImageInputCost, l.ImageCacheReadCost = breakdown.ImageInputCost, breakdown.ImageCacheReadCost
 	l.ImageInputPrice, l.CachedImageInputPrice = breakdown.ImageInputPricePerMToken, breakdown.CacheReadImagePricePerMToken
 	l.InputCost = breakdown.InputCost
@@ -5306,8 +5366,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				  requested_service_tier, actual_service_tier, billing_service_tier,
 				  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 				  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-				  client_user_agent, upstream_user_agent, user_agent_overridden, turn_state_overridden, turn_state_rewrite_note, internal_reason, parent_request_id, prompt_policy_incident_id, request_id, upstream_request_id, upstream_proxy_id, upstream_proxy_name, injected_turn_state, upstream_turn_state, user_billing_mode, image_unit_price, billed_image_count, daybreak_program, video_seconds)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75)`)
+				  client_user_agent, upstream_user_agent, user_agent_overridden, turn_state_overridden, turn_state_rewrite_note, internal_reason, parent_request_id, prompt_policy_incident_id, request_id, upstream_request_id, upstream_proxy_id, upstream_proxy_name, injected_turn_state, upstream_turn_state, user_billing_mode, image_unit_price, billed_image_count, daybreak_program, video_seconds, created_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76)`)
 		if err != nil {
 			return fmt.Errorf("准备语句: %w", err)
 		}
@@ -5319,7 +5379,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 				e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 				e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 				e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.TurnStateOverridden, e.TurnStateRewriteNote, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID), e.RequestID, e.UpstreamRequestID, e.UpstreamProxyID, e.UpstreamProxyName, e.InjectedTurnState, e.UpstreamTurnState, e.UserBillingMode, e.ImageUnitPrice, e.BilledImageCount, e.DaybreakProgram, e.VideoSeconds)
+				e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.TurnStateOverridden, e.TurnStateRewriteNote, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID), e.RequestID, e.UpstreamRequestID, e.UpstreamProxyID, e.UpstreamProxyName, e.InjectedTurnState, e.UpstreamTurnState, e.UserBillingMode, e.ImageUnitPrice, e.BilledImageCount, e.DaybreakProgram, e.VideoSeconds, db.usageLogCreatedAtArg(e.CreatedAt))
 			if err != nil {
 				return fmt.Errorf("执行插入: %w", err)
 			}
@@ -5427,7 +5487,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer interface {
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.TurnStateOverridden, e.TurnStateRewriteNote, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID), e.RequestID, e.UpstreamRequestID, e.UpstreamProxyID, e.UpstreamProxyName, e.InjectedTurnState, e.UpstreamTurnState, e.UserBillingMode, e.ImageUnitPrice, e.BilledImageCount, e.DaybreakProgram, e.VideoSeconds)
+			e.ClientUserAgent, e.UpstreamUserAgent, e.UserAgentOverridden, e.TurnStateOverridden, e.TurnStateRewriteNote, e.InternalReason, e.ParentRequestID, nullablePromptPolicyIncidentID(e.PromptPolicyIncidentID), e.RequestID, e.UpstreamRequestID, e.UpstreamProxyID, e.UpstreamProxyName, e.InjectedTurnState, e.UpstreamTurnState, e.UserBillingMode, e.ImageUnitPrice, e.BilledImageCount, e.DaybreakProgram, e.VideoSeconds, db.usageLogCreatedAtArg(e.CreatedAt))
 		argIdx += usageLogInsertColumnCount
 	}
 
@@ -5436,7 +5496,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer interface {
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-		client_user_agent, upstream_user_agent, user_agent_overridden, turn_state_overridden, turn_state_rewrite_note, internal_reason, parent_request_id, prompt_policy_incident_id, request_id, upstream_request_id, upstream_proxy_id, upstream_proxy_name, injected_turn_state, upstream_turn_state, user_billing_mode, image_unit_price, billed_image_count, daybreak_program, video_seconds)
+		client_user_agent, upstream_user_agent, user_agent_overridden, turn_state_overridden, turn_state_rewrite_note, internal_reason, parent_request_id, prompt_policy_incident_id, request_id, upstream_request_id, upstream_proxy_id, upstream_proxy_name, injected_turn_state, upstream_turn_state, user_billing_mode, image_unit_price, billed_image_count, daybreak_program, video_seconds, created_at)
 		VALUES %s
 		RETURNING id`, strings.Join(valueStrings, ","))
 
@@ -5475,6 +5535,16 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer interface {
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// usageLogCreatedAtArg 把请求完成时刻转成 created_at 的绑定参数。SQLite 沿用列默认值
+// CURRENT_TIMESTAMP 的 UTC 秒级文本,区间查询按字符串比较,格式不一致就会错位。
+// 零值(不经 InsertUsageLog 直接拼的条目)退回写入时刻,不会写出 0001 年。
+func (db *DB) usageLogCreatedAtArg(createdAt time.Time) any {
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	return db.timeArg(createdAt.UTC())
 }
 
 func nullablePromptPolicyIncidentID(value string) any {
@@ -5961,7 +6031,8 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 				COALESCE(NULLIF(u.effective_model, ''), NULLIF(u.model, ''), 'unknown') AS model_name,
 				COALESCE(NULLIF(u.inbound_endpoint, ''), NULLIF(u.endpoint, ''), 'unknown') AS endpoint_name,
 				COALESCE(u.api_key_id, 0) AS api_key_id,
-				COALESCE(NULLIF(u.api_key_name, ''), NULLIF(u.api_key_masked, ''), 'unknown') AS api_key_label,
+				CASE WHEN u.api_key_id > 0 THEN '' ELSE
+					COALESCE(NULLIF(u.api_key_name, ''), NULLIF(u.api_key_masked, ''), 'unknown') END AS api_key_label,
 				COUNT(*) AS requests,
 				COALESCE(SUM(u.total_tokens), 0) AS tokens,
 				COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
@@ -5994,7 +6065,8 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 				COALESCE(NULLIF(u.effective_model, ''), NULLIF(u.model, ''), 'unknown'),
 				COALESCE(NULLIF(u.inbound_endpoint, ''), NULLIF(u.endpoint, ''), 'unknown'),
 				u.api_key_id,
-				COALESCE(NULLIF(u.api_key_name, ''), NULLIF(u.api_key_masked, ''), 'unknown'),
+				CASE WHEN u.api_key_id > 0 THEN '' ELSE
+					COALESCE(NULLIF(u.api_key_name, ''), NULLIF(u.api_key_masked, ''), 'unknown') END,
 				`+sumBigint("u.requests")+`,
 				`+sumBigint("u.total_tokens")+`,
 				`+sumBigint("u.input_tokens")+`,
@@ -6033,6 +6105,21 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 		}
 		return a.Endpoint < b.Endpoint
 	})
+	var keyIDs []int64
+	for key := range apiKeys {
+		if key.id > 0 {
+			keyIDs = append(keyIDs, key.id)
+		}
+	}
+	metadata, err := db.usageAPIKeyMetadata(ctx, keyIDs)
+	if err != nil {
+		return err
+	}
+	for key, item := range apiKeys {
+		if key.id > 0 {
+			item.Label = metadata[key.id].label()
+		}
+	}
 	stats.APIKeyStats = topUsageStats(apiKeys, 8, func(a, b *UsageAPIKeyStat) bool {
 		if a.Requests != b.Requests {
 			return a.Requests > b.Requests
@@ -6060,55 +6147,6 @@ func topUsageStats[K comparable, T any](byKey map[K]*T, limit int, less func(a, 
 		out[i] = *item
 	}
 	return out
-}
-
-// GetTrafficSnapshot 获取近实时流量快照
-func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) {
-	if db.isSQLite() {
-		return db.getTrafficSnapshotSQLite(ctx)
-	}
-	if db.isMySQL() {
-		return db.getTrafficSnapshotMySQL(ctx)
-	}
-
-	snapshot := &TrafficSnapshot{}
-	query := `
-	WITH per_second AS (
-		SELECT
-			date_trunc('second', created_at) AS sec,
-			COUNT(*)::float8 AS req_count,
-			COALESCE(SUM(total_tokens), 0)::float8 AS token_count
-		FROM usage_logs
-		WHERE created_at >= NOW() - INTERVAL '5 minutes'
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1
-	),
-	current_window AS (
-		SELECT
-			COALESCE(SUM(req_count), 0)::float8 AS req_10s,
-			COALESCE(SUM(token_count), 0)::float8 AS tok_10s
-		FROM per_second
-		WHERE sec >= date_trunc('second', NOW() - INTERVAL '10 seconds')
-	)
-	SELECT
-		COALESCE((SELECT req_10s FROM current_window), 0) / 10.0 AS qps,
-		COALESCE(MAX(req_count), 0) AS qps_peak,
-		COALESCE((SELECT tok_10s FROM current_window), 0) / 10.0 AS tps,
-		COALESCE(MAX(token_count), 0) AS tps_peak
-	FROM per_second
-	`
-
-	err := db.conn.QueryRowContext(ctx, query).Scan(
-		&snapshot.QPS,
-		&snapshot.QPSPeak,
-		&snapshot.TPS,
-		&snapshot.TPSPeak,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return snapshot, nil
 }
 
 // ListRecentUsageLogs 获取最近的请求日志
@@ -6417,14 +6455,10 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 	}
 	defer rows.Close()
 
-	type accountUsageKey struct {
-		ID     int64
-		Name   string
-		Masked string
-	}
 	dayStats := make(map[string]*AccountUsageDayStat)
 	modelStats := make(map[string]*AccountModelStat)
-	keyStats := make(map[accountUsageKey]*AccountKeyStat)
+	keyStats := make(map[usageAPIKeyIdentity]*AccountKeyStat)
+	var keyIDs []int64
 	durations := make([]int64, 0, 1024)
 	var cacheHitRequests, durationSamples int64
 	var durationMsSum, firstTokenMsSum float64
@@ -6515,11 +6549,17 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 		modelStat.AccountBilled += accountBilled
 		modelStat.UserBilled += userBilled
 
-		key := accountUsageKey{ID: apiKeyID, Name: apiKeyName, Masked: apiKeyMasked}
+		key := usageAPIKeyIdentity{id: apiKeyID}
+		if apiKeyID <= 0 {
+			key.name, key.masked = apiKeyName, apiKeyMasked
+		}
 		keyStat := keyStats[key]
 		if keyStat == nil {
-			keyStat = &AccountKeyStat{APIKeyID: apiKeyID, APIKeyName: apiKeyName, APIKeyMasked: apiKeyMasked}
+			keyStat = &AccountKeyStat{APIKeyID: key.id, APIKeyName: key.name, APIKeyMasked: key.masked}
 			keyStats[key] = keyStat
+			if apiKeyID > 0 {
+				keyIDs = append(keyIDs, apiKeyID)
+			}
 		}
 		keyStat.Requests++
 		keyStat.Tokens += totalTokens
@@ -6554,7 +6594,15 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 		}
 		return result.Models[i].Requests > result.Models[j].Requests
 	})
+	metadata, err := db.usageAPIKeyMetadata(ctx, keyIDs)
+	if err != nil {
+		return nil, err
+	}
 	for _, item := range keyStats {
+		if item.APIKeyID > 0 {
+			key := metadata[item.APIKeyID]
+			item.APIKeyName, item.APIKeyMasked = key.name, key.masked
+		}
 		result.ByAPIKey = append(result.ByAPIKey, *item)
 	}
 	sort.Slice(result.ByAPIKey, func(i, j int) bool {
@@ -7616,13 +7664,15 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelGrok)
 	case UpstreamChannelAntigravity:
 		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity)
+	case UpstreamChannelKiro:
+		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelKiro)
 	case UpstreamChannelClaude:
 		where += ` AND ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude)
 	case UpstreamChannelCodex:
 		// 缺省 upstream_type 的历史号仍归入 Codex 视图。
 		where += ` AND NOT (` + db.accountUpstreamTypePredicate(UpstreamChannelGrok) +
 			` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelAntigravity) +
-			` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + `)`
+			` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelClaude) + ` OR ` + db.accountUpstreamTypePredicate(UpstreamChannelKiro) + `)`
 	}
 
 	query := `
@@ -9344,6 +9394,11 @@ func (db *DB) insertAccountRowWithFamily(ctx context.Context, postgresQuery, sql
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET credential_family_id=$1 WHERE id=$2 AND COALESCE(credential_family_id,'')=''`, candidate, returnID); err != nil {
 			return err
+		}
+		if db.isMySQL() {
+			if err := db.enrollNewIntelligenceAccountMySQLTx(ctx, tx, returnID); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	})

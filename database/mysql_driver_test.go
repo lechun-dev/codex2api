@@ -701,17 +701,17 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		"codex_telemetry_enabled = VALUES(codex_telemetry_enabled)",
 		"codex_oauth_keepalive_enabled = VALUES(codex_oauth_keepalive_enabled)",
 		"codex_telemetry_timing_debug = VALUES(codex_telemetry_timing_debug)",
-		"codex_unified_client_identity_enabled = VALUES(codex_unified_client_identity_enabled)",
+		"background_quiet_hours = VALUES(background_quiet_hours)",
 	} {
 		if !strings.Contains(capture.query, fragment) {
 			t.Fatalf("rewritten settings query missing %q: %s", fragment, capture.query)
 		}
 	}
-	if got := strings.Count(capture.query, "?"); got != 133 {
-		t.Fatalf("rewritten settings placeholder count = %d, want 133", got)
+	if got := strings.Count(capture.query, "?"); got != 132 {
+		t.Fatalf("rewritten settings placeholder count = %d, want 132", got)
 	}
-	if len(capture.args) != 133 {
-		t.Fatalf("rewritten settings argument count = %d, want 133", len(capture.args))
+	if len(capture.args) != 132 {
+		t.Fatalf("rewritten settings argument count = %d, want 132", len(capture.args))
 	}
 	wantTail := []interface{}{
 		settings.GithubToken,
@@ -722,7 +722,6 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		int64(settings.CodexOverloadWindowMinutes),
 		settings.SessionSlotBufferEnabled,
 		int64(NormalizeSessionSlotBufferSeconds(settings.SessionSlotBufferSeconds)),
-		NormalizeModelsListReadMaxBytes(settings.ModelsListReadMaxBytes),
 		settings.AutoActivate5hWindowEnabled,
 		settings.SchedulerEngine,
 		settings.CodexRequestCompression,
@@ -733,8 +732,8 @@ func TestUpdateSystemSettingsRewritesNewFieldsForMySQL56(t *testing.T) {
 		settings.CodexOAuthKeepaliveEnabled,
 		settings.CodexTelemetryTimingDebug,
 		settings.AutoResetCreditsOnExhaustionEnabled,
-		settings.CodexUnifiedClientIdentityEnabled,
 		int64(settings.CodexWSDownstreamKeepaliveSlots),
+		"[]",
 		settings.PreservePromptFilterCustomPatterns,
 		settings.PreservePromptFilterReviewAPIKey,
 	}
@@ -925,7 +924,7 @@ func TestCreateAccountGroupUsesMySQL56InsertPath(t *testing.T) {
 }
 
 func TestInsertAccountWithCredentialsUsesMySQL56InsertPath(t *testing.T) {
-	capture := &mysqlCaptureDriver{lastInsertID: 88}
+	capture := &mysqlCaptureDriver{lastInsertID: 88, queryRows: [][]driver.Value{{`{"new_accounts_enabled":false}`}, {"codex"}}}
 	driverName := fmt.Sprintf("codex2api-mysql-account-insert-%d", atomic.AddUint64(&mysqlCaptureDriverSequence, 1))
 	sql.Register(driverName, mysqlRewriteDriver{inner: capture})
 

@@ -61,7 +61,7 @@ func TestIntelligenceCheckMySQLExpressionsUseColumnsNotJSON(t *testing.T) {
 	}
 
 	eligible := db.intelligenceEligibleSQL()
-	if !strings.Contains(eligible, "REGEXP") || !strings.Contains(eligible, "NOT IN") {
+	if !strings.Contains(eligible, "status<>") || !strings.Contains(eligible, "error_message") || strings.Contains(eligible, "NOT IN") {
 		t.Fatalf("MySQL 资格表达式不完整: %s", eligible)
 	}
 	assertNoMySQL56IncompatibleSQL(t, eligible)

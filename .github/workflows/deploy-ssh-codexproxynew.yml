@@ -1,5 +1,5 @@
-# 2026-09-06 coder(lq): 独立部署到 codexProxyNew (47.245.107.32)，不并入现有 Deploy SSH。
-# Secrets: CODEXPROXYNEW_DEPLOY_HOST / CODEXPROXYNEW_DEPLOY_USER / CODEXPROXYNEW_DEPLOY_SSH_KEY
+# 2026-11-23 coder(lq): codexProxyNew 更换 EIP，部署与回滚统一使用已核验的新地址。
+# Secrets: CODEXPROXYNEW_DEPLOY_USER / CODEXPROXYNEW_DEPLOY_SSH_KEY
 name: Deploy SSH (codexProxyNew)
 
 on:
@@ -12,6 +12,10 @@ on:
           - deploy
           - rollback
         default: deploy
+      release_tag:
+        description: Optional existing release tag (run workflow from main to use current deployment settings)
+        type: string
+        default: ''
       rollback_release:
         description: Existing release directory name, for example 42-abc1234
         type: string
@@ -40,13 +44,14 @@ permissions:
   contents: read
 
 env:
+  DEPLOY_HOST: 47.237.8.197
   # Public host key read through a verified SSH connection to codexProxyNew.
   # Rotate this pin if the server is rebuilt; never replace it with ssh-keyscan:
   # its unauthenticated algorithm probes trigger this server's Fail2ban rules.
   DEPLOY_HOST_PUBLIC_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTi8KskrvQPQdWYslNorfLxpEZzmbJ7NFvv7HsJRpN7
 
 concurrency:
-  group: deploy-ssh-codexproxynew-${{ github.ref }}
+  group: deploy-ssh-codexproxynew
   cancel-in-progress: false
 
 jobs:
@@ -71,8 +76,22 @@ jobs:
       SERVICE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.service_name || 'codex2api' }}
       HEALTHCHECK_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.healthcheck_url || '' }}
     steps:
+      # 2026-11-23 coder(lq): 从 main 使用最新连接配置，但可构建现有 tag，避免移动已发布标签。
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid release tag" >&2
+            exit 1
+          fi
+
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -89,7 +108,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         env:
-          VITE_APP_VERSION: ${{ github.sha }}
+          VITE_APP_VERSION: ${{ steps.checkout.outputs.commit }}
         run: |
           npm ci
           npm run build
@@ -116,7 +135,6 @@ jobs:
       - name: Install SSH key
         env:
           DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
-          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.CODEXPROXYNEW_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
@@ -127,19 +145,21 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          # Prefer configured known_hosts; otherwise use the verified public key.
+          # 2026-11-23 coder(lq): 保留已配置的主机记录；仅在新 EIP 缺失时补入核验公钥，不覆盖冲突密钥。
           # Never probe with ssh-keyscan: its preauth connections trigger Fail2ban.
+          : > ~/.ssh/known_hosts
           if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" > ~/.ssh/known_hosts
+          fi
+          if ! ssh-keygen -F "$DEPLOY_HOST" -f ~/.ssh/known_hosts >/dev/null; then
+            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" >> ~/.ssh/known_hosts
           fi
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy binary
         timeout-minutes: 30
         env:
-          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
+          SOURCE_SHA: ${{ steps.checkout.outputs.commit }}
           DEPLOY_USER: ${{ secrets.CODEXPROXYNEW_DEPLOY_USER }}
         run: |
           set -euo pipefail
@@ -148,7 +168,7 @@ jobs:
           [[ "$DEPLOY_DIR" != *".."* ]]
           [[ "$SERVICE_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]]
 
-          release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          release="$DEPLOY_DIR/releases/${GITHUB_RUN_NUMBER}-${SOURCE_SHA::7}"
           upload_tmp="/tmp/codex2api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           remote="$DEPLOY_USER@$DEPLOY_HOST"
           ssh_opts=(
@@ -230,7 +250,6 @@ jobs:
       - name: Install SSH key
         env:
           DEPLOY_SSH_KEY: ${{ secrets.CODEXPROXYNEW_DEPLOY_SSH_KEY }}
-          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.CODEXPROXYNEW_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
@@ -241,19 +260,20 @@ jobs:
           chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          # Prefer configured known_hosts; otherwise use the verified public key.
+          # 2026-11-23 coder(lq): 保留已配置的主机记录；仅在新 EIP 缺失时补入核验公钥，不覆盖冲突密钥。
           # Never probe with ssh-keyscan: its preauth connections trigger Fail2ban.
+          : > ~/.ssh/known_hosts
           if [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" > ~/.ssh/known_hosts
+          fi
+          if ! ssh-keygen -F "$DEPLOY_HOST" -f ~/.ssh/known_hosts >/dev/null; then
+            printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_PUBLIC_KEY" >> ~/.ssh/known_hosts
           fi
           chmod 600 ~/.ssh/known_hosts
 
       - name: Roll back release
         timeout-minutes: 10
         env:
-          DEPLOY_HOST: ${{ secrets.CODEXPROXYNEW_DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.CODEXPROXYNEW_DEPLOY_USER }}
         run: |
           set -euo pipefail

@@ -5,7 +5,7 @@
 | 工作流 | 文件 | 目标服务器 |
 | --- | --- | --- |
 | `Deploy SSH` | `.github/workflows/deploy-ssh.yml` | 现有国内服务器 |
-| `Deploy SSH (codexProxyNew)` | `.github/workflows/deploy-ssh-codexproxynew.yml` | `codexProxyNew`（`47.245.107.32`） |
+| `Deploy SSH (codexProxyNew)` | `.github/workflows/deploy-ssh-codexproxynew.yml` | `codexProxyNew`（`47.237.8.197`） |
 
 两套工作流都只支持在 GitHub Actions 里手动运行，不会因为推送到 `main` 自动部署。
 
@@ -35,9 +35,10 @@ find /deploy/codex2api/releases -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
 
 | Secret | 说明 |
 | --- | --- |
-| `CODEXPROXYNEW_DEPLOY_HOST` | `47.245.107.32` |
 | `CODEXPROXYNEW_DEPLOY_USER` | `deployuser` |
 | `CODEXPROXYNEW_DEPLOY_SSH_KEY` | 可登录 `codexProxyNew` 的 SSH 私钥内容 |
+
+`codexProxyNew` 的公开目标地址统一配置在专用工作流的 `env.DEPLOY_HOST`（`47.237.8.197`），部署和回滚不再读取旧的 `CODEXPROXYNEW_DEPLOY_HOST` Secret。SSH 私钥和用户名仍使用上述 Secrets。可选的 `CODEXPROXYNEW_SSH_KNOWN_HOSTS` 会保留；新地址缺少记录时补入已核验的公钥，已有冲突记录不会被覆盖。
 
 数据库密码、Redis 密码仍放在服务器本地 `.env`，不要放进仓库。
 
@@ -137,10 +138,13 @@ Actions -> Deploy SSH (codexProxyNew) -> Run workflow
 
 `codexProxyNew` 这台机器在海外，启动时连国内数据库会比较慢，对应工作流的服务重启等待时间更长。
 
+部署已有版本时，在 `Deploy SSH (codexProxyNew)` 选择 **main** 运行工作流，将 `release_tag` 填为如 `v3.1.12`。这样使用 main 的最新连接配置，构建指定 tag 的源码，release 目录与前端版本标记也使用源码实际提交；无需移动或删除 tag。留空则构建所选分支/tag。回滚时忽略此参数。
+
 参数：
 
 | 参数 | 建议值 |
 | --- | --- |
+| `release_tag` | 仅 codexProxyNew：可选的已有版本 tag，例如 `v3.1.12` |
 | `goarch` | x86_64 服务器选 `amd64`，ARM 选 `arm64` |
 | `deploy_dir` | `/deploy/codex2api` |
 | `service_name` | `codex2api` |

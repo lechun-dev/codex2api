@@ -1,25 +1,46 @@
 name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
       - 'v*'
+  # 2026-11-23 coder(lq): Recover a missed tag event without deleting or moving an already published tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to publish, e.g. v3.1.12'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      VERSION: ${{ github.ref_name }}
+      VERSION: ${{ inputs.tag || github.ref_name }}
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: expected vMAJOR.MINOR.PATCH with an optional suffix" >&2
+            exit 1
+          fi
+
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v5
+        with:
+          # 2026-11-23 coder(lq): Dispatch runs on main, but release binaries must come from the requested existing tag, never the dispatch branch.
+          ref: refs/tags/${{ env.VERSION }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -36,7 +57,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         env:
-          VITE_APP_VERSION: ${{ github.ref_name }}
+          VITE_APP_VERSION: ${{ env.VERSION }}
         run: |
           npm ci
           npm run build
@@ -92,7 +113,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ steps.checkout.outputs.commit }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
             dist/*.zip

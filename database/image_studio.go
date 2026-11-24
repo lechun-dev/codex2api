@@ -301,11 +301,12 @@ func (db *DB) InsertImageGenerationJob(ctx context.Context, input ImageGeneratio
 	if strings.TrimSpace(input.ParamsJSON) == "" {
 		input.ParamsJSON = "{}"
 	}
+	// 2026-11-24 coder(lq): MySQL 5.6 TEXT cannot default to ''; initialize queued jobs explicitly instead of storing NULL.
 	return db.insertRowID(ctx,
-		`INSERT INTO image_generation_jobs (status, prompt, params_json, api_key_id, api_key_name, api_key_masked)
-		 VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-		`INSERT INTO image_generation_jobs (status, prompt, params_json, api_key_id, api_key_name, api_key_masked)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
+		`INSERT INTO image_generation_jobs (status, prompt, params_json, api_key_id, api_key_name, api_key_masked, error_message)
+		 VALUES ($1,$2,$3,$4,$5,$6,'') RETURNING id`,
+		`INSERT INTO image_generation_jobs (status, prompt, params_json, api_key_id, api_key_name, api_key_masked, error_message)
+		 VALUES ($1,$2,$3,$4,$5,$6,'')`,
 		ImageJobQueued, input.Prompt, input.ParamsJSON, input.APIKeyID, input.APIKeyName, input.APIKeyMasked,
 	)
 }
@@ -476,13 +477,16 @@ func scanImageGenerationJob(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*ImageGenerationJob, error) {
 	var job ImageGenerationJob
+	// 2026-11-24 coder(lq): Existing MySQL jobs may have NULL errors; normalize once for history, summaries and result polling.
+	var errorMessage sql.NullString
 	var createdRaw, startedRaw, completedRaw interface{}
 	if err := scanner.Scan(
 		&job.ID, &job.Status, &job.Prompt, &job.ParamsJSON, &job.APIKeyID, &job.APIKeyName, &job.APIKeyMasked,
-		&job.ErrorMessage, &job.DurationMs, &createdRaw, &startedRaw, &completedRaw,
+		&errorMessage, &job.DurationMs, &createdRaw, &startedRaw, &completedRaw,
 	); err != nil {
 		return nil, err
 	}
+	job.ErrorMessage = errorMessage.String
 	if job.Status == ImageJobSucceeded && job.ErrorMessage != "" {
 		job.Warning = job.ErrorMessage
 		job.ErrorMessage = ""

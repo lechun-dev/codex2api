@@ -1,5 +1,11 @@
 # Changelog
 
+## v3.1.13 - 2026-11-24
+
+### Fixed
+
+- **Image Studio history and result polling tolerate legacy NULL error messages on MySQL.** New jobs explicitly initialize their error message without requiring a TEXT default or schema migration, preserving MySQL 5.6/8.0 compatibility. Regression tests cover nullable job states, real failure messages, success warnings and API key isolation.
+
 ## v3.1.9 - 2026-11-22
 
 ### Features
